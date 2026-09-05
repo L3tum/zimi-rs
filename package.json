@@ -1,0 +1,14 @@
+{
+  "name": "zimservice-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "extract-inline": "node tests/web/extract-inline.mjs",
+    "lint": "node tests/web/extract-inline.mjs && eslint web/common.js .web-lint-tmp/*.js"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9",
+    "eslint": "^9",
+    "globals": "^16"
+  }
+}

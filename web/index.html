@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Library — zimservice</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%2358a6ff'/%3E%3Ctext x='50' y='70' font-size='62' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EZ%3C/text%3E%3C/svg%3E">
+<style>
+:root { --bg: #0d1117; --fg: #c9d1d9; --card: #161b22; --border: #30363d; --accent: #58a6ff; --green: #3fb950; --yellow: #d29922; --red: #f85149; --muted: #8b949e; --purple: #a371f7; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--fg); min-height: 100vh; }
+.nav { display: flex; align-items: center; gap: 20px; padding: 12px 24px; border-bottom: 1px solid var(--border); background: var(--card); }
+.nav a { color: var(--accent); text-decoration: none; font-size: 14px; padding: 4px 2px; }
+.nav a:hover { text-decoration: underline; }
+.nav a.active { color: var(--fg); font-weight: 600; border-bottom: 2px solid var(--accent); }
+.nav .brand { font-weight: 700; font-size: 18px; color: var(--fg); margin-right: 8px; }
+.container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+h1 { font-size: 24px; margin-bottom: 8px; }
+.status-bar { display: flex; align-items: center; gap: 16px; margin: 12px 0 20px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+.status-bar .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+.dot.ok { background: var(--green); } .dot.bad { background: var(--red); }
+h2 { font-size: 18px; margin: 28px 0 12px; }
+.zim-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+.zim-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.zim-card h3 { font-size: 16px; margin-bottom: 8px; color: var(--accent); }
+.zim-card .meta { font-size: 13px; color: var(--muted); line-height: 1.7; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; background: #21262d; border: 1px solid var(--border); color: var(--muted); }
+.status { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+.status-ready { background: #1a3a2a; color: var(--green); }
+.status-pending { background: #3d2e00; color: var(--yellow); }
+.status-indexing { background: #1a2a3a; color: var(--accent); }
+.status-error { background: #3a1a1a; color: var(--red); }
+.prog { height: 5px; background: #21262d; border-radius: 3px; margin-top: 6px; overflow: hidden; }
+.prog div { height: 100%; background: var(--accent); border-radius: 3px; transition: width .4s; }
+.zim-settings { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding-top: 10px; border-top: 1px solid #21262d; font-size: 12px; }
+.zim-settings input[type=text] { flex: 1; min-width: 0; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border); background: #0d1117; color: var(--fg); font-size: 12px; }
+.zim-settings input[type=text]:focus { outline: none; border-color: var(--accent); }
+.zim-settings .cat-saved { color: var(--green); font-size: 11px; opacity: 0; transition: opacity .3s; }
+.btn { display: inline-block; padding: 6px 14px; border-radius: 6px; font-size: 13px; cursor: pointer; border: 1px solid var(--border); background: var(--card); color: var(--fg); text-decoration: none; }
+.btn:hover { border-color: var(--accent); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn-primary { background: #238636; border-color: #2ea043; color: white; }
+.btn-danger { color: var(--red); }
+.btn-danger:hover { border-color: var(--red); }
+.toggle { position: relative; width: 34px; height: 19px; flex: none; }
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle .slider { position: absolute; inset: 0; background: #30363d; border-radius: 10px; cursor: pointer; transition: .2s; }
+.toggle .slider:before { content: ''; position: absolute; width: 15px; height: 15px; left: 2px; bottom: 2px; background: white; border-radius: 50%; transition: .2s; }
+.toggle input:checked + .slider { background: #238636; }
+.toggle input:checked + .slider:before { transform: translateX(15px); }
+.toggle input:disabled + .slider { opacity: .4; cursor: not-allowed; }
+/* Downloads */
+.dl-form { display: flex; gap: 8px; margin-bottom: 14px; }
+.dl-form input { padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border); background: #0d1117; color: var(--fg); font-size: 13px; }
+.dl-form input.url { flex: 1; }
+.dl-form input:focus { outline: none; border-color: var(--accent); }
+.dl-list { display: flex; flex-direction: column; gap: 8px; }
+.dl-item { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }
+.dl-item .row1 { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+.dl-item .name { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dl-item .url { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
+.dl-item .detail { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.dl-item .detail .err { color: var(--red); }
+.empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+.toast { position: fixed; bottom: 24px; right: 24px; padding: 10px 16px; border-radius: 6px; font-size: 13px; display: none; z-index: 100; }
+.toast.show { display: block; }
+.toast.ok { background: #1a3a2a; color: var(--green); border: 1px solid #2ea043; }
+.toast.err { background: #3a1a1a; color: var(--red); border: 1px solid #da3633; }
+</style>
+</head>
+<body>
+<nav class="nav">
+  <span class="brand">zimservice</span>
+  <a href="/" class="active">Library</a>
+  <a href="/search.html">Search</a>
+  <a href="/settings.html">Settings</a>
+</nav>
+<div class="container">
+  <h1>Library</h1>
+  <div class="status-bar" id="statusBar">Loading…</div>
+  <div class="zim-grid" id="zims"></div>
+
+  <h2>Downloads</h2>
+  <div class="dl-form">
+    <input type="text" class="url" id="dlUrl" placeholder="https://…/.zim  or  magnet: / torrent URL">
+    <input type="text" id="dlName" placeholder="name (optional)" style="width:180px">
+    <button class="btn btn-primary" id="dlAdd" onclick="addDownload()">Add</button>
+  </div>
+  <div class="dl-list" id="dlList"></div>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/common.js"></script>
+<script>
+
+// ── Library ─────────────────────────────────────────────────────────────
+let zimsData = [];
+
+async function loadLibrary() {
+  const bar = document.getElementById('statusBar');
+  try {
+    const [health, list] = await Promise.all([
+      apiFetch('/health').then(r => r.ok ? r.json() : Promise.reject(new Error('health ' + r.status))),
+      apiFetch('/list').then(r => r.ok ? r.json() : Promise.reject(new Error('list ' + r.status))),
+    ]);
+    zimsData = list.zims || [];
+    bar.innerHTML =
+      `<span><span class="dot ok"></span>v${esc(health.version)}</span>` +
+      `<span>${zimsData.length} ZIMs</span>` +
+      `<span>${fmtNum(health.articles_count)} articles indexed</span>` +
+      `<span><span class="dot ${health.qbit_connected ? 'ok' : 'bad'}"></span>qBittorrent ${health.qbit_connected ? 'connected' : 'not configured'}</span>` +
+      `<a class="btn" style="padding:2px 10px" href="/openapi.json">API</a>`;
+    renderZims();
+  } catch (e) {
+    bar.innerHTML = `<span><span class="dot bad"></span>Error loading library: ${esc(e.message)}</span>`;
+  }
+}
+
+function renderZims() {
+  const grid = document.getElementById('zims');
+  if (!zimsData.length) {
+    grid.innerHTML = '<div class="empty">No ZIM files found. Add one via Downloads below, or place a .zim file in the configured ZIM directory.</div>';
+    return;
+  }
+  grid.innerHTML = zimsData.map(z => {
+    const pct = Math.min(100, Math.round((z.index_progress || 0) * 100));
+    const bar = (z.index_status === 'indexing' || z.index_status === 'pending')
+      ? `<div class="prog"><div style="width:${pct}%"></div></div>` : '';
+    return `
+    <div class="zim-card">
+      <h3>${esc(z.display_title)}</h3>
+      <div class="meta">
+        <div><span class="badge">${esc(z.language)}</span> ${z.category ? `<span class="badge">${esc(z.category)}</span>` : ''} ${z.date ? `<span class="badge">${esc(z.date)}</span>` : ''}</div>
+        <div>${fmtNum(z.entry_count)} entries · ${fmtBytes(z.file_size)}</div>
+        <div>${fmtNum(z.indexed_entries)} indexed · ${pct}%</div>
+        ${bar}
+        <div style="margin-top:8px">
+          <span class="status status-${esc(z.index_status)}">${esc(z.index_status)}</span>
+          ${z.embed_enabled ? '<span class="badge" style="color:var(--green)">embedding on</span>' : ''}
+        </div>
+      </div>
+      <div class="zim-settings">
+        <label class="toggle" title="Enable semantic (embedding) search for this ZIM">
+          <input type="checkbox" data-embed="${esc(z.name)}" ${z.embed_enabled ? 'checked' : ''}>
+          <span class="slider"></span>
+        </label>
+        <span title="Embedding">embed</span>
+        <input type="text" data-cat="${esc(z.name)}" value="${esc(z.category || '')}" placeholder="category (default)">
+        <span class="cat-saved" data-catmsg="${esc(z.name)}">✓</span>
+      </div>
+      <div style="margin-top:12px;display:flex;gap:8px">
+        <a class="btn" href="/search.html?q=&zim=${encodeURIComponent(z.name)}">Search</a>
+        <a class="btn" href="/settings.html#zim-${encodeURIComponent(z.name)}">Settings</a>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// Per-ZIM settings (immediate save)
+document.getElementById('zims').addEventListener('change', async (e) => {
+  const name = e.target.dataset.embed;
+  if (!name) return;
+  try {
+    const r = await apiFetch(`/settings/zim/${encodeURIComponent(name)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ embed_enabled: e.target.checked }),
+    });
+    if (!r.ok) throw new Error((await r.json()).error || r.status);
+    toast(`Embedding ${e.target.checked ? 'enabled' : 'disabled'} for ${name}`);
+  } catch (err) { toast('Save failed: ' + err.message, false); e.target.checked = !e.target.checked; }
+});
+
+let catTimers = {};
+document.getElementById('zims').addEventListener('input', (e) => {
+  const name = e.target.dataset.cat;
+  if (!name) return;
+  clearTimeout(catTimers[name]);
+  catTimers[name] = setTimeout(() => saveCategory(name, e.target), 800);
+});
+async function saveCategory(name, input) {
+  const z = zimsData.find(x => x.name === name);
+  if (!z) return;
+  const val = input.value.trim();
+  if (val === (z.category || '')) return; // unchanged
+  try {
+    const r = await apiFetch(`/settings/zim/${encodeURIComponent(name)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ category: val || null }),
+    });
+    if (!r.ok) throw new Error((await r.json()).error || r.status);
+    z.category = val || null;
+    const msg = document.querySelector(`[data-catmsg="${CSS.escape(name)}"]`);
+    if (msg) { msg.style.opacity = 1; setTimeout(() => msg.style.opacity = 0, 1200); }
+  } catch (err) { toast('Category save failed: ' + err.message, false); }
+}
+
+// ── Downloads ───────────────────────────────────────────────────────────
+let dlPoll = null;
+
+async function loadDownloads() {
+  let data;
+  try {
+    const r = await apiFetch('/downloads');
+    data = await r.json();
+  } catch (e) { return; }
+  const dl = data.downloads || [];
+  renderDownloads(dl);
+  // Keep polling only while something is in flight.
+  const active = dl.some(d => d.status === 'queued' || d.status === 'downloading' || d.status === 'seeding');
+  if (active && !dlPoll) dlPoll = setInterval(loadDownloads, 3000);
+  if (!active && dlPoll) { clearInterval(dlPoll); dlPoll = null; }
+}
+
+function renderDownloads(dl) {
+  const list = document.getElementById('dlList');
+  if (!dl.length) { list.innerHTML = '<div class="empty">No downloads yet.</div>'; return; }
+  list.innerHTML = dl.map(d => {
+    const pct = Math.min(100, Math.round((d.progress || 0) * 100));
+    const inFlight = d.status === 'queued' || d.status === 'downloading';
+    const speed = d.speed_bps ? ` · ${fmtBytes(d.speed_bps)}/s` : '';
+    const upSpeed = d.up_speed_bps ? ` · ▲ ${fmtBytes(d.up_speed_bps)}/s` : '';
+    const eta = d.eta_secs ? ` · ETA ${fmtEta(d.eta_secs)}` : '';
+    const prog = inFlight ? `<div class="prog"><div style="width:${pct}%;background:${d.status==='queued' ? 'var(--muted)' : 'var(--accent)'}"></div></div>` : '';
+    const statusColor = { queued: 'var(--muted)', downloading: 'var(--accent)', complete: 'var(--green)', seeding: 'var(--purple)', error: 'var(--red)', cancelled: 'var(--muted)' }[d.status] || 'var(--muted)';
+    const seedDetail = d.status === 'seeding'
+      ? `<div class="detail">${d.up_speed_bps != null ? `▲ ${fmtBytes(d.up_speed_bps)}/s` : '▲ –'}${d.ratio != null ? ` · ratio ${d.ratio.toFixed(2)}` : ''}${d.num_seeds != null ? ` · ${d.num_seeds} seeders` : ''}${d.speed_bps ? ` · ▼ ${fmtBytes(d.speed_bps)}/s` : ''}</div>`
+      : '';
+    return `
+    <div class="dl-item">
+      <div class="row1">
+        <span class="status" style="background:#21262d;color:${statusColor}">${esc(d.status)}</span>
+        <span class="name">${esc(d.name)}</span>
+        ${inFlight ? `<button class="btn btn-danger" style="padding:3px 10px" data-id="${d.id}">Cancel</button>` : ''}
+      </div>
+      <div class="row1" style="margin-top:4px"><span class="url">${esc(d.url)}</span></div>
+      ${prog}
+      ${inFlight ? `<div class="detail">${pct}%${speed}${upSpeed}${eta}</div>` : ''}
+      ${seedDetail}
+      ${d.error ? `<div class="detail"><span class="err">${esc(d.error)}</span></div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+async function addDownload() {
+  const url = document.getElementById('dlUrl').value.trim();
+  const name = document.getElementById('dlName').value.trim();
+  if (!url) { toast('Enter a URL or magnet link', false); return; }
+  const btn = document.getElementById('dlAdd');
+  btn.disabled = true;
+  try {
+    const r = await apiFetch('/downloads', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, name: name || undefined }),
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error || r.status);
+    document.getElementById('dlUrl').value = '';
+    document.getElementById('dlName').value = '';
+    toast('Download queued');
+    loadDownloads();
+  } catch (e) { toast('Failed: ' + e.message, false); }
+  btn.disabled = false;
+}
+document.getElementById('dlUrl').addEventListener('keydown', e => { if (e.key === 'Enter') addDownload(); });
+document.getElementById('dlList').addEventListener('click', e => {
+  const btn = e.target.closest('[data-id]');
+  if (btn) cancelDownload(Number(btn.dataset.id));
+});
+
+async function cancelDownload(id) {
+  try {
+    const r = await apiFetch(`/downloads/${id}`, { method: 'DELETE' });
+    if (!r.ok) throw new Error(r.status);
+    loadDownloads();
+  } catch (e) { toast('Cancel failed: ' + e.message, false); }
+}
+
+loadLibrary();
+loadDownloads();
+setInterval(() => { if (!document.hidden) loadLibrary(); }, 15000); // keep index progress / new files fresh (paused while the tab is hidden)
+</script>
+</body>
+</html>

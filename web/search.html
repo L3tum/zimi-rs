@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Search — zimservice</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%2358a6ff'/%3E%3Ctext x='50' y='70' font-size='62' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EZ%3C/text%3E%3C/svg%3E">
+<style>
+:root { --bg: #0d1117; --fg: #c9d1d9; --card: #161b22; --border: #30363d; --accent: #58a6ff; --green: #3fb950; --muted: #8b949e; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--fg); min-height: 100vh; }
+.nav { display: flex; align-items: center; gap: 20px; padding: 12px 24px; border-bottom: 1px solid var(--border); background: var(--card); }
+.nav a { color: var(--accent); text-decoration: none; font-size: 14px; padding: 4px 2px; }
+.nav a:hover { text-decoration: underline; }
+.nav a.active { color: var(--fg); font-weight: 600; border-bottom: 2px solid var(--accent); }
+.nav .brand { font-weight: 700; font-size: 18px; color: var(--fg); margin-right: 8px; }
+.container { max-width: 900px; margin: 0 auto; padding: 24px; }
+.search-box { display: flex; gap: 8px; margin-bottom: 16px; position: relative; }
+.search-box input { flex: 1; padding: 10px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--fg); font-size: 16px; }
+.search-box input:focus { outline: none; border-color: var(--accent); }
+.search-box button { padding: 10px 20px; border-radius: 6px; border: none; background: #238636; color: white; font-size: 14px; cursor: pointer; }
+.search-box button:hover { background: #2ea043; }
+.suggest-list { position: absolute; top: 100%; left: 0; right: 96px; background: var(--card); border: 1px solid var(--border); border-top: none; border-radius: 0 0 6px 6px; z-index: 10; display: none; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+.suggest-list div { padding: 8px 14px; cursor: pointer; font-size: 14px; }
+.suggest-list div:hover, .suggest-list div.sel { background: #21262d; }
+.filters { display: flex; gap: 12px; margin-bottom: 20px; align-items: center; flex-wrap: wrap; }
+.filters label { font-size: 12px; color: var(--muted); margin-right: 4px; }
+.filters select { padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--card); color: var(--fg); font-size: 13px; }
+.result { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
+.result h3 { font-size: 15px; color: var(--accent); margin-bottom: 6px; }
+.result h3 a { color: var(--accent); text-decoration: none; }
+.result h3 a:hover { text-decoration: underline; }
+.result .snippet { font-size: 13px; color: var(--muted); line-height: 1.5; }
+.result .meta { font-size: 11px; color: #484f58; margin-top: 6px; }
+.result mark { background: #3d2e00; color: #d29922; border-radius: 2px; padding: 0 2px; }
+.stats { font-size: 12px; color: var(--muted); margin-bottom: 12px; min-height: 16px; }
+.state { color: var(--muted); font-size: 14px; padding: 32px 0; text-align: center; display: none; }
+</style>
+</head>
+<body>
+<nav class="nav">
+  <span class="brand">zimservice</span>
+  <a href="/">Library</a>
+  <a href="/search.html" class="active">Search</a>
+  <a href="/settings.html">Settings</a>
+</nav>
+<div class="container">
+  <div class="search-box">
+    <input type="text" id="q" placeholder="Search across all ZIMs…" autocomplete="off" autofocus>
+    <button id="go">Search</button>
+    <div class="suggest-list" id="suggestions"></div>
+  </div>
+  <div class="filters">
+    <div><label for="zim">ZIM</label><select id="zim"><option value="">All ZIMs</option></select></div>
+    <div><label for="lang">Language</label><select id="lang"><option value="">All languages</option></select></div>
+    <div><label for="mode">Engine</label><select id="mode">
+      <option value="hybrid" selected>Hybrid</option>
+      <option value="fts">Full-text</option>
+      <option value="trgm">Fuzzy / trigram</option>
+      <option value="vector">Semantic (vector)</option>
+    </select></div>
+  </div>
+  <div class="stats" id="stats"></div>
+  <div class="state" id="loading">Searching…</div>
+  <div class="state" id="error"></div>
+  <div class="state" id="empty">No results. Try different terms or enable the fuzzy engine for approximate matches.</div>
+  <div id="results"></div>
+</div>
+<script src="/common.js"></script>
+<script>
+'use strict';
+
+let zims = [];
+const params = new URLSearchParams(location.search);
+const initialQ = params.get('q') || '';
+const initialZim = params.get('zim') || '';
+const initialLang = params.get('lang') || '';
+const initialMode = ['hybrid','fts','trgm','vector'].includes(params.get('mode')) ? params.get('mode') : 'hybrid';
+const qInput = document.getElementById('q');
+qInput.value = initialQ;
+document.getElementById('mode').value = initialMode;
+
+async function loadZims() {
+  try {
+    const r = await apiFetch('/list');
+    const data = await r.json();
+    zims = data.zims || [];
+    const zimSel = document.getElementById('zim');
+    const langSel = document.getElementById('lang');
+    const langs = new Set();
+    zims.forEach(z => {
+      const opt = document.createElement('option');
+      opt.value = z.name;
+      opt.textContent = z.display_title;
+      if (z.name === initialZim) opt.selected = true;
+      zimSel.appendChild(opt);
+      if (z.language) langs.add(z.language);
+    });
+    [...langs].sort().forEach(l => {
+      const opt = document.createElement('option');
+      opt.value = l;
+      opt.textContent = l;
+      if (l === initialLang) opt.selected = true;
+      langSel.appendChild(opt);
+    });
+    if (initialQ) doSearch();
+  } catch (e) {
+    showState('error', 'Could not load ZIM list: ' + esc(e.message));
+  }
+}
+
+function showState(which, msg) {
+  ['loading', 'error', 'empty'].forEach(id => {
+    document.getElementById(id).style.display = 'none';
+  });
+  if (which && which !== 'results') {
+    const el = document.getElementById(which);
+    if (msg != null) el.textContent = msg;
+    el.style.display = 'block';
+  }
+}
+
+let searchSeq = 0;
+async function doSearch() {
+  const q = qInput.value.trim();
+  if (!q) return;
+  closeSuggestions();
+  const zim = document.getElementById('zim').value;
+  const lang = document.getElementById('lang').value;
+  const mode = document.getElementById('mode').value;
+  const url = `/search?q=${encodeURIComponent(q)}&highlight=true` +
+    (zim ? '&zim=' + encodeURIComponent(zim) : '') +
+    (lang ? '&language=' + encodeURIComponent(lang) : '') +
+    '&mode=' + encodeURIComponent(mode);
+  const seq = ++searchSeq;
+  showState('loading');
+  const t0 = performance.now();
+  try {
+    const r = await apiFetch(url);
+    const data = await r.json();
+    if (seq !== searchSeq) return; // stale response
+    if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+    const ms = (performance.now() - t0).toFixed(0);
+    document.getElementById('stats').textContent = `${data.results.length} results in ${ms}ms` +
+      (data.total != null && data.total !== data.results.length ? ` (of ${data.total} total)` : '');
+    renderResults(data.results || []);
+  } catch (e) {
+    if (seq !== searchSeq) return;
+    showState('error', 'Search failed: ' + esc(e.message));
+    document.getElementById('stats').textContent = '';
+  }
+  history.replaceState(null, '', url);
+}
+
+function renderResults(results) {
+  document.getElementById('results').innerHTML = results.map(res => `
+    <div class="result">
+      <h3><a href="/w/${encodeURIComponent(res.zim_name)}/${encodeURIComponent(res.path)}">${esc(res.title)}</a></h3>
+      <div class="snippet">${snippetHtml(res.snippet || res.content_preview || '')}</div>
+      <div class="meta">${esc(res.zim_name)} · ${esc(res.language)} · score ${Number(res.score).toFixed(3)}</div>
+    </div>
+  `).join('');
+  showState(results.length ? 'results' : 'empty');
+}
+
+// The API wraps matched terms in <b>…</b> (ts_headline) when highlight=true.
+// Everything else is plain text, so: find the literal <b>/</b> tag pairs,
+// escape everything, and re-emit the matched pairs as <mark>…</mark>.
+function snippetHtml(raw) {
+  if (!raw) return '';
+  const re = /<\/b>|<b>/g;
+  let out = '';
+  let i = 0;
+  let inMark = false;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    out += esc(raw.slice(i, m.index));
+    if (m[0] === '<b>' && !inMark) {
+      inMark = true;
+      out += '<mark>';
+    } else if (m[0] === '</b>' && inMark) {
+      inMark = false;
+      out += '</mark>';
+    } else {
+      out += esc(m[0]); // unbalanced tag → render as literal text
+    }
+    i = m.index + m[0].length;
+  }
+  out += esc(raw.slice(i));
+  return out;
+}
+
+// ── Autocomplete (no inline handlers; safe with arbitrary titles) ──────────
+let suggestTimer = null;
+let suggestItems = [];
+let suggestSel = -1;
+
+function closeSuggestions() {
+  document.getElementById('suggestions').style.display = 'none';
+  suggestItems = [];
+  suggestSel = -1;
+}
+
+qInput.addEventListener('input', function() {
+  clearTimeout(suggestTimer);
+  const q = this.value.trim();
+  if (q.length < 2) { closeSuggestions(); return; }
+  suggestTimer = setTimeout(async () => {
+    try {
+      const r = await apiFetch(`/suggest?q=${encodeURIComponent(q)}&limit=8`);
+      const data = await r.json();
+      if (qInput.value.trim() !== q) return; // user kept typing
+      renderSuggestions(data.suggestions || []);
+    } catch (e) { /* non-fatal */ }
+  }, 200);
+});
+
+function renderSuggestions(items) {
+  const list = document.getElementById('suggestions');
+  list.innerHTML = '';
+  suggestItems = items;
+  suggestSel = -1;
+  if (!items.length) { list.style.display = 'none'; return; }
+  items.forEach((s, i) => {
+    const div = document.createElement('div');
+    div.textContent = s;
+    div.addEventListener('mousedown', (e) => { e.preventDefault(); pickSuggestion(s); });
+    div.addEventListener('mouseenter', () => setSuggestSel(i));
+    list.appendChild(div);
+  });
+  list.style.display = 'block';
+}
+
+function setSuggestSel(i) {
+  const list = document.getElementById('suggestions');
+  suggestSel = i;
+  [...list.children].forEach((el, j) => el.classList.toggle('sel', j === i));
+  if (suggestSel >= 0) qInput.value = suggestItems[suggestSel];
+}
+
+function pickSuggestion(title) {
+  qInput.value = title;
+  closeSuggestions();
+  doSearch();
+}
+
+qInput.addEventListener('keydown', function(e) {
+  const open = document.getElementById('suggestions').style.display === 'block';
+  if (e.key === 'Enter') {
+    if (open && suggestSel >= 0) pickSuggestion(suggestItems[suggestSel]);
+    else doSearch();
+  } else if (open && e.key === 'ArrowDown') {
+    e.preventDefault();
+    setSuggestSel((suggestSel + 1) % suggestItems.length);
+  } else if (open && e.key === 'ArrowUp') {
+    e.preventDefault();
+    setSuggestSel(suggestSel <= 0 ? suggestItems.length - 1 : suggestSel - 1);
+  } else if (e.key === 'Escape' && open) {
+    closeSuggestions();
+  }
+});
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.search-box')) closeSuggestions();
+});
+document.getElementById('go').addEventListener('click', doSearch);
+
+loadZims();
+</script>
+</body>
+</html>

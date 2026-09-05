@@ -1,0 +1,248 @@
+//! O(1) random article selection via index seek (no `ORDER BY random()`).
+//!
+//! `fetch_random_article` bounds the id range, picks a local target, then does
+//! a single forward index seek with a backward fallback — both scoped to the
+//! requested ZIM so a scoped call never returns another ZIM's article.
+use crate::db::pool::Pool;
+use crate::error::{Error, Result};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// MIN/MAX article id bounds, optionally scoped to one ZIM by name. Two
+/// named consts (global / scoped) so the SQL is pinned in one place and the
+/// query call selects by `zim_filter` — no inline literal duplication.
+const BOUNDS_SQL_GLOBAL: &str = "SELECT MIN(id), MAX(id) FROM articles";
+const BOUNDS_SQL_OPT: &str =
+    "SELECT MIN(a.id), MAX(a.id) FROM articles a JOIN zims z ON z.id = a.zim_id WHERE z.name = $1";
+
+/// Article-row SELECT for the merged seek-or-fallback statement. Postgres
+/// permits `ORDER BY … LIMIT 1` on each union member, and branch order makes
+/// the forward result row 0 (preferred); `query_opt` returns that first row.
+/// The forward branch serves `id >= $target`; the backward branch (only
+/// reached with stale cached bounds) serves the largest `id <= $target`.
+/// Two variants (global / ZIM-scoped) differ only in the trailing
+/// `AND z.name = $2` — kept as consts so the SQL is byte-stable.
+const SEEK_SQL_GLOBAL: &str = "SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z.name \
+     FROM articles a JOIN zims z ON z.id = a.zim_id \
+     WHERE a.id >= $1 ORDER BY a.id ASC LIMIT 1 \
+     UNION ALL SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z.name \
+     FROM articles a JOIN zims z ON z.id = a.zim_id \
+     WHERE a.id <= $1 ORDER BY a.id DESC LIMIT 1";
+const SEEK_SQL_OPT: &str = "SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z.name \
+     FROM articles a JOIN zims z ON z.id = a.zim_id \
+     WHERE a.id >= $1 AND z.name = $2 ORDER BY a.id ASC LIMIT 1 \
+     UNION ALL SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z.name \
+     FROM articles a JOIN zims z ON z.id = a.zim_id \
+     WHERE a.id <= $1 AND z.name = $2 ORDER BY a.id DESC LIMIT 1";
+
+/// A single article row returned by `fetch_random_article`.
+pub struct RandomArticle {
+    pub id: i64,
+    pub zim_id: i32,
+    pub path: String,
+    pub title: String,
+    pub snippet: String,
+    pub zim: String,
+}
+
+/// Uniform i64 in [lo, hi] (caller guarantees hi >= lo). Bounds are cast
+/// through u64 (bit pattern) so the full i64::MIN..=i64::MAX range — width
+/// 2^64 — is handled without sign-extension overflow.
+///
+/// ```
+/// for seed in 0..100 {
+///     let v = zimservice::db::random_article::random_id_in_range(0, 999, seed);
+///     assert!((0..=999).contains(&v));
+/// }
+/// // Degenerate: lo == hi always returns lo.
+/// assert_eq!(
+///     zimservice::db::random_article::random_id_in_range(7, 7, 42),
+///     7
+/// );
+/// ```
+pub fn random_id_in_range(lo: i64, hi: i64, seed: u64) -> i64 {
+    // Value distance in u64 wrapping space (two's complement makes this
+    // exact), widened to u128 so the full-range width 2^64 fits.
+    let width = (hi as u64).wrapping_sub(lo as u64) as u128 + 1;
+    let offset = seed as u128 % width;
+    (lo as u64).wrapping_add(offset as u64) as i64
+}
+
+/// (min_id, max_id) per scope (`None` = global), invalidated when an indexed
+/// article set changes. Stale bounds are safe (the merged seek's backward
+/// branch covers a gap, and `bounds_cached(refresh = true)` self-heals on a
+/// miss). Steady state is one round trip: with fresh bounds `target ∈ [min,max]`
+/// so the forward seek always hits and the fallback branch never fires.
+type BoundsMap = std::collections::HashMap<Option<String>, (i64, i64)>;
+static BOUNDS_CACHE: std::sync::LazyLock<std::sync::Mutex<BoundsMap>> =
+    std::sync::LazyLock::new(std::sync::Mutex::default);
+
+/// Drop the cached bounds for one scope (`None` = global). Called after a
+/// reindex changes a ZIM's scoped bounds and the global min/max. No-op for a
+/// key that was never cached.
+pub fn invalidate_bounds_cache(zim_filter: Option<&str>) {
+    BOUNDS_CACHE
+        .lock()
+        .expect("bounds cache poisoned")
+        .remove(&zim_filter.map(str::to_owned));
+}
+
+/// Read (min_id, max_id) for a scope from the cache, running the
+/// `BOUNDS_SQL_*` query exactly once on a miss (or when `refresh` is set).
+/// An empty table/ZIM yields `None`, which is **not** cached so recovery needs
+/// no invalidation.
+async fn bounds_cached(
+    pool: &Pool,
+    zim_filter: Option<&str>,
+    refresh: bool,
+) -> Result<Option<(i64, i64)>> {
+    let key = zim_filter.map(str::to_owned);
+    {
+        let cache = BOUNDS_CACHE.lock().expect("bounds cache poisoned");
+        if !refresh {
+            if let Some(v) = cache.get(&key) {
+                return Ok(Some(*v));
+            }
+        }
+    }
+    let client = pool.get().await.map_err(Error::Pool)?;
+    let row = match zim_filter {
+        Some(zim) => client.query_one(BOUNDS_SQL_OPT, &[&zim]).await,
+        None => client.query_one(BOUNDS_SQL_GLOBAL, &[]).await,
+    }
+    .map_err(Error::Database)?;
+    let bounds = (row.get::<_, Option<i64>>(0), row.get::<_, Option<i64>>(1));
+    match bounds {
+        (Some(min_id), Some(max_id)) => {
+            BOUNDS_CACHE
+                .lock()
+                .expect("bounds cache poisoned")
+                .insert(key, (min_id, max_id));
+            Ok(Some((min_id, max_id)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// One merged seek-or-fallback round trip: `query_opt` on [`SEEK_SQL_GLOBAL`]
+/// / [`SEEK_SQL_OPT`], returning the forward row (branch 0) when it exists,
+/// else the backward row. Both branches carry the ZIM scope when one is given.
+async fn seek(
+    client: &tokio_postgres::Client,
+    target: i64,
+    zim_filter: Option<&str>,
+) -> Result<Option<tokio_postgres::Row>> {
+    match zim_filter {
+        Some(zim) => client.query_opt(SEEK_SQL_OPT, &[&target, &zim]).await,
+        None => client.query_opt(SEEK_SQL_GLOBAL, &[&target]).await,
+    }
+    .map_err(Error::Database)
+}
+
+/// Fetch a random article using an O(1) index-seek strategy.
+///
+/// 1. Get MIN/MAX article id (optionally filtered by ZIM name).
+/// 2. Pick a random target in [min_id, max_id] in Rust.
+/// 3. Seek to the smallest live id >= target (single index seek).
+/// 4. If that yields nothing (e.g. gap at the top of the range), fall back to
+///    the largest id <= target.
+///
+/// Both seeks carry the ZIM filter when one is given, so a scoped request can
+/// never return an article from another ZIM. This also avoids the O(n log n)
+/// `ORDER BY random() LIMIT 1` full-table scan.
+pub async fn fetch_random_article(pool: &Pool, zim_filter: Option<&str>) -> Result<RandomArticle> {
+    let client = pool.get().await.map_err(Error::Pool)?;
+
+    // 1. Bounds, from the per-scope cache (steady state = 0 RT).
+    let (min_id, max_id) = match bounds_cached(pool, zim_filter, false).await? {
+        Some(b) => b,
+        None => return Err(Error::NotFound("no articles found".into())),
+    };
+
+    // 2. Pick a random target in [min_id, max_id] locally — no SQL round trip.
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (std::process::id() as u64);
+    let target = random_id_in_range(min_id, max_id, seed);
+
+    // 3. One merged seek: smallest live id >= target, else (stale-bounds gap)
+    //    the largest id <= target — same ZIM scope. With fresh bounds the
+    //    forward branch always hits, so this is a single round trip.
+    let row = match seek(&client, target, zim_filter).await? {
+        Some(r) => r,
+        None => {
+            // Only possible with stale cached bounds (an id was deleted).
+            // Refresh the bounds once and retry; the backward branch of the
+            // merged statement still covers a partial gap.
+            let (min_id, max_id) = match bounds_cached(pool, zim_filter, true).await? {
+                Some(b) => b,
+                None => return Err(Error::NotFound("no articles found".into())),
+            };
+            let target = random_id_in_range(min_id, max_id, seed);
+            match seek(&client, target, zim_filter).await? {
+                Some(r) => r,
+                None => return Err(Error::NotFound("no articles found".into())),
+            }
+        }
+    };
+
+    Ok(RandomArticle {
+        id: row.get(0),
+        zim_id: row.get(1),
+        path: row.get(2),
+        title: row.get(3),
+        snippet: row.get(4),
+        zim: row.get(5),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{invalidate_bounds_cache, random_id_in_range};
+
+    /// PERF-9: dropping a bounds-cache key that was never present is a no-op
+    /// (no panic); the empty/unknown keys must not error.
+    #[test]
+    fn invalidate_bounds_cache_noop_for_unknown_keys() {
+        invalidate_bounds_cache(None);
+        invalidate_bounds_cache(Some("__never_cached__"));
+    }
+
+    #[test]
+    fn single_element_range_always_returns_it() {
+        for seed in [0u64, 1, 42, u64::MAX] {
+            assert_eq!(random_id_in_range(7, 7, seed), 7);
+            assert_eq!(random_id_in_range(i64::MIN, i64::MIN, seed), i64::MIN);
+            assert_eq!(random_id_in_range(i64::MAX, i64::MAX, seed), i64::MAX);
+        }
+    }
+
+    #[test]
+    fn results_stay_in_range() {
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0u64..1000 {
+            let v = random_id_in_range(0, 999, seed);
+            assert!((0..=999).contains(&v), "out of range: {v}");
+            seen.insert(v);
+        }
+        assert!(seen.len() >= 10, "expected spread, got {}", seen.len());
+    }
+
+    #[test]
+    fn full_i64_range_does_not_panic() {
+        // Casts bounds individually to u128 — `hi - lo` in i64 would overflow.
+        for seed in [0u64, 1, 999, u64::MAX] {
+            let v = random_id_in_range(i64::MIN, i64::MAX, seed);
+            let _ = v; // any value is valid; not panicking is the assertion
+        }
+    }
+
+    #[test]
+    fn seed_zero_and_max_are_distinct() {
+        assert_ne!(
+            random_id_in_range(0, 10_000, 0),
+            random_id_in_range(0, 10_000, u64::MAX)
+        );
+    }
+}

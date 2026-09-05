@@ -1,0 +1,103 @@
+[package]
+name = "zimservice"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "Cross-ZIM search and serve platform with Postgres FTS, semantic search, and qBittorrent integration"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs", "io-util", "io-std"] }
+
+# HTTP server
+axum = "0.8"
+tower-http = { version = "0.7", features = ["cors", "limit", "trace"] }
+
+# OpenAPI
+utoipa = { version = "5", features = ["preserve_path_order", "chrono"] }
+
+# Database
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-uuid-1", "with-time-0_3", "with-chrono-0_4"] }
+tokio-postgres-rustls = "0.12"
+postgres-types = { version = "0.2", features = ["with-serde_json-1"] }
+deadpool-postgres = "0.14"
+rustls = "0.23"
+rustls-native-certs = "0.8"
+
+# ZIM
+zim = "0.5"
+
+# HTML extraction
+deformat = { version = "0.15", features = ["readability"] }
+
+# Parallel
+rayon = "1"
+
+# Text processing
+regex = "1"
+
+# XML (OPDS catalog)
+quick-xml = { version = "0.41", default-features = false }
+
+# JSON / serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Utilities
+anyhow = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+# Admin-password hashing (already in the build graph transitively via
+# postgres-protocol's SCRAM stack; hex is formatted with a local helper).
+sha2 = "0.11"
+# argon2id KDF for the admin password (SEC-M1)
+argon2 = "0.5"
+# salt generation for argon2id (OsRng) — feature unifies with argon2's dep
+password-hash = { version = "0.5", features = ["getrandom"] }
+futures = "0.3"
+bytes = "1"
+
+url = "2"
+
+# HTTP client (embeddings, qBittorrent)
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "cookies", "form", "rustls"] }
+
+[target.'cfg(unix)'.dependencies]
+# POSIX kill(2) for the cross-platform PID-liveness check (S2 self-healing
+# instance lock): covers macOS/FreeBSD in addition to Linux.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+wiremock = "0.6"
+dtor = "0.0.6"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+correctness = "warn"
+suspicious = "warn"
+style = "warn"
+complexity = "warn"
+perf = "warn"
+unwrap_used = "warn"
+# expect_used is deliberately not enabled (LINT-3, 2026-08-30 review): ~40 sites
+# use expect() as the intentional panic-on-poisoned-lock idiom plus 15 production
+# expects; enabling it would fail `make clippy` (-D warnings) without a multi-file sweep.
+

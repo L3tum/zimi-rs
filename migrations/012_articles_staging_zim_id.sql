@@ -1,0 +1,11 @@
+-- PERF-8: zim_id index on the staging table (defined UNLOGGED,
+-- indexless, in 001_initial.sql:84-92). Beneficiary queries in
+-- src/zim/index.rs: the per-10k-chunk upsert
+-- `... FROM articles_staging WHERE zim_id = $1` (:804-805 — the hot
+-- one), the pre-crash cleanup DELETE (:391), and the phase-4
+-- DELETE (:846).
+-- UNLOGGED table → the index is unlogged too (zero WAL cost). Plain
+-- (non-CONCURRENTLY) CREATE INDEX: the harness runs each migration file
+-- inside ONE transaction (migrate.rs:148-151), which rejects
+-- CONCURRENTLY (see 010:16 note).
+CREATE INDEX IF NOT EXISTS idx_articles_staging_zim ON articles_staging (zim_id);

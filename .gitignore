@@ -1,0 +1,34 @@
+# Rust
+target/
+*.rs.bk
+
+# ZIM files (large, not in git)
+zims/
+downloads/
+*.zim
+
+# Config (may contain secrets)
+config.toml
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.db
+*.db-shm
+*.db-wal
+
+# Testing
+test-data/
+
+# JS tooling (npm / eslint)
+node_modules/
+.web-lint-tmp/
+__pycache__

@@ -1,0 +1,155 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # JS syntax check for the embedded web UI (dependency-free, ~seconds).
+      # Strict because `make web-check` skips silently without node; CI always
+      # has node, so a missing-node must fail the gate, not pass it.
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: make web-check
+        env:
+          ZIMSERVICE_WEB_CHECK_STRICT: "1"
+      # Behavioral unit tests for web/common.js helpers (apiFetch admin-auth
+      # flow, esc, formatters) — same strict policy: CI always has node.
+      - run: make web-test
+        env:
+          ZIMSERVICE_WEB_CHECK_STRICT: "1"
+  # Real JS lint (eslint) of the embedded web UI: web/common.js + the inline
+  # <script> blocks (extracted by tests/web/extract-inline.mjs). Kept as a
+  # separate job (not folded into `lint`) so lint findings in the pre-existing
+  # web UI JS establish a baseline without blocking the core gates.
+  web-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-audit --no-fund
+      - run: make web-lint
+        env:
+          ZIMSERVICE_WEB_CHECK_STRICT: "1"
+  # MSRV gate: fail CI if the code silently requires a newer toolchain than
+  # the declared `rust-version` (1.91). Runs the DB-less unit tests (not just
+  # `cargo check`) so a runtime/toolchain dependency is caught too.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91
+      - run: cargo test --lib --bins --test wiremock --all-features
+  # Rustdoc gate: catch broken intra-doc links and doc build failures.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustdoc }
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Unit half runs with the default parallel --test-threads: it holds no
+      # shared process state (per-test tempdirs, ephemeral-port MockServers,
+      # read-only tests/fixtures) and its DB-gated tests skip — this job has
+      # no Postgres service. The DB-backed `test-db` job below stays pinned
+      # (single shared dev DB; see tests/integration.rs:5-8).
+      - run: cargo test --lib --bins --test wiremock
+      - run: cargo test --doc
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: llvm-tools-preview }
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # DB-less coverage floor (ratchet): the DB-gated tests skip here (no DB),
+      # so this measures lib/bins/wiremock line coverage. Raise the floor in
+      # .github/coverage_floor.txt as coverage improves — the job fails if the
+      # measured coverage drops below it, so the floor can only effectively rise.
+      - run: cargo llvm-cov --all-features --lib --bins --test wiremock --fail-under-lines "$(cat .github/coverage_floor.txt)"
+  test-db:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
+        env:
+          POSTGRES_USER: zimservice
+          POSTGRES_PASSWORD: zimservice
+          POSTGRES_DB: zimservice
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U zimservice"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # `--bins` here (not just in the DB-less `test` job): the binary's
+      # DB-gated startup smoke tests (single-instance refusal + the mutating
+      # guard's refuse/acquire/release, `src/startup.rs`) run against a real
+      # Postgres, and `ZIMSERVICE_REQUIRE_DB=1` turns a skip into a hard
+      # failure. They are schema-free (advisory locks + pg_locks only) and
+      # serialize with every other DB test via `DbExclusiveGuard`.
+      # Both DB-backed halves run with the default parallel --test-threads:
+      # they share one dev DB, but every DB-gated test is serialized by
+      # DbExclusiveGuard (src/testing.rs: cross-process lockfile + in-process
+      # slot), and the migration drift check now runs in a dedicated temp DB
+      # it drops instead of tampering the shared schema_migrations.
+      - run: |
+          ZIMSERVICE_REQUIRE_DB=1 \
+          DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
+          cargo test --lib --bins
+      - run: |
+          ZIMSERVICE_REQUIRE_DB=1 \
+          DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
+          cargo test --test integration -- --skip trgm_index_perf_check --include-ignored
+  test-db-perf:
+    if: github.event_name == 'push'   # main only; PRs stay fast
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: zimservice
+          POSTGRES_PASSWORD: zimservice
+          POSTGRES_DB: zimservice
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U zimservice"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          ZIMSERVICE_REQUIRE_DB=1 \
+          DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
+          cargo test --test integration trgm_index_perf_check -- --ignored
+  # Cross-platform smoke: the crate builds and its DB-less unit tests pass on
+  # macOS and Windows (DB-gated tests skip — no Postgres service here). Catches
+  # platform-specific compile/link issues a Linux-only CI would miss.
+  non-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --all-features
+      - run: cargo test --lib --bins --test wiremock

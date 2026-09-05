@@ -1,0 +1,11 @@
+# Build artifacts and VCS — never needed in the image.
+target
+.git
+
+# Repo docs/plans — not shipped.
+plans
+docs
+.github
+
+# NOTE: do NOT ignore `web/` (compile-time include_str! at serve/handlers/web.rs) or
+# `examples/` (compiled under --all-targets locally).

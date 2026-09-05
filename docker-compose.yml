@@ -1,0 +1,72 @@
+services:
+  zimservice:
+    build: .
+    ports:
+      # Loopback-only publish: the app is only reachable from the host that
+      # runs the stack. The app additionally refuses access.mode=open on a
+      # non-loopback bind (main.rs), so a misconfig can't expose it either.
+      - "127.0.0.1:8899:8899"
+    volumes:
+      - ./zims:/zims
+      - ./downloads:/downloads
+    environment:
+      # Production sets POSTGRES_PASSWORD in .env; local dev is covered by the
+      # Makefile DB targets (they export a loopback default). Keep POSTGRES_USER
+      # fixed at `zimservice` — the URL below depends on it.
+      - DATABASE_URL=postgres://zimservice:${POSTGRES_PASSWORD:?set a Postgres password}@postgres:5432/zimservice
+      # Password mode is the compose default: the app refuses to start with
+      # an empty or placeholder admin password (main.rs startup check), and
+      # the shell-level :? fails fast with a clear message if unset.
+      - ACCESS_MODE=password
+      - AUTH_PASSWORD=${AUTH_PASSWORD:?set a real admin password}
+      - ZIM_DIR=/zims
+      - LOG_LEVEL=info
+      # Uncomment to enable qBittorrent:
+      # - QBITTORRENT_URL=http://qbittorrent:8080
+      # - QBITTORRENT_USER=admin
+      # - QBITTORRENT_PASS=adminadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    # pgvector image: the `vector` extension is required by migration 001
+    # (CREATE EXTENSION vector) — a stock postgres image fails at migration.
+    image: pgvector/pgvector:pg16
+    ports:
+      # Loopback-only: Postgres must not be reachable from other hosts.
+      - "127.0.0.1:5432:5432"
+    environment:
+      - POSTGRES_USER=zimservice
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set a Postgres password}
+      - POSTGRES_DB=zimservice
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zimservice"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # Optional: qBittorrent for torrent downloads
+  # qbittorrent:
+  #   image: linuxserver/qbittorrent:latest
+  #   ports:
+  #     - "8080:8080"   # WebUI
+  #     - "6881:6881"   # BitTorrent
+  #     - "6881:6881/udp"
+  #   environment:
+  #     - PUID=1000
+  #     - PGID=1000
+  #     - TZ=UTC
+  #     - WEBUI_PORT=8080
+  #   volumes:
+  #     - qbittorrent-config:/config
+  #     - ./downloads:/data
+  #   restart: unless-stopped
+
+volumes:
+  pgdata:
+  # qbittorrent-config:
