@@ -1194,9 +1194,10 @@ fn file_mtime_u64(path: &Path) -> u64 {
 mod tests {
     use super::{
         escape_copy_text_into, extract_qid, extract_qid_windowed, generate_snippet, is_wikipedia,
-        parse_zim_date, truncate_at_sentence, QID_SCAN_BYTES,
+        mark_index_error, parse_zim_date, truncate_at_sentence, zims, QID_SCAN_BYTES,
     };
     use chrono::NaiveDate;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
     // ── is_wikipedia (WP3.4) ───────────────────────────────────────────────
 
@@ -1447,6 +1448,135 @@ mod tests {
             let mut out = String::new();
             escape_copy_text_into(&mut out, input);
             assert_eq!(out, expected, "input: {input:?}");
+        }
+    }
+
+    // ── H3: mark_index_error per-ZIM isolation (DB-gated) ───────────────────
+
+    /// H3: `mark_index_error` must mark only the failed ZIM's row
+    /// (`index_status` → `error`, `updated_at` bumped) and leave every other
+    /// ZIM row untouched — one corrupt archive must not dirty the rest of the
+    /// library. DB-gated exactly like the poller's `test_pool`/startup smoke
+    /// tests: skips cleanly when the DB is unreachable unless
+    /// `ZIMSERVICE_REQUIRE_DB` is set (then a skip is a hard failure).
+    #[tokio::test]
+    async fn db_mark_index_error_only_touches_that_zim_row() {
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
+        });
+        let config = crate::config::Config {
+            database_url: url.clone(),
+            db_pool_size: 4,
+            ..Default::default()
+        };
+        let pool = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::db::pool::create_pool(&config),
+        )
+        .await
+        {
+            Ok(Ok(pool)) => pool,
+            Ok(Err(e)) => {
+                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
+                    panic!("ZIMSERVICE_REQUIRE_DB is set but cannot reach {url}: {e}");
+                }
+                eprintln!("skipping db_mark_index_error_only_touches_that_zim_row: cannot reach {url} ({e})");
+                return;
+            }
+            Err(_) => {
+                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
+                    panic!("ZIMSERVICE_REQUIRE_DB is set but timed out reaching {url}");
+                }
+                eprintln!("skipping db_mark_index_error_only_touches_that_zim_row: timed out reaching {url}");
+                return;
+            }
+        };
+        let _db_gate = crate::testing::DbExclusiveGuard::acquire();
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+
+        // Two ZIM rows in distinct states (a corrupt/in-flight one and a
+        // healthy bystander) so a leaky UPDATE cannot be masked by a row
+        // that happens to look unchanged. Idempotent clean slate first so a
+        // rerun (or a crashed prior run) cannot collide on `name`.
+        const A: &str = "h3_corrupt_zim";
+        const B: &str = "h3_bystander_zim";
+        {
+            let mut conn = pool.acquire().await.expect("connection");
+            for name in [A, B] {
+                crate::db::raw::execute(
+                    &mut *conn,
+                    "DELETE FROM zims WHERE name = $1",
+                    |q| q.bind(name),
+                )
+                .await
+                .unwrap();
+            }
+            crate::db::raw::execute(
+                &mut *conn,
+                "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime, index_status, indexed_entries, article_count)
+                 VALUES ($1, $1, $1, 2048, now(), 'indexing', 1, 1)",
+                |q| q.bind(A),
+            )
+            .await
+            .unwrap();
+            crate::db::raw::execute(
+                &mut *conn,
+                "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime, index_status, indexed_entries, article_count)
+                 VALUES ($1, $1, $1, 2048, now(), 'ready', 5, 5)",
+                |q| q.bind(B),
+            )
+            .await
+            .unwrap();
+        }
+
+        let db = crate::db::sea_orm_db(&pool);
+        async fn fetch_row(db: &sea_orm::DatabaseConnection, name: &str) -> zims::Model {
+            zims::Entity::find()
+                .filter(zims::Column::Name.eq(name))
+                .one(db)
+                .await
+                .expect("select zims row")
+                .expect("row must exist")
+        }
+        let before_a = fetch_row(&db, A).await;
+        let before_b = fetch_row(&db, B).await;
+
+        // The corrupt ZIM's failure is recorded against its own name only.
+        let meta =
+            crate::zim::ZimMeta::stub(A.to_string(), format!("/nonexistent/{A}.zim"), 2048);
+        mark_index_error(&pool, &meta).await;
+
+        let after_a = fetch_row(&db, A).await;
+        let after_b = fetch_row(&db, B).await;
+
+        // The corrupt ZIM's row is marked: status flipped to `error`, the
+        // timestamp bumped (>=: Postgres `now()` may land on the same
+        // microsecond), and no other column touched.
+        assert_eq!(after_a.index_status, "error", "corrupt ZIM must be marked error");
+        assert!(
+            after_a.updated_at >= before_a.updated_at,
+            "updated_at must not move backwards on the marked row"
+        );
+        assert_eq!(after_a.name, before_a.name);
+        assert_eq!(after_a.index_progress, before_a.index_progress);
+        assert_eq!(after_a.indexed_entries, before_a.indexed_entries);
+        assert_eq!(after_a.indexed_at, before_a.indexed_at);
+
+        // ...and the other ZIM's row is completely untouched (no cross-ZIM
+        // leak: the UPDATE is scoped by `name`, not a blanket status sweep).
+        assert_eq!(after_b, before_b, "bystander ZIM row must be untouched");
+
+        // Cleanup (best-effort; the clean-slate DELETE above handles reruns).
+        let mut conn = pool.acquire().await.expect("connection");
+        for name in [A, B] {
+            let _ = crate::db::raw::execute(
+                &mut *conn,
+                "DELETE FROM zims WHERE name = $1",
+                |q| q.bind(name),
+            )
+            .await;
         }
     }
 }

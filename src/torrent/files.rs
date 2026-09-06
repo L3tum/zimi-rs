@@ -502,4 +502,61 @@ mod tests {
         assert!(validate_download_name("a.b.zim").is_ok());
         assert!(validate_download_name(&"a".repeat(255)).is_ok());
     }
+
+    // ── verify_zim: the corrupt-file guard (H3) ─────────────────────────────
+
+    #[test]
+    fn verify_zim_accepts_intact_fixture() {
+        // Positive control: the intact fixture must parse, so the rejection
+        // cases below are caused by corruption, not a broken fixture.
+        let base = tmp("verify-ok");
+        let good = base.join("tiny.zim");
+        std::fs::copy("tests/fixtures/tiny.zim", &good).unwrap();
+        verify_zim(&good).expect("intact tiny.zim must verify");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn verify_zim_rejects_truncated_file_without_state_change() {
+        let base = tmp("verify-trunc");
+        let bytes = std::fs::read("tests/fixtures/tiny.zim").unwrap();
+        assert!(
+            bytes.len() > 200,
+            "fixture sanity: tiny.zim must be larger than the truncation points"
+        );
+        for (label, cut) in [("head", 100usize), ("mid", bytes.len() / 2)] {
+            let trunc = base.join(format!("{label}.zim"));
+            std::fs::write(&trunc, &bytes[..cut]).unwrap();
+
+            let err = verify_zim(&trunc).unwrap_err();
+            assert!(
+                matches!(err, Error::Zim(_)),
+                "{}-truncated ZIM must be rejected with Error::Zim, got: {err}",
+                label
+            );
+            // No state change: verification is read-only — the corrupt file
+            // is left exactly as it was, so the caller can still quarantine it.
+            assert_eq!(
+                std::fs::read(&trunc).unwrap(),
+                &bytes[..cut],
+                "verify_zim must not modify the file it rejects"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn verify_zim_rejects_non_zim_garbage() {
+        // Non-ZIM bytes (no ZIMROCKS magic) with a `.zim` extension — the
+        // "downloaded a text file / error page" case.
+        let base = tmp("verify-garbage");
+        let garbage = base.join("garbage.zim");
+        std::fs::write(&garbage, b"this is not a ZIM archive, just plain bytes").unwrap();
+        let err = verify_zim(&garbage).unwrap_err();
+        assert!(
+            matches!(err, Error::Zim(_)),
+            "non-ZIM garbage must be rejected with Error::Zim, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
