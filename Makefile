@@ -98,7 +98,7 @@ test-strict-perf:
 # (cross-process lockfile + in-process slot), and the migration drift check
 # now runs in a dedicated temp DB it drops.
 test-strict-ci:
-	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --lib && \
+	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --lib --bins && \
 	    DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration -- --include-ignored --skip trgm_index_perf_check)
 
 # JS syntax check for the embedded web UI (web/*.js + inline <script> blocks).
