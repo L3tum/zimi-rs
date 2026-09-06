@@ -11,10 +11,12 @@
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+use crate::db::entities::downloads::{ActiveModel, Column, Entity};
 use crate::db::Pool;
 use crate::error::{Error, Result};
 use crate::netguard::{resolve_download_host, validate_download_url};
 use crate::zim::ZimManager;
+use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, QueryFilter};
 
 use super::poller::{build_download_client, ClientProfile, DownloadPoller};
 use super::*;
@@ -362,47 +364,51 @@ async fn queue_opds_updates(db: &Pool, updates: &[opds::OpdsUpdate]) -> Result<(
     if updates.is_empty() {
         return Ok(());
     }
-    let client = db.get().await.map_err(Error::Pool)?;
+    let db = crate::db::sea_orm_db(db);
     for u in updates {
         // Second line of defense (B10): `find_updates` already dedups to
         // one (newest) update per local ZIM; this per-URL guard prevents
         // re-queueing while an older version of the same catalog is still
         // queued/downloading, so the update lands cleanly on completion.
-        let pending = client
-            .query_opt(
-                &format!(
-                    "SELECT 1 FROM downloads WHERE url = $1 AND status IN ({live})",
-                    live = crate::torrent::in_list([
-                        crate::torrent::DownloadStatus::Queued,
-                        crate::torrent::DownloadStatus::Downloading,
-                        crate::torrent::DownloadStatus::Complete,
-                        crate::torrent::DownloadStatus::Seeding,
-                    ])
-                ),
-                &[&u.download_url],
-            )
+        let pending: Option<crate::db::entities::downloads::Model> = Entity::find()
+            .filter(Column::Url.eq(u.download_url.clone()))
+            .filter(Column::Status.is_in([
+                crate::torrent::DownloadStatus::Queued.as_str(),
+                crate::torrent::DownloadStatus::Downloading.as_str(),
+                crate::torrent::DownloadStatus::Complete.as_str(),
+                crate::torrent::DownloadStatus::Seeding.as_str(),
+            ]))
+            .one(&db)
             .await
-            .map_err(Error::Database)?;
+            .map_err(Error::from)?;
         if pending.is_some() {
             continue;
         }
-        match client
-            .execute(
-                "INSERT INTO downloads (name, url, status) VALUES ($1, $2, $3)",
-                &[
-                    &u.catalog_name,
-                    &u.download_url,
-                    &crate::torrent::DownloadStatus::Queued.as_str(),
-                ],
-            )
-            .await
-        {
+        let result = Entity::insert(ActiveModel {
+            name: ActiveValue::Set(u.catalog_name.clone()),
+            url: ActiveValue::Set(u.download_url.clone()),
+            status: ActiveValue::Set(
+                crate::torrent::DownloadStatus::Queued.as_str().to_owned(),
+            ),
+            ..Default::default()
+        })
+        .exec(&db)
+        .await;
+        match result {
             Ok(_) => {}
-            Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
-                // Concurrent insert (e.g. manual POST /downloads) — safe to skip.
+            // 23505 unique_violation (concurrent insert, e.g. manual POST
+            // /downloads) — safe to skip.
+            Err(e)
+                if matches!(
+                    &e,
+                    sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(
+                        sqlx::Error::Database(d)
+                    )) if d.code().as_deref() == Some("23505")
+                ) =>
+            {
                 continue;
             }
-            Err(e) => return Err(Error::Database(e)),
+            Err(e) => return Err(Error::SeaOrm(e)),
         }
         tracing::info!(
             "OPDS: queued auto-update for {} → {} ({})",
@@ -644,14 +650,7 @@ mod tests {
     async fn opds_check_rejects_loopback_url_before_http() {
         use wiremock::MockServer;
         let server = MockServer::start().await;
-        let mut cfg = deadpool_postgres::Config::new();
-        cfg.url = Some("postgres://u:p@127.0.0.1:1/nodb".into());
-        let pool = cfg
-            .builder(tokio_postgres::NoTls)
-            .unwrap()
-            .max_size(1)
-            .build()
-            .unwrap();
+        let pool = crate::testing::dead_pool();
         let mut map = crate::settings::default_settings();
         map.insert(KEY_TORRENT_AUTO_UPDATE.into(), serde_json::json!(true));
         map.insert(KEY_TORRENT_OPDS_URL.into(), serde_json::json!(server.uri()));
@@ -697,13 +696,15 @@ mod tests {
             .expect("migrations");
         let x = "http://it.example/x.zim";
         let y = "http://it.example/y.zim";
-        let c = pool.get().await.expect("conn");
-        c.execute("DELETE FROM downloads WHERE url IN ($1, $2)", &[&x, &y])
-            .await
-            .unwrap();
-        c.execute(
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE url IN ($1, $2)", |q| {
+            q.bind(x).bind(y)
+        })
+        .await
+        .unwrap();
+        crate::db::raw::execute(
+            &pool,
             "INSERT INTO downloads (name, url, status) VALUES ('it-x', $1, 'queued')",
-            &[&x],
+            |q| q.bind(x),
         )
         .await
         .unwrap();
@@ -726,17 +727,22 @@ mod tests {
             .await
             .expect("queueing runs");
 
-        let x_count: i64 = c
-            .query_one("SELECT count(*) FROM downloads WHERE url = $1", &[&x])
-            .await
-            .unwrap()
-            .get(0);
+        let x_count: i64 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT count(*) FROM downloads WHERE url = $1",
+            |q| q.bind(x),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(x_count, 1, "B10 guard: pending URL must not be re-queued");
-        let y_status: Option<String> = c
-            .query_opt("SELECT status FROM downloads WHERE url = $1", &[&y])
-            .await
-            .unwrap()
-            .map(|r| r.get::<_, String>(0));
+        let y_status: Option<String> = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT status FROM downloads WHERE url = $1",
+            |q| q.bind(y),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             y_status.as_deref(),
             Some("queued"),
@@ -744,8 +750,10 @@ mod tests {
         );
 
         // Cleanup (shared single-DB suite).
-        c.execute("DELETE FROM downloads WHERE url IN ($1, $2)", &[&x, &y])
-            .await
-            .unwrap();
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE url IN ($1, $2)", |q| {
+            q.bind(x).bind(y)
+        })
+        .await
+        .unwrap();
     }
 }

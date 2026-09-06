@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use sqlx::postgres::PgConnection;
+
 use crate::config::Config;
 use crate::db;
 use crate::search::SearchEngine;
@@ -161,20 +163,23 @@ pub async fn build_state(
     // `ZIMSERVICE_ALLOW_MULTI_INSTANCE=1` opt-out, where they proceed and
     // the warning is the only signal that they are staling a live server.
     if !advisory_lock_held {
-        let conn = pool.get().await.map_err(|e| anyhow::anyhow!("pool: {e}"))?;
-        let held: bool = conn
-            .query_one(
-                &format!(
-                    "SELECT EXISTS(\n\
-                     SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON l.pid = a.pid\n\
-                     WHERE {ADVISORY_LOCK_MATCH}\n\
-                     )"
-                ),
-                &[],
-            )
-            .await
-            .map(|r| r.get::<_, bool>(0))
-            .unwrap_or(false);
+        let mut conn = pool.acquire().await.map_err(|e| anyhow::anyhow!("pool: {e}"))?;
+        // Raw escape hatch (db::raw): `pg_locks` catalog probe — the SeaORM
+        // builder only sees application tables.
+        let held = db::raw::fetch_scalar_optional(
+            &mut *conn,
+            &format!(
+                "SELECT EXISTS(\n\
+                 SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON l.pid = a.pid\n\
+                 WHERE {ADVISORY_LOCK_MATCH}\n\
+                 )"
+            ),
+            |q| q,
+        )
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
         if held {
             if mode.resync() {
                 tracing::warn!(
@@ -289,32 +294,27 @@ pub async fn build_state(
 /// `ZIMSERVICE_ALLOW_MULTI_DB` opt-out keeps only the PID lock (per-zim_dir)
 /// guard, and `ZIMSERVICE_ALLOW_MULTI_INSTANCE` keeps neither.
 ///
-/// **Liveness contract** (H1): while `lock_conn` is present, the guard
+/// **Liveness contract** (H1): while `lock_task` is present, the guard
 /// monitors the advisory-lock connection for the failure the S1 guard
 /// cannot otherwise see — the lock connection dying *mid-run* (Postgres
 /// restart, network partition), which silently releases the advisory lock
 /// and would let a second `serve` against the same database start undetected.
-/// The monitor polls the I/O driver's `JoinHandle` (which completes when the
-/// socket closes); on a real, non-graceful completion it logs and exits the
-/// process (fail-closed), because a running server whose uniqueness guarantee
-/// has silently evaporated must not keep serving. A graceful drop aborts the
-/// driver first, and the resulting cancelled join is not a connection loss —
-/// no spurious exit on shutdown. Monitoring is skipped when no advisory
-/// lock is held (`ZIMSERVICE_ALLOW_MULTI_DB`'s `None` arm: there is no
-/// connection, and hence no lock, to lose).
+/// The monitor task **owns** the dedicated connection and probes it on an
+/// interval (`SELECT 1`); on a failed probe it logs and exits the process
+/// (fail-closed), because a running server whose uniqueness guarantee has
+/// silently evaporated must not keep serving. A graceful drop aborts the
+/// monitor task first, which closes the connection (releasing the lock)
+/// before any further probe — no spurious exit on shutdown. Monitoring is
+/// skipped when no advisory lock is held (`ZIMSERVICE_ALLOW_MULTI_DB`'s
+/// `None` arm: there is no connection, and hence no lock, to lose).
 pub struct SingleInstanceGuard {
-    /// Dedicated connection holding the advisory lock. Dropping this
-    /// connection (on process exit or guard drop) releases the lock.
-    /// The field is never read — it exists solely to keep the connection
-    /// (and therefore the lock) alive for the guard's lifetime.
-    #[allow(dead_code)]
-    lock_conn: Option<tokio_postgres::Client>,
-    /// Abort handle for the I/O driver of `lock_conn`. The driver's
-    /// `JoinHandle` itself is owned by the liveness-monitor task (H1), which
-    /// watches for the socket closing; this handle lets `Drop` still abort
-    /// the driver (closing the connection and releasing the advisory lock)
-    /// without taking the handle the monitor joined on.
-    lock_task: Option<tokio::task::AbortHandle>,
+    /// Join handle of the H1 liveness-monitor task, which owns the dedicated
+    /// connection holding the advisory lock. Aborting it (on drop) drops the
+    /// connection, closing the socket so Postgres releases the lock.
+    /// (sqlx's `PgConnection` has no separately abortable I/O driver the way
+    /// tokio-postgres' spawned `Connection` did, so the guard holds the
+    /// monitor task's handle instead of a client + driver handle pair.)
+    lock_task: Option<tokio::task::JoinHandle<()>>,
     /// Path to the `.zimservice.lock` file; unlinked on drop.
     lock_path: Option<std::path::PathBuf>,
 }
@@ -324,15 +324,16 @@ impl SingleInstanceGuard {
     /// the `ZIMSERVICE_ALLOW_MULTI_DB` opt-out let another instance keep it,
     /// or when both guards were disabled).
     pub fn advisory_lock_held(&self) -> bool {
-        self.lock_conn.is_some()
+        self.lock_task.is_some()
     }
 }
 
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
-        // Release the advisory lock first by closing the dedicated connection
-        // (abort the I/O driver so the socket closes and Postgres drops the
-        // lock). Best-effort.
+        // Release the advisory lock first by aborting the monitor task: that
+        // drops the dedicated connection, so the socket closes and Postgres
+        // drops the lock. Best-effort (worst case: the server-side socket
+        // timeout releases it).
         if let Some(task) = self.lock_task.take() {
             task.abort();
         }
@@ -343,40 +344,31 @@ impl Drop for SingleInstanceGuard {
                 tracing::debug!("could not remove instance lock file {}: {e}", p.display());
             }
         }
-        // `lock_conn` / `lock_task` drop here; the connection is already
-        // closed by the abort above.
     }
 }
 
 /// Open a *dedicated* non-pooled connection (honoring the DSN's TLS mode,
 /// same as the pool) and try to take the per-DB single-instance advisory
-/// lock non-blockingly. Returns `(client, conn_task, acquired)`; the
-/// connection is kept open in all cases (an unacquired lock releases
-/// nothing) and the caller decides what `acquired == false` means.
+/// lock non-blockingly. Returns `(conn, acquired)`; the connection is kept
+/// open in all cases (an unacquired lock releases nothing) and the caller
+/// decides what `acquired == false` means. Dropping the returned connection
+/// closes the socket (sqlx does this on drop of `PgConnection`).
 ///
 /// Shared by [`try_acquire_advisory_lock`] (S1: the connection lives for the
-/// process lifetime in the `serve` guard, I/O driver spawned) and
+/// process lifetime in the `serve` guard, owned by its liveness monitor) and
 /// [`acquire_mutating_guard`] (H1: held for the guard's lifetime) — the
 /// dedicated connection means the lock cannot be silently released by pool
 /// recycling.
-async fn connect_and_try_instance_lock(
-    config: &Config,
-) -> anyhow::Result<(
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<std::result::Result<(), tokio_postgres::Error>>,
-    bool,
-)> {
-    let (client, conn_task) = db::pool::connect_dedicated(&config.database_url)
+async fn connect_and_try_instance_lock(config: &Config) -> anyhow::Result<(PgConnection, bool)> {
+    let mut conn = db::pool::connect_dedicated(&config.database_url)
         .await
         .map_err(|e| anyhow::anyhow!("advisory-lock connect: {e}"))?;
 
-    let acquired: bool = client
-        .query_one(INSTANCE_LOCK_SQL, &[])
+    let acquired: Option<bool> = db::raw::fetch_scalar_optional(&mut conn, INSTANCE_LOCK_SQL, |q| q)
         .await
-        .map_err(|e| anyhow::anyhow!("advisory lock: {e}"))?
-        .get(0);
+        .map_err(|e| anyhow::anyhow!("advisory lock: {e}"))?;
 
-    Ok((client, conn_task, acquired))
+    Ok((conn, acquired.unwrap_or(false)))
 }
 
 /// S1: open a *dedicated* non-pooled connection for the advisory lock,
@@ -386,22 +378,13 @@ async fn connect_and_try_instance_lock(
 /// closed in both cases — an unacquired lock releases nothing, and the
 /// caller decides what `None` means: hard refusal, or a warned opt-out).
 /// `Err` on connect/lock-query failure.
-async fn try_acquire_advisory_lock(
-    config: &Config,
-) -> anyhow::Result<
-    Option<(
-        tokio_postgres::Client,
-        tokio::task::JoinHandle<std::result::Result<(), tokio_postgres::Error>>,
-    )>,
-> {
-    let (client, conn_task, acquired) = connect_and_try_instance_lock(config).await?;
+async fn try_acquire_advisory_lock(config: &Config) -> anyhow::Result<Option<PgConnection>> {
+    let (conn, acquired) = connect_and_try_instance_lock(config).await?;
 
     if acquired {
-        Ok(Some((client, conn_task)))
+        Ok(Some(conn))
     } else {
-        // Close the dedicated connection (releases nothing — we didn't get it).
-        conn_task.abort();
-        drop(client);
+        // Drop the dedicated connection (releases nothing — we didn't get it).
         Ok(None)
     }
 }
@@ -434,22 +417,11 @@ async fn try_acquire_advisory_lock(
 pub struct MutatingGuard {
     /// Dedicated connection holding the advisory lock. The field is never
     /// read — it exists solely to keep the connection (and therefore the
-    /// lock) alive for the guard's lifetime (mirrors
-    /// [`SingleInstanceGuard::lock_conn`]).
+    /// lock) alive for the guard's lifetime. Dropping it closes the socket,
+    /// which makes Postgres release the lock (sqlx closes `PgConnection` on
+    /// drop — the old tokio-postgres I/O-driver abort is gone with the driver).
     #[allow(dead_code)]
-    lock_conn: tokio_postgres::Client,
-    /// Abort handle for the connection's I/O driver: aborting it closes the
-    /// socket (releasing the lock) even on a panic unwind.
-    lock_task: tokio::task::AbortHandle,
-}
-
-impl Drop for MutatingGuard {
-    fn drop(&mut self) {
-        // Close the dedicated connection (aborts the I/O driver) so Postgres
-        // drops the advisory lock. Best-effort: worst case the lock releases
-        // when the socket times out server-side.
-        self.lock_task.abort();
-    }
+    lock_conn: PgConnection,
 }
 
 /// H1: acquire a [`MutatingGuard`] for a mutating subcommand (`index`,
@@ -483,29 +455,27 @@ pub async fn acquire_mutating_guard(config: &Config) -> anyhow::Result<Option<Mu
 
     // Dedicated (non-pooled) connection, same as the `serve` guard (S1):
     // a pooled connection could be recycled and silently release the lock.
-    let (client, conn_task, acquired) = connect_and_try_instance_lock(config).await?;
+    let (mut client, acquired) = connect_and_try_instance_lock(config).await?;
 
     if !acquired {
         // Someone else holds it — surface the holder's PID (best-effort) for
         // an actionable error, then refuse before any mutation. The pg_locks
         // predicate mirrors the warn-only check in `build_state`.
-        let pid: Option<i32> = client
-            .query_opt(
-                &format!(
-                    "SELECT a.pid FROM pg_locks l JOIN pg_stat_activity a ON l.pid = a.pid\n\
-                     WHERE {ADVISORY_LOCK_MATCH} LIMIT 1"
-                ),
-                &[],
-            )
-            .await
-            .ok()
-            .flatten()
-            .map(|r| r.get::<_, i32>(0));
+        let pid: Option<i32> = db::raw::fetch_scalar_optional(
+            &mut client,
+            &format!(
+                "SELECT a.pid FROM pg_locks l JOIN pg_stat_activity a ON l.pid = a.pid\n\
+                 WHERE {ADVISORY_LOCK_MATCH} LIMIT 1"
+            ),
+            |q| q,
+        )
+        .await
+        .ok()
+        .flatten();
         let holder = match pid {
             Some(p) => format!("advisory lock held by pid {p}"),
             None => "advisory lock held by another process".to_string(),
         };
-        conn_task.abort();
         drop(client);
         anyhow::bail!(
             "another zimservice instance ({holder}) is already using this database. A \
@@ -519,86 +489,66 @@ pub async fn acquire_mutating_guard(config: &Config) -> anyhow::Result<Option<Mu
 
     Ok(Some(MutatingGuard {
         lock_conn: client,
-        lock_task: conn_task.abort_handle(),
     }))
 }
 
-/// How often the advisory-lock liveness monitor polls the lock connection's
-/// I/O driver for completion (i.e. socket close). Connection death is only
-/// ever detected within this interval; 30s keeps the extra poll cost
+/// How often the advisory-lock liveness monitor probes the lock connection
+/// (a `SELECT 1` on the dedicated connection). Connection death is only
+/// ever detected within this interval; 30s keeps the extra probe cost
 /// negligible while bounding the window in which a silently-released
 /// advisory lock would be unnoticed.
 const ADVISORY_LOCK_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// H1: detect that an advisory-lock connection has died mid-run, and invoke
+/// H1: detect that the advisory-lock connection has died mid-run, and invoke
 /// `on_connection_lost` exactly once when it has.
 ///
-/// `lock_task` is the I/O driver spawned by [`db::pool::connect_dedicated`].
-/// Joining it yields `Result<Result<(), tokio_postgres::Error>, JoinError>`:
-/// the outer `Ok` means the driver *task* finished (the inner `Result` is the
-/// `Connection` future's outcome), the outer `Err` means the task was aborted
-/// or panicked. Every outcome **except** a self-abort means the socket is
-/// gone and Postgres has silently released the advisory lock:
-///
-/// - `Ok(Ok(Ok(())))` — the `Connection` future resolved cleanly (a clean
-///   socket close); the lock is released, so this is a loss.
-/// - `Ok(Ok(Err(e)))` — the `Connection` future errored (Postgres restart,
-///   network drop): the common case.
-/// - `Ok(Err(join_err))` where `is_cancelled()` — `Drop` aborted the driver
-///   on graceful shutdown: **not** a loss; return `None`, no callback.
-/// - `Ok(Err(join_err))` otherwise — the driver task panicked: the connection
-///   is gone; fail closed.
-///
-/// The failure action is injected as `on_connection_lost` (a one-line reason
-/// string), so the detection logic is unit-testable with a recording callback
-/// instead of killing the process. It returns `Some(reason)` when a loss was
-/// detected, `None` for a graceful drop.
+/// sqlx's `PgConnection` has no separately abortable I/O driver to join
+/// (tokio-postgres' spawned `Connection` task did), so liveness is probed by
+/// a `SELECT 1` on the dedicated connection itself, every
+/// [`ADVISORY_LOCK_CHECK_INTERVAL`]. Any probe failure — Postgres restart,
+/// network drop, or a server-side close — means the socket is gone and
+/// Postgres has silently released the advisory lock, so the callback fires
+/// (and the function returns). The function is only ever *cancelled* on a
+/// graceful drop (the caller aborts the owning task), in which case the
+/// callback never runs and no connection loss has been observed.
 async fn detect_advisory_lock_loss(
-    mut lock_task: tokio::task::JoinHandle<std::result::Result<(), tokio_postgres::Error>>,
+    mut conn: PgConnection,
     on_connection_lost: impl FnOnce(String),
-) -> Option<String> {
+) {
     loop {
-        match tokio::time::timeout(ADVISORY_LOCK_CHECK_INTERVAL, &mut lock_task).await {
-            // Timeout: connection still alive — poll again.
+        match tokio::time::timeout(
+            ADVISORY_LOCK_CHECK_INTERVAL,
+            db::raw::execute(&mut conn, "SELECT 1", |q| q),
+        )
+        .await
+        {
+            // Timeout: connection still alive — probe again.
             Err(_) => {}
-            // Self-abort on graceful drop — not a connection loss.
-            Ok(Err(join_err)) if join_err.is_cancelled() => return None,
-            // Driver task panicked — the connection is gone; fail closed.
-            Ok(Err(join_err)) => {
-                let reason = format!("advisory-lock I/O driver panicked: {join_err}");
-                on_connection_lost(reason.clone());
-                return Some(reason);
-            }
-            // Clean close: the socket is gone and the lock was released.
-            Ok(Ok(Ok(()))) => {
-                let reason =
-                    "advisory-lock connection closed cleanly (advisory lock released)".to_string();
-                on_connection_lost(reason.clone());
-                return Some(reason);
-            }
-            // Connection error (Postgres restart / network drop) — the common case.
-            Ok(Ok(Err(e))) => {
+            Ok(Ok(_)) => {}
+            // Probe failed — the socket is gone and the lock was released.
+            Ok(Err(e)) => {
                 let reason = format!("advisory-lock connection dropped: {e}");
-                on_connection_lost(reason.clone());
-                return Some(reason);
+                on_connection_lost(reason);
+                return;
             }
         }
     }
 }
 
 /// H1: spawn the detached liveness monitor for an acquired advisory lock.
-/// Fail-closed action: when the dedicated lock connection dies mid-run the
+/// The monitor task **owns** the dedicated connection (probing it on an
+/// interval); fail-closed action: when that connection dies mid-run the
 /// process exits (1), because a second `serve` on the same database could
-/// otherwise start against a silently-released lock. Graceful shutdown aborts
-/// the driver first, so the monitor's join is cancelled and it never fires.
-fn spawn_advisory_lock_monitor(
-    lock_task: tokio::task::JoinHandle<std::result::Result<(), tokio_postgres::Error>>,
-) {
+/// otherwise start against a silently-released lock. Graceful shutdown
+/// aborts the task first (which closes the connection), so the monitor never
+/// fires on shutdown. Returns the monitor handle so the guard can abort it
+/// on drop.
+fn spawn_advisory_lock_monitor(conn: PgConnection) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // The production callback logs and exits(1) on a real loss, so the
-        // detector only returns in the graceful-drop case (None). Discard the
-        // result — the fail-closed action already ran inside the callback.
-        let _ = detect_advisory_lock_loss(lock_task, |reason| {
+        // detector only returns after the fail-closed action already ran
+        // inside the callback.
+        detect_advisory_lock_loss(conn, |reason| {
             tracing::error!(
                 reason = %reason,
                 "single-instance advisory lock lost mid-run — another `serve` on \
@@ -607,7 +557,7 @@ fn spawn_advisory_lock_monitor(
             std::process::exit(1);
         })
         .await;
-    });
+    })
 }
 
 /// S2: cross-database PID lock with PID-liveness check. If the file exists but
@@ -666,11 +616,11 @@ pub async fn acquire_instance_guard(
     config: &Config,
 ) -> anyhow::Result<Option<SingleInstanceGuard>> {
     let advisory = try_acquire_advisory_lock(config).await?;
-    let Some((client, conn_task)) = advisory else {
+    let Some(conn) = advisory else {
         return Ok(None);
     };
     let lock_path = acquire_zim_dir_pid_lock(config)?;
-    // A PID lock conflict above bailed, dropping `client`/`conn_task` at the
+    // A PID lock conflict above bailed, dropping `conn` at the
     // error boundary and releasing the advisory lock.
 
     tracing::warn!(
@@ -685,13 +635,11 @@ pub async fn acquire_instance_guard(
 
     // H1: watch the lock connection for a mid-run death (Postgres restart /
     // network drop silently releases the advisory lock). The monitor owns
-    // the driver handle; the guard keeps its abort handle for Drop.
-    let abort_handle = conn_task.abort_handle();
-    spawn_advisory_lock_monitor(conn_task);
+    // the connection; the guard keeps its handle to abort it on Drop.
+    let monitor_task = spawn_advisory_lock_monitor(conn);
 
     Ok(Some(SingleInstanceGuard {
-        lock_conn: Some(client),
-        lock_task: Some(abort_handle),
+        lock_task: Some(monitor_task),
         lock_path: Some(lock_path),
     }))
 }
@@ -706,7 +654,7 @@ pub async fn acquire_instance_guard_multi_db(
     config: &Config,
 ) -> anyhow::Result<SingleInstanceGuard> {
     match try_acquire_advisory_lock(config).await? {
-        Some((client, conn_task)) => {
+        Some(conn) => {
             let lock_path = acquire_zim_dir_pid_lock(config)?;
             // The lock is free, so both guards are in force exactly as in the
             // default path — the opt-out only changes the behavior when the
@@ -718,11 +666,9 @@ pub async fn acquire_instance_guard_multi_db(
             // H1: the lock is held, so it is monitored for a mid-run loss
             // exactly as in the default path (the opt-out's `None` arm holds
             // no lock and spawns no monitor).
-            let abort_handle = conn_task.abort_handle();
-            spawn_advisory_lock_monitor(conn_task);
+            let monitor_task = spawn_advisory_lock_monitor(conn);
             Ok(SingleInstanceGuard {
-                lock_conn: Some(client),
-                lock_task: Some(abort_handle),
+                lock_task: Some(monitor_task),
                 lock_path: Some(lock_path),
             })
         }
@@ -738,7 +684,6 @@ pub async fn acquire_instance_guard_multi_db(
                  deployments on a shared zim_dir are supported by this opt-out."
             );
             Ok(SingleInstanceGuard {
-                lock_conn: None,
                 lock_task: None,
                 lock_path: Some(lock_path),
             })
@@ -929,25 +874,75 @@ mod tests {
         );
     }
 
-    // ── H1: advisory-lock liveness-monitor detection (no Postgres) ─────────
+    // ── H1: advisory-lock liveness-monitor detection ─────────────────────
+    //
+    // The sqlx detector probes a *real* dedicated connection (`SELECT 1` on
+    // an interval), so both tests are DB-gated like the smoke tests below:
+    // they skip cleanly when no DB is reachable unless `ZIMSERVICE_REQUIRE_DB`
+    // is set.
 
     #[tokio::test]
     async fn liveness_monitor_fires_on_closed_connection() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        // A driver handle that completes immediately with a clean close
-        // (`Ok(())`) — the "socket went away" case the monitor must catch.
-        // Because it is already complete, the first `timeout(...)` poll inside
-        // the detector returns at once; no 30s wait.
-        let handle: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>> =
-            tokio::spawn(async { Ok(()) });
+        // A dedicated connection whose backend is terminated up front — the
+        // "socket went away" case the monitor must catch. Because the backend
+        // is already gone, the first `SELECT 1` probe fails at once; no
+        // interval wait.
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
+        });
+        let mut conn = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::db::pool::connect_dedicated(&url),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
+                    panic!("ZIMSERVICE_REQUIRE_DB set but cannot reach {url}: {e}");
+                }
+                eprintln!("skipping liveness_monitor_fires_on_closed_connection: cannot reach {url} ({e})");
+                return;
+            }
+            Err(_) => {
+                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
+                    panic!("ZIMSERVICE_REQUIRE_DB set but timed out reaching {url}");
+                }
+                eprintln!("skipping liveness_monitor_fires_on_closed_connection: timed out reaching {url}");
+                return;
+            }
+        };
+        let _db_gate = crate::testing::DbExclusiveGuard::acquire();
+        // sqlx's `Connection::close` consumes the handle, so sever the socket
+        // the way a real crash does: a second dedicated connection terminates
+        // this one's backend server-side. Any in-flight or next query on
+        // `conn` now fails at once.
+        let mut helper = crate::db::pool::connect_dedicated(&url)
+            .await
+            .expect("helper conn");
+        let pid: i32 = crate::db::raw::fetch_scalar_optional(
+            &mut conn,
+            "SELECT pg_backend_pid()",
+            |q| q,
+        )
+        .await
+        .expect("backend pid")
+        .expect("row");
+        let _ = crate::db::raw::execute(
+            &mut helper,
+            "SELECT pg_terminate_backend($1)",
+            |q| q.bind(pid),
+        )
+        .await;
+        drop(helper);
         let fired = Arc::new(AtomicBool::new(false));
         let fired_cb = fired.clone();
         let detector =
-            detect_advisory_lock_loss(handle, move |_| fired_cb.store(true, Ordering::SeqCst));
-        let detected = tokio::time::timeout(std::time::Duration::from_secs(5), detector)
+            detect_advisory_lock_loss(conn, move |_| fired_cb.store(true, Ordering::SeqCst));
+        tokio::time::timeout(std::time::Duration::from_secs(5), detector)
             .await
             .expect("detection of a closed connection must fire within 5s");
-        assert!(detected.is_some(), "a non-graceful close must be detected");
         assert!(
             fired.load(Ordering::SeqCst),
             "on_connection_lost must be invoked"
@@ -957,16 +952,41 @@ mod tests {
     #[tokio::test]
     async fn liveness_monitor_stays_quiet_while_alive() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        // A long-lived driver: within a short window the detector must NOT
-        // report a loss and must NOT fire the callback (no false positive on a
-        // healthy connection). We abandon the (still-pending) detector — its
-        // inner `timeout` loop simply never completes in this window.
-        let _long_lived: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>> =
-            tokio::spawn(async { std::future::pending().await });
+        // A live dedicated connection: within a short window the detector
+        // must NOT report a loss and must NOT fire the callback (no false
+        // positive on a healthy connection). We abandon the (still-pending)
+        // detector — its probe loop simply never completes in this window —
+        // which also drops the connection.
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
+        });
+        let conn = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::db::pool::connect_dedicated(&url),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
+                    panic!("ZIMSERVICE_REQUIRE_DB set but cannot reach {url}: {e}");
+                }
+                eprintln!("skipping liveness_monitor_stays_quiet_while_alive: cannot reach {url} ({e})");
+                return;
+            }
+            Err(_) => {
+                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
+                    panic!("ZIMSERVICE_REQUIRE_DB set but timed out reaching {url}");
+                }
+                eprintln!("skipping liveness_monitor_stays_quiet_while_alive: timed out reaching {url}");
+                return;
+            }
+        };
+        let _db_gate = crate::testing::DbExclusiveGuard::acquire();
         let fired = Arc::new(AtomicBool::new(false));
         let fired_cb = fired.clone();
         let detector =
-            detect_advisory_lock_loss(_long_lived, move |_| fired_cb.store(true, Ordering::SeqCst));
+            detect_advisory_lock_loss(conn, move |_| fired_cb.store(true, Ordering::SeqCst));
         let _ = tokio::time::timeout(std::time::Duration::from_millis(120), detector).await;
         assert!(
             !fired.load(Ordering::SeqCst),
@@ -1014,15 +1034,19 @@ mod tests {
         };
         // Serialize with other DB tests (cross-process lockfile).
         let _db_gate = crate::testing::DbExclusiveGuard::acquire();
-        let (holder, holder_task) = first;
-        // The first instance takes the advisory lock (and keeps the driver
-        // alive so the connection — and therefore the lock — stays open).
-        let held = holder
-            .query_one(INSTANCE_LOCK_SQL, &[])
-            .await
-            .expect("first connection must hold the lock");
+        // The first instance takes the advisory lock (and keeps the
+        // connection alive so the lock stays open).
+        let mut holder = first;
+        let held: bool = crate::db::raw::fetch_scalar_optional(
+            &mut holder,
+            INSTANCE_LOCK_SQL,
+            |q| q,
+        )
+        .await
+        .expect("first connection must hold the lock")
+        .unwrap();
         assert!(
-            held.get::<_, bool>(0),
+            held,
             "setup: first connection must acquire the lock"
         );
 
@@ -1042,10 +1066,10 @@ mod tests {
             result.is_none(),
             "acquire_instance_guard must refuse (Ok(None)) while another instance holds the lock"
         );
-        // `holder`/`holder_task` stayed alive across the assertion above, so the
-        // first instance genuinely held the lock the whole time. Dropping them
-        // here closes the connection and releases the lock.
-        drop(holder_task);
+        // `holder` stayed alive across the assertion above, so the first
+        // instance genuinely held the lock the whole time. Dropping it here
+        // closes the socket and releases the lock.
+        drop(holder);
     }
 
     // ── H1: DB-gated mutating-guard refusal (skips without Postgres) ─────
@@ -1095,15 +1119,19 @@ mod tests {
         };
         // Serialize with other DB tests (cross-process lockfile).
         let _db_gate = crate::testing::DbExclusiveGuard::acquire();
-        let (server_conn, server_task) = server;
-        // The "server" takes the advisory lock and keeps the driver alive so
-        // the lock stays open for the test.
-        let held = server_conn
-            .query_one(INSTANCE_LOCK_SQL, &[])
-            .await
-            .expect("server-sim must hold the lock");
+        // The "server" takes the advisory lock and keeps the connection open
+        // so the lock stays open for the test.
+        let mut server_conn = server;
+        let held: bool = crate::db::raw::fetch_scalar_optional(
+            &mut server_conn,
+            INSTANCE_LOCK_SQL,
+            |q| q,
+        )
+        .await
+        .expect("server-sim must hold the lock")
+        .unwrap();
         assert!(
-            held.get::<_, bool>(0),
+            held,
             "setup: server-sim must acquire the lock"
         );
 
@@ -1130,15 +1158,16 @@ mod tests {
         );
 
         // 2) Release the server-sim's lock → the guard must now acquire.
-        let released = server_conn
-            .query_one(
-                "SELECT pg_advisory_unlock(hashtext('zimservice:instance'))",
-                &[],
-            )
-            .await
-            .expect("unlock must run");
+        let released: bool = crate::db::raw::fetch_scalar_optional(
+            &mut server_conn,
+            "SELECT pg_advisory_unlock(hashtext('zimservice:instance'))",
+            |q| q,
+        )
+        .await
+        .expect("unlock must run")
+        .unwrap();
         assert!(
-            released.get::<_, bool>(0),
+            released,
             "setup: server-sim must release the lock"
         );
         let guard = acquire_mutating_guard(&config)
@@ -1157,21 +1186,20 @@ mod tests {
         );
 
         // 4) Dropping the guard releases the lock again. Bounded retry: the
-        //    aborted driver's socket close and Postgres's server-side lock
+        //    dropped connection's socket close and Postgres's server-side lock
         //    release are asynchronous (the connect handshake below usually
         //    orders them first). A failed attempt holds nothing, so retries
         //    are safe; a successful one means *we* now hold it.
         drop(guard);
-        let (verify, verify_task) = crate::db::pool::connect_dedicated(&url)
+        let mut verify = crate::db::pool::connect_dedicated(&url)
             .await
             .expect("verify connect");
         let mut free = false;
         for _ in 0..20 {
-            free = verify
-                .query_one(INSTANCE_LOCK_SQL, &[])
+            free = crate::db::raw::fetch_scalar_optional(&mut verify, INSTANCE_LOCK_SQL, |q| q)
                 .await
                 .expect("verify try-lock")
-                .get(0);
+                .unwrap();
             if free {
                 break;
             }
@@ -1181,8 +1209,8 @@ mod tests {
             free,
             "dropping the MutatingGuard must release the advisory lock"
         );
-        verify_task.abort();
+        // Dropping the connections closes the sockets, releasing any held lock.
         drop(verify);
-        drop(server_task);
+        drop(server_conn);
     }
 }

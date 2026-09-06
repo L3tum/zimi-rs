@@ -6,8 +6,6 @@ pub use std::collections::HashMap;
 pub use std::sync::Arc;
 pub use std::time::{Duration, Instant};
 
-pub use deadpool_postgres::Config as DpConfig;
-
 pub use zimservice::db::migrate::run_migrations;
 pub use zimservice::db::pool::Pool;
 pub use zimservice::search::{SearchEngine, SearchParams};
@@ -39,20 +37,21 @@ pub static SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 pub async fn pool_or_skip() -> Option<(Pool, zimservice::testing::DbExclusiveGuard)> {
     let url_explicit = std::env::var("DATABASE_URL").is_ok();
     let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.into());
-    let mut cfg = DpConfig::new();
-    cfg.url = Some(url.clone());
-    let pool = match cfg.builder(tokio_postgres::NoTls) {
-        Ok(b) => b,
-        Err(e) => return skip(&url, url_explicit, &e.to_string()),
+    // sqlx has no `connect_with_timeout`; the 3 s bound is applied with
+    // `tokio::time::timeout` around the eager connect instead.
+    let pool = match tokio::time::timeout(
+        Duration::from_secs(3),
+        sqlx::postgres::PgPoolOptions::new().max_connections(4).connect(&url),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return skip(&url, url_explicit, &e.to_string()),
+        Err(_) => return skip(&url, url_explicit, "connect timed out (3s)"),
     };
-    let pool = match pool.max_size(4).build() {
-        Ok(p) => p,
-        Err(e) => return skip(&url, url_explicit, &e.to_string()),
-    };
-    match tokio::time::timeout(Duration::from_secs(3), pool.get()).await {
-        Ok(Ok(_)) => Some((pool, zimservice::testing::DbExclusiveGuard::acquire())),
-        Ok(Err(e)) => skip(&url, url_explicit, &e.to_string()),
-        Err(_) => skip(&url, url_explicit, "timed out connecting"),
+    match pool.acquire().await {
+        Ok(_) => Some((pool, zimservice::testing::DbExclusiveGuard::acquire())),
+        Err(e) => skip(&url, url_explicit, &e.to_string()),
     }
 }
 
@@ -120,20 +119,26 @@ pub async fn seed_search_fixture(pool: &Pool) -> SearchEngine {
         .await
         .expect("migrations (fixture tables must exist)");
 
+    zimservice::db::raw::execute(
+        pool,
+        "DELETE FROM zims WHERE name = $1",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(
+        pool,
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap();
     {
-        let c = pool.get().await.unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
-            .await
-            .unwrap();
-        c.execute(
-            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
-                               index_status, indexed_entries, article_count)
-             VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
-            &[&ZIM],
-        )
-        .await
-        .unwrap();
-        c.batch_execute(&format!(
+        // One statement per `raw::execute` (sqlx has no multi-statement
+        // protocol call; `split_statements` replaces the old `batch_execute`).
+        for stmt in zimservice::db::raw::split_statements(&format!(
             "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES
              ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpine', 'Alpine',
               'The Alps are mountains.', to_tsvector('simple','alpine peaks europe')),
@@ -142,9 +147,11 @@ pub async fn seed_search_fixture(pool: &Pool) -> SearchEngine {
              ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Andes', 'Andes',
               'The Andes are mountains in South America.',
               to_tsvector('simple','andes mountains south america'))"
-        ))
-        .await
-        .unwrap();
+        )) {
+            zimservice::db::raw::execute(pool, &stmt, |q| q)
+                .await
+                .unwrap();
+        }
     }
 
     let settings = SettingsCache::load(pool.clone(), HashMap::new(), HashMap::new())
@@ -157,134 +164,6 @@ pub async fn seed_search_fixture(pool: &Pool) -> SearchEngine {
     )
 }
 
-/// C12 (Step 4.2 / DEC-5) — DB-gated perf check. Seeds a dedicated ZIM with
-/// 100k articles, then runs `EXPLAIN (ANALYZE, BUFFERS)` against each of the
-/// three split trgm queries that `SearchEngine::search` builds (btree prefix,
-/// GIN contains, GiST similarity) plus a pure `ORDER BY title_lower` shape
-/// (Q5, WI-36 PERF-4 keep/drop decision), and asserts **none** of the
-/// regression-gated shapes falls back to a `Seq Scan` over `articles`.
-/// Prints the plans for `docs/perf-notes.md`.
-/// Runs entirely in a dedicated temporary database (dropped afterwards) —
-/// the shared dev DB is never seeded or `ANALYZE`d by this test.
-/// Skipped cleanly when the DB is unreachable; run with
-/// `--include-ignored` (e.g. `make test-strict-perf`).
-/// Name of the perf tests' dedicated temporary database: a fixed prefix
-/// plus the current pid, so concurrent or restarted runs never collide and
-/// stale-DB cleanup can find leftovers by prefix.
-pub fn perf_tmp_db_name() -> String {
-    format!("zimservice_it_perf_{}", std::process::id())
-}
-
-/// The suite's `DATABASE_URL` (or the compose default) with its path segment
-/// replaced by `db_name`.
-pub fn with_db_name(db_name: &str) -> String {
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.into());
-    let mut u = url::Url::parse(&url).expect("DATABASE_URL must parse");
-    u.set_path(&format!("/{db_name}"));
-    u.to_string()
-}
-
-/// Build the perf tests' dedicated temporary database and a pool for it.
-///
-/// Both perf tests seed bulk rows and run `ANALYZE`, so they must never
-/// touch the shared dev DB (Tests Minor #9): everything runs in this temp
-/// DB, which [`perf_drop_temp_db`] drops again afterwards. Before creating
-/// its own, this also **sweeps** any stale `zimservice_it_perf_*` databases
-/// left behind by a killed run (a panic between create and drop would
-/// otherwise leak it), so a killed run self-heals on the next start.
-///
-/// Returns `None` — recording a mid-test skip — when the role cannot
-/// `CREATE DATABASE` or the temp pool fails to build/connect.
-pub async fn perf_temp_db(shared: &Pool) -> Option<(Pool, String)> {
-    let c = shared.get().await.expect("pool conn");
-    let can_create: bool = c
-        .query_one(
-            "SELECT has_database_privilege(current_user, 'template1', 'CREATE')",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    if !can_create {
-        skip_midtest("role cannot CREATE DATABASE — perf temp DB unavailable");
-        return None;
-    }
-    // Startup sweep: force-drop stale temp DBs from killed runs (any pid).
-    // `WITH (FORCE)` (PG 13+) detaches any connections a killed run left.
-    let stale: Vec<String> = c
-        .query(
-            "SELECT datname FROM pg_database
-             WHERE datname LIKE 'zimservice_it_perf_%' AND datname <> current_database()",
-            &[],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get::<_, String>(0))
-        .collect();
-    for db in &stale {
-        let _ = c
-            .execute(
-                &format!("DROP DATABASE IF EXISTS \"{db}\" WITH (FORCE)"),
-                &[],
-            )
-            .await;
-    }
-    let tmp_db = perf_tmp_db_name();
-    if c.execute(&format!("CREATE DATABASE \"{tmp_db}\""), &[])
-        .await
-        .is_err()
-    {
-        skip_midtest(&format!("perf temp DB create failed: {tmp_db}"));
-        return None;
-    }
-    let mut tc = DpConfig::new();
-    tc.url = Some(with_db_name(&tmp_db));
-    let tpool = match tc
-        .builder(tokio_postgres::NoTls)
-        .ok()
-        .and_then(|b| b.max_size(2).build().ok())
-    {
-        Some(p) => p,
-        None => {
-            let _ = c
-                .execute(
-                    &format!("DROP DATABASE IF EXISTS \"{tmp_db}\" WITH (FORCE)"),
-                    &[],
-                )
-                .await;
-            skip_midtest("perf temp pool build failed");
-            return None;
-        }
-    };
-    if tpool.get().await.is_err() {
-        drop(tpool);
-        let _ = c
-            .execute(
-                &format!("DROP DATABASE IF EXISTS \"{tmp_db}\" WITH (FORCE)"),
-                &[],
-            )
-            .await;
-        skip_midtest("perf temp DB connect failed");
-        return None;
-    }
-    Some((tpool, tmp_db))
-}
-
-/// Post-test cleanup for the perf temp DB: drop it (force-detaching any
-/// remaining connections). Mirrors the legacy-upgrade test's same-scope drop;
-/// if an assertion panics before this runs, the next run's startup sweep in
-/// [`perf_temp_db`] removes the leftover.
-pub async fn perf_drop_temp_db(shared: &Pool, tmp_db: &str) {
-    let c = shared.get().await.expect("pool conn");
-    let _ = c
-        .execute(
-            &format!("DROP DATABASE IF EXISTS \"{tmp_db}\" WITH (FORCE)"),
-            &[],
-        )
-        .await;
-}
-
 // ── B5.6: contention (unique active download + seeding visibility) ──────
 
 /// Insert a row with the given `status`; returns the new id or the raw error.
@@ -293,14 +172,14 @@ pub async fn insert_download(
     name: &str,
     url: &str,
     status: &str,
-) -> std::result::Result<i32, tokio_postgres::Error> {
-    let c = pool.get().await.expect("pool conn");
-    c.query_one(
+) -> std::result::Result<i32, zimservice::error::Error> {
+    zimservice::db::raw::fetch_scalar_optional(
+        pool,
         "INSERT INTO downloads (name, url, status) VALUES ($1, $2, $3) RETURNING id",
-        &[&name, &url, &status],
+        |q| q.bind(name).bind(url).bind(status),
     )
     .await
-    .map(|r| r.get::<_, i32>(0))
+    .map(|id| id.expect("insert row present"))
 }
 
 // ── B5.7: DB-backed handler happy paths ────────────────────────────────

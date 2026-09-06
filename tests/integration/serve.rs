@@ -8,13 +8,9 @@ use super::common::*;
 /// pool is never touched.
 #[tokio::test]
 async fn listener_five_bad_passwords_lock_out_client() {
-    let mut cfg = deadpool_postgres::Config::new();
-    cfg.url = Some("postgres://u:p@127.0.0.1:1/nodb".into());
-    let pool = cfg
-        .builder(tokio_postgres::NoTls)
-        .unwrap()
-        .max_size(1)
-        .build()
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_lazy("postgres://u:p@127.0.0.1:1/nodb")
         .unwrap();
     let mut map = zimservice::settings::default_settings();
     map.insert("access.mode".into(), serde_json::json!("password"));

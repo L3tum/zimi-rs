@@ -524,34 +524,32 @@ async fn tool_article_languages(state: &AppState, args: &Value) -> Result<Value,
 }
 
 async fn tool_list_collections(state: &AppState) -> Value {
-    let client = match state.db.get().await {
-        Ok(c) => c,
-        Err(e) => return tool_error(e.to_string()),
-    };
-    let rows = match client
-        .query(
-            "SELECT c.name, c.label, c.is_favorite, c.created_at,
-                    COALESCE(ARRAY_AGG(z.name) FILTER (WHERE z.id IS NOT NULL), '{}')
-             FROM collections c
-             LEFT JOIN zims z ON z.id = ANY(c.zim_ids)
-             GROUP BY c.id
-             ORDER BY c.name",
-            &[],
-        )
-        .await
+    let rows = match sqlx::query_as::<
+        _,
+        (String, String, bool, chrono::DateTime<chrono::Utc>, Vec<String>),
+    >(
+        "SELECT c.name, c.label, c.is_favorite, c.created_at,
+                COALESCE(ARRAY_AGG(z.name) FILTER (WHERE z.id IS NOT NULL), '{}')
+         FROM collections c
+         LEFT JOIN zims z ON z.id = ANY(c.zim_ids)
+         GROUP BY c.id
+         ORDER BY c.name",
+    )
+    .fetch_all(&state.db)
+    .await
     {
         Ok(r) => r,
         Err(e) => return tool_error(e.to_string()),
     };
     let collections: Vec<Value> = rows
         .iter()
-        .map(|r| {
+        .map(|(name, label, is_favorite, created_at, zims)| {
             json!({
-                "name": r.get::<_, String>(0),
-                "label": r.get::<_, String>(1),
-                "is_favorite": r.get::<_, bool>(2),
-                "zims": r.get::<_, Vec<String>>(4),
-                "created_at": r.get::<_, chrono::DateTime<chrono::Utc>>(3).to_rfc3339(),
+                "name": name,
+                "label": label,
+                "is_favorite": is_favorite,
+                "zims": zims,
+                "created_at": created_at.to_rfc3339(),
             })
         })
         .collect();

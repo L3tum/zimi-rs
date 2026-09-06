@@ -23,8 +23,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::time::sleep;
-use tokio_postgres::{Client, Row};
 
+use crate::db::entities::downloads::{Column, Entity, Model as DownloadRow};
 use crate::db::Pool;
 use crate::error::{Error, Result, TorrentKind};
 use crate::netguard::{assert_host_not_blocked, resolve_download_host, validate_download_url};
@@ -33,6 +33,8 @@ use crate::torrent::files::{install_zim, locate_torrent_zim, validate_download_n
 use crate::torrent::{
     connect_qbit, qbit_fingerprint, resolve_qbit_inputs, QbitClient, QbitClientCache,
 };
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect};
 
 mod complete;
 mod direct;
@@ -223,8 +225,21 @@ impl DownloadPoller {
     /// confirmed: when qB is unreachable (or the delete fails) the binding is
     /// kept so the next tick retries the removal instead of orphaning the
     /// torrent. Rows without a hash (direct downloads) skip qB entirely.
-    async fn status_if_changed(&self, client: &Client, id: i32, torrent_hash: &str) -> bool {
-        if status_no_longer_downloading(client, id).await.is_none() {
+    async fn status_if_changed(&self, id: i32, torrent_hash: &str) -> bool {
+        // The lifecycle helper takes a checked-out `&mut PgConnection` (it can
+        // pair the read with a follow-up write on the same connection). A
+        // failed acquire fails open like a failed status query: the check is
+        // skipped and the download continues (the next periodic check re-runs).
+        let mut conn = match self.db.acquire().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(
+                    "status check for download {id} could not acquire a connection: {e}"
+                );
+                return true;
+            }
+        };
+        if status_no_longer_downloading(&mut conn, id).await.is_none() {
             return true;
         }
         tracing::info!(
@@ -332,25 +347,18 @@ impl DownloadPoller {
     }
 
     /// LINT-2 extraction (verbatim `tick()` step-3 block 1): the in-flight
-    /// rows the tick body processes (downloading + seeding). `Row` has no
-    /// lifetime parameter in tokio-postgres, so returning it is sound.
-    async fn fetch_inflight_rows(&self) -> Result<Vec<Row>> {
-        let c = self.db.get().await.map_err(Error::Pool)?;
-        c.query(
-            &format!(
-                "SELECT id, name, url, hash, status, updated_at, \
-                 progress, speed_bps, eta_secs, ratio, up_speed_bps, num_seeds, file_path \
-                 FROM downloads \
-                 WHERE status IN ({active})",
-                active = crate::torrent::in_list([
-                    crate::torrent::DownloadStatus::Downloading,
-                    crate::torrent::DownloadStatus::Seeding
-                ])
-            ),
-            &[],
-        )
-        .await
-        .map_err(Error::Database)
+    /// rows the tick body processes (downloading + seeding). Returning the
+    /// entity `Model` (owned values) is sound — no connection is involved.
+    async fn fetch_inflight_rows(&self) -> Result<Vec<DownloadRow>> {
+        let db = crate::db::sea_orm_db(&self.db);
+        Entity::find()
+            .filter(Column::Status.is_in([
+                crate::torrent::DownloadStatus::Downloading.as_str(),
+                crate::torrent::DownloadStatus::Seeding.as_str(),
+            ]))
+            .all(&db)
+            .await
+            .map_err(Error::from)
     }
 
     /// LINT-2 extraction (verbatim `tick()` early-exit block): whether this
@@ -360,28 +368,39 @@ impl DownloadPoller {
     /// their own rows and are excluded), seeding rows, and cancellations with
     /// a live hash binding.
     async fn should_skip_tick(&self) -> Result<bool> {
-        let c = self.db.get().await.map_err(Error::Pool)?;
+        let db = crate::db::sea_orm_db(&self.db);
         // `url NOT LIKE '%.zim'` (after stripping query **and** fragment) =
-        // torrent rows (inverse of `is_direct_zim_url`).
-        let n: i64 = c
-            .query_one(
-                &format!(
-                    "SELECT count(*) FROM downloads \
-                 WHERE status = {queued} \
-                    OR (status = {down} AND {pred} NOT LIKE '%.zim') \
-                    OR status = {seed} \
-                    OR (status = {cancelled} AND hash IS NOT NULL)",
-                    queued = crate::torrent::DownloadStatus::Queued.as_str(),
-                    down = crate::torrent::DownloadStatus::Downloading.as_str(),
-                    seed = crate::torrent::DownloadStatus::Seeding.as_str(),
-                    cancelled = crate::torrent::DownloadStatus::Cancelled.as_str(),
-                    pred = ZIM_URL_PREDICATE
-                ),
-                &[],
+        // torrent rows (inverse of `is_direct_zim_url`). The predicate
+        // fragment is `Expr::cust` — see `retry_interrupted_directs`.
+        // sea-orm 1.x dropped `Select::count`; a `count(id)` projection
+        // (id = the non-null PK) yields the same number.
+        let n: i64 = Entity::find()
+            .select_only()
+            .column_as(Expr::col(Column::Id).count(), "n")
+            .filter(
+                Column::Status
+                    .eq(crate::torrent::DownloadStatus::Queued.as_str())
+                    .or(
+                        Column::Status
+                            .eq(crate::torrent::DownloadStatus::Downloading.as_str())
+                            .and(Expr::cust(format!(
+                                "({pred}) NOT LIKE '%.zim'",
+                                pred = ZIM_URL_PREDICATE
+                            ))),
+                    )
+                    .or(Column::Status.eq(crate::torrent::DownloadStatus::Seeding.as_str()))
+                    .or(
+                        Column::Status
+                            .eq(crate::torrent::DownloadStatus::Cancelled.as_str())
+                            .and(Column::Hash.is_not_null()),
+                    ),
             )
+            .into_tuple()
+            .one(&db)
             .await
-            .map_err(Error::Database)?
-            .get(0);
+            .map_err(Error::from)?
+            .map(|(n,)| n)
+            .unwrap_or(0);
         Ok(n == 0)
     }
 
@@ -392,23 +411,22 @@ impl DownloadPoller {
     /// cycling forever. A 401/403 session expiry is always exempt — the next
     /// re-login is the fix, not a human.
     async fn requeue_stale_errors(&self) -> Result<()> {
-        let c = self.db.get().await.map_err(Error::Pool)?;
-        let stale: Vec<(i32, String)> = c
-            .query(
-                &format!(
-                    "SELECT id, error FROM downloads \
-                     WHERE status = {err} \
-                       AND updated_at < now() - interval '10 minutes' \
-                       AND error ~* $1",
-                    err = crate::torrent::DownloadStatus::Error.as_str()
-                ),
-                &[&REQUEUE_ERROR_PATTERN],
-            )
-            .await
-            .map_err(Error::Database)?
-            .iter()
-            .map(|r| (r.get(0), r.get(1)))
-            .collect();
+        // Raw escape hatch (db::raw): the case-insensitive regex match
+        // `error ~* $1` — sea-query 0.32 has no regex operator, so the
+        // SELECT stays raw (the guarded UPDATE lives in
+        // `downloads_lifecycle::requeue_stale_errors`, builder-built).
+        let stale: Vec<(i32, String)> = crate::db::raw::fetch_all(
+            &self.db,
+            &format!(
+                "SELECT id, error FROM downloads \
+                 WHERE status = {err} \
+                   AND updated_at < now() - interval '10 minutes' \
+                   AND error ~* $1",
+                err = crate::torrent::DownloadStatus::Error.as_str()
+            ),
+            |q| q.bind(REQUEUE_ERROR_PATTERN),
+        )
+        .await?;
         if stale.is_empty() {
             return Ok(());
         }
@@ -508,17 +526,18 @@ impl DownloadPoller {
     /// bookkeeping queries. Drain them: once the hash is NULL the row
     /// early-exits.
     async fn process_cancelled(&self, qbit: Option<&Arc<QbitClient>>) -> Result<()> {
-        let cancelled = {
-            let c = self.db.get().await.map_err(Error::Pool)?;
-            c.query(
-                &format!(
-                    "SELECT id, hash FROM downloads WHERE status = {cancelled} AND hash IS NOT NULL",
-                    cancelled = crate::torrent::DownloadStatus::Cancelled.as_str()
-                ),
-                &[],
-            )
-            .await
-            .map_err(Error::Database)?
+        let cancelled: Vec<(i32, Option<String>)> = {
+            let db = crate::db::sea_orm_db(&self.db);
+            Entity::find()
+                .select_only()
+                .column(Column::Id)
+                .column(Column::Hash)
+                .filter(Column::Status.eq(crate::torrent::DownloadStatus::Cancelled.as_str()))
+                .filter(Column::Hash.is_not_null())
+                .into_tuple()
+                .all(&db)
+                .await
+                .map_err(Error::from)?
         };
         // BUG-21: no qB → drain the hash bindings so the rows early-exit.
         if qbit.is_none() {
@@ -532,18 +551,21 @@ impl DownloadPoller {
                 );
             }
         }
-        for r in &cancelled {
-            let id: i32 = r.get(0);
-            let hash: String = r.get(1);
+        for (id, hash) in &cancelled {
+            let id = *id;
             // qB down — keep the hash binding; the next tick retries the removal.
             if qbit.is_none() {
                 continue;
             }
+            // The `hash IS NOT NULL` filter above guarantees a binding
+            // (belt & braces).
+            let Some(hash) = hash.as_deref() else {
+                continue;
+            };
             // BUG-5: the helper owns the two-statement cleanup — confirm the
             // row left `downloading`, drop the torrent from qB, and clear the
             // stale `hash` binding (kept when the removal can't be confirmed).
-            let client = self.db.get().await.map_err(Error::Pool)?;
-            let _ = self.status_if_changed(&client, id, &hash).await;
+            let _ = self.status_if_changed(id, hash).await;
         }
         Ok(())
     }
@@ -562,17 +584,20 @@ impl DownloadPoller {
         p: &crate::settings::PollerParams,
         torrents: &[super::TorrentInfo],
     ) -> Result<()> {
-        let queued = {
-            let c = self.db.get().await.map_err(Error::Pool)?;
-            c.query(
-                &format!(
-                    "SELECT id, name, url FROM downloads WHERE status = {queued} ORDER BY id LIMIT $1",
-                    queued = crate::torrent::DownloadStatus::Queued.as_str()
-                ),
-                &[&MAX_QUEUED_PER_TICK],
-            )
-            .await
-            .map_err(Error::Database)?
+        let queued: Vec<(i32, String, String)> = {
+            let db = crate::db::sea_orm_db(&self.db);
+            Entity::find()
+                .select_only()
+                .column(Column::Id)
+                .column(Column::Name)
+                .column(Column::Url)
+                .filter(Column::Status.eq(crate::torrent::DownloadStatus::Queued.as_str()))
+                .order_by(Column::Id, Order::Asc)
+                .limit(MAX_QUEUED_PER_TICK as u64)
+                .into_tuple()
+                .all(&db)
+                .await
+                .map_err(Error::from)?
         };
         // Only torrents in OUR category count against the active budget — other
         // people's qBittorrent downloads must not starve ours.
@@ -586,19 +611,31 @@ impl DownloadPoller {
         // '%.zim'` (after stripping query and fragment) is the SQL form of
         // `is_direct_zim_url`.
         let direct_active: i32 = {
-            let c = self.db.get().await.map_err(Error::Pool)?;
-            c.query_one(
-                &format!(
-                    "SELECT count(*) FROM downloads \
-                 WHERE status = {down} AND {pred} LIKE '%.zim' AND file_path IS NOT NULL",
-                    down = crate::torrent::DownloadStatus::Downloading.as_str(),
+            let db = crate::db::sea_orm_db(&self.db);
+            // The predicate fragment is `Expr::cust` (byte-stable, see
+            // `retry_interrupted_directs`). Query errors keep the budget
+            // whole: the count falls back to 0, as before. sea-orm 1.x
+            // dropped `Select::count`; a `count(id)` projection (id = the
+            // non-null PK) yields the same number.
+            let n: i64 = Entity::find()
+                .select_only()
+                .column_as(Expr::col(Column::Id).count(), "n")
+                .filter(Column::Status.eq(
+                    crate::torrent::DownloadStatus::Downloading.as_str(),
+                ))
+                .filter(Expr::cust(format!(
+                    "({pred}) LIKE '%.zim'",
                     pred = ZIM_URL_PREDICATE
-                ),
-                &[],
-            )
-            .await
-            .map(|r| r.get::<_, i64>(0) as i32)
-            .unwrap_or(0)
+                )))
+                .filter(Column::FilePath.is_not_null())
+                .into_tuple()
+                .one(&db)
+                .await
+                .ok()
+                .flatten()
+                .map(|(n,)| n)
+                .unwrap_or(0);
+            n as i32
         };
         let mut budget = (self
             .settings
@@ -606,22 +643,20 @@ impl DownloadPoller {
             .saturating_sub(active + direct_active))
         .max(0) as i64;
 
-        for r in &queued {
-            let id: i32 = r.get(0);
-            let name: String = r.get(1);
-            let url: String = r.get(2);
+        for (id, name, url) in &queued {
+            let id = *id;
 
             // SSRF guard (defense in depth — the API boundary also validates
             // before queueing). Direct .zim URLs must be http/https; torrent
             // URLs may be magnet: but http(s) ones are still host-checked.
             // `is_direct` is computed once and reused below (Ponytail S2).
-            let is_direct = super::is_direct_zim_url(&url);
+            let is_direct = super::is_direct_zim_url(url);
             {
                 let allow_private = p.allow_private_networks;
                 let check = if is_direct {
-                    validate_download_url(&url, allow_private)
+                    validate_download_url(url, allow_private)
                 } else {
-                    assert_host_not_blocked(&url, allow_private, false)
+                    assert_host_not_blocked(url, allow_private, false)
                 };
                 if let Err(e) = check {
                     tracing::warn!("download {id} rejected: {e}");
@@ -636,7 +671,7 @@ impl DownloadPoller {
                 // Defense in depth: names are validated at insert time, but
                 // a stale row with a bad name must not write outside the ZIM
                 // dir (the name is spliced into the `.part` path).
-                if let Err(e) = validate_download_name(&name) {
+                if let Err(e) = validate_download_name(name) {
                     tracing::warn!("direct download {id} rejected: {e}");
                     mark_error(&self.db, id, &format!("invalid name: {e}")).await;
                     continue;
@@ -654,7 +689,7 @@ impl DownloadPoller {
                 )
                 .await?;
                 if claimed > 0 {
-                    self.spawn_direct(id, &url, &part);
+                    self.spawn_direct(id, url, &part);
                     budget -= 1;
                 }
                 continue;
@@ -677,7 +712,7 @@ impl DownloadPoller {
                 break; // no capacity for more active downloads this tick
             }
 
-            match q.add_torrent(&url, &p.category, &p.save_path).await {
+            match q.add_torrent(url, &p.category, &p.save_path).await {
                 Ok(_msg) => {
                     // Any Ok response from qB add_torrent is success (B5).
                     // Do NOT update the name column — keep the user-provided display name.
@@ -770,6 +805,27 @@ mod tests {
     use super::{Pool, REQUEUE_ERROR_PATTERN};
     use crate::torrent::TorrentInfo;
 
+    /// `(progress, speed_bps, eta_secs, ratio, up_speed_bps, num_seeds)`
+    type StatsTuple = (
+        f32,
+        Option<i64>,
+        Option<i64>,
+        Option<f32>,
+        Option<i64>,
+        Option<i64>,
+    );
+
+    /// `(status, progress, speed_bps, eta_secs, ratio, up_speed_bps, num_seeds)`
+    type StatusStatsTuple = (
+        String,
+        f32,
+        Option<i64>,
+        Option<i64>,
+        Option<f32>,
+        Option<i64>,
+        Option<i64>,
+    );
+
     /// WI-10: count of DB-gated test skips in the lib test suite.
     /// Read by the `#[dtor::dtor]` exit summary at process end.
     pub(super) static LIB_SKIPPED: std::sync::atomic::AtomicUsize =
@@ -853,18 +909,11 @@ mod tests {
 
     pub(crate) mod download {
         use super::*;
+        use crate::db::raw;
 
         pub(crate) fn download_settings() -> crate::settings::SettingsCache {
-            let mut dp = deadpool_postgres::Config::new();
-            dp.url = Some("postgres://u:p@127.0.0.1:1/nodb".into());
-            let pool = dp
-                .builder(tokio_postgres::NoTls)
-                .unwrap()
-                .max_size(1)
-                .build()
-                .unwrap();
             crate::settings::SettingsCache::new_with_map(
-                pool,
+                crate::testing::dead_pool(),
                 crate::settings::default_settings(),
                 std::collections::HashMap::new(),
             )
@@ -956,18 +1005,18 @@ mod tests {
             let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
                 "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
             });
-            let mut cfg = deadpool_postgres::Config::new();
-            cfg.url = Some(url.clone());
-            let pool = match cfg.builder(tokio_postgres::NoTls) {
-                Ok(b) => b,
-                Err(e) => return test_pool_skip(&url, &e.to_string()),
+            let config = crate::config::Config {
+                database_url: url.clone(),
+                db_pool_size: 4,
+                ..Default::default()
             };
-            let pool = match pool.max_size(4).build() {
-                Ok(p) => p,
-                Err(e) => return test_pool_skip(&url, &e.to_string()),
-            };
-            match tokio::time::timeout(std::time::Duration::from_secs(3), pool.get()).await {
-                Ok(Ok(_)) => Some((pool, crate::testing::DbExclusiveGuard::acquire())),
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                crate::db::pool::create_pool(&config),
+            )
+            .await
+            {
+                Ok(Ok(pool)) => Some((pool, crate::testing::DbExclusiveGuard::acquire())),
                 Ok(Err(e)) => test_pool_skip(&url, &e.to_string()),
                 Err(_) => test_pool_skip(&url, "timed out connecting"),
             }
@@ -1024,23 +1073,23 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let c = pool.get().await.expect("conn");
-            let zim_id: i32 = c
-                .query_one(
-                    "INSERT INTO downloads (name, url, status) VALUES ($1, $2, 'queued') RETURNING id",
-                    &[&"it-zim", &"http://127.0.0.1:9/x.zim"],
-                )
-                .await
-                .expect("insert zim row")
-                .get(0);
-            let qb_id: i32 = c
-                .query_one(
-                    "INSERT INTO downloads (name, url, status) VALUES ($1, $2, 'queued') RETURNING id",
-                    &[&"it-torrent", &"magnet:?xt=urn:btih:aaa"],
-                )
-                .await
-                .expect("insert torrent row")
-                .get(0);
+            let mut c = pool.acquire().await.expect("conn");
+            let zim_id: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, status) VALUES ($1, $2, 'queued') RETURNING id",
+                |q| q.bind("it-zim").bind("http://127.0.0.1:9/x.zim"),
+            )
+            .await
+            .expect("insert zim row")
+            .expect("row");
+            let qb_id: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, status) VALUES ($1, $2, 'queued') RETURNING id",
+                |q| q.bind("it-torrent").bind("magnet:?xt=urn:btih:aaa"),
+            )
+            .await
+            .expect("insert torrent row")
+            .expect("row");
 
             let tmp = tempfile::tempdir().expect("tempdir");
             let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
@@ -1060,12 +1109,15 @@ mod tests {
             // (verified on drop, as the rest of this crate's wiremock suite does):
             // one `filter=all` info fetch, one login, one add — not `active`.
 
-            let c = pool.get().await.expect("conn");
-            let qb_status: String = c
-                .query_one("SELECT status FROM downloads WHERE id = $1", &[&qb_id])
-                .await
-                .expect("read qb row")
-                .get(0);
+            let mut c = pool.acquire().await.expect("conn");
+            let qb_status: String = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT status FROM downloads WHERE id = $1",
+                |q| q.bind(qb_id),
+            )
+            .await
+            .expect("read qb row")
+            .expect("row");
             assert_eq!(
                 qb_status, "downloading",
                 "torrent row enqueued to qB this tick"
@@ -1078,24 +1130,26 @@ mod tests {
             // a local connection-refused, never leaving the machine), which would
             // race the read. `file_path` is set by the synchronous claim and
             // never cleared by that task, so it is the stable signal.
-            let zp: Option<String> = c
-                .query_one("SELECT file_path FROM downloads WHERE id = $1", &[&zim_id])
-                .await
-                .expect("read zim row")
-                .get(0);
+            let zp: Option<String> = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT file_path FROM downloads WHERE id = $1",
+                |q| q.bind(zim_id),
+            )
+            .await
+            .expect("read zim row");
             assert!(
                 zp.as_deref().unwrap_or("").ends_with(".part"),
                 "direct row must be claimed with a .part file_path, got: {zp:?}"
             );
 
-            let _ = pool.get().await; // keep pool alive for cleanup
-            let c2 = pool.get().await.expect("conn");
-            let _ = c2
-                .execute(
-                    "DELETE FROM downloads WHERE id IN ($1, $2)",
-                    &[&zim_id, &qb_id],
-                )
-                .await;
+            let _ = pool.acquire().await; // keep pool alive for cleanup
+            let mut c2 = pool.acquire().await.expect("conn");
+            let _ = raw::execute(
+                &mut *c2,
+                "DELETE FROM downloads WHERE id IN ($1, $2)",
+                |q| q.bind(zim_id).bind(qb_id),
+            )
+            .await;
             let _ = tmp;
         }
 
@@ -1140,7 +1194,7 @@ mod tests {
         /// Insert a `downloads` row under the unique prefix (fresh `now()` →
         /// no grace expiry; magnet URL keeps it on the qB-torrent code path).
         async fn it_insert_row(
-            c: &tokio_postgres::Client,
+            pool: &Pool,
             name: &str,
             hash: Option<&str>,
             status: &str,
@@ -1148,13 +1202,22 @@ mod tests {
             ratio: Option<f32>,
             num_seeds: Option<i64>,
         ) -> i32 {
-            c.query_one(
+            let mut c = pool.acquire().await.expect("conn");
+            raw::fetch_scalar_optional(
+                &mut *c,
                 "INSERT INTO downloads (name, url, hash, status, progress, ratio, num_seeds, \n                 updated_at) VALUES ($1, 'magnet:?xt=urn:btih:it', $2, $3, $4, $5, $6, \n                 now()) RETURNING id",
-                &[&name, &hash, &status, &progress, &ratio, &num_seeds],
+                |q| {
+                    q.bind(name)
+                        .bind(hash)
+                        .bind(status)
+                        .bind(progress)
+                        .bind(ratio)
+                        .bind(num_seeds)
+                },
             )
             .await
             .expect("insert it-inflight row")
-            .get(0)
+            .expect("row")
         }
 
         /// Shared harness for direct `process_inflight` / `flush_stats` tests:
@@ -1188,21 +1251,22 @@ mod tests {
             crate::db::migrate::run_migrations(&pool)
                 .await
                 .expect("migrations");
-            let c = pool.get().await.expect("conn");
-            let _ = c
-                .execute(
-                    "DELETE FROM downloads WHERE name LIKE '__it_inflight__%'",
-                    &[],
-                )
-                .await;
-            let id = it_insert_row(&c, name, hash, status, progress, ratio, num_seeds).await;
+            let mut c = pool.acquire().await.expect("conn");
+            let _ = raw::execute(
+                &mut *c,
+                "DELETE FROM downloads WHERE name LIKE '__it_inflight__%'",
+                |q| q,
+            )
+            .await;
+            let id = it_insert_row(&pool, name, hash, status, progress, ratio, num_seeds).await;
             if stale {
                 // Age the row past `MISSING_TORRENT_GRACE` (10 min) so the
                 // missing-torrent expiry arms judge it this tick.
-                c.execute(
+                raw::execute(
+                    &mut *c,
                     "UPDATE downloads SET updated_at = now() - interval '11 minutes' \
                      WHERE id = $1",
-                    &[&id],
+                    |q| q.bind(id),
                 )
                 .await
                 .expect("stale the row's updated_at");
@@ -1235,7 +1299,7 @@ mod tests {
                 .await
                 .expect("rows")
                 .into_iter()
-                .filter(|r| r.get::<_, String>(1).starts_with(IT_INFLIGHT_PREFIX))
+                .filter(|r| r.name.starts_with(IT_INFLIGHT_PREFIX))
                 .collect::<Vec<_>>();
             assert_eq!(rows.len(), 1, "only this suite's row may be in-flight");
             let changed = poller
@@ -1252,14 +1316,14 @@ mod tests {
             poller.flush_stats(&changed).await;
             check(id, changed, pool.clone()).await;
 
-            let _ = pool.get().await; // keep pool alive for cleanup
-            let c2 = pool.get().await.expect("conn");
-            let _ = c2
-                .execute(
-                    "DELETE FROM downloads WHERE name LIKE '__it_inflight__%'",
-                    &[],
-                )
-                .await;
+            let _ = pool.acquire().await; // keep pool alive for cleanup
+            let mut c2 = pool.acquire().await.expect("conn");
+            let _ = raw::execute(
+                &mut *c2,
+                "DELETE FROM downloads WHERE name LIKE '__it_inflight__%'",
+                |q| q,
+            )
+            .await;
             let _ = tmp;
         }
 
@@ -1280,23 +1344,22 @@ mod tests {
                 "itc1hash",
                 it_torrent("itc1hash", "changed-row", "downloading", 0.75, 100, 50, 0.5, 3),
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
-                    let c = pool.get().await.expect("conn");
+                    let mut c = pool.acquire().await.expect("conn");
                     // 1 MiB remaining at 100 KiB/s → eta 10 s; speeds 1024×'d.
                     assert_eq!(
                         changed,
                         vec![(id, 0.75, 102_400, Some(10), Some(0.5), 51_200, 3)],
                         "the changed row must be queued exactly once with the fresh stats"
                     );
-                    let row = c
-                        .query_one(
-                            "SELECT progress, speed_bps, eta_secs, ratio, up_speed_bps, \n                            num_seeds FROM downloads WHERE id = $1",
-                            &[&id],
-                        )
-                        .await
-                        .expect("read row");
                     let (prog, speed, eta, ratio, up, seeds):
-                        (f32, i64, Option<i64>, Option<f32>, i64, i64) =
-                        (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4), row.get(5));
+                        (f32, i64, Option<i64>, Option<f32>, i64, i64) = raw::fetch_optional(
+                        &mut *c,
+                        "SELECT progress, speed_bps, eta_secs, ratio, up_speed_bps, \n                            num_seeds FROM downloads WHERE id = $1",
+                        |q| q.bind(id),
+                    )
+                    .await
+                    .expect("read row")
+                    .expect("row present");
                     assert_eq!(
                         (prog, speed, eta, ratio, up, seeds),
                         (0.75, 102_400, Some(10), Some(0.5), 51_200, 3),
@@ -1324,24 +1387,26 @@ mod tests {
                 "itu1hash",
                 it_torrent("itu1hash", "unchanged-row", "downloading", 0.5, 0, 0, 1.0, 3),
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
-                    let c = pool.get().await.expect("conn");
+                    let mut c = pool.acquire().await.expect("conn");
                     assert!(
                         changed.is_empty(),
                         "an unchanged row must not be queued for a stats write"
                     );
-                    let row = c
-                        .query_one(
+                    let (prog, speed, eta, ratio, up, seeds): StatsTuple =
+                        raw::fetch_optional(
+                            &mut *c,
                             "SELECT progress, speed_bps, eta_secs, ratio, up_speed_bps, \n                            num_seeds FROM downloads WHERE id = $1",
-                            &[&id],
+                            |q| q.bind(id),
                         )
                         .await
-                        .expect("read row");
-                    assert_eq!(row.get::<_, f32>(0), 0.5, "progress stays untouched");
-                    assert_eq!(row.get::<_, Option<i64>>(1), None, "speed_bps stays NULL");
-                    assert_eq!(row.get::<_, Option<i64>>(2), None, "eta_secs stays NULL");
-                    assert_eq!(row.get::<_, Option<f32>>(3), Some(1.0), "ratio stays 1.0");
-                    assert_eq!(row.get::<_, Option<i64>>(4), None, "up_speed stays NULL");
-                    assert_eq!(row.get::<_, Option<i64>>(5), Some(3), "num_seeds stays 3");
+                        .expect("read row")
+                        .expect("row present");
+                    assert_eq!(prog, 0.5, "progress stays untouched");
+                    assert_eq!(speed, None, "speed_bps stays NULL");
+                    assert_eq!(eta, None, "eta_secs stays NULL");
+                    assert_eq!(ratio, Some(1.0), "ratio stays 1.0");
+                    assert_eq!(up, None, "up_speed stays NULL");
+                    assert_eq!(seeds, Some(3), "num_seeds stays 3");
                 },
             )
             .await;
@@ -1364,16 +1429,18 @@ mod tests {
                 "aaa", // the row's stale hash keys the by_hash map
                 it_torrent("bbb", "rebind-row", "downloading", 0.5, 0, 0, 0.0, 0),
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
-                    let c = pool.get().await.expect("conn");
+                    let mut c = pool.acquire().await.expect("conn");
                     assert!(
                         changed.is_empty(),
                         "a rebind alone must not queue a stats write"
                     );
-                    let hash: Option<String> = c
-                        .query_one("SELECT hash FROM downloads WHERE id = $1", &[&id])
-                        .await
-                        .expect("read row")
-                        .get(0);
+                    let hash: Option<String> = raw::fetch_scalar_optional(
+                        &mut *c,
+                        "SELECT hash FROM downloads WHERE id = $1",
+                        |q| q.bind(id),
+                    )
+                    .await
+                    .expect("read row");
                     assert_eq!(
                         hash.as_deref(),
                         Some("bbb"),
@@ -1403,16 +1470,19 @@ mod tests {
                 "itf1hash",
                 t,
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
-                    let c = pool.get().await.expect("conn");
+                    let mut c = pool.acquire().await.expect("conn");
                     assert!(
                         changed.is_empty(),
                         "a fatal row must not queue a stats write"
                     );
-                    let row = c
-                        .query_one("SELECT status, error FROM downloads WHERE id = $1", &[&id])
-                        .await
-                        .expect("read row");
-                    let (status, error): (String, Option<String>) = (row.get(0), row.get(1));
+                    let (status, error): (String, Option<String>) = raw::fetch_optional(
+                        &mut *c,
+                        "SELECT status, error FROM downloads WHERE id = $1",
+                        |q| q.bind(id),
+                    )
+                    .await
+                    .expect("read row")
+                    .expect("row present");
                     assert_eq!(
                         (status.as_str(), error.as_deref()),
                         ("error", Some("cannot allocate files")),
@@ -1440,23 +1510,25 @@ mod tests {
                 "its1hash",
                 it_torrent("its1hash", "seeding-row", "uploading", 1.0, 0, 200, 1.5, 7),
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
-                    let c = pool.get().await.expect("conn");
+                    let mut c = pool.acquire().await.expect("conn");
                     assert!(
                         changed.is_empty(),
                         "seeding rows refresh in place and must not queue a stats write"
                     );
-                    let row = c
-                        .query_one(
-                            "SELECT status, ratio, up_speed_bps, num_seeds, \n                            speed_bps FROM downloads WHERE id = $1",
-                            &[&id],
-                        )
-                        .await
-                        .expect("read row");
-                    let status: String = row.get(0);
-                    let ratio: Option<f32> = row.get(1);
-                    let up: Option<i64> = row.get(2);
-                    let seeds: Option<i64> = row.get(3);
-                    let speed: Option<i64> = row.get(4);
+                    let (status, ratio, up, seeds, speed): (
+                        String,
+                        Option<f32>,
+                        Option<i64>,
+                        Option<i64>,
+                        Option<i64>,
+                    ) = raw::fetch_optional(
+                        &mut *c,
+                        "SELECT status, ratio, up_speed_bps, num_seeds, \n                            speed_bps FROM downloads WHERE id = $1",
+                        |q| q.bind(id),
+                    )
+                    .await
+                    .expect("read row")
+                    .expect("row present");
                     assert_eq!(
                         (status.as_str(), ratio, up, seeds, speed),
                         ("seeding", Some(1.5), Some(204_800), Some(7), Some(0)),
@@ -1485,30 +1557,28 @@ mod tests {
                 "its2hash",
                 it_torrent("its2hash", "seed0-row", "uploading", 1.0, 0, 0, 0.5, 2),
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
-                    let c = pool.get().await.expect("conn");
+                    let mut c = pool.acquire().await.expect("conn");
                     assert!(
                         changed.is_empty(),
                         "an unchanged seeding row must take no DB write"
                     );
-                    let row = c
-                        .query_one(
-                            "SELECT status, progress, speed_bps, eta_secs, ratio, \
-                            up_speed_bps, num_seeds FROM downloads WHERE id = $1",
-                            &[&id],
-                        )
-                        .await
-                        .expect("read row");
-                    assert_eq!(row.get::<_, String>(0), "seeding", "status stays seeding");
-                    assert_eq!(row.get::<_, f32>(1), 1.0, "progress stays 1.0");
-                    assert_eq!(row.get::<_, Option<i64>>(2), None, "speed_bps stays NULL");
-                    assert_eq!(row.get::<_, Option<i64>>(3), None, "eta_secs stays NULL");
-                    assert_eq!(row.get::<_, Option<f32>>(4), Some(0.5), "ratio stays 0.5");
-                    assert_eq!(
-                        row.get::<_, Option<i64>>(5),
-                        None,
-                        "up_speed_bps stays NULL"
-                    );
-                    assert_eq!(row.get::<_, Option<i64>>(6), Some(2), "num_seeds stays 2");
+                    let (status, progress, speed, eta, ratio, up, seeds): StatusStatsTuple =
+                        raw::fetch_optional(
+                        &mut *c,
+                        "SELECT status, progress, speed_bps, eta_secs, ratio, \
+                        up_speed_bps, num_seeds FROM downloads WHERE id = $1",
+                        |q| q.bind(id),
+                    )
+                    .await
+                    .expect("read row")
+                    .expect("row present");
+                    assert_eq!(status, "seeding", "status stays seeding");
+                    assert_eq!(progress, 1.0, "progress stays 1.0");
+                    assert_eq!(speed, None, "speed_bps stays NULL");
+                    assert_eq!(eta, None, "eta_secs stays NULL");
+                    assert_eq!(ratio, Some(0.5), "ratio stays 0.5");
+                    assert_eq!(up, None, "up_speed_bps stays NULL");
+                    assert_eq!(seeds, Some(2), "num_seeds stays 2");
                 },
             )
             .await;
@@ -1531,16 +1601,19 @@ mod tests {
                 "ghost1hash", // no torrent carries the row's bound hash
                 it_torrent("ghost1hash", "ghost1-row", "downloading", 0.5, 0, 0, 0.0, 0),
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
-                    let c = pool.get().await.expect("conn");
+                    let mut c = pool.acquire().await.expect("conn");
                     assert!(
                         changed.is_empty(),
                         "a missing torrent must not queue a stats write"
                     );
-                    let row = c
-                        .query_one("SELECT status, error FROM downloads WHERE id = $1", &[&id])
-                        .await
-                        .expect("read row");
-                    let (status, error): (String, Option<String>) = (row.get(0), row.get(1));
+                    let (status, error): (String, Option<String>) = raw::fetch_optional(
+                        &mut *c,
+                        "SELECT status, error FROM downloads WHERE id = $1",
+                        |q| q.bind(id),
+                    )
+                    .await
+                    .expect("read row")
+                    .expect("row present");
                     assert_eq!(
                         (status.as_str(), error.as_deref()),
                         ("error", Some("torrent not found in qBittorrent")),
@@ -1567,16 +1640,19 @@ mod tests {
                 "ghost2hash",
                 it_torrent("ghost2hash", "ghost2-row", "downloading", 0.5, 0, 0, 0.0, 0),
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
-                    let c = pool.get().await.expect("conn");
+                    let mut c = pool.acquire().await.expect("conn");
                     assert!(
                         changed.is_empty(),
                         "a within-grace missing torrent must not queue a stats write"
                     );
-                    let row = c
-                        .query_one("SELECT status, error FROM downloads WHERE id = $1", &[&id])
-                        .await
-                        .expect("read row");
-                    let (status, error): (String, Option<String>) = (row.get(0), row.get(1));
+                    let (status, error): (String, Option<String>) = raw::fetch_optional(
+                        &mut *c,
+                        "SELECT status, error FROM downloads WHERE id = $1",
+                        |q| q.bind(id),
+                    )
+                    .await
+                    .expect("read row")
+                    .expect("row present");
                     assert_eq!(
                         (status.as_str(), error.as_deref()),
                         ("downloading", None),
@@ -1604,20 +1680,24 @@ mod tests {
                 "ghost3hash", // the row's torrent is gone from qB
                 it_torrent("ghost3hash", "ghost3-row", "uploading", 1.0, 0, 0, 0.0, 0),
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
-                    let c = pool.get().await.expect("conn");
+                    let mut c = pool.acquire().await.expect("conn");
                     assert!(
                         changed.is_empty(),
                         "a settled seeding row must not queue a stats write"
                     );
-                    let row = c
-                        .query_one(
-                            "SELECT status, error, ratio, num_seeds FROM downloads WHERE id = $1",
-                            &[&id],
-                        )
-                        .await
-                        .expect("read row");
-                    let (status, error): (String, Option<String>) = (row.get(0), row.get(1));
-                    let (ratio, seeds): (Option<f32>, Option<i64>) = (row.get(2), row.get(3));
+                    let (status, error, ratio, seeds): (
+                        String,
+                        Option<String>,
+                        Option<f32>,
+                        Option<i64>,
+                    ) = raw::fetch_optional(
+                        &mut *c,
+                        "SELECT status, error, ratio, num_seeds FROM downloads WHERE id = $1",
+                        |q| q.bind(id),
+                    )
+                    .await
+                    .expect("read row")
+                    .expect("row present");
                     assert_eq!(
                         (status.as_str(), error.as_deref()),
                         ("complete", None),
@@ -1662,16 +1742,19 @@ mod tests {
                 "seed2hash",
                 t,
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
-                    let c = pool.get().await.expect("conn");
+                    let mut c = pool.acquire().await.expect("conn");
                     assert!(
                         changed.is_empty(),
                         "a settled seeding row must not queue a stats write"
                     );
-                    let row = c
-                        .query_one("SELECT status, error FROM downloads WHERE id = $1", &[&id])
-                        .await
-                        .expect("read row");
-                    let (status, error): (String, Option<String>) = (row.get(0), row.get(1));
+                    let (status, error): (String, Option<String>) = raw::fetch_optional(
+                        &mut *c,
+                        "SELECT status, error FROM downloads WHERE id = $1",
+                        |q| q.bind(id),
+                    )
+                    .await
+                    .expect("read row")
+                    .expect("row present");
                     assert_eq!(
                         (status.as_str(), error.as_deref()),
                         ("complete", Some("cannot allocate files")),
@@ -1698,20 +1781,24 @@ mod tests {
                 "ghost4hash",
                 it_torrent("ghost4hash", "ghost4-row", "uploading", 1.0, 0, 0, 0.0, 0),
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
-                    let c = pool.get().await.expect("conn");
+                    let mut c = pool.acquire().await.expect("conn");
                     assert!(
                         changed.is_empty(),
                         "a within-grace missing seeding torrent must take no DB write"
                     );
-                    let row = c
-                        .query_one(
-                            "SELECT status, error, ratio, num_seeds FROM downloads WHERE id = $1",
-                            &[&id],
-                        )
-                        .await
-                        .expect("read row");
-                    let (status, error): (String, Option<String>) = (row.get(0), row.get(1));
-                    let (ratio, seeds): (Option<f32>, Option<i64>) = (row.get(2), row.get(3));
+                    let (status, error, ratio, seeds): (
+                        String,
+                        Option<String>,
+                        Option<f32>,
+                        Option<i64>,
+                    ) = raw::fetch_optional(
+                        &mut *c,
+                        "SELECT status, error, ratio, num_seeds FROM downloads WHERE id = $1",
+                        |q| q.bind(id),
+                    )
+                    .await
+                    .expect("read row")
+                    .expect("row present");
                     assert_eq!(
                         (status.as_str(), error.as_deref()),
                         ("seeding", None),
@@ -1748,23 +1835,26 @@ mod tests {
             crate::db::migrate::run_migrations(&pool)
                 .await
                 .expect("migrations");
-            let c = pool.get().await.expect("conn");
+            let mut c = pool.acquire().await.expect("conn");
             // Sweep leftovers from a crashed run (shared single-DB suite).
-            let _ = c
-                .execute(
-                    "DELETE FROM downloads WHERE name LIKE '__it_inflight__%'",
-                    &[],
-                )
-                .await;
-            let _ = c
-                .execute("DELETE FROM zims WHERE name = $1", &[&"__it_inflight__b4"])
-                .await;
+            let _ = raw::execute(
+                &mut *c,
+                "DELETE FROM downloads WHERE name LIKE '__it_inflight__%'",
+                |q| q,
+            )
+            .await;
+            let _ = raw::execute(
+                &mut *c,
+                "DELETE FROM zims WHERE name = $1",
+                |q| q.bind("__it_inflight__b4"),
+            )
+            .await;
 
             // Two same-named rows: A bound to a stale (non-matching) hash, B
             // unbound. Both freshly `downloading` (no grace expiry) on the
             // magnet (qB-torrent) code path.
             let id_a = it_insert_row(
-                &c,
+                &pool,
                 "__it_inflight__b4dup",
                 Some("b4stalehash"),
                 "downloading",
@@ -1774,7 +1864,7 @@ mod tests {
             )
             .await;
             let id_b = it_insert_row(
-                &c,
+                &pool,
                 "__it_inflight__b4dup",
                 None,
                 "downloading",
@@ -1838,7 +1928,7 @@ mod tests {
                 .await
                 .expect("rows")
                 .into_iter()
-                .filter(|r| r.get::<_, String>(1).starts_with(IT_INFLIGHT_PREFIX))
+                .filter(|r| r.name.starts_with(IT_INFLIGHT_PREFIX))
                 .collect::<Vec<_>>();
             assert_eq!(rows.len(), 2, "both same-named rows must be in-flight");
             let changed = poller
@@ -1854,35 +1944,37 @@ mod tests {
                 .expect("process_inflight");
             poller.flush_stats(&changed).await;
 
-            let row_a = c
-                .query_one(
-                    "SELECT status, hash, file_path FROM downloads WHERE id = $1",
-                    &[&id_a],
-                )
-                .await
-                .expect("read row A");
-            let row_b = c
-                .query_one(
-                    "SELECT status, hash, file_path FROM downloads WHERE id = $1",
-                    &[&id_b],
-                )
-                .await
-                .expect("read row B");
+            let row_a: (String, Option<String>, Option<String>) = raw::fetch_optional(
+                &mut *c,
+                "SELECT status, hash, file_path FROM downloads WHERE id = $1",
+                |q| q.bind(id_a),
+            )
+            .await
+            .expect("read row A")
+            .expect("row present");
+            let row_b: (String, Option<String>, Option<String>) = raw::fetch_optional(
+                &mut *c,
+                "SELECT status, hash, file_path FROM downloads WHERE id = $1",
+                |q| q.bind(id_b),
+            )
+            .await
+            .expect("read row B")
+            .expect("row present");
 
             // Row A (bound to a stale, non-matching hash): must NOT fall back to
             // the name match — still `downloading`, hash untouched, no file.
             assert_eq!(
-                row_a.get::<_, String>(0),
+                row_a.0,
                 "downloading",
                 "hash-bound row must not name-fallback to the same-named torrent"
             );
             assert_eq!(
-                row_a.get::<_, Option<String>>(1).as_deref(),
+                row_a.1.as_deref(),
                 Some("b4stalehash"),
                 "hash-bound row's hash must not be rebound to the matched torrent"
             );
             assert_eq!(
-                row_a.get::<_, Option<String>>(2),
+                row_a.2,
                 None,
                 "hash-bound row must not run handle_complete (no file installed)"
             );
@@ -1890,16 +1982,16 @@ mod tests {
             // Row B (hash NULL): matched by the name fallback — completed, hash
             // bound to the torrent's real hash, one file installed.
             assert_eq!(
-                row_b.get::<_, String>(0),
+                row_b.0,
                 "complete",
                 "hash-NULL row must complete via the name fallback"
             );
             assert_eq!(
-                row_b.get::<_, Option<String>>(1).as_deref(),
+                row_b.1.as_deref(),
                 Some("b4realhash"),
                 "hash-NULL row's hash must be bound to the torrent's real hash"
             );
-            let fp: Option<String> = row_b.get(2);
+            let fp: Option<String> = row_b.2;
             let fp = fp.expect("row B must have an installed file_path");
             assert!(
                 std::path::Path::new(&fp).starts_with(&zims.zim_dir),
@@ -1930,15 +2022,14 @@ mod tests {
             let mut last = String::from("(no zims row)");
             let mut settled = false;
             while tokio::time::Instant::now() < deadline {
-                if let Some((st, cnt)) = c
-                    .query_opt(
-                        "SELECT index_status, article_count FROM zims WHERE name = $1",
-                        &[&"__it_inflight__b4"],
-                    )
-                    .await
-                    .expect("query zims")
-                    .map(|z| (z.get::<_, String>(0), z.get::<_, i64>(1)))
-                {
+                let row: Option<(String, i64)> = raw::fetch_optional(
+                    &mut *c,
+                    "SELECT index_status, article_count FROM zims WHERE name = $1",
+                    |q| q.bind("__it_inflight__b4"),
+                )
+                .await
+                .expect("query zims");
+                if let Some((st, cnt)) = row {
                     last = format!("{st}/{cnt}");
                     if st == "ready" && cnt > 0 {
                         settled = true;
@@ -1951,16 +2042,19 @@ mod tests {
                 settled,
                 "auto-index did not settle within 30s (last: {last})"
             );
-            let c2 = pool.get().await.expect("conn");
-            let _ = c2
-                .execute(
-                    "DELETE FROM downloads WHERE id IN ($1, $2)",
-                    &[&id_a, &id_b],
-                )
-                .await;
-            let _ = c2
-                .execute("DELETE FROM zims WHERE name = $1", &[&"__it_inflight__b4"])
-                .await;
+            let mut c2 = pool.acquire().await.expect("conn");
+            let _ = raw::execute(
+                &mut *c2,
+                "DELETE FROM downloads WHERE id IN ($1, $2)",
+                |q| q.bind(id_a).bind(id_b),
+            )
+            .await;
+            let _ = raw::execute(
+                &mut *c2,
+                "DELETE FROM zims WHERE name = $1",
+                |q| q.bind("__it_inflight__b4"),
+            )
+            .await;
             let _ = (tmp, content_tmp);
         }
 
@@ -1977,17 +2071,17 @@ mod tests {
             crate::db::migrate::run_migrations(&pool)
                 .await
                 .expect("migrations");
-            let c = pool.get().await.expect("conn");
-            let _ = c
-                .execute(
-                    "DELETE FROM downloads WHERE name LIKE '__it_inflight__%'",
-                    &[],
-                )
-                .await;
+            let mut c = pool.acquire().await.expect("conn");
+            let _ = raw::execute(
+                &mut *c,
+                "DELETE FROM downloads WHERE name LIKE '__it_inflight__%'",
+                |q| q,
+            )
+            .await;
             // Two rows aged past `MISSING_TORRENT_GRACE`, each bound to a hash
             // no qB torrent carries (the maps below are empty).
             let dl_id = it_insert_row(
-                &c,
+                &pool,
                 "__it_inflight__qbu1",
                 Some("qbu1hash"),
                 "downloading",
@@ -1997,7 +2091,7 @@ mod tests {
             )
             .await;
             let sd_id = it_insert_row(
-                &c,
+                &pool,
                 "__it_inflight__qbu2",
                 Some("qbu2hash"),
                 "seeding",
@@ -2007,10 +2101,11 @@ mod tests {
             )
             .await;
             for id in [dl_id, sd_id] {
-                c.execute(
+                raw::execute(
+                    &mut *c,
                     "UPDATE downloads SET updated_at = now() - interval '11 minutes' \
                      WHERE id = $1",
-                    &[&id],
+                    |q| q.bind(id),
                 )
                 .await
                 .expect("stale the row's updated_at");
@@ -2047,7 +2142,7 @@ mod tests {
                 .await
                 .expect("rows")
                 .into_iter()
-                .filter(|r| r.get::<_, String>(1).starts_with(IT_INFLIGHT_PREFIX))
+                .filter(|r| r.name.starts_with(IT_INFLIGHT_PREFIX))
                 .collect::<Vec<_>>();
             assert_eq!(rows.len(), 2, "both stale rows must be in-flight");
             let changed = poller
@@ -2067,16 +2162,22 @@ mod tests {
                 "qB unreachable → no stats may be queued"
             );
 
-            let dl_status: String = c
-                .query_one("SELECT status FROM downloads WHERE id = $1", &[&dl_id])
-                .await
-                .expect("read downloading row")
-                .get(0);
-            let sd_status: String = c
-                .query_one("SELECT status FROM downloads WHERE id = $1", &[&sd_id])
-                .await
-                .expect("read seeding row")
-                .get(0);
+            let dl_status: String = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT status FROM downloads WHERE id = $1",
+                |q| q.bind(dl_id),
+            )
+            .await
+            .expect("read downloading row")
+            .expect("row present");
+            let sd_status: String = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT status FROM downloads WHERE id = $1",
+                |q| q.bind(sd_id),
+            )
+            .await
+            .expect("read seeding row")
+            .expect("row present");
             assert_eq!(
                 dl_status, "downloading",
                 "an unreachable qB must not judge the downloading row missing"
@@ -2086,14 +2187,14 @@ mod tests {
                 "an unreachable qB must not settle the seeding row"
             );
 
-            let _ = pool.get().await; // keep pool alive for cleanup
-            let c2 = pool.get().await.expect("conn");
-            let _ = c2
-                .execute(
-                    "DELETE FROM downloads WHERE id IN ($1, $2)",
-                    &[&dl_id, &sd_id],
-                )
-                .await;
+            let _ = pool.acquire().await; // keep pool alive for cleanup
+            let mut c2 = pool.acquire().await.expect("conn");
+            let _ = raw::execute(
+                &mut *c2,
+                "DELETE FROM downloads WHERE id IN ($1, $2)",
+                |q| q.bind(dl_id).bind(sd_id),
+            )
+            .await;
             let _ = tmp;
         }
 
@@ -2103,14 +2204,12 @@ mod tests {
         /// runs regardless of tick success.
         #[tokio::test]
         async fn run_stops_on_cancel_between_ticks() {
-            let mut dp = deadpool_postgres::Config::new();
-            dp.url = Some("postgres://u:p@127.0.0.1:1/nodb".into());
-            let pool = dp
-                .builder(tokio_postgres::NoTls)
-                .unwrap()
-                .max_size(1)
-                .build()
-                .unwrap();
+            // Dead pool (lazy build — no connection is attempted here): any
+            // acquire fails against the dead port. `dead_pool()` carries a
+            // short `acquire_timeout` — sqlx's 30 s default would otherwise
+            // hold the first (reconcile/tick) DB op well past the 10 s cancel
+            // deadline below.
+            let pool = crate::testing::dead_pool();
             let tmp = tempfile::tempdir().unwrap();
             let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
             // Dead qB port: connection-refused is instant, so `resolve_torrent`
@@ -2171,15 +2270,20 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let c = pool.get().await.expect("conn");
-            let id: i32 = c
-                .query_one(
-                    "INSERT INTO downloads (name, url, hash, status) \n                 VALUES ($1, $2, $3, 'cancelled') RETURNING id",
-                    &[&"it-cancelled", &"magnet:?xt=urn:btih:bbb", &"c0ffee"],
-                )
-                .await
-                .expect("insert cancelled row")
-                .get(0);
+            let mut c = pool.acquire().await.expect("conn");
+            let id: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, hash, status) \
+                 VALUES ($1, $2, $3, 'cancelled') RETURNING id",
+                |q| {
+                    q.bind("it-cancelled")
+                        .bind("magnet:?xt=urn:btih:bbb")
+                        .bind("c0ffee")
+                },
+            )
+            .await
+            .expect("insert cancelled row")
+            .expect("row present");
 
             let tmp = tempfile::tempdir().expect("tempdir");
             let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
@@ -2197,19 +2301,24 @@ mod tests {
 
             // The delete mock's `.expect(1)` (verified on drop) is the qB-remove
             // assertion; the row's stale hash must be cleared by the same tick.
-            let c = pool.get().await.expect("conn");
-            let hash: Option<String> = c
-                .query_one("SELECT hash FROM downloads WHERE id = $1", &[&id])
-                .await
-                .expect("read row")
-                .get(0);
+            let mut c = pool.acquire().await.expect("conn");
+            let hash: Option<String> = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT hash FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await
+            .expect("read row");
             assert_eq!(hash, None, "stale hash binding must be cleared");
 
-            let _ = pool.get().await; // keep pool alive for cleanup
-            let c2 = pool.get().await.expect("conn");
-            let _ = c2
-                .execute("DELETE FROM downloads WHERE id = $1", &[&id])
-                .await;
+            let _ = pool.acquire().await; // keep pool alive for cleanup
+            let mut c2 = pool.acquire().await.expect("conn");
+            let _ = raw::execute(
+                &mut *c2,
+                "DELETE FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await;
             let _ = tmp;
         }
 
@@ -2251,61 +2360,61 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let c = pool.get().await.expect("conn");
+            let mut c = pool.acquire().await.expect("conn");
             // Keep-alive queued row: the tick's early exit skips the requeue
             // block when nothing else is pending, so one queued row keeps the
             // cycle alive (its own outcome is never asserted).
-            let _ka: i32 = c
-                .query_one(
-                    "INSERT INTO downloads (name, url, status) VALUES ($1, $2, 'queued') RETURNING id",
-                    &[&"it-keepalive", &"http://127.0.0.1:9/keepalive.zim"],
-                )
-                .await
-                .expect("insert keepalive")
-                .get(0);
+            let _ka: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, status) VALUES ($1, $2, 'queued') RETURNING id",
+                |q| q.bind("it-keepalive").bind("http://127.0.0.1:9/keepalive.zim"),
+            )
+            .await
+            .expect("insert keepalive")
+            .expect("row present");
             // Three stale (>10 min) transient-error rows.
             // Already failed twice with this exact message (guard-seeded below).
-            let guarded: i32 = c
-                .query_one(
-                    "INSERT INTO downloads (name, url, status, error, updated_at) \
-                     VALUES ($1, $2, 'error', $3, now() - interval '11 minutes') RETURNING id",
-                    &[
-                        &"it-guarded",
-                        &"magnet:?xt=urn:btih:ccc",
-                        &"connection refused",
-                    ],
-                )
-                .await
-                .expect("insert guarded row")
-                .get(0);
+            let guarded: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, status, error, updated_at) \
+                 VALUES ($1, $2, 'error', $3, now() - interval '11 minutes') RETURNING id",
+                |q| {
+                    q.bind("it-guarded")
+                        .bind("magnet:?xt=urn:btih:ccc")
+                        .bind("connection refused")
+                },
+            )
+            .await
+            .expect("insert guarded row")
+            .expect("row present");
             // Fresh message — first failure, must be requeued.
-            let fresh: i32 = c
-                .query_one(
-                    "INSERT INTO downloads (name, url, status, error, updated_at) \
-                     VALUES ($1, $2, 'error', $3, now() - interval '11 minutes') RETURNING id",
-                    &[
-                        &"it-fresh",
-                        &"magnet:?xt=urn:btih:ddd",
-                        &"timeout while connecting",
-                    ],
-                )
-                .await
-                .expect("insert fresh row")
-                .get(0);
+            let fresh: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, status, error, updated_at) \
+                 VALUES ($1, $2, 'error', $3, now() - interval '11 minutes') RETURNING id",
+                |q| {
+                    q.bind("it-fresh")
+                        .bind("magnet:?xt=urn:btih:ddd")
+                        .bind("timeout while connecting")
+                },
+            )
+            .await
+            .expect("insert fresh row")
+            .expect("row present");
             // 401 session expiry — exempt from the guard even at count 2.
-            let auth: i32 = c
-                .query_one(
-                    "INSERT INTO downloads (name, url, status, error, updated_at) \
-                     VALUES ($1, $2, 'error', $3, now() - interval '11 minutes') RETURNING id",
-                    &[
-                        &"it-auth",
-                        &"magnet:?xt=urn:btih:eee",
-                        &"connection failed: HTTP 401",
-                    ],
-                )
-                .await
-                .expect("insert auth row")
-                .get(0);
+            let auth: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, status, error, updated_at) \
+                 VALUES ($1, $2, 'error', $3, now() - interval '11 minutes') RETURNING id",
+                |q| {
+                    q.bind("it-auth")
+                        .bind("magnet:?xt=urn:btih:eee")
+                        .bind("connection failed: HTTP 401")
+                },
+            )
+            .await
+            .expect("insert auth row")
+            .expect("row present");
             drop(c);
 
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -2329,18 +2438,17 @@ mod tests {
 
             poller.tick().await.expect("tick runs");
 
-            let c = pool.get().await.expect("conn");
+            let mut c = pool.acquire().await.expect("conn");
             // The guarded row must NOT have been requeued: status `error` with
             // its message intact (a requeue nulls `error`).
-            let row = c
-                .query_one(
-                    "SELECT status, error FROM downloads WHERE id = $1",
-                    &[&guarded],
-                )
-                .await
-                .expect("read guarded row");
-            let gs: String = row.get(0);
-            let ge: Option<String> = row.get(1);
+            let (gs, ge): (String, Option<String>) = raw::fetch_optional(
+                &mut *c,
+                "SELECT status, error FROM downloads WHERE id = $1",
+                |q| q.bind(guarded),
+            )
+            .await
+            .expect("read guarded row")
+            .expect("row present");
             assert_eq!(gs, "error", "guarded row must stay error, got: {gs}");
             assert_eq!(
                 ge.as_deref(),
@@ -2357,22 +2465,25 @@ mod tests {
             // The fresh and the 401 rows were requeued and enqueued to qB in the
             // same tick (add mock `.expect(2)` is verified on drop).
             for id in [fresh, auth] {
-                let s: String = c
-                    .query_one("SELECT status FROM downloads WHERE id = $1", &[&id])
-                    .await
-                    .expect("read row")
-                    .get(0);
+                let s: String = raw::fetch_scalar_optional(
+                    &mut *c,
+                    "SELECT status FROM downloads WHERE id = $1",
+                    |q| q.bind(id),
+                )
+                .await
+                .expect("read row")
+                .expect("row present");
                 assert_eq!(s, "downloading", "row {id} must be enqueued, got: {s}");
             }
 
-            let _ = pool.get().await; // keep pool alive for cleanup
-            let c2 = pool.get().await.expect("conn");
-            let _ = c2
-                .execute(
-                    "DELETE FROM downloads WHERE id IN ($1, $2, $3, $4)",
-                    &[&_ka, &guarded, &fresh, &auth],
-                )
-                .await;
+            let _ = pool.acquire().await; // keep pool alive for cleanup
+            let mut c2 = pool.acquire().await.expect("conn");
+            let _ = raw::execute(
+                &mut *c2,
+                "DELETE FROM downloads WHERE id IN ($1, $2, $3, $4)",
+                |q| q.bind(_ka).bind(guarded).bind(fresh).bind(auth),
+            )
+            .await;
             let _ = tmp;
         }
 
@@ -2415,26 +2526,28 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let c = pool.get().await.expect("conn");
+            let mut c = pool.acquire().await.expect("conn");
             // Keep-alive queued row (the early exit skips the requeue block when
             // nothing else is pending).
-            let ka: i32 = c
-                .query_one(
-                    "INSERT INTO downloads (name, url, status) VALUES ($1, $2, 'queued') RETURNING id",
-                    &[&"wi23-ka", &"http://127.0.0.1:9/keepalive3.zim"],
-                )
-                .await
-                .expect("insert keepalive")
-                .get(0);
-            let client = &c;
-            let ins_row = |name: String, url: String, status: String, err: String| async move {
-                client
-                    .query_one(
+            let ka: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, status) VALUES ($1, $2, 'queued') RETURNING id",
+                |q| q.bind("wi23-ka").bind("http://127.0.0.1:9/keepalive3.zim"),
+            )
+            .await
+            .expect("insert keepalive")
+            .expect("row present");
+            let ins_row = |name: String, url: String, status: String, err: String| {
+                let pool = pool.clone();
+                async move {
+                    raw::fetch_scalar_optional(
+                        &pool,
                         "INSERT INTO downloads (name, url, status, error, updated_at) \
-                     VALUES ($1, $2, $3, $4, now() - interval '11 minutes') RETURNING id",
-                        &[&name, &url, &status, &err],
+                         VALUES ($1, $2, $3, $4, now() - interval '11 minutes') RETURNING id",
+                        |q| q.bind(name).bind(url).bind(status).bind(err),
                     )
                     .await
+                }
             };
             // Stale transient-error row → requeued and enqueued this tick.
             let transient: i32 = ins_row(
@@ -2445,7 +2558,7 @@ mod tests {
             )
             .await
             .expect("insert transient row")
-            .get(0);
+            .expect("row present");
             // Stale NON-transient error row → out of scope, stays `error`.
             let nontransient: i32 = ins_row(
                 "wi23-nontransient".into(),
@@ -2455,7 +2568,7 @@ mod tests {
             )
             .await
             .expect("insert nontransient row")
-            .get(0);
+            .expect("row present");
             // Cancelled row with a stale transient error message → stays `cancelled`.
             let cancelled: i32 = ins_row(
                 "wi23-cancelled".into(),
@@ -2465,7 +2578,7 @@ mod tests {
             )
             .await
             .expect("insert cancelled row")
-            .get(0);
+            .expect("row present");
             // Complete row with a stale error note → stays `complete`.
             let complete: i32 = ins_row(
                 "wi23-complete".into(),
@@ -2475,7 +2588,7 @@ mod tests {
             )
             .await
             .expect("insert complete row")
-            .get(0);
+            .expect("row present");
             drop(c);
 
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -2492,12 +2605,15 @@ mod tests {
 
             poller.tick().await.expect("tick runs");
 
-            let c = pool.get().await.expect("conn");
-            let s: String = c
-                .query_one("SELECT status FROM downloads WHERE id = $1", &[&transient])
-                .await
-                .expect("read")
-                .get(0);
+            let mut c = pool.acquire().await.expect("conn");
+            let s: String = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT status FROM downloads WHERE id = $1",
+                |q| q.bind(transient),
+            )
+            .await
+            .expect("read")
+            .expect("row present");
             assert_ne!(
                 s, "error",
                 "transient row must have been requeued, got: {s}"
@@ -2507,22 +2623,31 @@ mod tests {
                 (cancelled, "cancelled"),
                 (complete, "complete"),
             ] {
-                let s: String = c
-                    .query_one("SELECT status FROM downloads WHERE id = $1", &[&id])
-                    .await
-                    .expect("read")
-                    .get(0);
+                let s: String = raw::fetch_scalar_optional(
+                    &mut *c,
+                    "SELECT status FROM downloads WHERE id = $1",
+                    |q| q.bind(id),
+                )
+                .await
+                .expect("read")
+                .expect("row present");
                 assert_eq!(s, want, "row {id} must stay {want}, got: {s}");
             }
 
-            let _ = pool.get().await; // keep pool alive for cleanup
-            let c2 = pool.get().await.expect("conn");
-            let _ = c2
-                .execute(
-                    "DELETE FROM downloads WHERE id IN ($1, $2, $3, $4, $5)",
-                    &[&ka, &transient, &nontransient, &cancelled, &complete],
-                )
-                .await;
+            let _ = pool.acquire().await; // keep pool alive for cleanup
+            let mut c2 = pool.acquire().await.expect("conn");
+            let _ = raw::execute(
+                &mut *c2,
+                "DELETE FROM downloads WHERE id IN ($1, $2, $3, $4, $5)",
+                |q| {
+                    q.bind(ka)
+                        .bind(transient)
+                        .bind(nontransient)
+                        .bind(cancelled)
+                        .bind(complete)
+                },
+            )
+            .await;
             let _ = tmp;
         }
 
@@ -2567,11 +2692,15 @@ mod tests {
                 .expect("migrations");
 
             // Sweep leftovers from a crashed prior run (shared dev DB).
-            let c = pool.get().await.expect("conn");
-            let _ = c
-                .execute("DELETE FROM downloads WHERE name = $1", &[&ZIM])
+            let mut c = pool.acquire().await.expect("conn");
+            let _ = raw::execute(
+                &mut *c,
+                "DELETE FROM downloads WHERE name = $1",
+                |q| q.bind(ZIM),
+            )
+            .await;
+            let _ = raw::execute(&mut *c, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
                 .await;
-            let _ = c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM]).await;
 
             // Stage the torrent content: a real (structurally valid)
             // `tiny.zim` copy at the path qBittorrent would report as
@@ -2615,7 +2744,8 @@ mod tests {
 
             // (a) The in-flight row, as the qB-enqueue step would have left
             // it: `downloading`, hash bound, fresh `updated_at`.
-            let id = it_insert_row(&c, ZIM, Some(HASH), "downloading", 0.99, None, None).await;
+            let id = it_insert_row(&pool, ZIM, Some(HASH), "downloading", 0.99, None, None)
+                .await;
 
             // What qBittorrent reports this tick: the torrent is complete
             // (`uploading` @ 1.0) and its content is staged on disk.
@@ -2645,7 +2775,7 @@ mod tests {
                 .await
                 .expect("rows")
                 .into_iter()
-                .filter(|r| r.get::<_, String>(1) == ZIM)
+                .filter(|r| r.name == ZIM)
                 .collect::<Vec<_>>();
             assert_eq!(rows.len(), 1, "only this suite's row may be in-flight");
             let changed = poller
@@ -2663,15 +2793,14 @@ mod tests {
 
             // (c) The synchronous part of completion: the row settled
             // `complete` with the file installed into the ZIM dir.
-            let row = c
-                .query_one(
-                    "SELECT status, file_path FROM downloads WHERE id = $1",
-                    &[&id],
-                )
-                .await
-                .expect("read row");
-            let status: String = row.get(0);
-            let file_path: Option<String> = row.get(1);
+            let (status, file_path): (String, Option<String>) = raw::fetch_optional(
+                &mut *c,
+                "SELECT status, file_path FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await
+            .expect("read row")
+            .expect("row present");
             assert_eq!(
                 status, "complete",
                 "row must settle complete (keep_completed = false)"
@@ -2695,15 +2824,15 @@ mod tests {
             let mut last: (String, i64) = (String::from("(no zims row)"), 0);
             let mut ready = false;
             while tokio::time::Instant::now() < deadline {
-                if let Some(z) = c
-                    .query_opt(
-                        "SELECT index_status, article_count FROM zims WHERE name = $1",
-                        &[&ZIM],
-                    )
-                    .await
-                    .expect("query zims")
-                {
-                    last = (z.get::<_, String>(0), z.get::<_, i64>(1));
+                let row: Option<(String, i64)> = raw::fetch_optional(
+                    &mut *c,
+                    "SELECT index_status, article_count FROM zims WHERE name = $1",
+                    |q| q.bind(ZIM),
+                )
+                .await
+                .expect("query zims");
+                if let Some((st, cnt)) = row {
+                    last = (st, cnt);
                     if last.0 == "ready" && last.1 > 0 {
                         ready = true;
                         break;
@@ -2715,28 +2844,30 @@ mod tests {
                 ready,
                 "auto-index did not reach ready within 30s (last: {last:?})"
             );
-            let entries: i64 = c
-                .query_one("SELECT indexed_entries FROM zims WHERE name = $1", &[&ZIM])
-                .await
-                .expect("zims row")
-                .get(0);
+            let entries: i64 = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT indexed_entries FROM zims WHERE name = $1",
+                |q| q.bind(ZIM),
+            )
+            .await
+            .expect("zims row")
+            .expect("row present");
             assert!(entries > 0, "indexed_entries must be non-zero");
 
             // (d) The article is servable over the real router. The search
             // word is taken from the indexed title (a weight-A term the FTS
             // branch must find; exact token, `simple` tsconfig is case-
             // sensitive, so the word is used verbatim).
-            let art = c
-                .query_one(
-                    "SELECT a.title, a.content_preview FROM articles a
-                     JOIN zims z ON z.id = a.zim_id
-                     WHERE z.name = $1 AND a.path = 'main.html'",
-                    &[&ZIM],
-                )
-                .await
-                .expect("indexed article row");
-            let title: String = art.get(0);
-            let preview: Option<String> = art.get(1);
+            let (title, preview): (String, Option<String>) = raw::fetch_optional(
+                &mut *c,
+                "SELECT a.title, a.content_preview FROM articles a
+                 JOIN zims z ON z.id = a.zim_id
+                 WHERE z.name = $1 AND a.path = 'main.html'",
+                |q| q.bind(ZIM),
+            )
+            .await
+            .expect("indexed article row")
+            .expect("row present");
             let first_word = |s: &str| -> String {
                 s.split_whitespace()
                     .map(|tok| {
@@ -2859,10 +2990,14 @@ mod tests {
             assert!(!v["chunks"][0]["text"].as_str().unwrap_or("").is_empty());
 
             // Cleanup (shared dev DB; articles/qid rows cascade off zims).
-            let _ = c
-                .execute("DELETE FROM downloads WHERE id = $1", &[&id])
+            let _ = raw::execute(
+                &mut *c,
+                "DELETE FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await;
+            let _ = raw::execute(&mut *c, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
                 .await;
-            let _ = c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM]).await;
             let _ = tmp;
         }
     }
@@ -2871,6 +3006,7 @@ mod tests {
     mod reconcile {
         use super::download::{download_settings, test_pool};
         use super::*;
+        use crate::db::raw;
         use crate::torrent::QbitClient;
         use std::sync::Arc;
         use wiremock::matchers::{method, path, query_param};
@@ -2944,27 +3080,33 @@ mod tests {
             let client = make_client(&server).await;
             poller.reconcile(Some(client)).await.expect("reconcile");
 
-            let c = pool.get().await.expect("conn");
-            let complete_status: String = c
-                .query_one("SELECT status FROM downloads WHERE hash = 'aaa111'", &[])
-                .await
-                .expect("complete row")
-                .get(0);
+            let mut c = pool.acquire().await.expect("conn");
+            let complete_status: String = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT status FROM downloads WHERE hash = 'aaa111'",
+                |q| q,
+            )
+            .await
+            .expect("complete row")
+            .expect("row present");
             assert_eq!(complete_status, "complete", "adopted complete torrent");
 
-            let dl_status: String = c
-                .query_one("SELECT status FROM downloads WHERE hash = 'bbb222'", &[])
-                .await
-                .expect("downloading row")
-                .get(0);
+            let dl_status: String = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT status FROM downloads WHERE hash = 'bbb222'",
+                |q| q,
+            )
+            .await
+            .expect("downloading row")
+            .expect("row present");
             assert_eq!(dl_status, "downloading", "adopted downloading torrent");
 
-            let _ = c
-                .execute(
-                    "DELETE FROM downloads WHERE hash IN ('aaa111', 'bbb222')",
-                    &[],
-                )
-                .await;
+            let _ = raw::execute(
+                &mut *c,
+                "DELETE FROM downloads WHERE hash IN ('aaa111', 'bbb222')",
+                |q| q,
+            )
+            .await;
             let _ = tmp;
         }
 
@@ -2984,32 +3126,42 @@ mod tests {
             // qB has no torrents at all — the row's hash is orphaned.
             mount_qb_mocks(&server, "[]").await;
 
-            let c = pool.get().await.expect("conn");
-            let id: i32 = c
-                .query_one(
-                    "INSERT INTO downloads (name, url, hash, status, updated_at) \
-                     VALUES ($1, $2, $3, 'downloading', now() - interval '15 minutes') \
-                     RETURNING id",
-                    &[&"orphan.zim", &"magnet:?xt=urn:btih:orphan", &"orphan111"],
-                )
-                .await
-                .expect("insert")
-                .get(0);
+            let mut c = pool.acquire().await.expect("conn");
+            let id: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, hash, status, updated_at) \
+                 VALUES ($1, $2, $3, 'downloading', now() - interval '15 minutes') \
+                 RETURNING id",
+                |q| {
+                    q.bind("orphan.zim")
+                        .bind("magnet:?xt=urn:btih:orphan")
+                        .bind("orphan111")
+                },
+            )
+            .await
+            .expect("insert")
+            .expect("row present");
 
             let poller = make_poller(&pool, &tmp, &server).await;
             let client = make_client(&server).await;
             poller.reconcile(Some(client)).await.expect("reconcile");
 
-            let status: String = c
-                .query_one("SELECT status FROM downloads WHERE id = $1", &[&id])
-                .await
-                .expect("read")
-                .get(0);
+            let status: String = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT status FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await
+            .expect("read")
+            .expect("row present");
             assert_eq!(status, "error", "orphan past grace → error");
 
-            let _ = c
-                .execute("DELETE FROM downloads WHERE id = $1", &[&id])
-                .await;
+            let _ = raw::execute(
+                &mut *c,
+                "DELETE FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await;
             let _ = tmp;
         }
 
@@ -3032,35 +3184,41 @@ mod tests {
             );
             mount_qb_mocks(&server, &torrents_json).await;
 
-            let c = pool.get().await.expect("conn");
-            let id: i32 = c
-                .query_one(
-                    "INSERT INTO downloads (name, url, hash, status) \
-                     VALUES ($1, $2, $3, 'downloading') RETURNING id",
-                    &[
-                        &"renamed.zim",
-                        &"magnet:?xt=urn:btih:oldhash",
-                        &"oldhash000",
-                    ],
-                )
-                .await
-                .expect("insert")
-                .get(0);
+            let mut c = pool.acquire().await.expect("conn");
+            let id: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, hash, status) \
+                 VALUES ($1, $2, $3, 'downloading') RETURNING id",
+                |q| {
+                    q.bind("renamed.zim")
+                        .bind("magnet:?xt=urn:btih:oldhash")
+                        .bind("oldhash000")
+                },
+            )
+            .await
+            .expect("insert")
+            .expect("row present");
 
             let poller = make_poller(&pool, &tmp, &server).await;
             let client = make_client(&server).await;
             poller.reconcile(Some(client)).await.expect("reconcile");
 
-            let hash: String = c
-                .query_one("SELECT hash FROM downloads WHERE id = $1", &[&id])
-                .await
-                .expect("read")
-                .get(0);
+            let hash: String = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT hash FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await
+            .expect("read")
+            .expect("row present");
             assert_eq!(hash, "newhash999", "hash rebound to qB torrent");
 
-            let _ = c
-                .execute("DELETE FROM downloads WHERE id = $1", &[&id])
-                .await;
+            let _ = raw::execute(
+                &mut *c,
+                "DELETE FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await;
             let _ = tmp;
         }
 
@@ -3079,41 +3237,49 @@ mod tests {
             let server = MockServer::start().await;
             mount_qb_mocks(&server, "[]").await;
 
-            let c = pool.get().await.expect("conn");
-            let id: i32 = c
-                .query_one(
-                    "INSERT INTO downloads (name, url, status, file_path) \
-                     VALUES ($1, $2, 'downloading', $3) RETURNING id",
-                    &[
-                        &"direct.zim",
-                        &"http://example.com/x.zim",
-                        &"/tmp/x.zim.part",
-                    ],
-                )
-                .await
-                .expect("insert")
-                .get(0);
+            let mut c = pool.acquire().await.expect("conn");
+            let id: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, status, file_path) \
+                 VALUES ($1, $2, 'downloading', $3) RETURNING id",
+                |q| {
+                    q.bind("direct.zim")
+                        .bind("http://example.com/x.zim")
+                        .bind("/tmp/x.zim.part")
+                },
+            )
+            .await
+            .expect("insert")
+            .expect("row present");
 
             let poller = make_poller(&pool, &tmp, &server).await;
             let client = make_client(&server).await;
             poller.reconcile(Some(client)).await.expect("reconcile");
 
-            let status: String = c
-                .query_one("SELECT status FROM downloads WHERE id = $1", &[&id])
-                .await
-                .expect("read")
-                .get(0);
-            let fp: Option<String> = c
-                .query_one("SELECT file_path FROM downloads WHERE id = $1", &[&id])
-                .await
-                .expect("read")
-                .get(0);
+            let status: String = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT status FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await
+            .expect("read")
+            .expect("row present");
+            let fp: Option<String> = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT file_path FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await
+            .expect("read");
             assert_eq!(status, "queued", "interrupted direct download → queued");
             assert_eq!(fp, None, "file_path cleared");
 
-            let _ = c
-                .execute("DELETE FROM downloads WHERE id = $1", &[&id])
-                .await;
+            let _ = raw::execute(
+                &mut *c,
+                "DELETE FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await;
             let _ = tmp;
         }
 
@@ -3161,31 +3327,41 @@ mod tests {
             // qB has no torrents → the seeding row's torrent is gone.
             mount_qb_mocks(&server, "[]").await;
 
-            let c = pool.get().await.expect("conn");
-            let id: i32 = c
-                .query_one(
-                    "INSERT INTO downloads (name, url, hash, status) \
-                     VALUES ($1, $2, $3, 'seeding') RETURNING id",
-                    &[&"seed.zim", &"magnet:?xt=urn:btih:seedhash", &"seedhash01"],
-                )
-                .await
-                .expect("insert")
-                .get(0);
+            let mut c = pool.acquire().await.expect("conn");
+            let id: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, hash, status) \
+                 VALUES ($1, $2, $3, 'seeding') RETURNING id",
+                |q| {
+                    q.bind("seed.zim")
+                        .bind("magnet:?xt=urn:btih:seedhash")
+                        .bind("seedhash01")
+                },
+            )
+            .await
+            .expect("insert")
+            .expect("row present");
 
             let poller = make_poller(&pool, &tmp, &server).await;
             let client = make_client(&server).await;
             poller.reconcile(Some(client)).await.expect("reconcile");
 
-            let status: String = c
-                .query_one("SELECT status FROM downloads WHERE id = $1", &[&id])
-                .await
-                .expect("read")
-                .get(0);
+            let status: String = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT status FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await
+            .expect("read")
+            .expect("row present");
             assert_eq!(status, "complete", "seeding row settled to complete");
 
-            let _ = c
-                .execute("DELETE FROM downloads WHERE id = $1", &[&id])
-                .await;
+            let _ = raw::execute(
+                &mut *c,
+                "DELETE FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await;
             let _ = tmp;
         }
     }

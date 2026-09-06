@@ -543,16 +543,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
 
-        let c = pool.get().await.expect("conn");
-        let id: i32 = c
-            .query_one(
-                "INSERT INTO downloads (name, url, status)
+        let id: i32 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "INSERT INTO downloads (name, url, status)
                  VALUES ('utiny', 'http://example.net/utiny.zim', 'downloading') RETURNING id",
-                &[],
-            )
-            .await
-            .expect("insert downloading row")
-            .get(0);
+            |q| q,
+        )
+        .await
+        .expect("insert downloading row")
+        .unwrap();
         let part = tmp.path().join("utiny.part");
         std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage utiny.zim as .part");
 
@@ -568,48 +567,61 @@ mod tests {
 
         let dst = zims.zim_dir.join("utiny.zim");
         assert!(dst.exists(), "part renamed into zim_dir");
-        let status: String = c
-            .query_one("SELECT status FROM downloads WHERE id = $1", &[&id])
-            .await
-            .expect("read row")
-            .get(0);
-        let file_path: Option<String> = c
-            .query_one("SELECT file_path FROM downloads WHERE id = $1", &[&id])
-            .await
-            .expect("read row")
-            .get(0);
+        let status: String = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT status FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .expect("read row")
+        .unwrap();
+        let file_path: Option<String> = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT file_path FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .expect("read row")
+        .flatten();
         assert_eq!(status, "complete");
         assert_eq!(file_path, Some(dst.display().to_string()));
-        let zims_rows: i64 = c
-            .query_one("SELECT count(*) FROM zims WHERE name = 'utiny'", &[])
-            .await
-            .expect("zims count")
-            .get(0);
+        let zims_rows: i64 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT count(*) FROM zims WHERE name = 'utiny'",
+            |q| q,
+        )
+        .await
+        .expect("zims count")
+        .unwrap();
         assert_eq!(
             zims_rows, 1,
             "resync must have registered the installed ZIM"
         );
-        let articles: i64 = c
-            .query_one(
-                "SELECT count(*) FROM articles
+        let articles: i64 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT count(*) FROM articles
                  WHERE zim_id = (SELECT id FROM zims WHERE name = 'utiny')",
-                &[],
-            )
-            .await
-            .expect("article count")
-            .get(0);
+            |q| q,
+        )
+        .await
+        .expect("article count")
+        .unwrap();
         assert!(
             articles > 0,
             "auto-index must have indexed the fixture's articles"
         );
 
         // Cleanup (shared single-DB suite; articles cascade off zims).
-        c.execute("DELETE FROM downloads WHERE id = $1", &[&id])
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
             .await
             .unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&"utiny"])
-            .await
-            .unwrap();
+        crate::db::raw::execute(
+            &pool,
+            "DELETE FROM zims WHERE name = $1",
+            |q| q.bind("utiny"),
+        )
+        .await
+        .unwrap();
     }
 
     /// TEST-5 (CI-DB): the cancel-race proof — the row flipped to `cancelled`
@@ -626,22 +638,22 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
 
-        let c = pool.get().await.expect("conn");
-        let id: i32 = c
-            .query_one(
-                "INSERT INTO downloads (name, url, status)
+        let id: i32 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "INSERT INTO downloads (name, url, status)
                  VALUES ('utiny', 'http://example.net/utiny.zim', 'downloading') RETURNING id",
-                &[],
-            )
-            .await
-            .expect("insert downloading row")
-            .get(0);
+            |q| q,
+        )
+        .await
+        .expect("insert downloading row")
+        .unwrap();
         let part = tmp.path().join("utiny.part");
         std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage utiny.zim as .part");
         // Cancel lands before finalize (the in-loop race, made deterministic).
-        c.execute(
+        crate::db::raw::execute(
+            &pool,
             "UPDATE downloads SET status = 'cancelled' WHERE id = $1",
-            &[&id],
+            |q| q.bind(id),
         )
         .await
         .unwrap();
@@ -661,21 +673,27 @@ mod tests {
             !zims.zim_dir.join("utiny.zim").exists(),
             "cancelled download must not be installed"
         );
-        let status: String = c
-            .query_one("SELECT status FROM downloads WHERE id = $1", &[&id])
-            .await
-            .expect("read row")
-            .get(0);
-        let file_path: Option<String> = c
-            .query_one("SELECT file_path FROM downloads WHERE id = $1", &[&id])
-            .await
-            .expect("read row")
-            .get(0);
+        let status: String = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT status FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .expect("read row")
+        .unwrap();
+        let file_path: Option<String> = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT file_path FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .expect("read row")
+        .flatten();
         assert_eq!(status, "cancelled");
         assert_eq!(file_path, None, "cancelled row keeps no file_path");
 
         // Cleanup (shared single-DB suite).
-        c.execute("DELETE FROM downloads WHERE id = $1", &[&id])
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
             .await
             .unwrap();
     }

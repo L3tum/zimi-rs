@@ -40,8 +40,8 @@ impl HealthProbes {
     /// `app/version` is a network round-trip; `SELECT 1` is the cheapest
     /// possible probe and `/health` is rate-limit-exempt (ratelimit.rs:190).
     pub async fn probe_db(&self, db: &db::Pool) -> bool {
-        match db.get().await {
-            Ok(pg) => pg.query_one("SELECT 1", &[]).await.is_ok(),
+        match db.acquire().await {
+            Ok(mut pg) => sqlx::query("SELECT 1").execute(&mut *pg).await.is_ok(),
             Err(_) => false,
         }
     }

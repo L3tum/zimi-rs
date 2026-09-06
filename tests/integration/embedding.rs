@@ -23,43 +23,54 @@ async fn reindex_prunes_removed_articles() {
     };
     run_migrations(&pool).await.expect("migrations");
     const ZIM: &str = "__itest_prune__";
-    let zim_id: i32 = {
-        let c = pool.get().await.unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
-            .await
-            .unwrap();
-        c.execute(
-            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                               index_status, indexed_entries, article_count)\n             VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
-            &[&ZIM],
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+        .await
+        .unwrap();
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap();
+    let zim_id: i32 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT id FROM zims WHERE name = $1",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
+
+    {
+        // Clean slate in case a prior run left rows.
+        zimservice::db::raw::execute(
+            &pool,
+            "DELETE FROM articles WHERE zim_id = $1",
+            |q| q.bind(zim_id),
         )
         .await
         .unwrap();
-        c.query_one("SELECT id FROM zims WHERE name = $1", &[&ZIM])
-            .await
-            .unwrap()
-            .get(0)
-    };
-
-    {
-        let c = pool.get().await.unwrap();
-        // Clean slate in case a prior run left rows.
-        c.execute("DELETE FROM articles WHERE zim_id = $1", &[&zim_id])
-            .await
-            .unwrap();
-        c.execute("DELETE FROM qid_index WHERE zim_id = $1", &[&zim_id])
-            .await
-            .unwrap();
+        zimservice::db::raw::execute(
+            &pool,
+            "DELETE FROM qid_index WHERE zim_id = $1",
+            |q| q.bind(zim_id),
+        )
+        .await
+        .unwrap();
         for p in ["A/keep-1", "A/keep-2", "A/removed"] {
-            c.execute(
+            zimservice::db::raw::execute(
+                &pool,
                 "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id, updated_at)\n                 VALUES ($1, $1, 'preview', 'snippet', to_tsvector('simple', $1), 'en', 'C', $2, now() - interval '1 hour')",
-                &[&p.to_string(), &zim_id],
+                |q| q.bind(p).bind(zim_id),
             )
             .await
             .unwrap();
         }
-        c.execute(
+        zimservice::db::raw::execute(
+            &pool,
             "INSERT INTO qid_index (zim_id, path, qid) VALUES ($1, 'A/keep-1', 101), ($1, 'A/keep-2', 102), ($1, 'A/removed', 103)",
-            &[&zim_id],
+            |q| q.bind(zim_id),
         )
         .await
         .unwrap();
@@ -72,21 +83,29 @@ async fn reindex_prunes_removed_articles() {
     // untouched (its `updated_at` stays old). The stale row is pruned once, at
     // finalize, via `updated_at < index_started_at` (exact `finalize_zim`
     // statements).
-    let index_started_at: String = {
-        let c = pool.get().await.unwrap();
-        c.query_one("SELECT now()::text", &[]).await.unwrap().get(0)
-    };
+    let index_started_at: String = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT now()::text",
+        |q| q,
+    )
+    .await
+    .unwrap()
+    .expect("row present");
     {
-        let c = pool.get().await.unwrap();
         // (PERF 1) no up-front `DELETE FROM articles`. Staging pre-clean +
         // re-stage the 2 survivors:
-        c.execute("DELETE FROM articles_staging WHERE zim_id = $1", &[&zim_id])
-            .await
-            .unwrap();
+        zimservice::db::raw::execute(
+            &pool,
+            "DELETE FROM articles_staging WHERE zim_id = $1",
+            |q| q.bind(zim_id),
+        )
+        .await
+        .unwrap();
         for p in ["A/keep-1", "A/keep-2"] {
-            c.execute(
+            zimservice::db::raw::execute(
+                &pool,
                 "INSERT INTO articles_staging (path, title, content_preview, snippet, language, namespace, zim_id)\n                 VALUES ($1, $1, 'preview', 'snippet', 'en', 'C', $2)",
-                &[&p.to_string(), &zim_id],
+                |q| q.bind(p).bind(zim_id),
             )
             .await
             .unwrap();
@@ -94,33 +113,39 @@ async fn reindex_prunes_removed_articles() {
         // Phase-2 upsert (same SQL shape as bulk_insert) — updates the 2
         // survivors in place and bumps their `updated_at` to now(); the removed
         // article is absent from the ZIM, so its row is left stale.
-        c.execute(
+        zimservice::db::raw::execute(
+            &pool,
             "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)\n             SELECT path, title, content_preview, snippet,\n                    setweight(to_tsvector('simple', title), 'A')\n                    || setweight(to_tsvector('simple', coalesce(content_preview, '')), 'B'),\n                    language, namespace, zim_id\n             FROM articles_staging WHERE zim_id = $1\n             ON CONFLICT (zim_id, path) DO UPDATE SET\n                title = EXCLUDED.title, content_preview = EXCLUDED.content_preview,\n                snippet = EXCLUDED.snippet, search_vector = EXCLUDED.search_vector,\n                updated_at = now()",
-            &[&zim_id],
+            |q| q.bind(zim_id),
         )
         .await
         .unwrap();
         // qid rows for the survivors (phase-3 shape, simplified):
-        c.execute(
+        zimservice::db::raw::execute(
+            &pool,
             "INSERT INTO qid_index (zim_id, path, qid) VALUES ($1, 'A/keep-1', 101), ($1, 'A/keep-2', 102)\n             ON CONFLICT (zim_id, path) DO UPDATE SET qid = EXCLUDED.qid",
-            &[&zim_id],
+            |q| q.bind(zim_id),
         )
         .await
         .unwrap();
-        c.execute("DELETE FROM articles_staging WHERE zim_id = $1", &[&zim_id])
-            .await
-            .unwrap();
+        zimservice::db::raw::execute(
+            &pool,
+            "DELETE FROM articles_staging WHERE zim_id = $1",
+            |q| q.bind(zim_id),
+        )
+        .await
+        .unwrap();
 
         // (PERF 1 no-availability-window) the removed row is still queryable
         // until the finalize prune — `articles` never holds a partial set.
-        let removed_present: bool = c
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM articles WHERE zim_id = $1 AND path = 'A/removed')",
-                &[&zim_id],
-            )
-            .await
-            .unwrap()
-            .get(0);
+        let removed_present: bool = zimservice::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT EXISTS (SELECT 1 FROM articles WHERE zim_id = $1 AND path = 'A/removed')",
+            |q| q.bind(zim_id),
+        )
+        .await
+        .unwrap()
+        .expect("row present");
         assert!(
             removed_present,
             "removed row must remain until the finalize prune (no gap)"
@@ -128,60 +153,51 @@ async fn reindex_prunes_removed_articles() {
 
         // Finalize prune — the exact `finalize_zim` statements: stale rows by
         // `updated_at < index_started_at`, then orphaned qids by NOT EXISTS.
-        let del: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![
-            &ZIM as &(dyn postgres_types::ToSql + Sync),
-            &index_started_at as &(dyn postgres_types::ToSql + Sync),
-        ];
-        c.execute(
+        zimservice::db::raw::execute(
+            &pool,
             "DELETE FROM articles\n             WHERE zim_id = (SELECT id FROM zims WHERE name = $1)\n               AND updated_at < $2::timestamptz",
-            &del,
+            |q| q.bind(ZIM).bind(index_started_at),
         )
         .await
         .unwrap();
-        c.execute(
+        zimservice::db::raw::execute(
+            &pool,
             "DELETE FROM qid_index q\n             WHERE q.zim_id = (SELECT id FROM zims WHERE name = $1)\n               AND NOT EXISTS (SELECT 1 FROM articles a\n                    WHERE a.zim_id = q.zim_id AND a.path = q.path)",
-            &[&ZIM],
+            |q| q.bind(ZIM),
         )
         .await
         .unwrap();
     }
 
     // Assert: removed article + its qid are gone; both survivors remain.
-    let c = pool.get().await.unwrap();
-    let remaining: Vec<String> = c
-        .query(
-            "SELECT path FROM articles WHERE zim_id = $1 ORDER BY path",
-            &[&zim_id],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get::<_, String>(0))
-        .collect();
+    let remaining: Vec<String> = zimservice::db::raw::fetch_scalar_all(
+        &pool,
+        "SELECT path FROM articles WHERE zim_id = $1 ORDER BY path",
+        |q| q.bind(zim_id),
+    )
+    .await
+    .unwrap();
     assert_eq!(remaining, vec!["A/keep-1", "A/keep-2"]);
-    let qids: Vec<String> = c
-        .query(
-            "SELECT path FROM qid_index WHERE zim_id = $1 ORDER BY path",
-            &[&zim_id],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get::<_, String>(0))
-        .collect();
+    let qids: Vec<String> = zimservice::db::raw::fetch_scalar_all(
+        &pool,
+        "SELECT path FROM qid_index WHERE zim_id = $1 ORDER BY path",
+        |q| q.bind(zim_id),
+    )
+    .await
+    .unwrap();
     assert_eq!(qids, vec!["A/keep-1", "A/keep-2"]);
-    let staging_left: i64 = c
-        .query_one(
-            "SELECT count(*) FROM articles_staging WHERE zim_id = $1",
-            &[&zim_id],
-        )
-        .await
-        .unwrap()
-        .get(0);
+    let staging_left: i64 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT count(*) FROM articles_staging WHERE zim_id = $1",
+        |q| q.bind(zim_id),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
     assert_eq!(staging_left, 0, "staging must be cleared");
 
     // Cleanup tail.
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
 }
@@ -197,17 +213,16 @@ async fn vector_index_is_partial_after_migration() {
         None => return,
     };
     run_migrations(&pool).await.expect("migrations");
-    let c = pool.get().await.unwrap();
 
     // The legacy non-partial shape (indpred IS NULL) must be gone.
-    let legacy: bool = c
-        .query_one(
-            "SELECT EXISTS (\n                SELECT 1 FROM pg_index i\n                JOIN pg_class cl ON cl.oid = i.indexrelid\n                WHERE cl.relname = 'idx_articles_embedding' AND i.indpred IS NULL\n            )",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
+    let legacy: bool = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT EXISTS (\n                SELECT 1 FROM pg_index i\n                JOIN pg_class cl ON cl.oid = i.indexrelid\n                WHERE cl.relname = 'idx_articles_embedding' AND i.indpred IS NULL\n            )",
+        |q| q,
+    )
+    .await
+    .unwrap()
+    .expect("row present");
     assert!(
         !legacy,
         "legacy non-partial embedding index must be dropped by migration 010"
@@ -215,22 +230,22 @@ async fn vector_index_is_partial_after_migration() {
 
     // Wherever the index exists, it must be the partial shape, and the
     // shape-agnostic runtime check must agree with pg_index.
-    let db_exists: bool = c
-        .query_one(
-            "SELECT EXISTS (\n                SELECT 1 FROM pg_index i\n                JOIN pg_class cl ON cl.oid = i.indexrelid\n                WHERE cl.relname = 'idx_articles_embedding'\n            )",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    let partial: bool = c
-        .query_one(
-            "SELECT EXISTS (\n                SELECT 1 FROM pg_index i\n                JOIN pg_class cl ON cl.oid = i.indexrelid\n                WHERE cl.relname = 'idx_articles_embedding' AND i.indpred IS NOT NULL\n            )",
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
+    let db_exists: bool = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT EXISTS (\n                SELECT 1 FROM pg_index i\n                JOIN pg_class cl ON cl.oid = i.indexrelid\n                WHERE cl.relname = 'idx_articles_embedding'\n            )",
+        |q| q,
+    )
+    .await
+    .unwrap()
+    .expect("row present");
+    let partial: bool = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT EXISTS (\n                SELECT 1 FROM pg_index i\n                JOIN pg_class cl ON cl.oid = i.indexrelid\n                WHERE cl.relname = 'idx_articles_embedding' AND i.indpred IS NOT NULL\n            )",
+        |q| q,
+    )
+    .await
+    .unwrap()
+    .expect("row present");
 
     let (_count, runtime_exists) = zimservice::embed::vector_index_state(&pool)
         .await
@@ -272,23 +287,26 @@ async fn search_does_not_hold_pool_connection_during_embed() {
     run_migrations(&normal).await.expect("migrations");
 
     // Single-connection pool the search engine is forced to share: if the
-    // search holds its connection across the embed await, the `get()` below
-    // blocks until the embed returns (or its wait_timeout expires).
+    // search holds its connection across the embed await, the `acquire()`
+    // below blocks until the embed returns (or its acquire_timeout expires).
     let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    let mut scfg = DpConfig::new();
-    scfg.url = Some(url.clone());
-    let small = match scfg.builder(tokio_postgres::NoTls) {
-        Ok(b) => b
-            .max_size(1)
-            .wait_timeout(Some(Duration::from_secs(1)))
-            .build(),
-        Err(_) => return skip_midtest("single-connection probe pool config failed"),
-    };
-    let small = match small {
-        Ok(p) => p,
-        Err(_) => return skip_midtest("single-connection probe pool build failed"),
-    };
-    if small.get().await.is_err() {
+    // sqlx connects eagerly (no lazy build); `acquire_timeout` replaces the
+    // old deadpool `wait_timeout`, and `tokio::time::timeout` replaces
+    // deadpool's `connect_with_timeout`.
+    let small =
+        match tokio::time::timeout(
+            Duration::from_secs(3),
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(1))
+                .connect(&url),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(_)) | Err(_) => return skip_midtest("single-connection probe pool build failed"),
+        };
+    if small.acquire().await.is_err() {
         return skip_midtest("single-connection probe pool connect failed");
     }
 
@@ -352,7 +370,7 @@ async fn search_does_not_hold_pool_connection_during_embed() {
     // gone, so there is no flake risk left to guard against.
     let probe_deadline = Instant::now() + Duration::from_millis(1_000);
     loop {
-        match tokio::time::timeout(Duration::from_millis(100), small.get()).await {
+        match tokio::time::timeout(Duration::from_millis(100), small.acquire()).await {
             Ok(Ok(conn)) => {
                 // Sole connection free while embed pending — H2 bug absent.
                 drop(conn);
@@ -394,7 +412,6 @@ async fn embed_pipeline_embeds_then_guard_skips() {
     run_migrations(&pool).await.expect("migrations");
     const ZIM: &str = "__itest_embed__";
     const DIM: u32 = 1536; // == baseline articles.embedding dimension → no ALTER
-
     // Build a `{data:[{index,embedding:[…]}]}` body with one vector per
     // requested index (values distinct per index so the mapping is real).
     let embed_body = |indices: &[usize]| -> String {
@@ -411,31 +428,33 @@ async fn embed_pipeline_embeds_then_guard_skips() {
     };
 
     let zim_id: i32 = {
-        let c = pool.get().await.unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+        zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
             .await
             .unwrap();
-        c.execute(
-            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                               index_status, indexed_entries, article_count)\n             VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
-            &[&ZIM],
+        zimservice::db::raw::execute(
+            &pool,
+            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
+            |q| q.bind(ZIM),
         )
         .await
         .unwrap();
-        c.query_one("SELECT id FROM zims WHERE name = $1", &[&ZIM])
-            .await
-            .unwrap()
-            .get(0)
+        zimservice::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT id FROM zims WHERE name = $1",
+            |q| q.bind(ZIM),
+        )
+        .await
+        .unwrap()
+        .expect("row present")
     };
-    {
-        let c = pool.get().await.unwrap();
-        for (path, title) in [("A/one", "One"), ("A/two", "Two"), ("A/three", "Three")] {
-            c.execute(
-                "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)\n                 VALUES ($1, $2, 'preview '||$2, 'snip '||$2, to_tsvector('simple', $2), 'en', 'C', $3)",
-                &[&path, &title, &zim_id],
-            )
-            .await
-            .unwrap();
-        }
+    for (path, title) in [("A/one", "One"), ("A/two", "Two"), ("A/three", "Three")] {
+        zimservice::db::raw::execute(
+            &pool,
+            "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)\n                 VALUES ($1, $2, 'preview '||$2, 'snip '||$2, to_tsvector('simple', $2), 'en', 'C', $3)",
+            |q| q.bind(path).bind(title).bind(zim_id),
+        )
+        .await
+        .unwrap();
     }
 
     let server = MockServer::start().await;
@@ -461,24 +480,22 @@ async fn embed_pipeline_embeds_then_guard_skips() {
     zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM)
         .await
         .expect("pipeline run 1");
-    let c = pool.get().await.unwrap();
-    let n1: i64 = c
-        .query_one(
-            "SELECT count(*) FROM articles WHERE zim_id = $1 AND embedding IS NOT NULL",
-            &[&zim_id],
-        )
-        .await
-        .unwrap()
-        .get(0);
+    let n1: i64 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT count(*) FROM articles WHERE zim_id = $1 AND embedding IS NOT NULL",
+        |q| q.bind(zim_id),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
     assert_eq!(n1, 3, "all 3 articles embedded after run 1");
-    let model: Option<String> = c
-        .query_one(
-            "SELECT embed_model FROM articles WHERE zim_id = $1 AND embedding IS NOT NULL LIMIT 1",
-            &[&zim_id],
-        )
-        .await
-        .unwrap()
-        .get(0);
+    let model: Option<String> = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT embed_model FROM articles WHERE zim_id = $1 AND embedding IS NOT NULL LIMIT 1",
+        |q| q.bind(zim_id),
+    )
+    .await
+    .unwrap();
     assert_eq!(model, Some("test-model".to_string()));
     assert_eq!(
         server.received_requests().await.unwrap().len(),
@@ -490,14 +507,14 @@ async fn embed_pipeline_embeds_then_guard_skips() {
     zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM)
         .await
         .expect("pipeline run 2 (no-op)");
-    let n2: i64 = c
-        .query_one(
-            "SELECT count(*) FROM articles WHERE zim_id = $1 AND embedding IS NOT NULL",
-            &[&zim_id],
-        )
-        .await
-        .unwrap()
-        .get(0);
+    let n2: i64 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT count(*) FROM articles WHERE zim_id = $1 AND embedding IS NOT NULL",
+        |q| q.bind(zim_id),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
     assert_eq!(n2, 3, "run 2 leaves embeddings intact");
     assert_eq!(
         server.received_requests().await.unwrap().len(),
@@ -508,9 +525,10 @@ async fn embed_pipeline_embeds_then_guard_skips() {
     // Count-guard path: un-embed, provider returns 2 vectors for a claimed
     // batch of 3 → the guard skips the batch (Ok, not Err) and rows stay
     // unembedded.
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "UPDATE articles SET embedding = NULL, embed_at = NULL WHERE zim_id = $1",
-        &[&zim_id],
+        |q| q.bind(zim_id),
     )
     .await
     .unwrap();
@@ -522,14 +540,14 @@ async fn embed_pipeline_embeds_then_guard_skips() {
     zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM)
         .await
         .expect("pipeline run 3 (guard skip)");
-    let n3: i64 = c
-        .query_one(
-            "SELECT count(*) FROM articles WHERE zim_id = $1 AND embedding IS NOT NULL",
-            &[&zim_id],
-        )
-        .await
-        .unwrap()
-        .get(0);
+    let n3: i64 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT count(*) FROM articles WHERE zim_id = $1 AND embedding IS NOT NULL",
+        |q| q.bind(zim_id),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
     assert_eq!(n3, 0, "count-guard skip must leave rows unembedded");
     assert_eq!(
         server.received_requests().await.unwrap().len(),
@@ -538,7 +556,7 @@ async fn embed_pipeline_embeds_then_guard_skips() {
     );
 
     // Cleanup (cascades to articles).
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
 }
@@ -561,30 +579,32 @@ async fn embed_poisoned_rows_not_resent_within_run() {
     const DIM: u32 = 1536;
 
     let zim_id: i32 = {
-        let c = pool.get().await.unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+        zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
             .await
             .unwrap();
-        c.execute(
-            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                               index_status, indexed_entries, article_count)\n             VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
-            &[&ZIM],
+        zimservice::db::raw::execute(
+            &pool,
+            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
+            |q| q.bind(ZIM),
         )
         .await
         .unwrap();
-        c.query_one("SELECT id FROM zims WHERE name = $1", &[&ZIM])
-            .await
-            .unwrap()
-            .get(0)
+        zimservice::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT id FROM zims WHERE name = $1",
+            |q| q.bind(ZIM),
+        )
+        .await
+        .unwrap()
+        .expect("row present")
     };
-    {
-        let c = pool.get().await.unwrap();
-        c.execute(
-            "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)\n             VALUES ('A/poison', 'Poison', 'preview', 'snip', to_tsvector('simple', 'Poison'), 'en', 'C', $1)",
-            &[&zim_id],
-        )
-        .await
-        .unwrap();
-    }
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)\n         VALUES ('A/poison', 'Poison', 'preview', 'snip', to_tsvector('simple', 'Poison'), 'en', 'C', $1)",
+        |q| q.bind(zim_id),
+    )
+    .await
+    .unwrap();
 
     // The endpoint always 500s.
     let server = MockServer::start().await;
@@ -607,23 +627,10 @@ async fn embed_poisoned_rows_not_resent_within_run() {
     .collect();
     let settings = SettingsCache::new_with_map(pool.clone(), values, HashMap::new());
 
-    let claimable = || {
-        let pool = pool.clone();
-        Box::pin(async move {
-            let c = pool.get().await.unwrap();
-            c.execute(
-                "UPDATE articles SET embed_at = NULL WHERE zim_id = $1",
-                &[&zim_id],
-            )
-            .await
-            .unwrap()
-        })
-    };
-
     // Runs 1-3: each re-claims the (reset) row; the 500 bumps its poison
     // counter (1, 2, 3). Three embed HTTP calls total.
     for _ in 0..3 {
-        claimable().await;
+        claimable_reset(&pool, zim_id).await;
         assert!(
             zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM)
                 .await
@@ -639,7 +646,7 @@ async fn embed_poisoned_rows_not_resent_within_run() {
 
     // Run 4: the row is now poison (count 3). Even though it is re-claimable
     // (embed_at reset), the poison filter drops it → no embed HTTP call, Ok.
-    claimable().await;
+    claimable_reset(&pool, zim_id).await;
     zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM)
         .await
         .expect("run 4 (poison, no HTTP) returns Ok");
@@ -650,19 +657,18 @@ async fn embed_poisoned_rows_not_resent_within_run() {
     );
 
     // The row is still unembedded (the 500s never succeeded).
-    let c = pool.get().await.unwrap();
-    let n: i64 = c
-        .query_one(
-            "SELECT count(*) FROM articles WHERE zim_id = $1 AND embedding IS NOT NULL",
-            &[&zim_id],
-        )
-        .await
-        .unwrap()
-        .get(0);
+    let n: i64 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT count(*) FROM articles WHERE zim_id = $1 AND embedding IS NOT NULL",
+        |q| q.bind(zim_id),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
     assert_eq!(n, 0, "poison row is never embedded");
 
     // Cleanup (cascades to articles).
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
 }
@@ -696,69 +702,82 @@ async fn reindex_prune_keeps_live_rows_and_drops_stale() {
     const C: &str = "A/three"; // removed from the archive on the "new" version
     const D: &str = "A/four"; // added by the "new" version
 
-    let c = pool.get().await.unwrap();
-    // Clean slate (idempotent re-run).
-    c.execute("DELETE FROM zims WHERE name = $1", &[&NAME])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(NAME))
         .await
         .unwrap();
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
-        &[&NAME],
+        |q| q.bind(NAME),
     )
     .await
     .unwrap();
-    let zim_id: i32 = c
-        .query_one("SELECT id FROM zims WHERE name = $1", &[&NAME])
-        .await
-        .unwrap()
-        .get(0);
+    let zim_id: i32 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT id FROM zims WHERE name = $1",
+        |q| q.bind(NAME),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
 
     // Prior-index rows A/B/C, all with a past `updated_at`.
     for (path, title, qid) in [(A, "One", 111i64), (B, "Two", 222i64), (C, "Three", 333i64)] {
-        c.execute(
+        zimservice::db::raw::execute(
+            &pool,
             "INSERT INTO articles (path, title, content_preview, search_vector, language, namespace, zim_id, updated_at)\n             VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'en', 'C', $3, now() - interval '1 hour')",
-            &[&path, &title, &zim_id],
+            |q| q.bind(path).bind(title).bind(zim_id),
         )
         .await
         .unwrap();
-        c.execute(
+        zimservice::db::raw::execute(
+            &pool,
             "INSERT INTO qid_index (zim_id, path, qid) VALUES ($1, $2, $3)",
-            &[&zim_id, &path, &qid],
+            |q| q.bind(zim_id).bind(path).bind(qid),
         )
         .await
         .unwrap();
     }
 
     // Run start (what finalize_zim captures). Stale rows are well below it.
-    let index_started_at: String = c.query_one("SELECT now()::text", &[]).await.unwrap().get(0);
+    let index_started_at: String = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT now()::text",
+        |q| q,
+    )
+    .await
+    .unwrap()
+    .expect("row present");
 
     // Simulate the reindex: A + B re-upserted (updated_at bumped to now()), D
     // inserted (default updated_at = now()). C is NOT re-upserted → stale.
     for path in [A, B] {
-        c.execute(
+        zimservice::db::raw::execute(
+            &pool,
             "UPDATE articles SET updated_at = now() WHERE zim_id = $1 AND path = $2",
-            &[&zim_id, &path],
+            |q| q.bind(zim_id).bind(path),
         )
         .await
         .unwrap();
     }
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "INSERT INTO articles (path, title, content_preview, search_vector, language, namespace, zim_id)\n         VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'en', 'C', $3)",
-        &[&D, &"Four", &zim_id],
+        |q| q.bind(D).bind("Four").bind(zim_id),
     )
     .await
     .unwrap();
 
     // (1) No availability window: the stale row C is still queryable until the
     // final prune, so `articles` never holds a partial row set mid-run.
-    let c_present: bool = c
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM articles WHERE zim_id = $1 AND path = $2)",
-            &[&zim_id, &C],
-        )
-        .await
-        .unwrap()
-        .get(0);
+    let c_present: bool = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT EXISTS (SELECT 1 FROM articles WHERE zim_id = $1 AND path = $2)",
+        |q| q.bind(zim_id).bind(C),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
     assert!(
         c_present,
         "stale row must remain until the final prune (no gap)"
@@ -766,34 +785,31 @@ async fn reindex_prune_keeps_live_rows_and_drops_stale() {
 
     // (2) The exact prune `finalize_zim` runs: stale by updated_at, then orphaned
     // qids by NOT EXISTS against the just-pruned articles.
-    let del: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![
-        &NAME as &(dyn postgres_types::ToSql + Sync),
-        &index_started_at as &(dyn postgres_types::ToSql + Sync),
-    ];
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "DELETE FROM articles\n         WHERE zim_id = (SELECT id FROM zims WHERE name = $1)\n           AND updated_at < $2::timestamptz",
-        &del,
+        |q| q.bind(NAME).bind(index_started_at),
     )
     .await
     .unwrap();
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "DELETE FROM qid_index q\n         WHERE q.zim_id = (SELECT id FROM zims WHERE name = $1)\n           AND NOT EXISTS (SELECT 1 FROM articles a\n                WHERE a.zim_id = q.zim_id AND a.path = q.path)",
-        &[&NAME],
+        |q| q.bind(NAME),
     )
     .await
     .unwrap();
 
     // (2) A, B, D remain; C (stale) is gone.
-    let remaining: std::collections::BTreeSet<String> = c
-        .query(
-            "SELECT path FROM articles WHERE zim_id = $1 ORDER BY path",
-            &[&zim_id],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get::<_, String>(0))
-        .collect();
+    let remaining: std::collections::BTreeSet<String> = zimservice::db::raw::fetch_scalar_all(
+        &pool,
+        "SELECT path FROM articles WHERE zim_id = $1 ORDER BY path",
+        |q| q.bind(zim_id),
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
     assert_eq!(
         remaining,
         std::collections::BTreeSet::from([A.to_string(), B.to_string(), D.to_string()]),
@@ -801,16 +817,13 @@ async fn reindex_prune_keeps_live_rows_and_drops_stale() {
     );
 
     // (3) qid for C (orphaned) is gone; A + B qids kept; D has none.
-    let qid_paths: Vec<String> = c
-        .query(
-            "SELECT path FROM qid_index WHERE zim_id = $1 ORDER BY path",
-            &[&zim_id],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get::<_, String>(0))
-        .collect();
+    let qid_paths: Vec<String> = zimservice::db::raw::fetch_scalar_all(
+        &pool,
+        "SELECT path FROM qid_index WHERE zim_id = $1 ORDER BY path",
+        |q| q.bind(zim_id),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         qid_paths,
         vec![A.to_string(), B.to_string()],
@@ -818,7 +831,21 @@ async fn reindex_prune_keeps_live_rows_and_drops_stale() {
     );
 
     // Cleanup.
-    c.execute("DELETE FROM zims WHERE name = $1", &[&NAME])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(NAME))
         .await
         .unwrap();
+}
+
+/// W6.5 helper: reset the article's `embed_at` so the next pipeline run
+/// re-claims it (simulates the 10-minute claim window elapsing). A free
+/// `async fn` (not a closure) so it borrows the pool and can be called
+/// repeatedly without moving it.
+async fn claimable_reset(pool: &Pool, zim_id: i32) {
+    zimservice::db::raw::execute(
+        pool,
+        "UPDATE articles SET embed_at = NULL WHERE zim_id = $1",
+        |q| q.bind(zim_id),
+    )
+    .await
+    .unwrap();
 }

@@ -4,6 +4,21 @@
 use crate::torrent::TorrentInfo;
 
 use super::*;
+use crate::db::entities::downloads::{Column, Entity};
+use sea_orm::sea_query::Expr;
+use sea_orm::{EntityTrait, QueryFilter};
+
+/// Download row snapshot used by reconcile:
+/// `(id, name, url, hash, status, file_path, updated_at)`.
+type TorrentRow = (
+    i32,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    chrono::DateTime<chrono::Utc>,
+);
 
 impl DownloadPoller {
     pub(super) async fn reconcile(&self, qbit: Option<Arc<QbitClient>>) -> Result<()> {
@@ -24,32 +39,30 @@ impl DownloadPoller {
         // multi-GB re-download (B1). Only truly orphaned `.part`s (no live
         // row, or a terminal `cancelled`/`complete` row) are reclaimed.
         let active_paths: std::collections::HashSet<String> = {
-            let c = self.db.get().await.map_err(Error::Pool)?;
+            let db = crate::db::sea_orm_db(&self.db);
             // Propagate a failed query — never default to an empty active-set:
             // an empty set makes the sweep below delete the `.part` files of
             // *live* downloads, so a poisoned query must abort the tick
             // (same propagation-instead-of-unwrap_or_default convention as the
             // direct-download client builder in direct.rs).
-            let rows: Vec<(String,)> = c
-                .query(
-                    &format!(
-                        "SELECT file_path FROM downloads WHERE status IN ({act}) AND {pred} \
-                         LIKE '%.zim' AND file_path IS NOT NULL",
-                        act = crate::torrent::in_list([
-                            crate::torrent::DownloadStatus::Queued,
-                            crate::torrent::DownloadStatus::Downloading,
-                            crate::torrent::DownloadStatus::Error
-                        ]),
-                        pred = ZIM_URL_PREDICATE
-                    ),
-                    &[],
-                )
+            let rows: Vec<String> = Entity::find()
+                .select_only()
+                .column(Column::FilePath)
+                .filter(Column::Status.is_in([
+                    crate::torrent::DownloadStatus::Queued.as_str(),
+                    crate::torrent::DownloadStatus::Downloading.as_str(),
+                    crate::torrent::DownloadStatus::Error.as_str(),
+                ]))
+                .filter(Expr::cust(format!(
+                    "({pred}) LIKE '%.zim'",
+                    pred = ZIM_URL_PREDICATE
+                )))
+                .filter(Column::FilePath.is_not_null())
+                .into_tuple()
+                .all(&db)
                 .await
-                .map_err(Error::Database)?
-                .into_iter()
-                .map(|r| (r.get(0),))
-                .collect();
-            rows.into_iter().map(|(p,)| p).collect()
+                .map_err(Error::from)?;
+            rows.into_iter().collect()
         };
         if let Ok(rd) = std::fs::read_dir(&self.zims.zim_dir) {
             for entry in rd.flatten() {
@@ -75,34 +88,32 @@ impl DownloadPoller {
             .collect();
 
         // 1) Rows: rebind hashes, recover finished torrents, flag orphans.
-        let rows = {
-            let c = self.db.get().await.map_err(Error::Pool)?;
-            c.query(
-                &format!(
-                    "SELECT id, name, url, hash, status, file_path, updated_at FROM downloads \
-                     WHERE status IN ({vis})",
-                    vis = crate::torrent::in_list([
-                        crate::torrent::DownloadStatus::Downloading,
-                        crate::torrent::DownloadStatus::Complete,
-                        crate::torrent::DownloadStatus::Seeding
-                    ])
-                ),
-                &[],
-            )
-            .await
-            .map_err(Error::Database)?
+        let rows: Vec<TorrentRow> = {
+            let db = crate::db::sea_orm_db(&self.db);
+            Entity::find()
+                .select_only()
+                .column(Column::Id)
+                .column(Column::Name)
+                .column(Column::Url)
+                .column(Column::Hash)
+                .column(Column::Status)
+                .column(Column::FilePath)
+                .column(Column::UpdatedAt)
+                .filter(Column::Status.is_in([
+                    crate::torrent::DownloadStatus::Downloading.as_str(),
+                    crate::torrent::DownloadStatus::Complete.as_str(),
+                    crate::torrent::DownloadStatus::Seeding.as_str(),
+                ]))
+                .into_tuple()
+                .all(&db)
+                .await
+                .map_err(Error::from)?
         };
 
         let mut known_hashes = HashSet::new();
-        for r in &rows {
-            let id: i32 = r.get(0);
-            let name: String = r.get(1);
-            let url: String = r.get(2);
-            let hash: Option<String> = r.get(3);
-            let status: String = r.get(4);
-            let file_path: Option<String> = r.get(5);
-            let updated_at: chrono::DateTime<chrono::Utc> = r.get(6);
-            if crate::torrent::is_direct_zim_url(&url) {
+        for (id, name, url, hash, status, file_path, updated_at) in &rows {
+            let id = *id;
+            if crate::torrent::is_direct_zim_url(url) {
                 continue; // direct — handled above
             }
             if let Some(h) = &hash {
@@ -124,7 +135,7 @@ impl DownloadPoller {
                     if t.is_complete() {
                         // We died between qB finishing and the file install.
                         if let Err(e) = self
-                            .handle_complete(id, t, qbit.clone(), &p, file_path)
+                            .handle_complete(id, t, qbit.clone(), &p, file_path.clone())
                             .await
                         {
                             crate::db::downloads_lifecycle::mark_fatal_error(
@@ -168,7 +179,7 @@ impl DownloadPoller {
                         // File was deleted but the torrent is still around
                         // (seeding) — reinstall from it.
                         if let Err(e) = self
-                            .handle_complete(id, t, qbit.clone(), &p, file_path)
+                            .handle_complete(id, t, qbit.clone(), &p, file_path.clone())
                             .await
                         {
                             tracing::warn!("reconcile: re-install of download {id} failed: {e}");

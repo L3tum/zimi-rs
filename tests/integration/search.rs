@@ -46,12 +46,9 @@ async fn smoke_search_suggest_random_on_seed() {
     // `random_article_respects_zim_filter` (40 live draws).
 
     // Cleanup (fixture ZIM; the suite runs single-threaded).
-    {
-        let c = pool.get().await.unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
-            .await
-            .unwrap();
-    }
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+        .await
+        .unwrap();
 }
 
 /// `/search` returns a `results` array with `total == results.len()` (page
@@ -64,33 +61,35 @@ async fn search_handler_shape() {
     };
     run_migrations(&pool).await.expect("migrations");
     const ZIM: &str = "__itest_search__";
-    {
-        let c = pool.get().await.unwrap();
-        c.execute(
-            "DELETE FROM articles WHERE zim_id IN (SELECT id FROM zims WHERE name=$1)",
-            &[&ZIM],
-        )
+    zimservice::db::raw::execute(
+        &pool,
+        "DELETE FROM articles WHERE zim_id IN (SELECT id FROM zims WHERE name=$1)",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap();
+    // One statement per execute (sqlx has no multi-statement protocol call).
+    for stmt in zimservice::db::raw::split_statements(&format!(
+        "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES
+         ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpha_One', 'Alpha One', 'alpha one text', to_tsvector('simple','alpha one')),
+         ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpha_Two', 'Alpha Two', 'alpha two text', to_tsvector('simple','alpha two')),
+         ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpha_Three', 'Alpha Three', 'alpha three text', to_tsvector('simple','alpha three'))"
+    )) {
+        zimservice::db::raw::execute(&pool, &stmt, |q| q)
             .await
             .unwrap();
-        c.execute(
-            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
-                               index_status, indexed_entries, article_count)
-             VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
-            &[&ZIM],
-        )
-        .await
-        .unwrap();
-        c.batch_execute(&format!(
-            "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES
-             ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpha_One', 'Alpha One', 'alpha one text', to_tsvector('simple','alpha one')),
-             ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpha_Two', 'Alpha Two', 'alpha two text', to_tsvector('simple','alpha two')),
-             ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpha_Three', 'Alpha Three', 'alpha three text', to_tsvector('simple','alpha three'))"
-        ))
-        .await
-        .unwrap();
     }
 
     let state = live_state(pool.clone()).await;
@@ -134,14 +133,14 @@ async fn search_handler_shape() {
     assert_eq!(p2.results.len(), 1, "offset 2 leaves one row");
 
     // Cleanup.
-    let c = pool.get().await.unwrap();
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "DELETE FROM articles WHERE zim_id IN (SELECT id FROM zims WHERE name=$1)",
-        &[&ZIM],
+        |q| q.bind(ZIM),
     )
     .await
     .unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
 }
@@ -157,7 +156,7 @@ async fn search_branch_soft_fail_keeps_other_branches() {
         None => return,
     };
 
-    let client = pool.get().await.expect("conn");
+    let mut client = pool.acquire().await.expect("conn");
     let tracker = zimservice::health::DegradationTracker::default();
 
     // Broken branch: a query that cannot succeed.
@@ -165,36 +164,48 @@ async fn search_branch_soft_fail_keeps_other_branches() {
         sql: "SELECT * FROM __no_such_table__".into(),
         params: vec![],
     };
-    // Healthy branch on the SAME client: a trivial query.
+    // Healthy branch on the SAME client: a trivial query whose nine columns
+    // decode as a `SearchRow` (the shape `run_sql_on` decodes into).
     let healthy = zimservice::search::SqlQuery {
-        sql: "SELECT 1".into(),
+        sql: "SELECT 1::bigint, 1::int, 'a', 'b', 'c', NULL::text, 'd', 'e', 1.0".into(),
         params: vec![],
     };
 
     // Run broken first — it must not leave the client in an error state.
-    let r1 =
-        zimservice::search::run_sql_on(&client, &broken, "test broken branch", &tracker, "fts")
-            .await;
+    let r1 = zimservice::search::run_sql_on(
+        &mut *client,
+        &broken,
+        "test broken branch",
+        &tracker,
+        "fts",
+    )
+    .await;
     assert!(
         r1.is_empty(),
         "broken branch must degrade to empty, not error"
     );
 
     // The same client must still serve a healthy query.
-    let r2 =
-        zimservice::search::run_sql_on(&client, &healthy, "test healthy branch", &tracker, "fts")
-            .await;
-    assert_eq!(
-        r2.len(),
-        1,
-        "healthy branch on the same client must still work"
-    );
-    assert_eq!(r2[0].get::<_, i32>(0), 1);
+    let r2 = zimservice::search::run_sql_on(
+        &mut *client,
+        &healthy,
+        "test healthy branch",
+        &tracker,
+        "fts",
+    )
+    .await;
+    assert_eq!(r2.len(), 1, "healthy branch on the same client must still work");
+    assert_eq!(r2[0].0, 1);
 
     // And a broken branch again (idempotent degradation).
-    let r3 =
-        zimservice::search::run_sql_on(&client, &broken, "test broken branch 2", &tracker, "fts")
-            .await;
+    let r3 = zimservice::search::run_sql_on(
+        &mut *client,
+        &broken,
+        "test broken branch 2",
+        &tracker,
+        "fts",
+    )
+    .await;
     assert!(r3.is_empty());
 }
 
@@ -213,29 +224,31 @@ async fn snippet_live_returns_title_and_snippet() {
     const PATH: &str = "A/article";
     const TITLE: &str = "My Snippet Title";
     const SNIP: &str = "The indexed snippet body";
-    {
-        let c = pool.get().await.unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
-            .await
-            .unwrap();
-        c.execute(
-            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                               index_status, indexed_entries, article_count)\n             VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
-            &[&ZIM],
-        )
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
-        let zim_id: i32 = c
-            .query_one("SELECT id FROM zims WHERE name = $1", &[&ZIM])
-            .await
-            .unwrap()
-            .get(0);
-        c.execute(
-            "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)\n             VALUES ($1, $2, 'Some preview', $3, to_tsvector('simple', $2), 'en', 'C', $4)",
-            &[&PATH, &TITLE, &SNIP, &zim_id],
-        )
-        .await
-        .unwrap();
-    }
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap();
+    let zim_id: i32 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT id FROM zims WHERE name = $1",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)\n         VALUES ($1, $2, 'Some preview', $3, to_tsvector('simple', $2), 'en', 'C', $4)",
+        |q| q.bind(PATH).bind(TITLE).bind(SNIP).bind(zim_id),
+    )
+    .await
+    .unwrap();
 
     let state = live_state(pool.clone()).await;
     let app = zimservice::serve::build_router(state);
@@ -257,14 +270,14 @@ async fn snippet_live_returns_title_and_snippet() {
     assert_eq!(v["snippet"], SNIP);
 
     // Cleanup.
-    let c = pool.get().await.unwrap();
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "DELETE FROM articles WHERE zim_id IN (SELECT id FROM zims WHERE name = $1)",
-        &[&ZIM],
+        |q| q.bind(ZIM),
     )
     .await
     .unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
 }
@@ -280,24 +293,28 @@ async fn suggest_live_returns_matching_title() {
     run_migrations(&pool).await.expect("migrations");
     const ZIM: &str = "__itest_sug__";
     const TITLE: &str = "ZebraFruitArticle";
-    let c = pool.get().await.unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
-        &[&ZIM],
+        |q| q.bind(ZIM),
     )
     .await
     .unwrap();
-    let zim_id: i32 = c
-        .query_one("SELECT id FROM zims WHERE name = $1", &[&ZIM])
-        .await
-        .unwrap()
-        .get(0);
-    c.execute(
+    let zim_id: i32 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT id FROM zims WHERE name = $1",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
+    zimservice::db::raw::execute(
+        &pool,
         "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)\n         VALUES ($1, $2, 'p', 's', to_tsvector('simple', $2), 'en', 'C', $3)",
-        &[&"A/zebra", &TITLE, &zim_id],
+        |q| q.bind("A/zebra").bind(TITLE).bind(zim_id),
     )
     .await
     .unwrap();
@@ -329,14 +346,14 @@ async fn suggest_live_returns_matching_title() {
     );
 
     // Cleanup.
-    let c = pool.get().await.unwrap();
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "DELETE FROM articles WHERE zim_id IN (SELECT id FROM zims WHERE name = $1)",
-        &[&ZIM],
+        |q| q.bind(ZIM),
     )
     .await
     .unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
 }
@@ -351,13 +368,13 @@ async fn interlanguage_live_no_qid_returns_empty() {
     };
     run_migrations(&pool).await.expect("migrations");
     const ZIM: &str = "__itest_inter__";
-    let c = pool.get().await.unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
-        &[&ZIM],
+        |q| q.bind(ZIM),
     )
     .await
     .unwrap();
@@ -382,8 +399,7 @@ async fn interlanguage_live_no_qid_returns_empty() {
     assert_eq!(v["languages"], serde_json::json!([]));
 
     // Cleanup.
-    let c = pool.get().await.unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
 }
@@ -409,55 +425,63 @@ async fn interlanguage_live_returns_qid_and_languages() {
     const EN_PATH: &str = "A/foo";
     const FR_PATH: &str = "A/foo_fr";
     const QID: i64 = 12345;
-    {
-        let c = pool.get().await.unwrap();
-        for name in [EN, FR] {
-            c.execute("DELETE FROM zims WHERE name = $1", &[&name])
-                .await
-                .unwrap();
-            c.execute(
-                "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
-                &[&name],
-            )
+    for name in [EN, FR] {
+        zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(name))
             .await
             .unwrap();
-        }
-        let en_id: i32 = c
-            .query_one("SELECT id FROM zims WHERE name = $1", &[&EN])
-            .await
-            .unwrap()
-            .get(0);
-        let fr_id: i32 = c
-            .query_one("SELECT id FROM zims WHERE name = $1", &[&FR])
-            .await
-            .unwrap()
-            .get(0);
-        // Articles (so the LEFT JOIN yields a title) + the shared Q-ID rows.
-        c.execute(
-            "INSERT INTO articles (path, title, content_preview, search_vector, language, namespace, zim_id)\n             VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'en', 'C', $3)",
-            &[&EN_PATH, &"Foo (en)", &en_id],
-        )
-        .await
-        .unwrap();
-        c.execute(
-            "INSERT INTO articles (path, title, content_preview, search_vector, language, namespace, zim_id)\n             VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'fr', 'C', $3)",
-            &[&FR_PATH, &"Foo (fr)", &fr_id],
-        )
-        .await
-        .unwrap();
-        c.execute(
-            "INSERT INTO qid_index (zim_id, path, qid) VALUES ($1, $2, $3)",
-            &[&en_id, &EN_PATH, &QID],
-        )
-        .await
-        .unwrap();
-        c.execute(
-            "INSERT INTO qid_index (zim_id, path, qid) VALUES ($1, $2, $3)",
-            &[&fr_id, &FR_PATH, &QID],
+        zimservice::db::raw::execute(
+            &pool,
+            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                               index_status, indexed_entries, article_count)\n             VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
+            |q| q.bind(name),
         )
         .await
         .unwrap();
     }
+    let en_id: i32 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT id FROM zims WHERE name = $1",
+        |q| q.bind(EN),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
+    let fr_id: i32 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT id FROM zims WHERE name = $1",
+        |q| q.bind(FR),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
+    // Articles (so the LEFT JOIN yields a title) + the shared Q-ID rows.
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO articles (path, title, content_preview, search_vector, language, namespace, zim_id)\n         VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'en', 'C', $3)",
+        |q| q.bind(EN_PATH).bind("Foo (en)").bind(en_id),
+    )
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO articles (path, title, content_preview, search_vector, language, namespace, zim_id)\n         VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'fr', 'C', $3)",
+        |q| q.bind(FR_PATH).bind("Foo (fr)").bind(fr_id),
+    )
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO qid_index (zim_id, path, qid) VALUES ($1, $2, $3)",
+        |q| q.bind(en_id).bind(EN_PATH).bind(QID),
+    )
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO qid_index (zim_id, path, qid) VALUES ($1, $2, $3)",
+        |q| q.bind(fr_id).bind(FR_PATH).bind(QID),
+    )
+    .await
+    .unwrap();
 
     let state = live_state(pool.clone()).await;
     let app = zimservice::serve::build_router(state);
@@ -518,11 +542,10 @@ async fn interlanguage_live_returns_qid_and_languages() {
     );
 
     // Cleanup (qid_index + articles cascade off zims; delete the zims).
-    let c = pool.get().await.unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&EN])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(EN))
         .await
         .unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&FR])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(FR))
         .await
         .unwrap();
 }
@@ -560,8 +583,7 @@ async fn chunks_live_returns_chunked_article() {
     assert!(!chunks[0]["text"].as_str().unwrap_or("").is_empty());
 
     // Cleanup: drop the fixture's zims row so the harness stays idempotent.
-    let c = pool.get().await.unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&"tiny"])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind("tiny"))
         .await
         .unwrap();
 }

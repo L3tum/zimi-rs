@@ -6,8 +6,20 @@
 //! domain outcomes to HTTP responses. Business rules (one live download per
 //! URL/name; not-found vs not-cancellable) are expressed as outcomes, not as
 //! `Error` variants, so the presentation layer owns the 404/409/200 mapping.
+//!
+//! Query layer: the SeaORM query builder (entity `find` / active-model
+//! `insert` / `update_many`) over the shared pool via
+//! [`crate::db::sea_orm_db`]. `updated_at = now()` stays a *server-side*
+//! timestamp via `Expr::cust("now()")`, so the SQL semantics match the old
+//! raw statements exactly.
+use crate::db::entities::downloads::{ActiveModel, Column, Entity};
 use crate::db::pool::Pool;
+use crate::db::sea_orm_db;
 use crate::error::{Error, Result};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ActiveModelTrait, ActiveValue, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+};
 
 /// Normalised form of a download `url` for ZIM detection: the path with any
 /// `?query` / `#fragment` stripped, lowercased and trimmed. Reused by the
@@ -39,29 +51,28 @@ pub struct DownloadRow {
 
 /// Most recent downloads (newest first), capped at 500.
 pub async fn list_downloads(pool: &Pool) -> Result<Vec<DownloadRow>> {
-    let client = pool.get().await.map_err(Error::Pool)?;
-    let rows = client
-        .query(
-            "SELECT id, name, url, status, progress, speed_bps, eta_secs, error, created_at, ratio, up_speed_bps, num_seeds FROM downloads ORDER BY created_at DESC LIMIT 500",
-            &[],
-        )
+    let db = sea_orm_db(pool);
+    let models = Entity::find()
+        .order_by_desc(Column::CreatedAt)
+        .limit(500)
+        .all(&db)
         .await
-        .map_err(Error::Database)?;
-    Ok(rows
-        .iter()
-        .map(|r| DownloadRow {
-            id: r.get(0),
-            name: r.get(1),
-            url: r.get(2),
-            status: r.get(3),
-            progress: r.get(4),
-            speed_bps: r.get(5),
-            eta_secs: r.get(6),
-            error: r.get(7),
-            created_at: r.get(8),
-            ratio: r.get(9),
-            up_speed_bps: r.get(10),
-            num_seeds: r.get(11),
+        .map_err(Error::from)?;
+    Ok(models
+        .into_iter()
+        .map(|m| DownloadRow {
+            id: m.id,
+            name: m.name,
+            url: m.url,
+            status: m.status,
+            progress: m.progress,
+            speed_bps: m.speed_bps,
+            eta_secs: m.eta_secs,
+            error: m.error,
+            created_at: m.created_at,
+            ratio: m.ratio,
+            up_speed_bps: m.up_speed_bps,
+            num_seeds: m.num_seeds,
         })
         .collect())
 }
@@ -83,39 +94,44 @@ pub enum InsertOutcome {
 /// partial unique indexes are the authority, and the `23505` (unique
 /// violation) path below closes the concurrent-POST race.
 pub async fn insert_download(pool: &Pool, name: &str, url: &str) -> Result<InsertOutcome> {
-    let client = pool.get().await.map_err(Error::Pool)?;
-    let dup = client
-        .query_opt(
-            &format!(
-                "SELECT 1 FROM downloads WHERE (url = $2 OR name = $1) AND status IN ({act})",
-                act = crate::torrent::in_list([
-                    crate::torrent::DownloadStatus::Queued,
-                    crate::torrent::DownloadStatus::Downloading
-                ])
-            ),
-            &[&name, &url],
+    let db = sea_orm_db(pool);
+    // The `(url = $2 OR name = $1)` pre-check is only fast feedback — the
+    // 003/011 partial unique indexes are the authority, and the `23505`
+    // (unique violation) path below closes the concurrent-POST race.
+    let dup = Entity::find()
+        .filter(
+            Expr::col(Column::Url)
+                .eq(Expr::val(url))
+                .or(Expr::col(Column::Name).eq(Expr::val(name))),
         )
+        .filter(Column::Status.is_in([
+            crate::torrent::DownloadStatus::Queued.as_str(),
+            crate::torrent::DownloadStatus::Downloading.as_str(),
+        ]))
+        .limit(1)
+        .one(&db)
         .await
-        .map_err(Error::Database)?;
+        .map_err(Error::from)?;
     if dup.is_some() {
         return Ok(InsertOutcome::Duplicate);
     }
-    match client
-        .query_one(
-            "INSERT INTO downloads (name, url, status) VALUES ($1, $2, $3) RETURNING id",
-            &[
-                &name,
-                &url,
-                &crate::torrent::DownloadStatus::Queued.as_str(),
-            ],
-        )
-        .await
-    {
-        Ok(row) => Ok(InsertOutcome::Inserted(row.get(0))),
-        Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
+    // Only the three caller-provided columns are set; `created_at` /
+    // `updated_at` stay `NotSet` and keep the table's `now()` defaults
+    // (same column list as the old raw INSERT).
+    let model = ActiveModel {
+        name: ActiveValue::Set(name.to_owned()),
+        url: ActiveValue::Set(url.to_owned()),
+        status: ActiveValue::Set(crate::torrent::DownloadStatus::Queued.as_str().to_owned()),
+        ..Default::default()
+    };
+    match model.insert(&db).await {
+        Ok(m) => Ok(InsertOutcome::Inserted(m.id)),
+        // BUG-9: a concurrent POST hitting the partial unique index (23505)
+        // is a duplicate, not a DB fault — same mapping as `collections`.
+        Err(e) if crate::db::collections::orm_is_unique_violation(&e) => {
             Ok(InsertOutcome::Duplicate)
         }
-        Err(e) => Err(Error::Database(e)),
+        Err(e) => Err(Error::from(e)),
     }
 }
 
@@ -136,29 +152,34 @@ pub enum CancelOutcome {
 /// handler can map to 404 vs 409. Only `queued`/`downloading` rows are
 /// cancellable; anything else (complete/cancelled/…) is left alone.
 pub async fn cancel_download(pool: &Pool, id: i32) -> Result<CancelOutcome> {
-    let client = pool.get().await.map_err(Error::Pool)?;
-    let updated = client
-        .execute(
-            &format!(
-                "UPDATE downloads SET status = {cancelled}, updated_at = now() WHERE id = $1 AND status IN ({act})",
-                cancelled = crate::torrent::DownloadStatus::Cancelled.as_str(),
-                act = crate::torrent::in_list([
-                    crate::torrent::DownloadStatus::Queued,
-                    crate::torrent::DownloadStatus::Downloading
-                ])
-            ),
-            &[&id],
+    let db = sea_orm_db(pool);
+    let updated = Entity::update_many()
+        .col_expr(
+            Column::Status,
+            Expr::val(crate::torrent::DownloadStatus::Cancelled.as_str()).into(),
         )
+        .col_expr(Column::UpdatedAt, Expr::cust("now()"))
+        .filter(Column::Id.eq(id))
+        .filter(Column::Status.is_in([
+            crate::torrent::DownloadStatus::Queued.as_str(),
+            crate::torrent::DownloadStatus::Downloading.as_str(),
+        ]))
+        .exec(&db)
         .await
-        .map_err(Error::Database)?;
+        .map_err(Error::from)?
+        .rows_affected;
     if updated > 0 {
         return Ok(CancelOutcome::Cancelled(id));
     }
-    let status: Option<String> = client
-        .query_opt("SELECT status FROM downloads WHERE id = $1", &[&id])
+    // Distinguish not-found from not-cancellable (BUG-16c).
+    let status: Option<String> = Entity::find_by_id(id)
+        .select_only()
+        .column(Column::Status)
+        .into_tuple()
+        .one(&db)
         .await
-        .map_err(Error::Database)?
-        .map(|r| r.get(0));
+        .map_err(Error::from)?
+        .map(|(status,)| status);
     Ok(match status {
         Some(status) => CancelOutcome::NotCancellable { status },
         None => CancelOutcome::NotFound,
@@ -192,10 +213,11 @@ mod tests {
 
         // Sweep entry: this test owns the `__it_listdl__` prefix. A shared dev
         // DB may hold stale rows from a prior interrupted run — clear them first.
-        let c = pool.get().await.unwrap();
-        c.execute(
+        let mut c = pool.acquire().await.unwrap();
+        crate::db::raw::execute(
+            &mut *c,
             "DELETE FROM downloads WHERE name LIKE '__it_listdl__%'",
-            &[],
+            |q| q,
         )
         .await
         .unwrap();
@@ -209,7 +231,8 @@ mod tests {
         //
         // Every mapped column carries a value derived from i so a wrong column
         // mapping, or a shifted column order in the SELECT, is caught.
-        c.execute(
+        crate::db::raw::execute(
+            &mut *c,
             r#"
             INSERT INTO downloads
                 (name, url, hash, status, progress, speed_bps, eta_secs,
@@ -230,7 +253,7 @@ mod tests {
                 (i * 11)::bigint
             FROM generate_series(0, 504) AS i
             "#,
-            &[],
+            |q| q,
         )
         .await
         .unwrap();
@@ -329,9 +352,10 @@ mod tests {
         );
 
         // Sweep exit.
-        c.execute(
+        crate::db::raw::execute(
+            &mut *c,
             "DELETE FROM downloads WHERE name LIKE '__it_listdl__%'",
-            &[],
+            |q| q,
         )
         .await
         .unwrap();

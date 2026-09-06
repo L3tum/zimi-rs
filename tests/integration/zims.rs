@@ -2,6 +2,17 @@
 
 use super::common::*;
 
+/// `(progress, speed_bps, eta_secs, ratio, up_speed_bps, num_seeds, updated_at)`
+type DownloadStatsRow = (
+    f32,
+    Option<i64>,
+    Option<i64>,
+    Option<f32>,
+    Option<i64>,
+    Option<i64>,
+    chrono::DateTime<chrono::Utc>,
+);
+
 // ── T7: DB-backed MCP happy paths ─────────────────────────────────────────
 // One test per tool asserting the success envelope shape and a non-empty
 // result against the seeded fixture ZIM. Skipped when DB unreachable.
@@ -20,19 +31,21 @@ async fn mcp_tools_db_backed() {
 
     // Seed fixture ZIM + articles.
     {
-        let c = pool.get().await.unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+        zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
             .await
             .unwrap();
-        c.execute(
+        zimservice::db::raw::execute(
+            &pool,
             "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
                                index_status, indexed_entries, article_count)
              VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
-            &[&ZIM],
+            |q| q.bind(ZIM),
         )
         .await
         .unwrap();
-        c.batch_execute(&format!(
+        // One statement per execute (sqlx has no multi-statement protocol
+        // call; `split_statements` replaces the old `batch_execute`).
+        for stmt in zimservice::db::raw::split_statements(&format!(
             "INSERT INTO articles (zim_id, path, title, content_preview, search_vector, title_lower) VALUES
              ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpine', 'Alpine',
               'The Alps are mountains.', to_tsvector('simple','alpine peaks europe'), 'alpine'),
@@ -41,9 +54,11 @@ async fn mcp_tools_db_backed() {
              ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Andes', 'Andes',
               'The Andes are mountains in South America.',
               to_tsvector('simple','andes mountains south america'), 'andes')"
-        ))
-        .await
-        .unwrap();
+        )) {
+            zimservice::db::raw::execute(&pool, &stmt, |q| q)
+                .await
+                .unwrap();
+        }
     }
 
     let settings = SettingsCache::load(pool.clone(), HashMap::new(), HashMap::new())
@@ -114,8 +129,7 @@ async fn mcp_tools_db_backed() {
     assert!(sources.is_array(), "list_sources returns an array");
 
     // Cleanup.
-    let c = pool.get().await.unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
 }
@@ -134,25 +148,21 @@ async fn put_settings_unauthenticated_response_redacts_topology() {
 
     // Seed a topology key so the unauthenticated response has something to
     // redact. Captured so we can restore it on cleanup.
-    let original: Option<String> = {
-        let c = pool.get().await.unwrap();
-        c.query_one(
-            "SELECT value::text FROM settings WHERE key = $1",
-            &[&"torrent.url"],
-        )
-        .await
-        .ok()
-        .map(|r| r.get::<_, String>(0))
-    };
-    {
-        let c = pool.get().await.unwrap();
-        c.execute(
-            "INSERT INTO settings (key, value) VALUES ('torrent.url', $1)\n             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            &[&serde_json::json!("http://qb-host:8080").to_string()],
-        )
-        .await
-        .unwrap();
-    }
+    let original: Option<String> = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT value::text FROM settings WHERE key = $1",
+        |q| q.bind("torrent.url"),
+    )
+    .await
+    .ok()
+    .flatten();
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO settings (key, value) VALUES ('torrent.url', $1)\n             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        |q| q.bind(serde_json::json!("http://qb-host:8080").to_string()),
+    )
+    .await
+    .unwrap();
 
     let state = live_state(pool.clone()).await;
 
@@ -176,19 +186,21 @@ async fn put_settings_unauthenticated_response_redacts_topology() {
     );
 
     // Restore torrent.url to its prior value (usually the empty seed).
-    let c = pool.get().await.unwrap();
     match original {
-        Some(v) => c
-            .execute(
-                "UPDATE settings SET value = $1 WHERE key = 'torrent.url'",
-                &[&v],
-            )
-            .await
-            .unwrap(),
-        None => c
-            .execute("DELETE FROM settings WHERE key = 'torrent.url'", &[])
-            .await
-            .unwrap(),
+        Some(v) => zimservice::db::raw::execute(
+            &pool,
+            "UPDATE settings SET value = $1 WHERE key = 'torrent.url'",
+            |q| q.bind(v),
+        )
+        .await
+        .unwrap(),
+        None => zimservice::db::raw::execute(
+            &pool,
+            "DELETE FROM settings WHERE key = 'torrent.url'",
+            |q| q,
+        )
+        .await
+        .unwrap(),
     };
 }
 
@@ -238,15 +250,14 @@ async fn settings_update_roundtrip() {
         serde_json::json!("itest-model")
     );
     {
-        let c = pool.get().await.unwrap();
-        let val: String = c
-            .query_one(
-                "SELECT value::text FROM settings WHERE key = $1",
-                &[&"embedding.model"],
-            )
-            .await
-            .unwrap()
-            .get(0);
+        let val: String = zimservice::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT value::text FROM settings WHERE key = $1",
+            |q| q.bind("embedding.model"),
+        )
+        .await
+        .unwrap()
+        .expect("row present");
         assert_eq!(val, "\"itest-model\"");
     }
     settings.reload().await.expect("reload");
@@ -271,12 +282,13 @@ async fn settings_update_roundtrip() {
 
     // 4) Cleanup: drop the seeded row so the next reload falls back to the
     //    seed default (leaves the dev DB as we found it).
-    pool.get()
-        .await
-        .unwrap()
-        .execute("DELETE FROM settings WHERE key = $1", &[&"embedding.model"])
-        .await
-        .unwrap();
+    zimservice::db::raw::execute(
+        &pool,
+        "DELETE FROM settings WHERE key = $1",
+        |q| q.bind("embedding.model"),
+    )
+    .await
+    .unwrap();
 }
 
 // ── B1.2: random article must respect the ZIM filter ────────────────────
@@ -291,48 +303,32 @@ async fn random_article_respects_zim_filter() {
     run_migrations(&pool).await.expect("migrations");
     const ZIM_A: &str = "__itest_rand__";
     const ZIM_B: &str = "__itest_rand2__";
-    let cleanup = |pool: &Pool| {
-        let pool = pool.clone();
-        async move {
-            let c = pool.get().await.unwrap();
-            c.execute(
-                "DELETE FROM articles WHERE zim_id IN (SELECT id FROM zims WHERE name IN ($1,$2))",
-                &[&ZIM_A, &ZIM_B],
-            )
-            .await
-            .unwrap();
-            c.execute("DELETE FROM zims WHERE name IN ($1,$2)", &[&ZIM_A, &ZIM_B])
+    for name in [ZIM_A, ZIM_B] {
+        zimservice::db::raw::execute(
+            &pool,
+            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                               index_status, indexed_entries, article_count)\n             VALUES ($1, $1, $1, 0, now(), 'ready', 5, 5)",
+            |q| q.bind(name),
+        )
+        .await
+        .unwrap();
+        for stmt in zimservice::db::raw::split_statements(&format!(
+            "INSERT INTO articles (zim_id, path, title, content_preview) VALUES\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a1', 'Rand {name} 1', 'x'),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a2', 'Rand {name} 2', 'x'),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a3', 'Rand {name} 3', 'x'),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a4', 'Rand {name} 4', 'x'),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a5', 'Rand {name} 5', 'x')"
+        )) {
+            zimservice::db::raw::execute(&pool, &stmt, |q| q)
                 .await
                 .unwrap();
-        }
-    };
-    {
-        let c = pool.get().await.unwrap();
-        for name in [ZIM_A, ZIM_B] {
-            c.execute(
-                "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                               index_status, indexed_entries, article_count)\n             VALUES ($1, $1, $1, 0, now(), 'ready', 5, 5)",
-                &[&name],
-            )
-            .await
-            .unwrap();
-            c.batch_execute(&format!(
-                "INSERT INTO articles (zim_id, path, title, content_preview) VALUES\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a1', 'Rand {name} 1', 'x'),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a2', 'Rand {name} 2', 'x'),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a3', 'Rand {name} 3', 'x'),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a4', 'Rand {name} 4', 'x'),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a5', 'Rand {name} 5', 'x')"
-            ))
-            .await
-            .unwrap();
         }
     }
     // Sanity: ZIM_B articles exist, so an unfiltered seek would find them.
     {
-        let c = pool.get().await.unwrap();
-        let n: i64 = c
-            .query_one(
-                "SELECT count(*) FROM articles a JOIN zims z ON z.id=a.zim_id WHERE z.name=$1",
-                &[&ZIM_B],
-            )
-            .await
-            .unwrap()
-            .get(0);
+        let n: i64 = zimservice::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT count(*) FROM articles a JOIN zims z ON z.id=a.zim_id WHERE z.name=$1",
+            |q| q.bind(ZIM_B),
+        )
+        .await
+        .unwrap()
+        .expect("row present");
         assert_eq!(
             n, 5,
             "ZIM_B must have 5 articles for the regression to bite"
@@ -344,7 +340,7 @@ async fn random_article_respects_zim_filter() {
             match zimservice::db::random_article::fetch_random_article(&pool, Some(ZIM_A)).await {
                 Ok(a) => a,
                 Err(e) => {
-                    cleanup(&pool).await;
+                    cleanup_rand(&pool, ZIM_A, ZIM_B).await;
                     panic!("draw {i}: {e}")
                 }
             };
@@ -364,26 +360,45 @@ async fn random_article_respects_zim_filter() {
         let art = match zimservice::db::random_article::fetch_random_article(&pool, None).await {
             Ok(a) => a,
             Err(e) => {
-                cleanup(&pool).await;
+                cleanup_rand(&pool, ZIM_A, ZIM_B).await;
                 panic!("draw {i}: {e}")
             }
         };
-        let c = pool.get().await.unwrap();
-        let exists: bool = c
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM articles a\n                 JOIN zims z ON z.id = a.zim_id\n                 WHERE a.id = $1 AND z.name = $2)",
-                &[&art.id, &art.zim],
-            )
-            .await
-            .unwrap()
-            .get(0);
+        let exists: bool = zimservice::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT EXISTS (SELECT 1 FROM articles a\n                 JOIN zims z ON z.id = a.zim_id\n                 WHERE a.id = $1 AND z.name = $2)",
+            |q| q.bind(art.id).bind(art.zim.as_str()),
+        )
+        .await
+        .unwrap()
+        .expect("row present");
         assert!(
             exists,
             "unfiltered draw {i} is not a live article row: id={} zim={}",
             art.id, art.zim
         );
     }
-    cleanup(&pool).await;
+    cleanup_rand(&pool, ZIM_A, ZIM_B).await;
+}
+
+/// B1.2 cleanup: drop both seeded ZIMs (and their articles). A free
+/// `async fn` (not a closure) so it borrows the pool and can be called
+/// repeatedly without moving it.
+async fn cleanup_rand(pool: &Pool, zim_a: &str, zim_b: &str) {
+    zimservice::db::raw::execute(
+        pool,
+        "DELETE FROM articles WHERE zim_id IN (SELECT id FROM zims WHERE name IN ($1,$2))",
+        |q| q.bind(zim_a).bind(zim_b),
+    )
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(
+        pool,
+        "DELETE FROM zims WHERE name IN ($1,$2)",
+        |q| q.bind(zim_a).bind(zim_b),
+    )
+    .await
+    .unwrap();
 }
 
 // ── B1.3: `.zim` detection must strip query *and* fragment ───────────────
@@ -397,19 +412,16 @@ async fn direct_zim_fragment() {
     };
     run_migrations(&pool).await.expect("migrations");
     const ZIM: &str = "__itest_frag__";
-    {
-        let c = pool.get().await.unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
-            .await
-            .unwrap();
-        c.execute(
-            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                               index_status, indexed_entries, article_count)\n             VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
-            &[&ZIM],
-        )
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
-    }
-    let c = pool.get().await.unwrap();
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap();
     let cases = [
         // (url, should be a direct .zim row)
         ("https://x/file.zim#frag", true),
@@ -425,14 +437,17 @@ async fn direct_zim_fragment() {
             "SELECT 1 WHERE {} LIKE '%.zim'",
             zimservice::torrent::poller::ZIM_URL_PREDICATE.replace("url", "$1")
         );
-        let row = c.query_opt(&sql, &[&url]).await.unwrap();
+        let row: Option<i32> =
+            zimservice::db::raw::fetch_scalar_optional(&pool, &sql, |q| q.bind(url))
+                .await
+                .unwrap();
         assert_eq!(
             row.is_some(),
             expected,
             "SQL predicate disagrees with Rust is_direct_zim_url for {url}"
         );
     }
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
 }
@@ -448,10 +463,10 @@ async fn enqueue_rejects_same_name_active_row() {
         None => return,
     };
     run_migrations(&pool).await.expect("migrations");
-    let c = pool.get().await.unwrap();
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "DELETE FROM downloads WHERE name LIKE 'itest_dup%' OR name = 'itest_other.zim'",
-        &[],
+        |q| q,
     )
     .await
     .unwrap();
@@ -475,18 +490,23 @@ async fn enqueue_rejects_same_name_active_row() {
     )
     .await
     .unwrap_err();
-    assert_eq!(
-        err.code(),
-        Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
-        "same-name active row must be rejected by 011"
+    assert!(
+        matches!(
+            &err,
+            zimservice::error::Error::Database(e)
+                if e.as_database_error()
+                    .is_some_and(|d| d.code().as_deref() == Some("23505"))
+        ),
+        "same-name active row must be rejected by 011, got: {err:?}"
     );
     // Terminal rows do not block a new active row for the same name…
-    c.execute("DELETE FROM downloads WHERE id = $1", &[&id])
+    zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
         .await
         .unwrap();
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "INSERT INTO downloads (name, url, status) VALUES ('itest_dup.zim', 'http://testhost:1/done.zim', 'complete')",
-        &[],
+        |q| q,
     )
     .await
     .unwrap();
@@ -508,9 +528,10 @@ async fn enqueue_rejects_same_name_active_row() {
     .await
     .unwrap();
 
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "DELETE FROM downloads WHERE name LIKE 'itest_dup%' OR name = 'itest_other.zim'",
-        &[],
+        |q| q,
     )
     .await
     .unwrap();
@@ -586,10 +607,10 @@ async fn cancel_download_non_cancellable_is_409() {
     .expect("an active row cancels fine");
     assert_eq!(res.0.id, queued_id);
 
-    let c = pool.get().await.unwrap();
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "DELETE FROM downloads WHERE name IN ('itest_cancel_done.zim', 'itest_cancel_q.zim')",
-        &[],
+        |q| q,
     )
     .await
     .unwrap();
@@ -608,12 +629,9 @@ async fn active_download_unique_race() {
     run_migrations(&pool).await.expect("migrations");
     const NAME: &str = "__itest_race__";
     const URL: &str = "http://seed.example/__itest_race__.zim";
-    {
-        let c = pool.get().await.unwrap();
-        c.execute("DELETE FROM downloads WHERE url = $1", &[&URL])
-            .await
-            .unwrap();
-    }
+    zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(URL))
+        .await
+        .unwrap();
 
     let (r1, r2) = tokio::join!(
         insert_download(&pool, NAME, URL, "queued"),
@@ -630,29 +648,32 @@ async fn active_download_unique_race() {
     assert!(winner > 0, "winner should have an id");
 
     // Loser: unique_violation (SQLSTATE 23505).
-    let db_err = loser_err
-        .as_db_error()
+    let sqlx_err = match &loser_err {
+        zimservice::error::Error::Database(e) => e,
+        other => panic!("loser must be a Postgres error, got: {other:?}"),
+    };
+    let db_err = sqlx_err
+        .as_database_error()
         .expect("loser must be a Postgres error");
     assert_eq!(
-        *db_err.code(),
-        tokio_postgres::error::SqlState::UNIQUE_VIOLATION,
-        "expected 23505, got {:?}",
+        db_err.code().as_deref(),
+        Some("23505"),
+        "expected 23505, got: {:?}",
         db_err.code()
     );
 
     // Exactly one active row remains.
-    let c = pool.get().await.unwrap();
-    let n: i64 = c
-        .query_one(
-            "SELECT count(*) FROM downloads WHERE url = $1 AND status IN ('queued','downloading')",
-            &[&URL],
-        )
-        .await
-        .unwrap()
-        .get(0);
+    let n: i64 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT count(*) FROM downloads WHERE url = $1 AND status IN ('queued','downloading')",
+        |q| q.bind(URL),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
     assert_eq!(n, 1, "exactly one active row should remain");
 
-    c.execute("DELETE FROM downloads WHERE url = $1", &[&URL])
+    zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(URL))
         .await
         .unwrap();
 }
@@ -677,13 +698,10 @@ async fn stats_update_writes_changed_only() {
     ];
 
     // Clean up leftovers, seed three `downloading` rows (id ascending).
-    {
-        let c = pool.get().await.unwrap();
-        for u in urls.iter().map(|s| s.as_str()) {
-            c.execute("DELETE FROM downloads WHERE url = $1", &[&u])
-                .await
-                .unwrap();
-        }
+    for u in urls.iter().map(|s| s.as_str()) {
+        zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(u))
+            .await
+            .unwrap();
     }
     let ids = [
         insert_download(&pool, TAG, &urls[0], "downloading")
@@ -698,18 +716,13 @@ async fn stats_update_writes_changed_only() {
     ];
 
     // Record each row's pre-update `updated_at` (ordered by id).
-    let before: Vec<chrono::DateTime<chrono::Utc>> = {
-        let c = pool.get().await.unwrap();
-        c.query(
-            "SELECT updated_at FROM downloads WHERE id IN ($1, $2, $3) ORDER BY id",
-            &[&ids[0], &ids[1], &ids[2]],
-        )
-        .await
-        .unwrap()
-        .iter()
-        .map(|r| r.get::<_, chrono::DateTime<chrono::Utc>>(0))
-        .collect()
-    };
+    let before: Vec<chrono::DateTime<chrono::Utc>> = zimservice::db::raw::fetch_scalar_all(
+        &pool,
+        "SELECT updated_at FROM downloads WHERE id IN ($1, $2, $3) ORDER BY id",
+        |q| q.bind(ids[0]).bind(ids[1]).bind(ids[2]),
+    )
+    .await
+    .unwrap();
 
     // Rows 0 and 1 changed; row 2 did not → omit it from the batch.
     let changed: Vec<zimservice::torrent::poller::StatsRow> = vec![
@@ -720,23 +733,18 @@ async fn stats_update_writes_changed_only() {
         .await
         .unwrap();
 
-    let c = pool.get().await.unwrap();
     for (i, id) in ids.iter().enumerate() {
-        let r = c
-            .query_one(
+        let (progress, speed_bps, eta_secs, ratio, up_speed_bps, num_seeds, updated):
+            DownloadStatsRow =
+            zimservice::db::raw::fetch_optional(
+                &pool,
                 "SELECT progress, speed_bps, eta_secs, ratio, up_speed_bps, num_seeds, updated_at \
                  FROM downloads WHERE id = $1",
-                &[id],
+                |q| q.bind(id),
             )
             .await
-            .unwrap();
-        let progress: f32 = r.get(0);
-        let speed_bps: Option<i64> = r.get(1);
-        let eta_secs: Option<i64> = r.get(2);
-        let ratio: Option<f32> = r.get(3);
-        let up_speed_bps: Option<i64> = r.get(4);
-        let num_seeds: Option<i64> = r.get(5);
-        let updated: chrono::DateTime<chrono::Utc> = r.get(6);
+            .unwrap()
+            .expect("row present");
 
         if i < 2 {
             let (_, np, ns, ne, nr, nu, nn) = changed[i];
@@ -759,7 +767,7 @@ async fn stats_update_writes_changed_only() {
 
     // Clean up.
     for u in urls.iter().map(|s| s.as_str()) {
-        c.execute("DELETE FROM downloads WHERE url = $1", &[&u])
+        zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(u))
             .await
             .unwrap();
     }
@@ -777,12 +785,9 @@ async fn seeding_rows_not_constrained_and_visible() {
     run_migrations(&pool).await.expect("migrations");
     const NAME: &str = "__itest_race_seed__";
     const URL: &str = "http://seed.example/__itest_race_seed__.zim";
-    {
-        let c = pool.get().await.unwrap();
-        c.execute("DELETE FROM downloads WHERE url = $1", &[&URL])
-            .await
-            .unwrap();
-    }
+    zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(URL))
+        .await
+        .unwrap();
 
     // (a) Two seeding rows, same URL — both insert (no false 23505).
     let a = insert_download(&pool, NAME, URL, "seeding")
@@ -794,25 +799,27 @@ async fn seeding_rows_not_constrained_and_visible() {
     assert_ne!(a, b, "two distinct seeding rows");
 
     // (b) Seeding columns (006) round-trip.
-    let c = pool.get().await.unwrap();
-    c.execute(
+    zimservice::db::raw::execute(
+        &pool,
         "UPDATE downloads SET ratio = 2.5, up_speed_bps = 1024, num_seeds = 7 WHERE id = $1",
-        &[&a],
+        |q| q.bind(a),
     )
     .await
     .unwrap();
-    let row = c
-        .query_one(
+    let (ratio, up_speed_bps, num_seeds): (f32, Option<i64>, Option<i64>) =
+        zimservice::db::raw::fetch_optional(
+            &pool,
             "SELECT ratio, up_speed_bps, num_seeds FROM downloads WHERE id = $1",
-            &[&a],
+            |q| q.bind(a),
         )
         .await
-        .unwrap();
-    assert!((row.get::<_, f32>(0) - 2.5).abs() < f32::EPSILON);
-    assert_eq!(row.get::<_, i64>(1), 1024);
-    assert_eq!(row.get::<_, i64>(2), 7);
+        .unwrap()
+        .expect("row present");
+    assert!((ratio - 2.5).abs() < f32::EPSILON);
+    assert_eq!(up_speed_bps, Some(1024));
+    assert_eq!(num_seeds, Some(7));
 
-    c.execute("DELETE FROM downloads WHERE url = $1", &[&URL])
+    zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(URL))
         .await
         .unwrap();
 }
@@ -828,12 +835,9 @@ async fn collections_crud() {
     run_migrations(&pool).await.expect("migrations");
     const NAME: &str = "__itest_coll__";
     const LABEL: &str = "ITest Coll";
-    {
-        let c = pool.get().await.unwrap();
-        c.execute("DELETE FROM collections WHERE name = $1", &[&NAME])
-            .await
-            .unwrap();
-    }
+    zimservice::db::raw::execute(&pool, "DELETE FROM collections WHERE name = $1", |q| q.bind(NAME))
+        .await
+        .unwrap();
 
     let state = live_state(pool.clone()).await;
     use zimservice::serve::handlers::{

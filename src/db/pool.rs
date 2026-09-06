@@ -1,30 +1,36 @@
 //! Postgres connection pool configuration and TLS handling.
 
+use std::str::FromStr;
 use std::time::Duration;
 
-use deadpool_postgres::Config as DpConfig;
-pub use deadpool_postgres::Pool;
-use deadpool_postgres::Runtime;
-use rustls::RootCertStore;
-use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
-use tokio_postgres::NoTls;
-use tokio_postgres::Socket;
-use tokio_postgres_rustls::MakeRustlsConnect;
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgSslMode};
+use sqlx::ConnectOptions;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
 
+/// The shared pool type used across the crate.
+///
+/// `sqlx::PgPool` implements `sqlx::Executor` directly, so most call sites
+/// just pass `&pool` to [`crate::db::raw`] — no checkout needed. Multi-statement
+/// / session-bound work (advisory locks, migration transactions) checks out a
+/// connection with `pool.acquire()`; see [`connect_dedicated`] for the
+/// instance-lock path.
+pub type Pool = PgPool;
+
 /// Determines the TLS mode to use for the database connection based on the DSN.
 ///
-/// The verification level is not differentiated — all `require`/`verify-ca`/
-/// `verify-full` (and the `+tls` schemes) map to the single `Tls` variant,
-/// for which rustls' defaults apply; `verify-ca`/`verify-full` are accepted
-/// for compatibility, not because they change the connection.
+/// All `require`/`verify-ca`/`verify-full` (and the `+tls` schemes) map to the
+/// single `Tls` variant, which enforces chain validation against the native
+/// root store (sqlx's `SslMode::VerifyCa`) — the same effective level as the
+/// old tokio-postgres-rustls integration (certificate chain verified, hostname
+/// NOT verified). `verify-full` is accepted for compatibility but does not
+/// enable hostname verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsMode {
     /// No TLS (plain connection)
     None,
-    /// TLS required (rustls defaults apply)
+    /// TLS required (native-root chain validation, no hostname check)
     Tls,
 }
 
@@ -69,33 +75,56 @@ pub fn tls_mode_from_dsn(dsn: &str) -> Result<TlsMode> {
     Ok(TlsMode::None)
 }
 
-/// Build a rustls `ClientConfig` loaded with native root certificates.
-fn build_rustls_config() -> Result<rustls::ClientConfig> {
-    let mut root_store = RootCertStore::empty();
-    let cert_result = rustls_native_certs::load_native_certs();
-    for cert in cert_result.certs {
-        if let Err(e) = root_store.add(cert) {
-            tracing::warn!("Failed to add native cert to root store: {e}");
-        }
-    }
-    if !cert_result.errors.is_empty() {
-        tracing::warn!(
-            "Some native certificates failed to load: {:?}",
-            cert_result.errors.len()
-        );
-    }
-
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    Ok(config)
+/// sqlx's `PgConnectOptions::from_str` rejects libpq-style `sslmode=off`
+/// (it accepts `disable|allow|prefer|require|verify-ca|verify-full`).
+/// `off` is a legacy alias for `disable` in libpq — rewrite it so DSNs that
+/// worked before the driver swap keep working.
+fn normalize_sslmode(dsn: &str) -> String {
+    let Some((head, query)) = dsn.split_once('?') else {
+        return dsn.to_string();
+    };
+    let rebuilt = query
+        .split('&')
+        .map(|pair| {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == "sslmode" && v.to_lowercase() == "off" {
+                    return "sslmode=disable".to_string();
+                }
+            }
+            pair.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{head}?{rebuilt}")
 }
 
-/// Create a Postgres connection pool from config, with automatic TLS negotiation
-/// based on the DATABASE_URL scheme and sslmode parameter.
-/// deadpool's `max_size(0)` means "unbounded" — clamp to at least 1 so a
-/// misconfigured `db_pool_size = 0` can never create an unbounded pool.
+/// Build a `PgConnectOptions` for the DSN with the validated TLS mode applied.
+///
+/// `from_str` already parses the URL's `sslmode` (after [`normalize_sslmode`]);
+/// we then pin the mode explicitly because sqlx's URL default is `prefer` and
+/// this codebase's no-`sslmode` behavior is a *plain* connection, not a TLS
+/// negotiation.
+///
+/// Native root certificates: with sqlx's `tls-rustls-ring-native-roots`
+/// feature, `SslMode::VerifyCa` loads the OS trust store via
+/// rustls-native-certs (pre-deadpool parity) and validates the server chain
+/// against it (no hostname check — same effective level as before the
+/// driver swap).
+fn connect_options(dsn: &str, tls_mode: TlsMode) -> Result<PgConnectOptions> {
+    let mut opts = PgConnectOptions::from_str(&normalize_sslmode(&driver_dsn(dsn))).map_err(
+        |e| Error::Internal(anyhow::anyhow!("db connect options: {e}")),
+    )?;
+    match tls_mode {
+        TlsMode::None => opts = opts.ssl_mode(PgSslMode::Disable),
+        TlsMode::Tls => opts = opts.ssl_mode(PgSslMode::VerifyCa),
+    }
+    Ok(opts)
+}
+
+/// Create a Postgres connection pool from config, with automatic TLS
+/// negotiation based on the DATABASE_URL scheme and sslmode parameter.
+/// `effective_pool_size` clamps the size to at least 1 so a misconfigured
+/// `db_pool_size = 0` can never create an unbounded pool.
 ///
 /// A hard ceiling (ARCH): without it, `DB_POOL_SIZE=999999` would open that
 /// many connections and exhaust Postgres's `max_connections` (default 100).
@@ -104,8 +133,8 @@ fn build_rustls_config() -> Result<rustls::ClientConfig> {
 /// `max_connections` deliberately.
 const POOL_SIZE_CEILING: u32 = 100;
 
-pub fn effective_pool_size(raw: u32) -> usize {
-    raw.clamp(1, POOL_SIZE_CEILING) as usize
+pub fn effective_pool_size(raw: u32) -> u32 {
+    raw.clamp(1, POOL_SIZE_CEILING)
 }
 
 /// tokio-postgres' `Config::from_str` only accepts `postgres://` /
@@ -121,34 +150,17 @@ pub fn driver_dsn(raw: &str) -> String {
     }
 }
 
-/// Shared builder chain for both TLS modes so the timeout/runtime settings
-/// can't drift between them.
-fn build_pool<T>(dp_cfg: DpConfig, conn: T, size: usize) -> Result<Pool>
-where
-    T: MakeTlsConnect<Socket> + Clone + Sync + Send + 'static,
-    T::Stream: Sync + Send,
-    T::TlsConnect: Sync + Send,
-    <T::TlsConnect as TlsConnect<Socket>>::Future: Send,
-{
-    dp_cfg
-        .builder(conn)
-        .map_err(|e| Error::Internal(anyhow::anyhow!("db pool config: {e}")))?
-        .max_size(size)
-        // Fast 503 under pool exhaustion instead of deadpool's 30 s default.
-        .wait_timeout(Some(Duration::from_secs(10)))
-        // deadpool >=0.12 requires a runtime handle when any timeout is
-        // configured, or `build()` fails with `NoRuntimeSpecified`.
-        .runtime(Runtime::Tokio1)
-        .build()
-        .map_err(|e| Error::Internal(anyhow::anyhow!("db pool: {e}")))
-}
+// Shared builder chain for both TLS modes so the timeout/runtime settings
+// can't drift between them.
+// (folded into `connect_options` — the options are built once and shared
+// between `create_pool` and `connect_dedicated`)
 
 pub async fn create_pool(config: &Config) -> Result<Pool> {
     let tls_mode = tls_mode_from_dsn(&config.database_url)?;
 
-    // WI-6: warn when the operator asked for verification but we can only
-    // enforce encryption (require). The tokio-postgres-rustls integration does
-    // not differentiate between verify-ca and verify-full.
+    // WI-6: warn when the operator asked for verification we can't fully
+    // enforce: hostname verification (verify-full) is never performed, and
+    // `require` now additionally gets chain validation (verify-ca level).
     if matches!(tls_mode, TlsMode::Tls) {
         let query = config
             .database_url
@@ -161,33 +173,26 @@ pub async fn create_pool(config: &Config) -> Result<Pool> {
                     && matches!(value.to_lowercase().as_str(), "verify-ca" | "verify-full")
                 {
                     tracing::warn!(
-                        "DATABASE_URL specifies sslmode={value} but only encryption (require) is enforced — \
-                         certificate and hostname are NOT verified. This is a limitation of the \
-                         tokio-postgres-rustls integration."
+                        "DATABASE_URL specifies sslmode={value} but only verify-ca is enforced — \
+                         the certificate chain is validated against the native root store, \
+                         but the hostname is NOT verified. This is a limitation of the \
+                         sqlx-rustls integration."
                     );
                 }
             }
         }
     }
 
-    let mut dp_cfg = DpConfig::new();
-    dp_cfg.url = Some(driver_dsn(&config.database_url));
+    let opts = connect_options(&config.database_url, tls_mode)?;
 
-    let pool = match tls_mode {
-        TlsMode::None => build_pool(dp_cfg, NoTls, effective_pool_size(config.db_pool_size))?,
-        TlsMode::Tls => build_pool(
-            dp_cfg,
-            MakeRustlsConnect::new(build_rustls_config()?),
-            effective_pool_size(config.db_pool_size),
-        )?,
-    };
-
-    // Verify connection
-    let _conn = pool
-        .get()
+    let pool = PgPoolOptions::new()
+        .max_connections(effective_pool_size(config.db_pool_size))
+        .min_connections(1)
+        // Fast 503 under pool exhaustion instead of deadpool's 30 s default.
+        .acquire_timeout(Duration::from_secs(10))
+        .connect_with(opts)
         .await
-        .map_err(|e| Error::Internal(anyhow::anyhow!("db connect: {e}")))?;
-    drop(_conn);
+        .map_err(Error::Database)?;
 
     tracing::info!("Database pool created (tls_mode={tls_mode:?})");
 
@@ -195,41 +200,18 @@ pub async fn create_pool(config: &Config) -> Result<Pool> {
 }
 
 /// Open a dedicated, non-pooled connection that honors the same TLS mode as
-/// the pool, with the I/O driver already spawned (detached). Returns the
-/// `Client` and the spawned driver's `JoinHandle`.
+/// the pool.
 ///
 /// Used for the single-instance advisory lock (S1): a pooled connection may be
-/// recycled by deadpool, silently releasing the lock, so a dedicated connection
-/// is held for the guard's lifetime. The caller MUST keep the `JoinHandle`
-/// alive — dropping the `Connection` future closes the socket and releases any
-/// advisory lock held on it; abort the handle to close the connection and
-/// release the lock.
-pub async fn connect_dedicated(
-    database_url: &str,
-) -> Result<(
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<std::result::Result<(), tokio_postgres::Error>>,
-)> {
+/// recycled by the pool, silently releasing the lock, so a dedicated
+/// connection is held for the guard's lifetime. Dropping the returned
+/// connection closes the socket and releases any advisory lock held on it —
+/// the caller controls that via the `InstanceLock` guard.
+pub async fn connect_dedicated(database_url: &str) -> Result<PgConnection> {
     let tls_mode = tls_mode_from_dsn(database_url)?;
-    let dsn = driver_dsn(database_url);
-    let map_err =
-        |e: tokio_postgres::Error| Error::Internal(anyhow::anyhow!("dedicated db connect: {e}"));
-    let (client, task) = match tls_mode {
-        TlsMode::None => {
-            let (c, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-                .await
-                .map_err(&map_err)?;
-            (c, tokio::spawn(conn))
-        }
-        TlsMode::Tls => {
-            let (c, conn) =
-                tokio_postgres::connect(&dsn, MakeRustlsConnect::new(build_rustls_config()?))
-                    .await
-                    .map_err(&map_err)?;
-            (c, tokio::spawn(conn))
-        }
-    };
-    Ok((client, task))
+    let opts = connect_options(database_url, tls_mode)?;
+    let conn = opts.connect().await.map_err(Error::Database)?;
+    Ok(conn)
 }
 
 #[cfg(test)]
@@ -245,47 +227,32 @@ mod tests {
         assert_eq!(effective_pool_size(100), 100);
         // A huge (or misconfigured) value is capped at the ceiling, not passed
         // through — it must never open more connections than Postgres allows.
-        assert_eq!(
-            effective_pool_size(POOL_SIZE_CEILING + 1),
-            POOL_SIZE_CEILING as usize,
-        );
-        assert_eq!(effective_pool_size(u32::MAX), POOL_SIZE_CEILING as usize);
+        assert_eq!(effective_pool_size(POOL_SIZE_CEILING + 1), POOL_SIZE_CEILING);
+        assert_eq!(effective_pool_size(u32::MAX), POOL_SIZE_CEILING);
     }
 
-    /// deadpool >= 0.12 requires a `Runtime` handle whenever any pool timeout is
-    /// configured, or `build()` fails with `NoRuntimeSpecified` — which made the
-    /// real binary (whose `create_pool` sets `wait_timeout`) unstartable. `build()`
-    /// is lazy (no connection), so this is verifiable without a live database.
+    // Pool construction is now async and connection-backed, so the old
+    // deadpool `build()` regression test no longer applies; the 10 s acquire
+    // timeout is covered by the DB-gated tests.
+
     #[test]
-    fn pool_builds_with_wait_timeout_only_when_runtime_set() {
-        let cfg = || {
-            let mut c = DpConfig::new();
-            // Unreachable URL is fine: `build()` never connects.
-            c.url = Some("postgres://u:p@127.0.0.1:1/db".into());
-            c
-        };
-        // Regression: `wait_timeout` WITHOUT a runtime must NOT build.
-        let no_runtime = cfg()
-            .builder(NoTls)
-            .unwrap()
-            .max_size(1)
-            .wait_timeout(Some(Duration::from_secs(10)))
-            .build();
-        assert!(
-            no_runtime.is_err(),
-            "wait_timeout without a runtime must fail to build (deadpool >=0.12)"
+    fn normalize_sslmode_off_to_disable() {
+        assert_eq!(
+            normalize_sslmode("postgres://u:p@h/db?sslmode=off"),
+            "postgres://u:p@h/db?sslmode=disable"
         );
-        // The fix: adding the runtime handle makes the same builder build OK.
-        let with_runtime = cfg()
-            .builder(NoTls)
-            .unwrap()
-            .max_size(1)
-            .wait_timeout(Some(Duration::from_secs(10)))
-            .runtime(Runtime::Tokio1)
-            .build();
-        assert!(
-            with_runtime.is_ok(),
-            "wait_timeout + runtime must build: {with_runtime:?}"
+        assert_eq!(
+            normalize_sslmode("postgres://u:p@h/db?a=1&sslmode=OFF&b=2"),
+            "postgres://u:p@h/db?a=1&sslmode=disable&b=2"
+        );
+        // Non-off modes and no-sslmode DSNs pass through untouched.
+        assert_eq!(
+            normalize_sslmode("postgres://u:p@h/db?sslmode=require"),
+            "postgres://u:p@h/db?sslmode=require"
+        );
+        assert_eq!(
+            normalize_sslmode("postgres://u:p@h/db"),
+            "postgres://u:p@h/db"
         );
     }
 

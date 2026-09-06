@@ -28,12 +28,9 @@ async fn raw_content_range_206() {
     const PATH: &str = "main.html";
 
     // Start from a clean slate for the fixture's zims row (resync will upsert it).
-    {
-        let c = pool.get().await.unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
-            .await
-            .unwrap();
-    }
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+        .await
+        .unwrap();
 
     let zims = ZimManager::new(std::path::PathBuf::from(FIXTURES_DIR), pool.clone());
     zims.resync().await.expect("resync");
@@ -205,8 +202,7 @@ async fn raw_content_range_206() {
     );
 
     // Cleanup: drop the fixture's zims row so the harness stays idempotent.
-    let c = pool.get().await.unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
 }
@@ -225,8 +221,7 @@ async fn read_raw_entry_not_modified_before_entry_lookup() {
     const ZIM: &str = "tiny";
     const PATH: &str = "main.html";
 
-    let c = pool.get().await.unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
     let zims = ZimManager::new(std::path::PathBuf::from(FIXTURES_DIR), pool.clone());
@@ -276,8 +271,7 @@ async fn read_raw_entry_not_modified_before_entry_lookup() {
         "matching If-None-Match revalidates to 304 before the entry lookup"
     );
 
-    let c = pool.get().await.unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
 }
@@ -297,12 +291,9 @@ async fn raw_content_etag_304() {
     const PATH: &str = "main.html";
 
     // Start from a clean slate for the fixture's zims row (resync will upsert it).
-    {
-        let c = pool.get().await.unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
-            .await
-            .unwrap();
-    }
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+        .await
+        .unwrap();
 
     let zims = ZimManager::new(std::path::PathBuf::from(FIXTURES_DIR), pool.clone());
     zims.resync().await.expect("resync");
@@ -404,8 +395,7 @@ async fn raw_content_etag_304() {
     );
 
     // Cleanup: drop the fixture's zims row so the harness stays idempotent.
-    let c = pool.get().await.unwrap();
-    c.execute("DELETE FROM zims WHERE name = $1", &[&ZIM])
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
         .await
         .unwrap();
 }

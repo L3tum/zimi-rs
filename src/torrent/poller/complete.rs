@@ -232,16 +232,15 @@ mod tests {
         let content_file = content_dir.join("utiny.zim");
         std::fs::copy("tests/fixtures/tiny.zim", &content_file).unwrap();
 
-        let c = pool.get().await.expect("conn");
-        let id: i32 = c
-            .query_one(
-                "INSERT INTO downloads (name, url, status)
-                     VALUES ('utiny', 'magnet:?xt=urn:btih:it', 'downloading') RETURNING id",
-                &[],
-            )
-            .await
-            .expect("insert downloading row")
-            .get(0);
+        let id: i32 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "INSERT INTO downloads (name, url, status)
+                 VALUES ('utiny', 'magnet:?xt=urn:btih:it', 'downloading') RETURNING id",
+            |q| q,
+        )
+        .await
+        .expect("insert downloading row")
+        .unwrap();
 
         let t = TorrentInfo {
             hash: "it".into(),
@@ -265,21 +264,30 @@ mod tests {
             .await
             .expect("handle_complete");
 
-        let status: String = c
-            .query_one("SELECT status FROM downloads WHERE id = $1", &[&id])
-            .await
-            .expect("read row")
-            .get(0);
-        let file_path: Option<String> = c
-            .query_one("SELECT file_path FROM downloads WHERE id = $1", &[&id])
-            .await
-            .expect("read row")
-            .get(0);
-        let ratio: Option<f32> = c
-            .query_one("SELECT ratio FROM downloads WHERE id = $1", &[&id])
-            .await
-            .expect("read row")
-            .get(0);
+        let status: String = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT status FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .expect("read row")
+        .unwrap();
+        let file_path: Option<String> = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT file_path FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .expect("read row")
+        .flatten();
+        let ratio: Option<f32> = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT ratio FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .expect("read row")
+        .flatten();
         assert_eq!(status, "complete");
         assert_eq!(
             ratio, None,
@@ -294,12 +302,16 @@ mod tests {
         );
 
         // Cleanup (shared single-DB suite; articles cascade off zims).
-        c.execute("DELETE FROM downloads WHERE id = $1", &[&id])
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
             .await
             .unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&"utiny"])
-            .await
-            .unwrap();
+        crate::db::raw::execute(
+            &pool,
+            "DELETE FROM zims WHERE name = $1",
+            |q| q.bind("utiny"),
+        )
+        .await
+        .unwrap();
     }
 
     /// CI-DB (BUG-20): `handle_complete` is idempotent when the claimed
@@ -337,16 +349,15 @@ mod tests {
         let installed = zims.zim_dir.join("utiny.zim");
         std::fs::copy("tests/fixtures/tiny.zim", &installed).expect("pre-place utiny.zim");
 
-        let c = pool.get().await.expect("conn");
-        let id: i32 = c
-            .query_one(
-                "INSERT INTO downloads (name, url, status, file_path) \
-                     VALUES ('utiny', 'magnet:?xt=urn:btih:it', 'downloading', $1) RETURNING id",
-                &[&installed.display().to_string()],
-            )
-            .await
-            .expect("insert downloading row with claimed file_path")
-            .get(0);
+        let id: i32 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "INSERT INTO downloads (name, url, status, file_path) \
+                 VALUES ('utiny', 'magnet:?xt=urn:btih:it', 'downloading', $1) RETURNING id",
+            |q| q.bind(installed.display().to_string()),
+        )
+        .await
+        .expect("insert downloading row with claimed file_path")
+        .unwrap();
 
         // The torrent content (a valid utiny.zim) — only reachable if the
         // skip regresses, which the inode assertion then fails on.
@@ -402,24 +413,28 @@ mod tests {
             "second call must be a no-op: no rename (inode/mtime/size unchanged)"
         );
 
-        let row = c
-            .query_one(
+        let (status, file_path) =
+            crate::db::raw::fetch_optional::<(String, Option<String>), _, _>(
+                &pool,
                 "SELECT status, file_path FROM downloads WHERE id = $1",
-                &[&id],
+                |q| q.bind(id),
             )
             .await
-            .expect("read row");
-        let status: String = row.get(0);
-        let file_path: Option<String> = row.get(1);
+            .expect("read row")
+            .expect("row must exist");
         assert_eq!(status, "complete");
         assert_eq!(file_path, Some(installed.display().to_string()));
 
         // Cleanup (shared single-DB suite; articles cascade off zims).
-        c.execute("DELETE FROM downloads WHERE id = $1", &[&id])
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
             .await
             .unwrap();
-        c.execute("DELETE FROM zims WHERE name = $1", &[&"utiny"])
-            .await
-            .unwrap();
+        crate::db::raw::execute(
+            &pool,
+            "DELETE FROM zims WHERE name = $1",
+            |q| q.bind("utiny"),
+        )
+        .await
+        .unwrap();
     }
 }

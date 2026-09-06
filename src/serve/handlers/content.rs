@@ -551,30 +551,26 @@ pub async fn get_snippet(
     State(state): State<AppState>,
     Query(params): Query<SnippetQuery>,
 ) -> Result<Json<SnippetResponse>, crate::error::Error> {
-    let client = state.db.get().await.map_err(crate::error::Error::Pool)?;
-    let row = client
-        .query_opt(
-            "SELECT a.snippet, a.title, a.content_preview FROM articles a
-             JOIN zims z ON z.id = a.zim_id
-             WHERE z.name = $1 AND a.path = $2",
-            &[&params.zim, &params.path],
-        )
-        .await
-        .map_err(crate::error::Error::Database)?;
+    // Raw escape hatch (db::raw): cross-table join — the entities define no
+    // SeaORM relations (every entity's `Relation` is empty), so cross-table
+    // reads stay raw (same convention as `crate::db`); tuple shape unchanged.
+    let row = crate::db::raw::fetch_optional::<(String, String, Option<String>), _, _>(
+        &state.db,
+        "SELECT a.snippet, a.title, a.content_preview FROM articles a
+         JOIN zims z ON z.id = a.zim_id
+         WHERE z.name = $1 AND a.path = $2",
+        |q| q.bind(&params.zim).bind(&params.path),
+    )
+    .await?;
 
     match row {
-        Some(r) => {
-            let snippet: String = r.get(0);
-            let title: String = r.get(1);
-            let preview: Option<String> = r.get(2);
-            Ok(Json(SnippetResponse {
-                zim: params.zim,
-                path: params.path,
-                title,
-                snippet,
-                preview,
-            }))
-        }
+        Some((snippet, title, preview)) => Ok(Json(SnippetResponse {
+            zim: params.zim,
+            path: params.path,
+            title,
+            snippet,
+            preview,
+        })),
         None => Err(crate::error::Error::NotFound(format!(
             "article '{}' / '{}' not indexed",
             params.zim, params.path

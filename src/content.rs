@@ -172,19 +172,16 @@ pub(crate) async fn read_article_payload(
             raw_capped,
         ),
         Err(zim_err) => {
-            let db_row: Option<(String, Option<String>)> = {
-                let client = state.db.get().await.map_err(crate::error::Error::Pool)?;
-                client
-                    .query_opt(
-                        "SELECT a.title, a.content_preview FROM articles a
-                         JOIN zims z ON z.id = a.zim_id
-                         WHERE z.name = $1 AND a.path = $2",
-                        &[&zim_name, &path],
-                    )
-                    .await
-                    .map_err(crate::error::Error::Database)?
-                    .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
-            };
+            let db_row: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT a.title, a.content_preview FROM articles a
+                 JOIN zims z ON z.id = a.zim_id
+                 WHERE z.name = $1 AND a.path = $2",
+            )
+            .bind(zim_name)
+            .bind(path)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(crate::error::Error::Database)?;
             match db_row {
                 Some((db_title, Some(preview))) => (preview, "db".to_string(), db_title, false),
                 _ => return Err(zim_err),

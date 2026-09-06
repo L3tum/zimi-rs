@@ -9,7 +9,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::db::entities::articles::{Column as ArticleColumn, Entity as ArticleEntity};
+use crate::db::entities::zims::{Column as ZimColumn, Entity as ZimEntity};
 use crate::db::pool::Pool;
+use crate::db::{raw, sea_orm_db};
 use crate::error::{Error, Result};
 use crate::settings::{
     SettingsCache, EMBED_DEFAULT_DIMENSION, EMBED_DEFAULT_HNSW_THRESHOLD,
@@ -18,6 +21,9 @@ use crate::settings::{
     KEY_EMBEDDING_HNSW_THRESHOLD, KEY_EMBEDDING_IVFFLAT_THRESHOLD, KEY_EMBEDDING_MAX_CONCURRENCY,
     KEY_EMBEDDING_MODEL, KEY_EMBEDDING_TIMEOUT_SECS,
 };
+
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect};
 
 /// Minimum number of embedded vectors before `run_pipeline` attempts a
 /// vector-index build on completion (H2). Kept at 1 to preserve the original
@@ -176,30 +182,28 @@ pub fn format_vector(v: &[f32]) -> String {
 /// data belongs to a different model and would be silently destroyed, so we
 /// warn instead.
 pub async fn ensure_vector_dimension(pool: &Pool, dimension: u32) -> Result<()> {
-    let pg = pool.get().await.map_err(Error::Pool)?;
-    let row = pg
-        .query_one(
-            "SELECT atttypmod FROM pg_attribute
-             WHERE attrelid = 'articles'::regclass AND attname = 'embedding'",
-            &[],
-        )
-        .await
-        .map_err(Error::Database)?;
-    let typmod: i32 = row.get(0);
+    // Raw escape hatch (db::raw): pg_catalog probe — the SeaORM builder only
+    // sees application tables, not the catalog.
+    let typmod: i32 = raw::fetch_scalar_optional(
+        pool,
+        "SELECT atttypmod FROM pg_attribute
+         WHERE attrelid = 'articles'::regclass AND attname = 'embedding'",
+        |q| q,
+    )
+    .await?
+    .ok_or_else(|| Error::NotFound("articles.embedding column not found".into()))?;
     // pgvector stores the dimension as typmod - VARHDRSZ (4).
     let current = typmod.saturating_sub(4) as u32;
     if current == dimension {
         return Ok(());
     }
 
-    let stored: i64 = pg
-        .query_one(
-            "SELECT COUNT(*) FROM articles WHERE embedding IS NOT NULL",
-            &[],
-        )
+    let db = sea_orm_db(pool);
+    let stored: u64 = ArticleEntity::find()
+        .filter(ArticleColumn::Embedding.is_not_null())
+        .count(&db)
         .await
-        .map_err(Error::Database)?
-        .get(0);
+        .map_err(Error::from)?;
 
     if stored > 0 {
         tracing::warn!(
@@ -210,30 +214,33 @@ pub async fn ensure_vector_dimension(pool: &Pool, dimension: u32) -> Result<()> 
     }
 
     tracing::info!("altering articles.embedding from vector({current}) to vector({dimension})");
+    // Raw escape hatch: column-type DDL (`ALTER TABLE … TYPE vector(N)`) is
+    // not expressible in the SeaORM builder.
     let sql = format!("ALTER TABLE articles ALTER COLUMN embedding TYPE vector({dimension})");
-    pg.batch_execute(&sql).await.map_err(Error::Database)?;
+    raw::execute(pool, &sql, |q| q).await?;
     Ok(())
 }
 
 /// List ZIMs that are indexed, embed-enabled, and have at least one article
 /// without an embedding yet. Used by the background auto-embed loop.
 pub async fn list_embeddable_zims(pool: &Pool) -> Result<Vec<String>> {
-    let pg = pool.get().await.map_err(Error::Pool)?;
-    let rows = pg
-        .query(
-            "SELECT z.name FROM zims z
-             WHERE z.embed_enabled = TRUE
-               AND z.index_status = 'ready'
-               AND EXISTS (
-                   SELECT 1 FROM articles a
-                   WHERE a.zim_id = z.id AND a.embedding IS NULL
-               )
-             ORDER BY z.name",
-            &[],
-        )
+    let db = sea_orm_db(pool);
+    // The `EXISTS` subquery is `Expr::cust`: sea-query 0.32 has no subquery
+    // expression, so the parameter-free fragment stays raw inside the
+    // builder (table/alias names match the old SQL).
+    ZimEntity::find()
+        .select_only()
+        .column(ZimColumn::Name)
+        .filter(ZimColumn::EmbedEnabled.eq(true))
+        .filter(ZimColumn::IndexStatus.eq("ready"))
+        .filter(Expr::cust(
+            "EXISTS (SELECT 1 FROM articles a WHERE a.zim_id = zims.id AND a.embedding IS NULL)",
+        ))
+        .order_by(ZimColumn::Name, Order::Asc)
+        .into_tuple()
+        .all(&db)
         .await
-        .map_err(Error::Database)?;
-    Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+        .map_err(Error::from)
 }
 
 /// Background task: periodically embed any indexed articles that lack
@@ -478,9 +485,15 @@ pub async fn run_pipeline(pool: Pool, settings: SettingsCache, zim_name: &str) -
         // whose writer crashed is retried once older than the staleness
         // window; successfully embedded rows have embedding IS NOT NULL and
         // are never re-claimed.
-        let mut rows = {
-            let pg = pool.get().await.map_err(Error::Pool)?;
-            pg.query(
+        //
+        // Raw escape hatch (db::raw): `UPDATE … WHERE id IN (SELECT … LIMIT)
+        // RETURNING <computed expr>` is not expressible in the SeaORM
+        // builder (sea-query 0.32 has no subquery expressions, and the
+        // RETURNING column is a `coalesce(…) || …` expression, not a model
+        // column).
+        let mut rows: Vec<(i64, String)> = {
+            raw::fetch_all(
+                &pool,
                 "UPDATE articles SET embed_at = now() \
                  WHERE id IN (SELECT id FROM articles \
                      WHERE zim_id = (SELECT id FROM zims WHERE name = $1) \
@@ -488,10 +501,9 @@ pub async fn run_pipeline(pool: Pool, settings: SettingsCache, zim_name: &str) -
                        AND (embed_at IS NULL OR embed_at < now() - interval '10 minutes') \
                      LIMIT $2) \
                  RETURNING id, coalesce(snippet, '') || ' ' || coalesce(left(content_preview, 500), '')",
-                &[&zim_name, &batch_size],
+                |q| q.bind(zim_name).bind(batch_size),
             )
-            .await
-            .map_err(Error::Database)?
+            .await?
         };
 
         if rows.is_empty() {
@@ -503,7 +515,7 @@ pub async fn run_pipeline(pool: Pool, settings: SettingsCache, zim_name: &str) -
         // being re-claimed forever. If every claimed row is poison there is
         // nothing left to embed — drop the permit and stop.
         {
-            let claimed: Vec<i64> = rows.iter().map(|r| r.get::<_, i64>(0)).collect();
+            let claimed: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
             let kept = match filter_poisoned_ids(&claimed) {
                 Some(k) => k,
                 None => {
@@ -512,11 +524,11 @@ pub async fn run_pipeline(pool: Pool, settings: SettingsCache, zim_name: &str) -
                 }
             };
             let kept_set: std::collections::HashSet<i64> = kept.iter().copied().collect();
-            rows.retain(|r| kept_set.contains(&r.get::<_, i64>(0)));
+            rows.retain(|(id, _)| kept_set.contains(id));
         }
 
-        let ids: Vec<i64> = rows.iter().map(|r| r.get::<_, i64>(0)).collect();
-        let texts: Vec<String> = rows.iter().map(|r| r.get::<_, String>(1)).collect();
+        let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+        let texts: Vec<String> = rows.iter().map(|(_, t)| t.clone()).collect();
 
         // In-flight work = HTTP embed + bulk UPDATE, held under the permit
         // (released when the task ends).
@@ -547,6 +559,9 @@ pub async fn run_pipeline(pool: Pool, settings: SettingsCache, zim_name: &str) -
             }
 
             // Store in Postgres — one bulk UPDATE per batch.
+            // Raw escape hatch (db::raw): the bulk `UPDATE … FROM (VALUES …)`
+            // form is not expressible in the SeaORM builder; `v.vec` binds as
+            // text and is cast to `vector` exactly as before.
             let n = ids.len();
             let vec_strs: Vec<String> = embeddings.iter().map(|e| format_vector(e)).collect();
             let values: Vec<String> = (0..n)
@@ -558,15 +573,14 @@ pub async fn run_pipeline(pool: Pool, settings: SettingsCache, zim_name: &str) -
                  FROM (VALUES {}) AS v(id, vec) WHERE a.id = v.id",
                 values.join(", ")
             );
-            let refs: Vec<&(dyn postgres_types::ToSql + Sync)> = vec_strs
-                .iter()
-                .map(|s| s as &(dyn postgres_types::ToSql + Sync))
-                .chain(std::iter::once(
-                    &m as &(dyn postgres_types::ToSql + Sync),
-                ))
-                .collect();
-            let pg = p.get().await.map_err(Error::Pool)?;
-            match pg.execute(&sql, &refs).await.map_err(Error::Database) {
+            match raw::execute(&p, &sql, |q| {
+                let mut q = q;
+                for s in &vec_strs {
+                    q = q.bind(s);
+                }
+                q.bind(&m)
+            })
+            .await {
                 Ok(_) => {
                     // W6.5: success — clear these rows' poison counters.
                     record_batch_success(&ids);
@@ -620,25 +634,23 @@ pub async fn run_pipeline(pool: Pool, settings: SettingsCache, zim_name: &str) -
 /// `maybe_build_vector_index` / migration 010) still satisfies the shape-
 /// agnostic existence check (H2).
 pub async fn vector_index_state(pool: &Pool) -> Result<(i64, bool)> {
-    let pg = pool.get().await.map_err(Error::Pool)?;
-    let count: i64 = pg
-        .query_one(
-            "SELECT COUNT(*) FROM articles WHERE embedding IS NOT NULL",
-            &[],
-        )
+    let db = sea_orm_db(pool);
+    let count: u64 = ArticleEntity::find()
+        .filter(ArticleColumn::Embedding.is_not_null())
+        .count(&db)
         .await
-        .map_err(Error::Database)?
-        .get(0);
-    let exists: bool = pg
-        .query_one(
-            "SELECT COUNT(*) > 0 FROM pg_indexes i JOIN pg_index pi ON i.indexrelid = pi.indexrelid \
-             WHERE i.indexname = 'idx_articles_embedding' AND pi.indisvalid",
-            &[],
-        )
-        .await
-        .map_err(Error::Database)?
-        .get(0);
-    Ok((count, exists))
+        .map_err(Error::from)?;
+    // Raw escape hatch: pg_catalog index probe (the builder only sees
+    // application tables). `COUNT(*)` always returns a row.
+    let exists: bool = raw::fetch_scalar_optional(
+        pool,
+        "SELECT COUNT(*) > 0 FROM pg_indexes i JOIN pg_index pi ON i.indexrelid = pi.indexrelid \
+         WHERE i.indexname = 'idx_articles_embedding' AND pi.indisvalid",
+        |q| q,
+    )
+    .await?
+    .unwrap_or(false);
+    Ok((count as i64, exists))
 }
 
 /// Cheap O(1) pre-filter for the auto-embed vector-index build gate: returns
@@ -667,34 +679,32 @@ pub async fn vector_index_state(pool: &Pool) -> Result<(i64, bool)> {
 /// stale-low tick can never block or mis-size a build. On any probe error the
 /// filter fails closed (skip the count); the loop retries next tick.
 async fn index_build_worth_probing(pool: &Pool) -> bool {
-    let pg = match pool.get().await {
-        Ok(pg) => pg,
-        Err(_) => return false,
-    };
     // (1) A valid index already exists → nothing to build, skip the count.
-    let exists: bool = pg
-        .query_one(
-            "SELECT COUNT(*) > 0 FROM pg_indexes i JOIN pg_index pi ON i.indexrelid = pi.indexrelid \
-             WHERE i.indexname = 'idx_articles_embedding' AND pi.indisvalid",
-            &[],
-        )
-        .await
-        .ok()
-        .map(|r| r.get::<_, bool>(0))
-        .unwrap_or(true);
+    // Raw escape hatch: pg_catalog probe; on any probe error the filter
+    // fails closed (skip the count), as before.
+    let exists: bool = raw::fetch_scalar_optional(
+        pool,
+        "SELECT COUNT(*) > 0 FROM pg_indexes i JOIN pg_index pi ON i.indexrelid = pi.indexrelid \
+         WHERE i.indexname = 'idx_articles_embedding' AND pi.indisvalid",
+        |q| q,
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(true);
     if exists {
         return false;
     }
     // (2) Whole table below the build threshold → embedded subset is too.
-    let live: i64 = pg
-        .query_one(
-            "SELECT COALESCE(n_live_tup, 0) FROM pg_stat_user_tables WHERE relname = 'articles'",
-            &[],
-        )
-        .await
-        .ok()
-        .map(|r| r.get::<_, i64>(0))
-        .unwrap_or(0);
+    let live: i64 = raw::fetch_scalar_optional(
+        pool,
+        "SELECT COALESCE(n_live_tup, 0) FROM pg_stat_user_tables WHERE relname = 'articles'",
+        |q| q,
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0);
     live >= MIN_INDEX_BUILD_ROWS
 }
 
@@ -741,15 +751,11 @@ pub async fn maybe_build_vector_index(
     tracing::info!("building vector index CONCURRENTLY for {count} vectors");
     // CONCURRENTLY must not run inside an explicit transaction; a fresh
     // pooled connection is in autocommit, so this is safe.
-    let pg = match pool.get().await {
-        Ok(pg) => pg,
-        Err(e) => {
-            tracing::warn!("pool get for index build failed: {e}");
-            return false;
-        }
-    };
-    match pg.batch_execute(&sql).await {
-        Ok(()) => true,
+    // Raw escape hatch: `CREATE INDEX CONCURRENTLY` is session-scoped DDL
+    // the SeaORM builder cannot express. Any failure (pool acquire or build
+    // error) is tolerated and logged, as before.
+    match raw::execute(pool, &sql, |q| q).await {
+        Ok(_) => true,
         Err(e) => {
             // Tolerated: a concurrent build may already be in progress, or
             // the index appeared between the check and the build.

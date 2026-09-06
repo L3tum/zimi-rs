@@ -395,14 +395,7 @@ mod tests {
     /// Build a `SettingsCache` backed by a pool that never connects (we only
     /// read in-memory defaults), seeded with the given rate-limit values.
     fn settings_with_limits(rps: u64, burst: u64) -> crate::settings::SettingsCache {
-        let mut dp_cfg = deadpool_postgres::Config::new();
-        dp_cfg.url = Some("postgres://zimservice:zimservice@127.0.0.1:59999/zimservice".into());
-        let pool = dp_cfg
-            .builder(tokio_postgres::NoTls)
-            .unwrap()
-            .max_size(1)
-            .build()
-            .unwrap();
+        let pool = crate::testing::dead_pool();
         let mut map = std::collections::HashMap::new();
         map.insert(
             KEY_ACCESS_RATE_LIMIT_RPS.to_string(),

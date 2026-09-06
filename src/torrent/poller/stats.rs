@@ -84,19 +84,23 @@ pub async fn apply_stats_batch(pool: &Pool, changed: &[StatsRow]) -> Result<()> 
          ) v\n\
          WHERE d.id = v.id";
 
-    let params: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![
-        &ids,
-        &progress,
-        &speed_bps,
-        &eta_secs,
-        &ratio,
-        &up_speed_bps,
-        &num_seeds,
-    ];
-    let c = pool.get().await.map_err(Error::Pool)?;
-    c.execute(STATS_SQL, &params)
-        .await
-        .map_err(Error::Database)?;
+    // Raw escape hatch (db::raw): the SeaORM query builder cannot express a
+    // single `UPDATE … FROM unnest(…)` batch — the typed array parameters
+    // bind as the same `$1::int[] … $7::bigint[]` placeholders as before.
+    crate::db::raw::execute(
+        pool,
+        STATS_SQL,
+        |q| {
+            q.bind(&ids)
+                .bind(&progress)
+                .bind(&speed_bps)
+                .bind(&eta_secs)
+                .bind(&ratio)
+                .bind(&up_speed_bps)
+                .bind(&num_seeds)
+        },
+    )
+    .await?;
     Ok(())
 }
 

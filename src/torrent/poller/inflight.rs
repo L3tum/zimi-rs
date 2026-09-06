@@ -3,6 +3,7 @@
 use crate::torrent::TorrentInfo;
 
 use super::*;
+use crate::db::entities::downloads::Model as DownloadRow;
 
 impl DownloadPoller {
     /// LINT-2 extraction (verbatim `tick()` step-3 block 2): the in-flight
@@ -17,27 +18,27 @@ impl DownloadPoller {
         qbit: Option<Arc<QbitClient>>,
         qb_available: bool,
         p: &crate::settings::PollerParams,
-        rows: Vec<Row>,
+        rows: Vec<DownloadRow>,
     ) -> Result<Vec<StatsRow>> {
         // In-progress rows whose stats changed enough to write this tick;
         // flushed after the loop as per-row UPDATEs (M-poller-n1).
         let mut changed: Vec<StatsRow> = Vec::new();
         for r in rows {
-            let id: i32 = r.get(0);
-            let name: String = r.get(1);
-            let url: String = r.get(2);
-            let hash: Option<String> = r.get(3);
-            let row_status: String = r.get(4);
-            let updated: chrono::DateTime<chrono::Utc> = r.get(5);
+            let id = r.id;
+            let name = r.name;
+            let url = r.url;
+            let hash = r.hash;
+            let row_status = r.status;
+            let updated = r.updated_at;
             // Previous stat values for the skip-no-change decision. Only the
             // three the decision reads are bound (the rest are selected for
             // parity). `ratio`/`num_seeds` are nullable columns → `Option`.
-            let old_progress: f32 = r.get(6);
-            let old_ratio: Option<f32> = r.get(9);
-            let old_num_seeds: Option<i64> = r.get(11);
+            let old_progress = r.progress;
+            let old_ratio = r.ratio;
+            let old_num_seeds = r.num_seeds;
             // BUG-20: the claimed install path — `handle_complete` skips
             // locate/verify/install when it already exists on disk.
-            let file_path: Option<String> = r.get(12);
+            let file_path = r.file_path;
 
             // Direct downloads manage their own rows via spawned tasks.
             if crate::torrent::is_direct_zim_url(&url) {

@@ -8,7 +8,7 @@ mod sql;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use tokio_postgres::Row;
+use sqlx::Executor;
 
 use crate::db::pool::Pool;
 use crate::embed::{format_vector, EmbedClient, EmbedConfig};
@@ -28,6 +28,11 @@ use self::sql::{
 pub(crate) fn trgm_arms_enabled(query: &str) -> bool {
     query.chars().count() >= 3
 }
+
+/// One search-branch row, in the fixed column order every branch SELECT
+/// emits (id, zim_id, path, title, snippet, content_preview, language,
+/// zim_name, score).
+type SearchRow = (i64, i32, String, String, String, Option<String>, String, String, f64);
 
 /// Merge the three suggest branches into the final list, preserving the old
 /// single-query `ORDER BY CASE WHEN prefix THEN 0 ELSE 1 END, similarity
@@ -135,10 +140,11 @@ impl SearchEngine {
                 }
             }
         }
-        // Slow path: probe the DB.
-        let ok = match self.pool.get().await {
-            Ok(client) => client
-                .query_one("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'", &[])
+        // Slow path: probe the DB. Raw SQL (catalog probe — `pg_extension`
+        // has no SeaORM entity; plain SELECT, no special operators).
+        let ok = match self.pool.acquire().await {
+            Ok(mut client) => sqlx::query("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
+                .fetch_optional(&mut *client)
                 .await
                 .is_ok(),
             Err(_) => false,
@@ -363,13 +369,13 @@ impl SearchEngine {
                 }
             },
             async {
-                let client = match self.pool.get().await {
+                let mut client = match self.pool.acquire().await {
                     Ok(c) => c,
                     Err(e) => return Err(e.into()),
                 };
                 // Q0: full-text search
                 let fts = if let Some(sq) = &fts_sq {
-                    run_sql_on(&client, sq, "FTS", &self.degradation, "fts").await
+                    run_sql_on(&mut *client, sq, "FTS", &self.degradation, "fts").await
                 } else {
                     Vec::new()
                 };
@@ -384,7 +390,7 @@ impl SearchEngine {
                 // Q1: prefix match — uses btree index on title_lower
                 let prefix = if let Some(sq) = sq_prefix.as_ref().filter(|_| trgm_ok) {
                     run_sql_on(
-                        &client,
+                        &mut *client,
                         sq,
                         "trgm prefix query",
                         &self.degradation,
@@ -397,7 +403,7 @@ impl SearchEngine {
                 // Q2: contains match — uses GIN trgm index
                 let contains = if let Some(sq) = sq_contains.as_ref().filter(|_| trgm_ok) {
                     run_sql_on(
-                        &client,
+                        &mut *client,
                         sq,
                         "trgm contains query",
                         &self.degradation,
@@ -410,7 +416,7 @@ impl SearchEngine {
                 // Q3: similarity threshold — uses GiST trgm index
                 let similarity = if let Some(sq) = sq_similarity.as_ref().filter(|_| trgm_ok) {
                     run_sql_on(
-                        &client,
+                        &mut *client,
                         sq,
                         "trgm similarity query",
                         &self.degradation,
@@ -435,13 +441,13 @@ impl SearchEngine {
         // ── Merge trgm branches: dedup by article id (first occurrence wins
         // — Q1 prefix matches are generally the most relevant). ──
         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        let mut trgm_results: Vec<Row> = Vec::new();
+        let mut trgm_results: Vec<SearchRow> = Vec::new();
         for row in prefix_rows
             .into_iter()
             .chain(contains_rows)
             .chain(similarity_rows)
         {
-            let id: i64 = row.get(0);
+            let id: i64 = row.0;
             if seen.insert(id) {
                 trgm_results.push(row);
             }
@@ -451,7 +457,7 @@ impl SearchEngine {
         // seek is fast, so it adds little to the concurrent phase above. A
         // failure degrades this branch only (no early return): FTS + trgm
         // results are always kept. ──
-        let vector_results: Vec<Row> = if let Some(vec_str) = query_vec {
+        let vector_results: Vec<SearchRow> = if let Some(vec_str) = query_vec {
             let filtered = zim_filter.is_some() || lang_filter.is_some();
             let sq = vector_sql(
                 &vec_str,
@@ -465,10 +471,10 @@ impl SearchEngine {
             // from the concurrent phase above was already returned to the pool
             // at the end of that arm. A pool-get failure degrades this branch
             // only (no early return), matching the embed-failure path above.
-            match self.pool.get().await {
-                Ok(client) => {
+            match self.pool.acquire().await {
+                Ok(mut client) => {
                     run_sql_on(
-                        &client,
+                        &mut *client,
                         &sq,
                         "vector search",
                         &self.degradation,
@@ -539,7 +545,7 @@ impl SearchEngine {
 
         // H3: one pooled connection for all three arms (sequential on the
         // single-in-flight client).
-        let client = match self.pool.get().await {
+        let mut client = match self.pool.acquire().await {
             Ok(c) => c,
             Err(e) => return Err(e.into()),
         };
@@ -549,7 +555,7 @@ impl SearchEngine {
         let trgm_ok = self.ensure_trgm().await;
         let r_prefix = if trgm_ok {
             run_sql_on(
-                &client,
+                &mut *client,
                 &sq_prefix,
                 "suggest prefix query",
                 &self.degradation,
@@ -562,7 +568,7 @@ impl SearchEngine {
         let r_contains = match &sq_contains {
             Some(sq) if trgm_ok => {
                 run_sql_on(
-                    &client,
+                    &mut *client,
                     sq,
                     "suggest contains query",
                     &self.degradation,
@@ -575,7 +581,7 @@ impl SearchEngine {
         let r_similarity = match &sq_similarity {
             Some(sq) if trgm_ok => {
                 run_sql_on(
-                    &client,
+                    &mut *client,
                     sq,
                     "suggest similarity query",
                     &self.degradation,
@@ -602,19 +608,26 @@ impl SearchEngine {
 /// without taking a second pool connection — one failed branch degrades to
 /// an empty contribution rather than failing the whole search. `pub` for the
 /// soft-fail integration test.
-pub async fn run_sql_on(
-    client: &tokio_postgres::Client,
+///
+/// The executor bound is a plain `Executor<'e>` (not HRTB `for<'c>`): the
+/// sqlx build in use only implements `Executor` for `&'e mut PgConnection` /
+/// `&'e Pool` for the specific borrow lifetime, so an HRTB bound cannot be
+/// satisfied by a pooled-connection deref (`&mut *conn`).
+pub async fn run_sql_on<'e, E>(
+    client: E,
     sq: &SqlQuery,
     what: &str,
     degradation: &crate::health::DegradationTracker,
     branch: &'static str,
-) -> Vec<Row> {
-    let refs: Vec<&(dyn postgres_types::ToSql + Sync)> = sq
-        .params
-        .iter()
-        .map(|p| p as &(dyn postgres_types::ToSql + Sync))
-        .collect();
-    match client.query(&sq.sql, &refs).await {
+) -> Vec<SearchRow>
+where
+    E: Executor<'e, Database = sqlx::Postgres>,
+{
+    let mut query = sqlx::query_as::<_, SearchRow>(&sq.sql);
+    for p in &sq.params {
+        query = query.bind(p);
+    }
+    match query.fetch_all(client).await {
         Ok(rows) => {
             // BUG-B3: record success even on zero rows — a branch that
             // *recovers* with a legitimately empty result set must clear
@@ -631,17 +644,17 @@ pub async fn run_sql_on(
     }
 }
 
-fn row_to_result(row: &Row) -> SearchResult {
+fn row_to_result(row: &SearchRow) -> SearchResult {
     SearchResult {
-        id: row.get::<_, i64>(0),
-        zim_id: row.get::<_, i32>(1),
-        path: row.get::<_, String>(2),
-        title: row.get::<_, String>(3),
-        snippet: row.get::<_, String>(4),
-        content_preview: row.get::<_, Option<String>>(5),
-        language: row.get::<_, String>(6),
-        zim_name: row.get::<_, String>(7),
-        score: row.get::<_, f64>(8),
+        id: row.0,
+        zim_id: row.1,
+        path: row.2.clone(),
+        title: row.3.clone(),
+        snippet: row.4.clone(),
+        content_preview: row.5.clone(),
+        language: row.6.clone(),
+        zim_name: row.7.clone(),
+        score: row.8,
     }
 }
 
@@ -709,15 +722,7 @@ mod tests {
     #[tokio::test]
     async fn search_reads_settings_from_one_snapshot() {
         use crate::settings::{default_settings, SettingsCache};
-        use deadpool_postgres::Config as DpConfig;
-        let mut dp_cfg = DpConfig::new();
-        dp_cfg.url = Some("postgres://u:p@127.0.0.1:1/nodb".into());
-        let pool = dp_cfg
-            .builder(tokio_postgres::NoTls)
-            .unwrap()
-            .max_size(1)
-            .build()
-            .unwrap();
+        let pool = crate::testing::dead_pool();
         let mut map = default_settings();
         map.insert(KEY_SEARCH_DEFAULT_LIMIT.into(), serde_json::json!(7));
         let settings =
@@ -751,15 +756,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_trgm_soft_fails_and_caches_on_dead_pool() {
         use crate::settings::{default_settings, SettingsCache};
-        use deadpool_postgres::Config as DpConfig;
-        let mut dp_cfg = DpConfig::new();
-        dp_cfg.url = Some("postgres://u:p@127.0.0.1:1/nodb".into());
-        let pool = dp_cfg
-            .builder(tokio_postgres::NoTls)
-            .unwrap()
-            .max_size(1)
-            .build()
-            .unwrap();
+        let pool = crate::testing::dead_pool();
         let settings = SettingsCache::new_with_map(
             pool.clone(),
             default_settings(),

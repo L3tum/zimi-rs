@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::SystemTime;
 
-use crate::db::pool::Pool;
+use crate::db::{entities::zims, pool::Pool, sea_orm_db, raw};
 use crate::error::{Error, Result};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
 /// Max simultaneously-open ZIM handles. Each open ZIM holds one mmap fd, so this
 /// bounds fd usage. Oldest (by insertion order) is evicted when the cap is hit.
@@ -148,37 +149,17 @@ pub(crate) fn etag_from_metadata(md: &std::fs::Metadata) -> Option<String> {
     Some(format!("\"{}-{}\"", mtime_ms, md.len()))
 }
 
-/// Column indices for the `load_from_db` SELECT, in SELECT column order.
-/// These MUST stay in sync with the SELECT column order in `load_from_db`.
-const COL_ID: usize = 0;
-const COL_NAME: usize = 1;
-const COL_DISPLAY_TITLE: usize = 2;
-const COL_DESCRIPTION: usize = 3;
-const COL_LANGUAGE: usize = 4;
-const COL_CREATOR: usize = 5;
-const COL_PUBLISHER: usize = 6;
-const COL_DATE: usize = 7;
-const COL_ENTRY_COUNT: usize = 8;
-const COL_ARTICLE_COUNT: usize = 9;
-const COL_FILE_PATH: usize = 10;
-const COL_FILE_SIZE: usize = 11;
-const COL_CATEGORY: usize = 12;
-const COL_INDEX_STATUS: usize = 13;
-const COL_INDEX_PROGRESS: usize = 14;
-const COL_INDEXED_ENTRIES: usize = 15;
-const COL_EMBED_ENABLED: usize = 16;
-
 /// Read a non-negative count column as `u64`; a negative (corrupt) value
 /// clamps to 0 rather than wrapping to a huge number.
-fn count_u64(row: &tokio_postgres::Row, col: usize) -> u64 {
-    u64::try_from(row.get::<_, i64>(col)).unwrap_or(0)
+fn count_u64(v: i64) -> u64 {
+    u64::try_from(v).unwrap_or(0)
 }
 
 impl ZimManager {
     /// Create a new ZimManager and scan for ZIM files.
     ///
     /// ```no_run
-    /// # async fn example(pool: deadpool_postgres::Pool) {
+    /// # async fn example(pool: sqlx::postgres::PgPool) {
     /// let mgr = zimservice::zim::ZimManager::new(
     ///     std::path::PathBuf::from("/tmp/zims"),
     ///     pool,
@@ -267,65 +248,71 @@ impl ZimManager {
     }
 
     /// Persist ZIM metadata to the database (upsert).
+    ///
+    /// Raw (not the SeaORM builder): the statement binds `meta.date` as a
+    /// loose `Option<String>` straight into the `DATE` column, keeps
+    /// `file_mtime = now()` / `updated_at = now()` server-side, and the
+    /// `ON CONFLICT (name) DO UPDATE` arm re-writes `date = $7` — an explicit
+    /// `NULL` overwrite the builder's `NotSet`-skips-columns semantics
+    /// can't express (and `col = now()` in the DO UPDATE arm needs raw SQL
+    /// anyway).
     async fn persist_to_db(&self, meta: &ZimMeta) -> Result<()> {
-        let client = self.db.get().await.map_err(crate::error::Error::Pool)?;
         let entry_count = meta.entry_count as i64;
         let article_count = meta.article_count as i64;
         let file_size = meta.file_size as i64;
         let indexed_entries = meta.indexed_entries as i64;
 
-        let row = client
-            .query_opt(
-                "INSERT INTO zims (
-                    name, display_title, description, language, creator, publisher, date,
-                    entry_count, article_count, file_path, file_size, category,
-                    index_status, index_progress, indexed_entries, embed_enabled, file_mtime
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now())
-                ON CONFLICT (name) DO UPDATE SET
-                    display_title = $2,
-                    description = $3,
-                    language = $4,
-                    creator = $5,
-                    publisher = $6,
-                    date = $7,
-                    entry_count = $8,
-                    article_count = $9,
-                    file_path = $10,
-                    file_size = $11,
-                    category = $12,
-                    index_status = $13,
-                    index_progress = $14,
-                    indexed_entries = $15,
-                    embed_enabled = $16,
-                    file_mtime = now(),
-                    updated_at = now()
-                RETURNING id",
-                &[
-                    &meta.name as &(dyn postgres_types::ToSql + Sync),
-                    &meta.display_title,
-                    &meta.description,
-                    &meta.language,
-                    &meta.creator,
-                    &meta.publisher,
-                    &meta.date,
-                    &entry_count,
-                    &article_count,
-                    &meta.file_path,
-                    &file_size,
-                    &meta.category,
-                    &meta.index_status,
-                    &meta.index_progress,
-                    &indexed_entries,
-                    &meta.embed_enabled,
-                ],
-            )
-            .await
-            .map_err(crate::error::Error::Database)?;
+        let id: Option<i32> = raw::fetch_scalar_optional(
+            &self.db,
+            "INSERT INTO zims (
+                name, display_title, description, language, creator, publisher, date,
+                entry_count, article_count, file_path, file_size, category,
+                index_status, index_progress, indexed_entries, embed_enabled, file_mtime
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now())
+            ON CONFLICT (name) DO UPDATE SET
+                display_title = $2,
+                description = $3,
+                language = $4,
+                creator = $5,
+                publisher = $6,
+                date = $7,
+                entry_count = $8,
+                article_count = $9,
+                file_path = $10,
+                file_size = $11,
+                category = $12,
+                index_status = $13,
+                index_progress = $14,
+                indexed_entries = $15,
+                embed_enabled = $16,
+                file_mtime = now(),
+                updated_at = now()
+            RETURNING id",
+            |q| {
+                q.bind(&meta.name)
+                    .bind(&meta.display_title)
+                    .bind(&meta.description)
+                    .bind(&meta.language)
+                    .bind(&meta.creator)
+                    .bind(&meta.publisher)
+                    .bind(&meta.date)
+                    .bind(entry_count)
+                    .bind(article_count)
+                    .bind(&meta.file_path)
+                    .bind(file_size)
+                    .bind(&meta.category)
+                    .bind(&meta.index_status)
+                    .bind(meta.index_progress)
+                    .bind(indexed_entries)
+                    .bind(meta.embed_enabled)
+            },
+        )
+        .await?;
 
         // Write the DB id back into the in-memory cache. New ZIMs (added via
         // resync at runtime) start with id=None; without this, id-based lookups
         // (collections, per-ZIM settings) silently miss for them.
-        if let Some(id) = row.map(|r| r.get::<_, i32>(0)) {
+        if let Some(id) = id {
             let mut cache = self.cache.write().expect("zim cache lock poisoned");
             if let Some(cached) = cache.get_mut(&meta.name) {
                 cached.id = Some(id);
@@ -444,39 +431,38 @@ impl ZimManager {
     /// cache entries; an optional `resync()` then reconciles against the
     /// actual files (see `populate_zims` in main.rs).
     pub async fn load_from_db(&self) -> Result<()> {
-        let client = self.db.get().await.map_err(crate::error::Error::Pool)?;
-        let rows = client
-            .query(
-                "SELECT id, name, display_title, description, language, creator, publisher,
-                        date::text, entry_count, article_count, file_path, file_size,
-                        category, index_status, index_progress, indexed_entries, embed_enabled
-                 FROM zims ORDER BY name",
-                &[],
-            )
+        // SeaORM entity select: `date` comes back as `Option<NaiveDate>`
+        // (the old `date::text` — `NaiveDate::to_string` is the identical
+        // `YYYY-MM-DD` text) and `index_progress` as `REAL`/`f32` (exact
+        // when widened to the `f64` ZimMeta carries).
+        let db = sea_orm_db(&self.db);
+        let models = zims::Entity::find()
+            .order_by_asc(zims::Column::Name)
+            .all(&db)
             .await
-            .map_err(crate::error::Error::Database)?;
+            .map_err(Error::SeaOrm)?;
 
         let mut cache = self.cache.write().expect("zim cache lock poisoned");
-        for row in &rows {
-            let name: String = row.get(COL_NAME);
+        for m in models {
+            let name = m.name;
             let meta = ZimMeta {
-                id: row.get(COL_ID),
+                id: Some(m.id),
                 name: name.clone(),
-                display_title: row.get(COL_DISPLAY_TITLE),
-                description: row.get(COL_DESCRIPTION),
-                language: row.get(COL_LANGUAGE),
-                creator: row.get(COL_CREATOR),
-                publisher: row.get(COL_PUBLISHER),
-                date: row.get(COL_DATE),
-                entry_count: count_u64(row, COL_ENTRY_COUNT),
-                article_count: count_u64(row, COL_ARTICLE_COUNT),
-                file_path: row.get(COL_FILE_PATH),
-                file_size: count_u64(row, COL_FILE_SIZE),
-                category: row.get(COL_CATEGORY),
-                index_status: row.get(COL_INDEX_STATUS),
-                index_progress: row.get(COL_INDEX_PROGRESS),
-                indexed_entries: count_u64(row, COL_INDEXED_ENTRIES),
-                embed_enabled: row.get(COL_EMBED_ENABLED),
+                display_title: m.display_title,
+                description: m.description,
+                language: m.language,
+                creator: m.creator,
+                publisher: m.publisher,
+                date: m.date.map(|d| d.to_string()),
+                entry_count: count_u64(m.entry_count),
+                article_count: count_u64(m.article_count),
+                file_path: m.file_path,
+                file_size: count_u64(m.file_size),
+                category: m.category,
+                index_status: m.index_status,
+                index_progress: m.index_progress as f64,
+                indexed_entries: count_u64(m.indexed_entries),
+                embed_enabled: m.embed_enabled,
             };
             cache.insert(name, meta);
         }
@@ -628,11 +614,12 @@ impl ZimManager {
                 .write()
                 .expect("open-handles lock poisoned")
                 .remove(name);
-            let client = self.db.get().await.map_err(crate::error::Error::Pool)?;
-            client
-                .execute("DELETE FROM zims WHERE name = $1", &[name])
+            let db = sea_orm_db(&self.db);
+            zims::Entity::delete_many()
+                .filter(zims::Column::Name.eq(name))
+                .exec(&db)
                 .await
-                .map_err(crate::error::Error::Database)?;
+                .map_err(Error::SeaOrm)?;
             tracing::info!("resync: removed ZIM {name}");
             report.push(format!("{name} (removed)"));
         }
@@ -674,13 +661,15 @@ mod tests {
         dir
     }
 
-    /// Build a ZimManager with a pool that never connects (deadpool is lazy,
-    /// and `reconcile`/`resync`-guard paths never touch the DB).
+    /// Build a ZimManager with a pool that never connects (sqlx is lazy with
+    /// `connect_lazy`, and `reconcile`/`resync`-guard paths never touch the
+    /// DB). The short acquire timeout keeps a hypothetical DB touch a fast
+    /// failure instead of a 30 s hang.
     fn manager(dir: &Path) -> Arc<ZimManager> {
-        let mut cfg = deadpool_postgres::Config::new();
-        cfg.url = Some("postgres://u:p@127.0.0.1:1/nodb".into());
-        let pool = cfg.builder(tokio_postgres::NoTls).unwrap().build().unwrap();
-        ZimManager::new(dir.to_path_buf(), pool)
+        // `dead_pool()` carries the 250 ms acquire timeout plus a runtime
+        // fallback for sync `#[test]` bodies (sqlx 0.8 pool creation
+        // requires a current Tokio runtime even for `connect_lazy`).
+        ZimManager::new(dir.to_path_buf(), crate::testing::dead_pool())
     }
 
     fn write_zim(dir: &Path, name: &str, size: usize) {

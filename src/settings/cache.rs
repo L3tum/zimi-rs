@@ -5,10 +5,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use postgres_types::ToSql;
-use tokio_postgres::Row;
-
 use crate::db::pool::Pool;
+use crate::db::raw;
 use crate::error::{Error, Result};
 
 use super::auth::verify_admin_password;
@@ -169,22 +167,14 @@ impl SettingsCache {
     /// than adding a lock.
     pub async fn reload(&self) -> Result<()> {
         let _guard = self.inner.write_guard.lock().await;
-        let mut client = self.inner.pool.get().await.map_err(Error::Pool)?;
 
-        // Load existing settings
-        let rows: Vec<Row> = client
-            .query("SELECT key, value FROM settings", &[])
-            .await
-            .map_err(Error::Database)?;
+        // Load existing settings (single table — no checkout needed; a pool
+        // blip surfaces as `Error::Database(PoolTimedOut)` → 503, same as
+        // every other DB read in the crate).
+        let rows: Vec<(String, serde_json::Value)> =
+            raw::fetch_all(&self.inner.pool, "SELECT key, value FROM settings", |q| q).await?;
 
-        let mut map: HashMap<String, serde_json::Value> = rows
-            .iter()
-            .map(|r| {
-                let key: String = r.get(0);
-                let value: serde_json::Value = r.get(1);
-                (key, value)
-            })
-            .collect();
+        let mut map: HashMap<String, serde_json::Value> = rows.into_iter().collect();
 
         // Seed defaults for missing keys
         let defaults = default_settings();
@@ -202,22 +192,6 @@ impl SettingsCache {
         // and re-seeding is a no-op when the rows already exist. Missing
         // keys are inserted; existing values are never overwritten.
         if !seeded.is_empty() {
-            let categories: Vec<String> = seeded
-                .iter()
-                .map(|(key, _)| key.split('.').next().unwrap_or("general").to_string())
-                .collect();
-            let params: Vec<&(dyn ToSql + Sync)> = {
-                let mut p = Vec::with_capacity(seeded.len() * 3);
-                for ((key, value), cat) in seeded.iter().zip(categories.iter()) {
-                    let k: &(dyn ToSql + Sync) = key;
-                    let v: &(dyn ToSql + Sync) = value;
-                    let c: &(dyn ToSql + Sync) = cat;
-                    p.push(k);
-                    p.push(v);
-                    p.push(c);
-                }
-                p
-            };
             let placeholders: Vec<String> = (0..seeded.len())
                 .map(|i| format!("${}, ${}, ${}", i * 3 + 1, i * 3 + 2, i * 3 + 3))
                 .collect();
@@ -226,8 +200,15 @@ impl SettingsCache {
                  ON CONFLICT (key) DO NOTHING",
                 placeholders.join(", ")
             );
-            let tx = client.transaction().await.map_err(Error::Database)?;
-            tx.execute(&sql, &params).await.map_err(Error::Database)?;
+            let mut tx = self.inner.pool.begin().await.map_err(Error::Database)?;
+            raw::execute(&mut *tx, &sql, |mut q| {
+                for (key, value) in &seeded {
+                    let category = key.split('.').next().unwrap_or("general");
+                    q = q.bind(key).bind(value).bind(category);
+                }
+                q
+            })
+            .await?;
             tx.commit().await.map_err(Error::Database)?;
         }
 
@@ -270,23 +251,21 @@ impl SettingsCache {
     /// request. DB failure is logged and ignored — this is a convenience, not
     /// a correctness path.
     pub async fn upgrade_password(&self, hashed: String) {
-        if let Ok(client) = self.inner.pool.get().await {
-            let key: &str = KEY_ACCESS_ADMIN_PASSWORD;
-            let val: &serde_json::Value = &serde_json::json!(hashed);
-            match client
-                .execute(
-                    "UPDATE settings SET value = $1 WHERE key = $2",
-                    &[val, &key],
-                )
-                .await
-            {
-                Ok(_) => tracing::info!("upgraded access.admin_password to a salted hash"),
-                Err(e) => {
-                    tracing::warn!("failed to persist upgraded admin password (cached anyway): {e}")
-                }
+        // Best-effort: a pool blip is folded into the query error (sqlx has
+        // no separate pool-get step), so both failure classes take the same
+        // warn path as before.
+        let val: serde_json::Value = serde_json::json!(hashed);
+        match raw::execute(
+            &self.inner.pool,
+            "UPDATE settings SET value = $1 WHERE key = $2",
+            |q| q.bind(&val).bind(KEY_ACCESS_ADMIN_PASSWORD),
+        )
+        .await
+        {
+            Ok(_) => tracing::info!("upgraded access.admin_password to a salted hash"),
+            Err(e) => {
+                tracing::warn!("failed to persist upgraded admin password (cached anyway): {e}")
             }
-        } else {
-            tracing::warn!("failed to get pool for admin password upgrade (cached anyway)");
         }
         // Cache the hash regardless of DB outcome so the upgrade is sticky.
         let mut cache_guard = self
@@ -567,26 +546,21 @@ impl SettingsCache {
 
         if !to_update.is_empty() {
             let _guard = self.inner.write_guard.lock().await;
-            let mut client = self.inner.pool.get().await.map_err(Error::Pool)?;
 
             // 1) Persist to Postgres atomically (one transaction). No in-memory
             //    lock is held across the awaits; the cache is updated only after
             //    the commit succeeds (no partial cache/DB divergence, D1d).
-            let tx = client.transaction().await.map_err(Error::Database)?;
+            let mut tx = self.inner.pool.begin().await.map_err(Error::Database)?;
             for (key, value) in &to_update {
                 let category = key.split('.').next().unwrap_or("general");
-                let cat = category.to_string();
-                let p0: &(dyn ToSql + Sync) = key;
-                let p1: &(dyn ToSql + Sync) = value;
-                let p2: &(dyn ToSql + Sync) = &cat;
-                tx.execute(
+                raw::execute(
+                    &mut *tx,
                     "INSERT INTO settings (key, value, category, updated_at)
                      VALUES ($1, $2, $3, now())
                      ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()",
-                    &[p0, p1, p2],
+                    |q| q.bind(key).bind(value).bind(category),
                 )
-                .await
-                .map_err(Error::Database)?;
+                .await?;
             }
             tx.commit().await.map_err(Error::Database)?;
 
@@ -613,24 +587,20 @@ impl SettingsCache {
 
     /// Get per-ZIM settings from the zims table.
     pub async fn get_zim_settings(&self, zim_name: &str) -> Result<Option<serde_json::Value>> {
-        let client = self.inner.pool.get().await.map_err(Error::Pool)?;
-        let rows = client
-            .query(
-                "SELECT embed_enabled, category FROM zims WHERE name = $1",
-                &[&zim_name],
-            )
-            .await
-            .map_err(Error::Database)?;
+        let row = raw::fetch_optional::<(bool, Option<String>), _, _>(
+            &self.inner.pool,
+            "SELECT embed_enabled, category FROM zims WHERE name = $1",
+            |q| q.bind(zim_name),
+        )
+        .await?;
 
-        if rows.is_empty() {
-            return Ok(None);
+        match row {
+            Some((embed_enabled, category)) => Ok(Some(serde_json::json!({
+                "embed_enabled": embed_enabled,
+                "category": category,
+            }))),
+            None => Ok(None),
         }
-
-        let row = &rows[0];
-        Ok(Some(serde_json::json!({
-            "embed_enabled": row.get::<_, bool>(0),
-            "category": row.get::<_, Option<String>>(1),
-        })))
     }
 
     /// Update per-ZIM settings.
@@ -664,14 +634,15 @@ impl SettingsCache {
             }
         }
 
-        let mut client = self.inner.pool.get().await.map_err(Error::Pool)?;
-
         // Verify the ZIM exists before mutating (B6: return 404 for unknown names).
-        let exists: i64 = client
-            .query_one("SELECT COUNT(*) FROM zims WHERE name = $1", &[&zim_name])
-            .await
-            .map_err(Error::Database)?
-            .get(0);
+        let exists: i64 =
+            raw::fetch_scalar_optional(
+                &self.inner.pool,
+                "SELECT COUNT(*) FROM zims WHERE name = $1",
+                |q| q.bind(zim_name),
+            )
+            .await?
+            .unwrap_or(0);
         if exists == 0 {
             return Err(Error::NotFound(format!("ZIM '{zim_name}' not found")));
         }
@@ -679,36 +650,33 @@ impl SettingsCache {
         // Atomic: both UPDATEs in one transaction so a partial failure
         // (e.g. embed_enabled succeeds, category fails) can't leave the
         // ZIM row in an inconsistent state.
-        let tx = client.transaction().await.map_err(Error::Database)?;
+        let mut tx = self.inner.pool.begin().await.map_err(Error::Database)?;
 
         if let Some(embed_enabled) = updates.get("embed_enabled").and_then(|v| v.as_bool()) {
-            let p0: &(dyn ToSql + Sync) = &zim_name;
-            let p1: &(dyn ToSql + Sync) = &embed_enabled;
-            tx.execute(
+            raw::execute(
+                &mut *tx,
                 "UPDATE zims SET embed_enabled = $2, updated_at = now() WHERE name = $1",
-                &[p0, p1],
+                |q| q.bind(zim_name).bind(embed_enabled),
             )
-            .await
-            .map_err(Error::Database)?;
+            .await?;
         }
 
         if let Some(category) = updates.get("category") {
             if let Some(c) = category.as_str() {
-                tx.execute(
+                raw::execute(
+                    &mut *tx,
                     "UPDATE zims SET category = $2, updated_at = now() WHERE name = $1",
-                    &[&zim_name, &c],
+                    |q| q.bind(zim_name).bind(c),
                 )
-                .await
-                .map_err(Error::Database)?;
+                .await?;
             } else if category.is_null() {
                 // Explicit null resets the override to the default (NULL).
-                let p0: &(dyn ToSql + Sync) = &zim_name;
-                tx.execute(
+                raw::execute(
+                    &mut *tx,
                     "UPDATE zims SET category = NULL, updated_at = now() WHERE name = $1",
-                    &[p0],
+                    |q| q.bind(zim_name),
                 )
-                .await
-                .map_err(Error::Database)?;
+                .await?;
             }
         }
 
@@ -839,11 +807,15 @@ mod tests {
             KEY_TORRENT_URL.into(),
             serde_json::json!("http://127.0.0.1:9").clone(),
         );
-        // A dead pool means the commit fails; assert we got a Pool error (i.e.
+        // A dead pool means the commit fails; assert we got a pool error (i.e.
         // the key was *allowed* past the security gate into to_update).
         let res = cache.update(&updates, true).await;
         assert!(
-            matches!(res, Err(Error::Pool(_))),
+            matches!(
+                res,
+                Err(Error::Database(ref e))
+                    if matches!(e, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
+            ),
             "authenticated sensitive write should reach the DB, got {res:?}"
         );
     }
@@ -1259,7 +1231,8 @@ mod tests {
     #[tokio::test]
     async fn update_torrent_opds_url_public_proceeds_to_pool() {
         // A valid public URL passes validation → the write reaches the (dead)
-        // pool, so `update` returns `Err(Error::Pool)`, not a validation error.
+        // pool, so `update` returns `Err(Error::Database(PoolTimedOut/PoolClosed))`,
+        // not a validation error.
         let cache = SettingsCache::new_with_map(dead_pool(), default_settings(), HashMap::new());
         let mut updates = HashMap::new();
         updates.insert(
@@ -1268,7 +1241,8 @@ mod tests {
         );
         assert!(matches!(
             cache.update(&updates, true).await,
-            Err(Error::Pool(_))
+            Err(Error::Database(e))
+                if matches!(e, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
         ));
     }
 

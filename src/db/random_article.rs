@@ -4,6 +4,7 @@
 //! a single forward index seek with a backward fallback — both scoped to the
 //! requested ZIM so a scoped call never returns another ZIM's article.
 use crate::db::pool::Pool;
+use crate::db::raw;
 use crate::error::{Error, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -104,38 +105,45 @@ async fn bounds_cached(
             }
         }
     }
-    let client = pool.get().await.map_err(Error::Pool)?;
     let row = match zim_filter {
-        Some(zim) => client.query_one(BOUNDS_SQL_OPT, &[&zim]).await,
-        None => client.query_one(BOUNDS_SQL_GLOBAL, &[]).await,
-    }
-    .map_err(Error::Database)?;
-    let bounds = (row.get::<_, Option<i64>>(0), row.get::<_, Option<i64>>(1));
-    match bounds {
-        (Some(min_id), Some(max_id)) => {
-            BOUNDS_CACHE
-                .lock()
-                .expect("bounds cache poisoned")
-                .insert(key, (min_id, max_id));
-            Ok(Some((min_id, max_id)))
-        }
-        _ => Ok(None),
-    }
+        Some(zim) => raw::fetch_optional::<(Option<i64>, Option<i64>), _, _>(
+            pool,
+            BOUNDS_SQL_OPT,
+            |q| q.bind(zim),
+        )
+        .await,
+        None => raw::fetch_optional::<(Option<i64>, Option<i64>), _, _>(pool, BOUNDS_SQL_GLOBAL, |q| q)
+            .await,
+    };
+    let (min_id, max_id) = match row {
+        Ok(Some((Some(min_id), Some(max_id)))) => (min_id, max_id),
+        Ok(_) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    BOUNDS_CACHE
+        .lock()
+        .expect("bounds cache poisoned")
+        .insert(key, (min_id, max_id));
+    Ok(Some((min_id, max_id)))
 }
 
-/// One merged seek-or-fallback round trip: `query_opt` on [`SEEK_SQL_GLOBAL`]
-/// / [`SEEK_SQL_OPT`], returning the forward row (branch 0) when it exists,
-/// else the backward row. Both branches carry the ZIM scope when one is given.
-async fn seek(
-    client: &tokio_postgres::Client,
-    target: i64,
-    zim_filter: Option<&str>,
-) -> Result<Option<tokio_postgres::Row>> {
-    match zim_filter {
-        Some(zim) => client.query_opt(SEEK_SQL_OPT, &[&target, &zim]).await,
-        None => client.query_opt(SEEK_SQL_GLOBAL, &[&target]).await,
-    }
-    .map_err(Error::Database)
+/// One merged seek-or-fallback round trip: `fetch_optional` on
+/// [`SEEK_SQL_GLOBAL`] / [`SEEK_SQL_OPT`], returning the forward row (branch 0)
+/// when it exists, else the backward row. Both branches carry the ZIM scope
+/// when one is given.
+async fn seek(pool: &Pool, target: i64, zim_filter: Option<&str>) -> Result<Option<RandomArticle>> {
+    let row: Option<(i64, i32, String, String, String, String)> = match zim_filter {
+        Some(zim) => raw::fetch_optional(pool, SEEK_SQL_OPT, |q| q.bind(target).bind(zim)).await,
+        None => raw::fetch_optional(pool, SEEK_SQL_GLOBAL, |q| q.bind(target)).await,
+    }?;
+    Ok(row.map(|(id, zim_id, path, title, snippet, zim)| RandomArticle {
+        id,
+        zim_id,
+        path,
+        title,
+        snippet,
+        zim,
+    }))
 }
 
 /// Fetch a random article using an O(1) index-seek strategy.
@@ -150,8 +158,6 @@ async fn seek(
 /// never return an article from another ZIM. This also avoids the O(n log n)
 /// `ORDER BY random() LIMIT 1` full-table scan.
 pub async fn fetch_random_article(pool: &Pool, zim_filter: Option<&str>) -> Result<RandomArticle> {
-    let client = pool.get().await.map_err(Error::Pool)?;
-
     // 1. Bounds, from the per-scope cache (steady state = 0 RT).
     let (min_id, max_id) = match bounds_cached(pool, zim_filter, false).await? {
         Some(b) => b,
@@ -169,32 +175,24 @@ pub async fn fetch_random_article(pool: &Pool, zim_filter: Option<&str>) -> Resu
     // 3. One merged seek: smallest live id >= target, else (stale-bounds gap)
     //    the largest id <= target — same ZIM scope. With fresh bounds the
     //    forward branch always hits, so this is a single round trip.
-    let row = match seek(&client, target, zim_filter).await? {
-        Some(r) => r,
+    let article = match seek(pool, target, zim_filter).await? {
+        Some(article) => article,
         None => {
-            // Only possible with stale cached bounds (an id was deleted).
-            // Refresh the bounds once and retry; the backward branch of the
-            // merged statement still covers a partial gap.
+            // Only `None` is possible with stale cached bounds (an id was
+            // deleted). Refresh the bounds once and retry; the backward
+            // branch of the merged statement still covers a partial gap.
             let (min_id, max_id) = match bounds_cached(pool, zim_filter, true).await? {
                 Some(b) => b,
                 None => return Err(Error::NotFound("no articles found".into())),
             };
             let target = random_id_in_range(min_id, max_id, seed);
-            match seek(&client, target, zim_filter).await? {
-                Some(r) => r,
-                None => return Err(Error::NotFound("no articles found".into())),
-            }
+            seek(pool, target, zim_filter)
+                .await?
+                .ok_or_else(|| Error::NotFound("no articles found".into()))?
         }
     };
 
-    Ok(RandomArticle {
-        id: row.get(0),
-        zim_id: row.get(1),
-        path: row.get(2),
-        title: row.get(3),
-        snippet: row.get(4),
-        zim: row.get(5),
-    })
+    Ok(article)
 }
 
 #[cfg(test)]

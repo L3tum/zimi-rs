@@ -18,10 +18,14 @@ pub enum TorrentKind {
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("database error: {0}")]
-    Database(#[from] tokio_postgres::Error),
+    Database(#[from] sqlx::Error),
 
-    #[error("database pool error: {0}")]
-    Pool(#[from] deadpool_postgres::PoolError),
+    /// SeaORM driver error (entity / query-builder API). SeaORM runs on the
+    /// same sqlx Postgres driver, so when the underlying sqlx error can be
+    /// extracted it gets the exact same SQLSTATE mapping as
+    /// [`Error::Database`]; anything else is a 503 with details logged only.
+    #[error("database error: {0}")]
+    SeaOrm(#[from] sea_orm::DbErr),
 
     #[error("ZIM error: {0}")]
     Zim(String),
@@ -74,11 +78,12 @@ pub enum Error {
     /// HTTP error path.
     ///
     /// Allowed: blocking-task joins (`tokio::task::JoinError`), pool
-    /// configuration failures, and genuinely unclassifiable I/O.
+    /// configuration failures (building the pool from options), and genuinely
+    /// unclassifiable I/O.
     /// Not allowed: anything mappable to a specific variant (DB →
-    /// `Database`, pool → `Pool`, HTTP → `Http`, I/O → `Io`, …), and
-    /// anything carrying client-facing text (this variant always maps to
-    /// a redacted 500 — raw text stays in the log).
+    /// `Database` — including pool checkout timeouts, HTTP → `Http`, I/O →
+    /// `Io`, …), and anything carrying client-facing text (this variant
+    /// always maps to a redacted 500 — raw text stays in the log).
     #[error("internal error: {0}")]
     Internal(anyhow::Error),
 }
@@ -95,48 +100,34 @@ impl axum::response::IntoResponse for Error {
     }
 }
 
-/// Map a Postgres SQLSTATE + connection-closed flag to an HTTP status
-/// (ARCH m2). Pure so it can be unit-tested without constructing a
-/// `tokio_postgres::Error` (whose `DbError` builder is fiddly). A closed
-/// connection always takes precedence.
+/// Map a Postgres SQLSTATE to an HTTP status (ARCH m2). Pure so it can be
+/// unit-tested without constructing a `sqlx::Error` (whose `DatabaseError`
+/// builder is fiddly). SQLSTATEs arrive as strings (`"23505"`) via
+/// `sqlx::Error::as_database_error().code()`.
 ///
 /// - 23505 unique_violation / 23503 foreign_key_violation → 409
 /// - 23502 not_null_violation / 23514 check_violation → 400
 /// - anything else (a genuine DB fault) → 503
-pub(crate) fn sqlstate_status(code: Option<tokio_postgres::error::SqlState>, closed: bool) -> u16 {
-    use tokio_postgres::error::SqlState;
-    if closed {
-        return 503;
+pub(crate) fn sqlstate_status(code: Option<&str>) -> u16 {
+    match code {
+        Some("23505" | "23503") => 409,
+        Some("23502" | "23514") => 400,
+        _ => 503,
     }
-    // 409 conflicts (23505 unique, 23503 foreign-key).
-    if code == Some(SqlState::UNIQUE_VIOLATION) || code == Some(SqlState::FOREIGN_KEY_VIOLATION) {
-        return 409;
-    }
-    // 400 client-data violations (23502 not-null, 23514 check).
-    if code == Some(SqlState::NOT_NULL_VIOLATION) || code == Some(SqlState::CHECK_VIOLATION) {
-        return 400;
-    }
-    // No code / unknown code → genuine server-side DB fault.
-    503
 }
 
 /// Client-safe message for the non-23505 SQLSTATEs handled by
 /// [`sqlstate_status`] (the 23505 message is derived from the constraint name
 /// and is handled at the call site).
-pub(crate) fn sqlstate_message(code: Option<tokio_postgres::error::SqlState>) -> &'static str {
-    use tokio_postgres::error::SqlState;
-    if code == Some(SqlState::NOT_NULL_VIOLATION) {
-        return "missing required value";
+pub(crate) fn sqlstate_message(code: Option<&str>) -> &'static str {
+    match code {
+        Some("23502") => "missing required value",
+        Some("23503") => "referenced row does not exist",
+        Some("23514") => "value violates a constraint",
+        // BUG-14: an unknown SQLSTATE is a database fault, not a down pool
+        // (the down-pool case is `PoolTimedOut` → "database unavailable").
+        _ => "database error",
     }
-    if code == Some(SqlState::FOREIGN_KEY_VIOLATION) {
-        return "referenced row does not exist";
-    }
-    if code == Some(SqlState::CHECK_VIOLATION) {
-        return "value violates a constraint";
-    }
-    // BUG-14: an unknown SQLSTATE is a database fault, not a down pool (the
-    // down-pool case is `Error::Pool` → "database unavailable").
-    "database error"
 }
 
 /// Table prefixes a 23505 constraint may carry, in first-match order. Add a
@@ -177,36 +168,17 @@ impl Error {
             Error::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             Error::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             Error::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
-            // Database errors: a closed connection takes precedence (503);
-            // otherwise map the SQLSTATE to an honest client status (ARCH m2).
+            // Database errors: a pool checkout timeout is a down pool (503,
+            // "database unavailable"); otherwise a server-returned SQLSTATE
+            // maps to an honest client status (ARCH m2), and connection-level
+            // failures (IO/TLS/protocol) are a 503 closed connection.
             // 23505 keeps its constraint-derived field message (no raw DB text).
-            Error::Database(e) => {
-                let code = e.code().cloned();
-                let closed = e.is_closed();
-                let (status, msg) = if closed {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "database connection closed".into(),
-                    )
-                } else if code == Some(tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
-                    let field = e
-                        .as_db_error()
-                        .and_then(|db| db.constraint())
-                        .map(duplicate_field)
-                        .unwrap_or_else(|| "value".into());
-                    (
-                        StatusCode::CONFLICT,
-                        format!("duplicate value for '{field}'"),
-                    )
-                } else {
-                    (
-                        StatusCode::from_u16(sqlstate_status(code.clone(), closed))
-                            .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
-                        sqlstate_message(code).to_string(),
-                    )
-                };
-                (status, msg)
-            }
+            Error::Database(e) => sqlx_error_status_message(e),
+            // SeaORM runs on the same sqlx driver: unwrap to the sqlx error
+            // when possible and apply the identical SQLSTATE mapping; pool
+            // acquisition and SeaORM-internal failures are unclassified DB
+            // faults (503, raw detail stays in the log).
+            Error::SeaOrm(e) => sea_orm_status_message(e),
             // Decision 2026-08-27 (B6.9): keep 502 — upstream qBittorrent /
             // download failures dominate; client-data validation via torrent
             // is the rare case, so 502 is the more honest status.
@@ -223,12 +195,90 @@ impl Error {
                 tracing::error!("internal error: {self:?}");
                 let (status, msg) = match self {
                     Error::Http(_) => (StatusCode::BAD_GATEWAY, "upstream request failed"),
-                    Error::Pool(_) => (StatusCode::SERVICE_UNAVAILABLE, "database unavailable"),
                     _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
                 };
                 (status, msg.into())
             }
         }
+    }
+}
+
+/// HTTP status + client-safe message for a raw sqlx error. Shared by
+/// [`Error::Database`] and (when unwrappable) [`Error::SeaOrm`]: a pool
+/// checkout timeout is a down pool (503, "database unavailable"); a
+/// server-returned SQLSTATE maps to an honest client status (ARCH m2) with
+/// 23505 keeping its constraint-derived field message (no raw DB text);
+/// connection-level failures (IO/TLS/protocol) are a 503 closed connection.
+fn sqlx_error_status_message(e: &sqlx::Error) -> (axum::http::StatusCode, String) {
+    use axum::http::StatusCode;
+
+    if matches!(e, sqlx::Error::PoolTimedOut) {
+        (StatusCode::SERVICE_UNAVAILABLE, "database unavailable".into())
+    } else if let Some(db) = e.as_database_error() {
+        // This sqlx build's `DatabaseError::code()` yields `Option<Cow<str>>`
+        // that does not outlive the call — own it before the `&str` comparisons.
+        let code: Option<String> = db.code().map(|c| c.into_owned());
+        if code.as_deref() == Some("23505") {
+            let field = db
+                .constraint()
+                .map(duplicate_field)
+                .unwrap_or_else(|| "value".into());
+            (
+                StatusCode::CONFLICT,
+                format!("duplicate value for '{field}'"),
+            )
+        } else {
+            (
+                StatusCode::from_u16(sqlstate_status(code.as_deref()))
+                    .unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                sqlstate_message(code.as_deref()).to_string(),
+            )
+        }
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "database connection closed".into())
+    }
+}
+
+/// HTTP status + client-safe message for a SeaORM error.
+///
+/// SeaORM runs on the same sqlx driver: a pool-acquisition failure is a down
+/// pool (503, "database unavailable"), and when a `Conn`/`Exec`/`Query` error
+/// wraps a sqlx driver error the identical SQLSTATE mapping as
+/// [`Error::Database`] applies. Anything else is an unclassified DB fault
+/// (503, raw detail stays in the log).
+fn sea_orm_status_message(e: &sea_orm::DbErr) -> (axum::http::StatusCode, String) {
+    use axum::http::StatusCode;
+
+    match e {
+        sea_orm::DbErr::ConnectionAcquire(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "database unavailable".into())
+        }
+        _ => match sqlx_error_from_db_err(e) {
+            Some(sqlx_err) => sqlx_error_status_message(sqlx_err),
+            None => {
+                tracing::error!("database error: {e}");
+                (StatusCode::SERVICE_UNAVAILABLE, "database error".into())
+            }
+        },
+    }
+}
+
+/// Borrow the sqlx driver error SeaORM carries: `DbErr::Conn` / `Exec` /
+/// `Query` hold a [`sea_orm::RuntimeErr`], and a driver failure is
+/// `RuntimeErr::SqlxError`. Returns `None` for pool-acquisition failures
+/// and SeaORM-internal errors, which the caller treats as unclassified DB
+/// faults.
+fn sqlx_error_from_db_err(e: &sea_orm::DbErr) -> Option<&sqlx::Error> {
+    use sea_orm::RuntimeErr;
+
+    match e {
+        sea_orm::DbErr::Conn(rt) | sea_orm::DbErr::Exec(rt) | sea_orm::DbErr::Query(rt) => {
+            match rt {
+                RuntimeErr::SqlxError(e) => Some(e),
+                RuntimeErr::Internal(_) => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -240,10 +290,14 @@ mod tests {
 
     #[test]
     fn internal_errors_do_not_leak_text() {
-        let pool = Error::Pool(deadpool_postgres::PoolError::Closed);
+        // Pool checkout timeout (sqlx has no separate pool error type — a
+        // timed-out acquire is a `sqlx::Error::PoolTimedOut`):
+        let pool = Error::Database(sqlx::Error::PoolTimedOut);
         let (status, msg) = pool.status_and_message();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(msg, "database unavailable");
+        assert!(!msg.contains("postgres://"));
+        assert!(!msg.contains("://"));
 
         let internal = Error::Internal(anyhow::anyhow!("boom: secret-detail"));
         let (status, msg) = internal.status_and_message();
@@ -304,38 +358,30 @@ mod tests {
 
     #[test]
     fn sqlstate_status_matrix() {
-        use tokio_postgres::error::SqlState as S;
-        // Closed connection always wins, regardless of code.
-        assert_eq!(sqlstate_status(Some(S::UNIQUE_VIOLATION), true), 503);
-        assert_eq!(sqlstate_status(None, true), 503);
         // 409 conflicts.
-        assert_eq!(sqlstate_status(Some(S::UNIQUE_VIOLATION), false), 409);
-        assert_eq!(sqlstate_status(Some(S::FOREIGN_KEY_VIOLATION), false), 409);
+        assert_eq!(sqlstate_status(Some("23505")), 409);
+        assert_eq!(sqlstate_status(Some("23503")), 409);
         // 400 client-data violations.
-        assert_eq!(sqlstate_status(Some(S::NOT_NULL_VIOLATION), false), 400);
-        assert_eq!(sqlstate_status(Some(S::CHECK_VIOLATION), false), 400);
+        assert_eq!(sqlstate_status(Some("23502")), 400);
+        assert_eq!(sqlstate_status(Some("23514")), 400);
         // No code / unknown code → server-side DB fault.
-        assert_eq!(sqlstate_status(None, false), 503);
-        assert_eq!(sqlstate_status(Some(S::SYNTAX_ERROR), false), 503);
+        assert_eq!(sqlstate_status(None), 503);
+        assert_eq!(sqlstate_status(Some("42601")), 503);
     }
 
     #[test]
     fn sqlstate_message_matrix() {
-        use tokio_postgres::error::SqlState as S;
+        assert_eq!(sqlstate_message(Some("23502")), "missing required value");
         assert_eq!(
-            sqlstate_message(Some(S::NOT_NULL_VIOLATION)),
-            "missing required value"
-        );
-        assert_eq!(
-            sqlstate_message(Some(S::FOREIGN_KEY_VIOLATION)),
+            sqlstate_message(Some("23503")),
             "referenced row does not exist"
         );
         assert_eq!(
-            sqlstate_message(Some(S::CHECK_VIOLATION)),
+            sqlstate_message(Some("23514")),
             "value violates a constraint"
         );
         assert_eq!(sqlstate_message(None), "database error");
-        assert_eq!(sqlstate_message(Some(S::SYNTAX_ERROR)), "database error");
+        assert_eq!(sqlstate_message(Some("42601")), "database error");
     }
 
     #[test]
@@ -350,12 +396,41 @@ mod tests {
     }
 
     #[test]
-    fn pool_error_message_never_leaks_url() {
-        let pool = Error::Pool(deadpool_postgres::PoolError::Closed);
+    fn pool_timeout_never_leaks_url() {
+        let pool = Error::Database(sqlx::Error::PoolTimedOut);
         let (status, msg) = pool.status_and_message();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(msg, "database unavailable");
         assert!(!msg.contains("postgres://"));
         assert!(!msg.contains("://"));
+    }
+
+    #[test]
+    fn sea_orm_error_maps_like_sqlx_and_does_not_leak() {
+        // A SeaORM query error wrapping a pool timeout behaves exactly like
+        // the raw sqlx error (SQLSTATE/status mapping is shared).
+        let err = Error::SeaOrm(sea_orm::DbErr::Query(
+            sea_orm::RuntimeErr::SqlxError(sqlx::Error::PoolTimedOut),
+        ));
+        let (status, msg) = err.status_and_message();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(msg, "database unavailable");
+
+        // A SeaORM-internal error (no sqlx driver error to unwrap) is a 503
+        // and its raw detail never reaches the client.
+        let err = Error::SeaOrm(sea_orm::DbErr::Conn(
+            sea_orm::RuntimeErr::Internal("secret detail".into()),
+        ));
+        let (status, msg) = err.status_and_message();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(msg, "database error");
+        assert!(!msg.contains("secret detail"));
+
+        // RecordNotFound-style SeaORM errors are unclassified DB faults, not
+        // client input errors.
+        let err = Error::SeaOrm(sea_orm::DbErr::RecordNotFound("id".into()));
+        let (status, msg) = err.status_and_message();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!msg.contains("id"));
     }
 }

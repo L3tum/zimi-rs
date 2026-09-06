@@ -55,14 +55,7 @@ mod tests {
     /// tightened to `rps=1, burst=1` so the second request of the same burst
     /// is throttled. A fresh `RateLimiterHandle` starts with `burst` tokens.
     fn rate_limited_state() -> AppState {
-        let mut dp_cfg = deadpool_postgres::Config::new();
-        dp_cfg.url = Some("postgres://zimservice:zimservice@127.0.0.1:59999/zimservice".into());
-        let pool = dp_cfg
-            .builder(tokio_postgres::NoTls)
-            .unwrap()
-            .max_size(1)
-            .build()
-            .unwrap();
+        let pool = crate::testing::dead_pool();
         let mut values = crate::settings::default_settings();
         values.insert(KEY_ACCESS_RATE_LIMIT_RPS.into(), serde_json::json!(1));
         values.insert(KEY_ACCESS_RATE_LIMIT_BURST.into(), serde_json::json!(1));
@@ -536,14 +529,7 @@ mod tests {
     async fn auth_middleware_fail_closed_body() {
         // BUG-16d: password mode + empty `admin_password` → fail-closed 503 on
         // a non-health route, with the misconfiguration message in the body.
-        let mut dp_cfg = deadpool_postgres::Config::new();
-        dp_cfg.url = Some("postgres://zimservice:zimservice@127.0.0.1:59999/zimservice".into());
-        let pool = dp_cfg
-            .builder(tokio_postgres::NoTls)
-            .unwrap()
-            .max_size(1)
-            .build()
-            .unwrap();
+        let pool = crate::testing::dead_pool();
         let mut values = crate::settings::default_settings();
         values.insert(KEY_ACCESS_MODE.into(), serde_json::json!("password"));
         values.insert(KEY_ACCESS_ADMIN_PASSWORD.into(), serde_json::json!(""));
@@ -1055,14 +1041,7 @@ mod tests {
     /// the M1 read-gating flag. (Plaintext password → fast verify, no 100k
     /// hash in tests.)
     fn password_state(require_reads: bool) -> AppState {
-        let mut dp_cfg = deadpool_postgres::Config::new();
-        dp_cfg.url = Some("postgres://zimservice:zimservice@127.0.0.1:59999/zimservice".into());
-        let pool = dp_cfg
-            .builder(tokio_postgres::NoTls)
-            .unwrap()
-            .max_size(1)
-            .build()
-            .unwrap();
+        let pool = crate::testing::dead_pool();
         let mut values = crate::settings::default_settings();
         values.insert(KEY_ACCESS_MODE.into(), serde_json::json!("password"));
         values.insert(KEY_ACCESS_ADMIN_PASSWORD.into(), serde_json::json!("pw"));
@@ -1100,14 +1079,7 @@ mod tests {
     /// AppState like `password_state` but with an empty
     /// `access.admin_password` — the fail-closed 503 configuration (BUG-2).
     fn fail_closed_state() -> AppState {
-        let mut dp_cfg = deadpool_postgres::Config::new();
-        dp_cfg.url = Some("postgres://zimservice:zimservice@127.0.0.1:59999/zimservice".into());
-        let pool = dp_cfg
-            .builder(tokio_postgres::NoTls)
-            .unwrap()
-            .max_size(1)
-            .build()
-            .unwrap();
+        let pool = crate::testing::dead_pool();
         let mut values = crate::settings::default_settings();
         values.insert(KEY_ACCESS_MODE.into(), serde_json::json!("password"));
         values.insert(KEY_ACCESS_ADMIN_PASSWORD.into(), serde_json::json!(""));

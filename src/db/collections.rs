@@ -6,8 +6,17 @@
 //! and map the domain outcomes to HTTP responses. The repo works in
 //! `zim_ids` (`i32`); id↔name resolution is a presentation concern (it reads
 //! the ZIM registry, not the DB), so it stays in the handler.
-use crate::db::pool::Pool;
+//!
+//! Query layer: the SeaORM query builder (entity `find` / active-model
+//! `insert` / `update_many` / `delete_by_id`) over the shared pool via
+//! [`crate::db::sea_orm_db`]. `updated_at = now()` stays a *server-side*
+//! timestamp via `Expr::cust("now()")`, so the SQL semantics match the old
+//! raw statements exactly.
+use crate::db::entities::collections::{ActiveModel, Column, Entity};
+use crate::db::{pool::Pool, sea_orm_db};
 use crate::error::{Error, Result};
+use sea_orm::sea_query::Expr;
+use sea_orm::{ActiveModelTrait, ActiveValue, EntityTrait, QueryFilter, QueryOrder};
 
 /// One `collections` row — raw, with `zim_ids` still unresolved. The handler
 /// maps this to the wire `Collection` DTO (resolving `zim_ids` → names).
@@ -21,29 +30,26 @@ pub struct CollectionRow {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-fn collection_row(r: &tokio_postgres::Row) -> CollectionRow {
-    CollectionRow {
-        id: r.get(0),
-        name: r.get(1),
-        label: r.get(2),
-        zim_ids: r.get(3),
-        is_favorite: r.get(4),
-        created_at: r.get(5),
-        updated_at: r.get(6),
-    }
-}
-
 /// All collections, ordered by name.
 pub async fn list_collections(pool: &Pool) -> Result<Vec<CollectionRow>> {
-    let client = pool.get().await.map_err(Error::Pool)?;
-    let rows = client
-        .query(
-            "SELECT id, name, label, zim_ids, is_favorite, created_at, updated_at FROM collections ORDER BY name",
-            &[],
-        )
+    let db = sea_orm_db(pool);
+    let models = Entity::find()
+        .order_by_asc(Column::Name)
+        .all(&db)
         .await
-        .map_err(Error::Database)?;
-    Ok(rows.iter().map(collection_row).collect())
+        .map_err(Error::from)?;
+    Ok(models
+        .into_iter()
+        .map(|m| CollectionRow {
+            id: m.id,
+            name: m.name,
+            label: m.label,
+            zim_ids: m.zim_ids,
+            is_favorite: m.is_favorite,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+        })
+        .collect())
 }
 
 /// Outcome of [`insert_collection`].
@@ -65,17 +71,21 @@ pub async fn insert_collection(
     zim_ids: &[i32],
     is_favorite: bool,
 ) -> Result<InsertOutcome> {
-    let client = pool.get().await.map_err(Error::Pool)?;
-    match client
-        .query_one(
-            "INSERT INTO collections (name, label, zim_ids, is_favorite) VALUES ($1, $2, $3, $4) RETURNING id",
-            &[&name, &label, &zim_ids, &is_favorite],
-        )
-        .await
-    {
-        Ok(row) => Ok(InsertOutcome::Inserted(row.get(0))),
-        Err(e) if is_unique_violation(e.code().cloned()) => Ok(InsertOutcome::Duplicate),
-        Err(e) => Err(Error::Database(e)),
+    let db = sea_orm_db(pool);
+    // Only the four caller-provided columns are set; `created_at` /
+    // `updated_at` stay `NotSet` and keep the table's `now()` defaults
+    // (same column list as the old raw INSERT).
+    let model = ActiveModel {
+        name: ActiveValue::Set(name.to_owned()),
+        label: ActiveValue::Set(label.to_owned()),
+        zim_ids: ActiveValue::Set(zim_ids.to_vec()),
+        is_favorite: ActiveValue::Set(is_favorite),
+        ..Default::default()
+    };
+    match model.insert(&db).await {
+        Ok(m) => Ok(InsertOutcome::Inserted(m.id)),
+        Err(e) if orm_is_unique_violation(&e) => Ok(InsertOutcome::Duplicate),
+        Err(e) => Err(Error::from(e)),
     }
 }
 
@@ -105,43 +115,43 @@ pub async fn update_collection(
     id: i32,
     fields: &UpdateFields,
 ) -> Result<UpdateOutcome> {
-    let client = pool.get().await.map_err(Error::Pool)?;
-    // `+ Send` is required because `params` is held across the `.await` below
-    // (the repo future is `Send`).
-    let mut sets: Vec<String> = Vec::new();
-    let mut params: Vec<Box<dyn postgres_types::ToSql + Send + Sync>> = Vec::new();
-    if let Some(n) = &fields.name {
-        params.push(Box::new(n.clone()));
-        sets.push(format!("name = ${}", params.len()));
+    // Dynamic `UPDATE`: a `NotSet` active value is omitted from the SET list,
+    // so only the provided fields are written. `updated_at` stays server-side
+    // (`now()`) — it is added separately, not via the active model.
+    let mut model = ActiveModel {
+        ..Default::default()
+    };
+    if let Some(nm) = &fields.name {
+        model.name = ActiveValue::Set(nm.clone());
     }
     if let Some(l) = &fields.label {
-        params.push(Box::new(l.clone()));
-        sets.push(format!("label = ${}", params.len()));
+        model.label = ActiveValue::Set(l.clone());
     }
     if let Some(z) = &fields.zim_ids {
-        params.push(Box::new(z.clone()));
-        sets.push(format!("zim_ids = ${}", params.len()));
+        model.zim_ids = ActiveValue::Set(z.clone());
     }
     if let Some(f) = &fields.is_favorite {
-        params.push(Box::new(*f));
-        sets.push(format!("is_favorite = ${}", params.len()));
+        model.is_favorite = ActiveValue::Set(*f);
     }
     // Unreachable in practice (the handler 400s on an all-`None` body); a
     // benign fallback so we never build a malformed `UPDATE`.
-    if sets.is_empty() {
+    if !model.name.is_set()
+        && !model.label.is_set()
+        && !model.zim_ids.is_set()
+        && !model.is_favorite.is_set()
+    {
         return Ok(UpdateOutcome::NotFound);
     }
-    params.push(Box::new(id));
-    let sql = format!(
-        "UPDATE collections SET updated_at = now(), {} WHERE id = ${}",
-        sets.join(", "),
-        params.len()
-    );
-    let refs: Vec<&(dyn postgres_types::ToSql + Sync)> = params
-        .iter()
-        .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
-        .collect();
-    let updated = client.execute(&sql, &refs).await.map_err(Error::Database)?;
+    let db = sea_orm_db(pool);
+    let stmt = Entity::update_many()
+        .set(model)
+        .col_expr(Column::UpdatedAt, Expr::cust("now()"));
+    let updated = stmt
+        .filter(Expr::col(Column::Id).eq(Expr::val(id)))
+        .exec(&db)
+        .await
+        .map_err(Error::from)?
+        .rows_affected;
     Ok(if updated > 0 {
         UpdateOutcome::Updated
     } else {
@@ -160,11 +170,12 @@ pub enum DeleteOutcome {
 
 /// Delete a collection by id.
 pub async fn delete_collection(pool: &Pool, id: i32) -> Result<DeleteOutcome> {
-    let client = pool.get().await.map_err(Error::Pool)?;
-    let deleted = client
-        .execute("DELETE FROM collections WHERE id = $1", &[&id])
+    let db = sea_orm_db(pool);
+    let deleted = Entity::delete_by_id(id)
+        .exec(&db)
         .await
-        .map_err(Error::Database)?;
+        .map_err(Error::from)?
+        .rows_affected;
     Ok(if deleted > 0 {
         DeleteOutcome::Deleted
     } else {
@@ -173,11 +184,24 @@ pub async fn delete_collection(pool: &Pool, id: i32) -> Result<DeleteOutcome> {
 }
 
 /// BUG-9: true when the SQLSTATE is a unique-constraint violation (23505).
-/// Pure — it takes the code, not the driver `Error` (whose constructor is
-/// not public), so it can be unit-tested without a live connection. Same
-/// convention as `crate::error::sqlstate_status`.
-pub(crate) fn is_unique_violation(code: Option<tokio_postgres::error::SqlState>) -> bool {
-    code == Some(tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+/// Same convention as `crate::error::sqlstate_status`.
+pub(crate) fn is_unique_violation(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .is_some_and(|db| db.code().as_deref() == Some("23505"))
+}
+
+/// BUG-9 (SeaORM flavor): true when a SeaORM error wraps a sqlx
+/// unique-constraint violation (SQLSTATE 23505). SeaORM runs on the same
+/// sqlx driver, so the violation surfaces as
+/// `DbErr::{Exec, Query}(RuntimeErr::SqlxError(…))`.
+pub(crate) fn orm_is_unique_violation(e: &sea_orm::DbErr) -> bool {
+    match e {
+        sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(sqlx_err))
+        | sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(sqlx_err)) => {
+            is_unique_violation(sqlx_err)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -185,11 +209,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::is_unique_violation;
 
+    /// A non-DB error (e.g. pool timeout) is never a unique violation.
     #[test]
-    fn is_unique_violation_matches_only_23505() {
-        use tokio_postgres::error::SqlState as S;
-        assert!(is_unique_violation(Some(S::UNIQUE_VIOLATION)));
-        assert!(!is_unique_violation(Some(S::FOREIGN_KEY_VIOLATION)));
-        assert!(!is_unique_violation(None));
+    fn is_unique_violation_rejects_non_db_errors() {
+        assert!(!is_unique_violation(&sqlx::Error::PoolTimedOut));
     }
 }

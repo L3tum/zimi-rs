@@ -35,17 +35,43 @@ pub async fn mcp_call_tool(
     crate::mcp::call_tool(state, name, args).await
 }
 
-/// A dead pool pointing at an unreachable URL — used by tests that need a
-/// [`deadpool_postgres::Pool`] value but never touch the database.
-#[allow(clippy::unwrap_used)]
-pub fn dead_pool() -> deadpool_postgres::Pool {
-    let mut cfg = deadpool_postgres::Config::new();
-    cfg.url = Some("postgres://u:p@127.0.0.1:1/nodb".into());
-    cfg.builder(tokio_postgres::NoTls)
-        .unwrap()
-        .max_size(1)
-        .build()
-        .unwrap()
+/// A lazy pool pointing at an unreachable URL — used by tests that need a
+/// [`crate::db::Pool`](sqlx) value but never touch the database (or that
+/// expect the write to fail at the pool). `connect_lazy` defers the first
+/// (and here never-succeeding) connection, so no socket is opened at
+/// construction time. The short acquire timeout makes any accidental pool
+/// use fail fast (`sqlx::Error::PoolTimedOut`) instead of blocking on
+/// sqlx's 30 s default. Safe to call from both sync `#[test]` bodies and
+/// `#[tokio::test]`s (see the runtime fallback inside).
+pub fn dead_pool() -> crate::db::Pool {
+    let build = || {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy("postgres://u:p@127.0.0.1:1/nodb")
+            .expect("dead_pool: lazy connect must not fail")
+    };
+    // sqlx 0.8 spawns background maintenance tasks at pool-creation time and
+    // therefore requires a *current* Tokio runtime even for `connect_lazy`
+    // (which opens no socket). Sync `#[test]` bodies have no runtime, so in
+    // that case build the pool on a process-lifetime current-thread runtime
+    // (held in a `OnceLock` so its spawned tasks stay valid for as long as
+    // any pool outlives it).
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => build(),
+        Err(_) => {
+            // NOTE: must be an async block — `ready(build())` would run
+            // `build()` eagerly, outside the runtime context.
+            static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+            RT.get_or_init(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("dead_pool: fallback runtime must build")
+            })
+            .block_on(async { build() })
+        }
+    }
 }
 
 /// A fully in-memory [`crate::AppState`] for unit tests that need a complete

@@ -14,13 +14,15 @@ use std::time::Instant;
 
 use chrono::NaiveDate;
 
-use futures::SinkExt;
 use rayon::prelude::*;
 use regex::Regex;
 
-use crate::db::pool::Pool;
+use crate::db::entities::{articles_staging, zims};
+use crate::db::{pool::Pool, raw, sea_orm_db};
 use crate::error::{Error, Result};
 use crate::zim::ZimManager;
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, TransactionTrait};
 
 /// Number of chars of article text stored as `content_preview` (B12: the
 /// `/read` DB-fallback path uses this cap to decide whether a returned
@@ -176,12 +178,18 @@ async fn index_single_zim(
     meta: &crate::zim::ZimMeta,
     rayon_pool: &Option<Arc<rayon::ThreadPool>>,
 ) -> Result<()> {
-    let lock_conn = pool.get().await.map_err(Error::Pool)?;
-    let acquired: bool = lock_conn
-        .query_one("SELECT pg_try_advisory_lock(hashtext($1))", &[&meta.name])
-        .await
-        .map_err(Error::Database)?
-        .get(0);
+    // Session-scoped advisory lock: held on a dedicated pooled connection
+    // for the whole run (the pool may recycle a connection mid-run and
+    // silently drop the lock, so it must not be checked in and out). Raw
+    // SQL — the SeaORM builder has no advisory-lock concept.
+    let mut lock_conn = pool.acquire().await.map_err(Error::Database)?;
+    let acquired: bool = raw::fetch_scalar_optional(
+        &mut *lock_conn,
+        "SELECT pg_try_advisory_lock(hashtext($1))",
+        |q| q.bind(&meta.name),
+    )
+    .await?
+    .unwrap_or(false);
     if !acquired {
         tracing::info!(
             "ZIM '{}' is being indexed by another run — skipping",
@@ -202,9 +210,12 @@ async fn index_single_zim(
     // Release the lock while we still hold the connection. Advisory locks are
     // connection-scoped — returning it to the pool without unlocking would
     // leave the lock on that pooled connection and block future runs.
-    if let Err(e) = lock_conn
-        .execute("SELECT pg_advisory_unlock(hashtext($1))", &[&meta.name])
-        .await
+    if let Err(e) = raw::execute(
+        &mut *lock_conn,
+        "SELECT pg_advisory_unlock(hashtext($1))",
+        |q| q.bind(&meta.name),
+    )
+    .await
     {
         tracing::warn!("failed to release index lock for '{}': {e}", meta.name);
     }
@@ -239,16 +250,17 @@ async fn run_index(
 }
 
 /// Mark a ZIM's indexing as failed (best-effort; never masks the original
-/// error).
+/// error). The old code checked out a client and swallowed both the
+/// checkout and the write failure — a single builder call (which folds
+/// acquire + execute into one result) is the same best-effort shape.
 async fn mark_index_error(pool: &Pool, meta: &crate::zim::ZimMeta) {
-    if let Ok(client) = pool.get().await {
-        let _ = client
-            .execute(
-                "UPDATE zims SET index_status = 'error', updated_at = now() WHERE name = $1",
-                &[&meta.name],
-            )
-            .await;
-    }
+    let db = sea_orm_db(pool);
+    let _ = zims::Entity::update_many()
+        .col_expr(zims::Column::IndexStatus, Expr::val("error").into())
+        .col_expr(zims::Column::UpdatedAt, Expr::cust("now()"))
+        .filter(zims::Column::Name.eq(meta.name.clone()))
+        .exec(&db)
+        .await;
 }
 
 /// The indexing pipeline for one ZIM. The caller holds the advisory lock.
@@ -438,12 +450,9 @@ async fn index_body(
     // missing value (legacy checkpoint) degrades to "skip the prune" — safe
     // (no data loss, only possible leftover stale rows, cleaned next run).
     let index_started_at: String = if start_idx == 0 {
-        let client = pool.get().await.map_err(Error::Pool)?;
-        client
-            .query_one("SELECT now()::text", &[])
-            .await
-            .map_err(Error::Database)?
-            .get(0)
+        raw::fetch_scalar_optional(pool, "SELECT now()::text", |q| q)
+            .await?
+            .expect("SELECT now()::text always returns one row")
     } else {
         checkpoint
             .as_ref()
@@ -462,22 +471,27 @@ async fn index_body(
     // this zim_id so a concurrent run's staging is untouched.
     // Resolve the ZIM's numeric id once - reused for the staging cleanup
     // and every chunk's bulk inserts (avoids re-querying per 10k chunk).
-    let zim_id: i32 = {
-        let client = pool.get().await.map_err(Error::Pool)?;
-        client
-            .query_one("SELECT id FROM zims WHERE name = $1", &[&meta.name])
-            .await
-            .map_err(Error::Database)?
-            .get(0)
-    };
+    // (The old `query_one` panicked on a vanished row; the row is written
+    // by `persist_to_db`/`update_zim_status` before this point, so this is
+    // the same invariant, returned as an error instead of a panic.)
+    let zim_id: i32 = raw::fetch_scalar_optional(
+        pool,
+        "SELECT id FROM zims WHERE name = $1",
+        |q| q.bind(&meta.name),
+    )
+    .await?
+    .ok_or_else(|| {
+        Error::Internal(anyhow::anyhow!("ZIM '{}' row vanished before indexing", meta.name))
+    })?;
     // Staging cleanup is scoped to this zim_id so a concurrent run's
     // staging is untouched.
     {
-        let client = pool.get().await.map_err(Error::Pool)?;
-        client
-            .execute("DELETE FROM articles_staging WHERE zim_id = $1", &[&zim_id])
+        let db = sea_orm_db(pool);
+        articles_staging::Entity::delete_many()
+            .filter(articles_staging::Column::ZimId.eq(zim_id))
+            .exec(&db)
             .await
-            .map_err(Error::Database)?;
+            .map_err(Error::SeaOrm)?;
     }
 
     // PERF 1 (availability-preserving reindex): NO up-front `DELETE FROM
@@ -850,19 +864,28 @@ fn extract_qid(html: &str) -> Option<i64> {
 }
 
 /// Bulk insert a batch of articles using COPY to staging → upsert to main.
+///
+/// Phase 1 stays a **COPY** (sqlx's `PgConnection::copy_in_raw`): a sea-orm
+/// `insert_many` would round-trip the whole 10k-row chunk as individual
+/// bound value sets and measurably lose the bulk-load throughput the
+/// pipeline is tuned for. Phases 2–4 stay raw on the same connection: the
+/// tsvector upsert (`setweight(to_tsvector(...)) || setweight(...)`)
+/// and the `unnest`-zipped Q-ID insert are too exotic for the builder, and
+/// keeping them on the COPY connection preserves the old single-connection
+/// shape.
 async fn bulk_insert(
     pool: &Pool,
     rows: &[&ArticleRow],
     namespace: &str,
     zim_id: i32,
 ) -> Result<()> {
-    let client = pool.get().await.map_err(Error::Pool)?;
+    let mut client = pool.acquire().await.map_err(Error::Database)?;
 
     // Phase 1: COPY to staging table.
     // Build the whole chunk's payload in one buffer and send it in a single
     // `copy.send()` — one await per 10k-row chunk instead of one per row.
     let copy_sql = "COPY articles_staging (path, title, content_preview, snippet, language, namespace, zim_id) FROM STDIN WITH (FORMAT text)";
-    let mut copy = Box::pin(client.copy_in(copy_sql).await.map_err(Error::Database)?);
+    let mut copy = client.copy_in_raw(copy_sql).await.map_err(Error::Database)?;
 
     let mut buf = String::with_capacity(rows.len() * 2304); // ~2.2 KB/row with 2000-char previews
     for row in rows {
@@ -884,34 +907,31 @@ async fn bulk_insert(
         buf.push_str(&zim_id.to_string());
         buf.push('\n');
     }
-    copy.send(bytes::Bytes::from(buf))
-        .await
-        .map_err(Error::Database)?;
+    copy.send(buf.as_bytes()).await.map_err(Error::Database)?;
 
-    let _rows: u64 = copy.as_mut().finish().await.map_err(Error::Database)?;
+    let _rows: u64 = copy.finish().await.map_err(Error::Database)?;
 
     // Phase 2: Upsert from staging to main table
     // tsvector is computed in Postgres (guaranteed correct for 'simple' config)
-    client
-        .execute(
-            "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)
-            SELECT
-                path, title, content_preview, snippet,
-                setweight(to_tsvector('simple', title), 'A')
-                || setweight(to_tsvector('simple', coalesce(content_preview, '')), 'B'),
-                language, namespace, zim_id
-            FROM articles_staging
-            WHERE zim_id = $1
-            ON CONFLICT (zim_id, path) DO UPDATE SET
-                title = EXCLUDED.title,
-                content_preview = EXCLUDED.content_preview,
-                snippet = EXCLUDED.snippet,
-                search_vector = EXCLUDED.search_vector,
-                updated_at = now()",
-            &[&zim_id],
-        )
-        .await
-        .map_err(Error::Database)?;
+    raw::execute(
+        &mut *client,
+        "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)
+        SELECT
+            path, title, content_preview, snippet,
+            setweight(to_tsvector('simple', title), 'A')
+            || setweight(to_tsvector('simple', coalesce(content_preview, '')), 'B'),
+            language, namespace, zim_id
+        FROM articles_staging
+        WHERE zim_id = $1
+        ON CONFLICT (zim_id, path) DO UPDATE SET
+            title = EXCLUDED.title,
+            content_preview = EXCLUDED.content_preview,
+            snippet = EXCLUDED.snippet,
+            search_vector = EXCLUDED.search_vector,
+            updated_at = now()",
+        |q| q.bind(zim_id),
+    )
+    .await?;
 
     // Phase 3: Q-ID batch insert (only if we have Q-IDs)
     let qid_rows: Vec<(&str, i64)> = rows
@@ -926,25 +946,26 @@ async fn bulk_insert(
         // zips path/qid pairwise. `zim_id` is bound once.
         let qid_paths: Vec<String> = qid_rows.iter().map(|(p, _)| p.to_string()).collect();
         let qid_vals: Vec<i64> = qid_rows.iter().map(|(_, q)| *q).collect();
-        client
-            .execute(
-                "INSERT INTO qid_index (zim_id, path, qid) \
-                 SELECT $1, v.path, v.qid \
-                 FROM unnest($2::text[], $3::bigint[]) AS v(path, qid) \
-                 ON CONFLICT (zim_id, path) DO UPDATE SET qid = EXCLUDED.qid",
-                &[&zim_id, &qid_paths, &qid_vals],
-            )
-            .await
-            .map_err(Error::Database)?;
+        raw::execute(
+            &mut *client,
+            "INSERT INTO qid_index (zim_id, path, qid) \
+             SELECT $1, v.path, v.qid \
+             FROM unnest($2::text[], $3::bigint[]) AS v(path, qid) \
+             ON CONFLICT (zim_id, path) DO UPDATE SET qid = EXCLUDED.qid",
+            |q| q.bind(zim_id).bind(qid_paths).bind(qid_vals),
+        )
+        .await?;
     }
 
     // Phase 4: clear only THIS ZIM's staging rows. A global TRUNCATE would
     // wipe another concurrently-indexed ZIM's in-flight staging rows (staging
     // is shared); scoping to zim_id keeps parallel runs safe.
-    client
-        .execute("DELETE FROM articles_staging WHERE zim_id = $1", &[&zim_id])
-        .await
-        .map_err(Error::Database)?;
+    raw::execute(
+        &mut *client,
+        "DELETE FROM articles_staging WHERE zim_id = $1",
+        |q| q.bind(zim_id),
+    )
+    .await?;
 
     Ok(())
 }
@@ -977,35 +998,23 @@ async fn update_zim_status(
     date: &Option<NaiveDate>,
     article_count: u64,
 ) -> Result<()> {
-    let client = pool.get().await.map_err(Error::Pool)?;
+    let db = sea_orm_db(pool);
     let article_count_i64 = article_count as i64;
-    client
-        .execute(
-            "UPDATE zims SET
-                display_title = $2,
-                language = $3,
-                description = $4,
-                creator = $5,
-                publisher = $6,
-                date = $7,
-                article_count = $8,
-                index_status = 'indexing',
-                index_progress = 0.0,
-                updated_at = now()
-            WHERE name = $1",
-            &[
-                &meta.name as &(dyn postgres_types::ToSql + Sync),
-                &title,
-                &language,
-                description,
-                creator,
-                publisher,
-                date,
-                &article_count_i64,
-            ],
-        )
+    zims::Entity::update_many()
+        .col_expr(zims::Column::DisplayTitle, Expr::val(title).into())
+        .col_expr(zims::Column::Language, Expr::val(language).into())
+        .col_expr(zims::Column::Description, Expr::val(description.clone()).into())
+        .col_expr(zims::Column::Creator, Expr::val(creator.clone()).into())
+        .col_expr(zims::Column::Publisher, Expr::val(publisher.clone()).into())
+        .col_expr(zims::Column::Date, Expr::val(date.as_ref().cloned()).into())
+        .col_expr(zims::Column::ArticleCount, Expr::val(article_count_i64).into())
+        .col_expr(zims::Column::IndexStatus, Expr::val("indexing").into())
+        .col_expr(zims::Column::IndexProgress, Expr::val(0.0f32).into())
+        .col_expr(zims::Column::UpdatedAt, Expr::cust("now()"))
+        .filter(zims::Column::Name.eq(meta.name.clone()))
+        .exec(&db)
         .await
-        .map_err(Error::Database)?;
+        .map_err(Error::SeaOrm)?;
     Ok(())
 }
 
@@ -1016,19 +1025,18 @@ async fn update_progress(
     progress: f64,
     completed: u64,
 ) -> Result<()> {
-    let client = pool.get().await.map_err(Error::Pool)?;
+    let db = sea_orm_db(pool);
     let completed_i64 = completed as i64;
-    client
-        .execute(
-            "UPDATE zims SET index_progress = $2, indexed_entries = $3, updated_at = now() WHERE name = $1",
-            &[
-                &meta.name as &(dyn postgres_types::ToSql + Sync),
-                &progress,
-                &completed_i64,
-            ],
-        )
+    zims::Entity::update_many()
+        // `index_progress` is `REAL`: the old code bound the `f64` and let
+        // Postgres cast float8→real; the Rust `as f32` is the same rounding.
+        .col_expr(zims::Column::IndexProgress, Expr::val(progress as f32).into())
+        .col_expr(zims::Column::IndexedEntries, Expr::val(completed_i64).into())
+        .col_expr(zims::Column::UpdatedAt, Expr::cust("now()"))
+        .filter(zims::Column::Name.eq(meta.name.clone()))
+        .exec(&db)
         .await
-        .map_err(Error::Database)?;
+        .map_err(Error::SeaOrm)?;
     Ok(())
 }
 
@@ -1050,58 +1058,56 @@ async fn finalize_zim(
     index_started_at: &str,
     start: &Instant,
 ) -> Result<()> {
-    let mut client = pool.get().await.map_err(Error::Pool)?;
-    let total_i64 = total as i64;
-    let tx = client.transaction().await.map_err(Error::Database)?;
+    // One transaction (as before): either the old (complete) row set or the
+    // new (complete) row set is visible, never a mix. The two prune DELETEs
+    // stay raw (subquery on `zims.name` + the `$2::timestamptz` text cast
+    // are cleaner in raw SQL than in the builder); the ready-flip is a
+    // builder update on the same transaction.
+    let db = sea_orm_db(pool);
+    let tx = db.begin().await.map_err(Error::SeaOrm)?;
 
     if !index_started_at.is_empty() {
         // Prune rows whose path was removed from the archive (or belonged to a
         // prior index this run replaced). Uses the `updated_at` boundary —
         // only the indexing upsert advances `articles.updated_at` (embed writes
         // touch `embed_at` only), so this is exactly the stale set.
-        let del: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![
-            &meta.name as &(dyn postgres_types::ToSql + Sync),
-            &index_started_at as &(dyn postgres_types::ToSql + Sync),
-        ];
-        tx.execute(
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Postgres,
             "DELETE FROM articles
              WHERE zim_id = (SELECT id FROM zims WHERE name = $1)
                AND updated_at < $2::timestamptz",
-            &del,
-        )
-        .await
-        .map_err(Error::Database)?;
+            vec![
+                sea_orm::Value::from(&meta.name),
+                sea_orm::Value::from(index_started_at),
+            ],
+        );
+        tx.execute(stmt).await.map_err(Error::SeaOrm)?;
 
         // Drop Q-IDs that no longer reference a live article. `NOT EXISTS`
         // against the just-pruned `articles` is idempotent and safe on resume.
-        tx.execute(
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Postgres,
             "DELETE FROM qid_index q
              WHERE q.zim_id = (SELECT id FROM zims WHERE name = $1)
                AND NOT EXISTS (SELECT 1 FROM articles a
                     WHERE a.zim_id = q.zim_id AND a.path = q.path)",
-            &[&meta.name],
-        )
-        .await
-        .map_err(Error::Database)?;
+            vec![sea_orm::Value::from(&meta.name)],
+        );
+        tx.execute(stmt).await.map_err(Error::SeaOrm)?;
     }
 
-    let upd: Vec<&(dyn postgres_types::ToSql + Sync)> = vec![
-        &meta.name as &(dyn postgres_types::ToSql + Sync),
-        &total_i64 as &(dyn postgres_types::ToSql + Sync),
-    ];
-    tx.execute(
-        "UPDATE zims SET
-            index_status = 'ready',
-            index_progress = 1.0,
-            indexed_entries = $2,
-            indexed_at = now(),
-            updated_at = now()
-        WHERE name = $1",
-        &upd,
-    )
-    .await
-    .map_err(Error::Database)?;
-    tx.commit().await.map_err(Error::Database)?;
+    let total_i64 = total as i64;
+    zims::Entity::update_many()
+        .col_expr(zims::Column::IndexStatus, Expr::val("ready").into())
+        .col_expr(zims::Column::IndexProgress, Expr::val(1.0f32).into())
+        .col_expr(zims::Column::IndexedEntries, Expr::val(total_i64).into())
+        .col_expr(zims::Column::IndexedAt, Expr::cust("now()"))
+        .col_expr(zims::Column::UpdatedAt, Expr::cust("now()"))
+        .filter(zims::Column::Name.eq(meta.name.clone()))
+        .exec(&tx)
+        .await
+        .map_err(Error::SeaOrm)?;
+    tx.commit().await.map_err(Error::SeaOrm)?;
 
     tracing::info!(
         "Indexed '{}' — {} articles in {:.1}s",
