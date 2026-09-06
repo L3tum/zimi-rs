@@ -118,7 +118,7 @@ web-test:
 	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
 	    echo "web-test: node not found (strict mode)" >&2; exit 1; \
 	  fi; echo "web-test: node not found — skipping web UI unit tests"; exit 0; }
-	node --test tests/web/common.test.mjs
+	node --test tests/web/*.test.mjs
 
 # Real lint (eslint) of the embedded web UI: web/common.js + the inline
 # <script> blocks extracted by tests/web/extract-inline.mjs. Requires

@@ -141,9 +141,7 @@ let settings = {};   // raw server response: {cat: {key: {value, locked?, locked
 let originals = {};  // full key -> original value (for change detection + typing)
 
 async function load() {
-  const r = await apiFetch('/settings');
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  settings = await r.json();
+  settings = await apiJson('/settings');
   originals = {};
   for (const [cat, fields] of Object.entries(settings))
     for (const [key, info] of Object.entries(fields))
@@ -251,12 +249,10 @@ async function saveAll() {
   btn.dataset.saving = '1';
   btn.disabled = true;
   try {
-    const r = await apiFetch('/settings', {
+    const body = await apiJson('/settings', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(updates),
     });
-    const body = await r.json();
-    if (!r.ok) throw new Error(body.error || 'HTTP ' + r.status);
     if (body.errors && body.errors.length) {
       msg.className = 'msg error';
       msg.textContent = body.errors.join('\n');
@@ -282,8 +278,8 @@ let zimTimers = {};
 async function loadZimRows() {
   const wrap = document.getElementById('zimRows');
   try {
-    const r = await apiFetch('/list');
-    zimsData = (await r.json()).zims || [];
+    const data = await apiJson('/list');
+    zimsData = data.zims || [];
   } catch (e) { wrap.innerHTML = `<div class="sub">Could not load ZIM list: ${esc(e.message)}</div>`; return; }
   if (!zimsData.length) { wrap.innerHTML = '<div class="sub">No ZIMs in the library.</div>'; return; }
   wrap.innerHTML = zimsData.map(z => `
@@ -314,11 +310,10 @@ function handleAnchor() {
 }
 
 async function putZim(name, patch) {
-  const r = await apiFetch(`/settings/zim/${encodeURIComponent(name)}`, {
+  await apiJson(`/settings/zim/${encodeURIComponent(name)}`, {
     method: 'PUT', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch),
   });
-  if (!r.ok) throw new Error((await r.json()).error || 'HTTP ' + r.status);
   const msg = document.querySelector(`[data-zmsg="${CSS.escape(name)}"]`);
   if (msg) { msg.style.opacity = 1; setTimeout(() => msg.style.opacity = 0, 1200); }
 }

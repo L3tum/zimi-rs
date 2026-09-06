@@ -99,8 +99,8 @@ async function loadLibrary() {
   const bar = document.getElementById('statusBar');
   try {
     const [health, list] = await Promise.all([
-      apiFetch('/health').then(r => r.ok ? r.json() : Promise.reject(new Error('health ' + r.status))),
-      apiFetch('/list').then(r => r.ok ? r.json() : Promise.reject(new Error('list ' + r.status))),
+      apiJson('/health'),
+      apiJson('/list'),
     ]);
     zimsData = list.zims || [];
     bar.innerHTML =
@@ -160,11 +160,10 @@ document.getElementById('zims').addEventListener('change', async (e) => {
   const name = e.target.dataset.embed;
   if (!name) return;
   try {
-    const r = await apiFetch(`/settings/zim/${encodeURIComponent(name)}`, {
+    await apiJson(`/settings/zim/${encodeURIComponent(name)}`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ embed_enabled: e.target.checked }),
     });
-    if (!r.ok) throw new Error((await r.json()).error || r.status);
     toast(`Embedding ${e.target.checked ? 'enabled' : 'disabled'} for ${name}`);
   } catch (err) { toast('Save failed: ' + err.message, false); e.target.checked = !e.target.checked; }
 });
@@ -182,11 +181,10 @@ async function saveCategory(name, input) {
   const val = input.value.trim();
   if (val === (z.category || '')) return; // unchanged
   try {
-    const r = await apiFetch(`/settings/zim/${encodeURIComponent(name)}`, {
+    await apiJson(`/settings/zim/${encodeURIComponent(name)}`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ category: val || null }),
     });
-    if (!r.ok) throw new Error((await r.json()).error || r.status);
     z.category = val || null;
     const msg = document.querySelector(`[data-catmsg="${CSS.escape(name)}"]`);
     if (msg) { msg.style.opacity = 1; setTimeout(() => msg.style.opacity = 0, 1200); }
@@ -199,8 +197,7 @@ let dlPoll = null;
 async function loadDownloads() {
   let data;
   try {
-    const r = await apiFetch('/downloads');
-    data = await r.json();
+    data = await apiJson('/downloads');
   } catch (e) { return; }
   const dl = data.downloads || [];
   renderDownloads(dl);
@@ -247,12 +244,10 @@ async function addDownload() {
   const btn = document.getElementById('dlAdd');
   btn.disabled = true;
   try {
-    const r = await apiFetch('/downloads', {
+    await apiJson('/downloads', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url, name: name || undefined }),
     });
-    const body = await r.json();
-    if (!r.ok) throw new Error(body.error || r.status);
     document.getElementById('dlUrl').value = '';
     document.getElementById('dlName').value = '';
     toast('Download queued');

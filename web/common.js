@@ -62,3 +62,44 @@ function toast(msg, ok = true) {
   clearTimeout(_toastTimer);
   _toastTimer = setTimeout(() => t.className = 'toast', 3000);
 }
+
+// ── JSON fetch helper ────────────────────────────────────────────────────
+// Wraps apiFetch + r.json() + error extraction. Use in place of the repeated
+//   const r = await apiFetch(url, opts);
+//   const body = await r.json();
+//   if (!r.ok) throw new Error(body.error || 'HTTP ' + r.status);
+// pattern found across all pages.
+async function apiJson(url, opts) {
+  const r = await apiFetch(url, opts);
+  const body = await r.json();
+  if (!r.ok) throw new Error(body.error || 'HTTP ' + r.status);
+  return body;
+}
+
+// ── Search snippet highlighting ──────────────────────────────────────────
+// The API wraps matched terms in <b>…</b> (ts_headline) when highlight=true.
+// Everything else is plain text, so: find the literal <b>/</b> tag pairs,
+// escape everything, and re-emit the matched pairs as <mark>…</mark>.
+function snippetHtml(raw) {
+  if (!raw) return '';
+  const re = /<\/b>|<b>/g;
+  let out = '';
+  let i = 0;
+  let inMark = false;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    out += esc(raw.slice(i, m.index));
+    if (m[0] === '<b>' && !inMark) {
+      inMark = true;
+      out += '<mark>';
+    } else if (m[0] === '</b>' && inMark) {
+      inMark = false;
+      out += '</mark>';
+    } else {
+      out += esc(m[0]); // unbalanced tag → render as literal text
+    }
+    i = m.index + m[0].length;
+  }
+  out += esc(raw.slice(i));
+  return out;
+}

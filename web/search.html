@@ -82,8 +82,7 @@ document.getElementById('mode').value = initialMode;
 
 async function loadZims() {
   try {
-    const r = await apiFetch('/list');
-    const data = await r.json();
+    const data = await apiJson('/list');
     zims = data.zims || [];
     const zimSel = document.getElementById('zim');
     const langSel = document.getElementById('lang');
@@ -136,10 +135,8 @@ async function doSearch() {
   showState('loading');
   const t0 = performance.now();
   try {
-    const r = await apiFetch(url);
-    const data = await r.json();
+    const data = await apiJson(url);
     if (seq !== searchSeq) return; // stale response
-    if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
     const ms = (performance.now() - t0).toFixed(0);
     document.getElementById('stats').textContent = `${data.results.length} results in ${ms}ms` +
       (data.total != null && data.total !== data.results.length ? ` (of ${data.total} total)` : '');
@@ -163,33 +160,6 @@ function renderResults(results) {
   showState(results.length ? 'results' : 'empty');
 }
 
-// The API wraps matched terms in <b>…</b> (ts_headline) when highlight=true.
-// Everything else is plain text, so: find the literal <b>/</b> tag pairs,
-// escape everything, and re-emit the matched pairs as <mark>…</mark>.
-function snippetHtml(raw) {
-  if (!raw) return '';
-  const re = /<\/b>|<b>/g;
-  let out = '';
-  let i = 0;
-  let inMark = false;
-  let m;
-  while ((m = re.exec(raw)) !== null) {
-    out += esc(raw.slice(i, m.index));
-    if (m[0] === '<b>' && !inMark) {
-      inMark = true;
-      out += '<mark>';
-    } else if (m[0] === '</b>' && inMark) {
-      inMark = false;
-      out += '</mark>';
-    } else {
-      out += esc(m[0]); // unbalanced tag → render as literal text
-    }
-    i = m.index + m[0].length;
-  }
-  out += esc(raw.slice(i));
-  return out;
-}
-
 // ── Autocomplete (no inline handlers; safe with arbitrary titles) ──────────
 let suggestTimer = null;
 let suggestItems = [];
@@ -207,8 +177,7 @@ qInput.addEventListener('input', function() {
   if (q.length < 2) { closeSuggestions(); return; }
   suggestTimer = setTimeout(async () => {
     try {
-      const r = await apiFetch(`/suggest?q=${encodeURIComponent(q)}&limit=8`);
-      const data = await r.json();
+      const data = await apiJson(`/suggest?q=${encodeURIComponent(q)}&limit=8`);
       if (qInput.value.trim() !== q) return; // user kept typing
       renderSuggestions(data.suggestions || []);
     } catch (e) { /* non-fatal */ }
