@@ -298,3 +298,9 @@ Explicitly declared out of scope:
 - **CI mirror.** `make test-strict-ci` is the local twin of the CI test-db
   job (strict integration minus the slow perf test); the Makefile requires
   the two selections to stay in sync.
+- **Coverage ratchet.** The CI `coverage` job runs `cargo llvm-cov` against a
+  Postgres service (`.github/workflows/ci.yml`) over the same selection as
+  `test-db` with `ZIMSERVICE_REQUIRE_DB=1`, so DB-gated code counts toward the
+  line-coverage floor in `.github/coverage_floor.txt`. The floor can only
+  effectively rise: the job fails if measured coverage drops below it, so it
+  should be bumped to the newly measured value after coverage gains land.

@@ -388,9 +388,11 @@ gate on this: if the lock is already held by another instance, a second `serve`
 side-by-side. The lock protects in-process state that two live servers would
 corrupt — the settings cache, the rate limiter, the qBittorrent client cache, and
 the ZIM LRU. Set `ZIMSERVICE_ALLOW_MULTI_INSTANCE=1` to override and fall back to
-warn-only (not recommended). The read-only subcommands (`list --sync`, `status`,
-`index`, `mcp`, `embed`) stay warn-only. For production deployments, run at most
-one `serve` per Postgres database.
+warn-only (not recommended). The mutating subcommands (`index`, `embed`,
+`list --sync`) **refuse** to run while a server holds the lock (bail with the
+holder's PID, unless `ZIMSERVICE_ALLOW_MULTI_INSTANCE=1`); the read-only
+subcommands (`status`, `mcp`) stay warn-only. For production deployments, run
+at most one `serve` per Postgres database.
 
 **`zim_dir` is a per-database guarantee.** The advisory lock is per-database, so it
 cannot exclude an instance that runs against a *different* database. If two
