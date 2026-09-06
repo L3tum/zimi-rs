@@ -18,6 +18,21 @@ DEV_DSN ?= postgres://zimservice:zimservice@127.0.0.1:5432/zimservice
 
 WAIT_PG := @ok=0; for i in $$(seq 1 30); do docker compose exec -T postgres pg_isready -U zimservice >/dev/null 2>&1 && ok=1 && break; sleep 1; done; [ $$ok = 1 ] || { echo "postgres failed to become ready" >&2; exit 1; }
 
+# Shared boilerplate for every DB-gated dev target (a make macro, invoked as
+# $(call DB_WRAP,<commands>)): boot the compose Postgres, wait for it, run
+# the caller's commands ($1), then tear the container down. NOTE: a naive
+# recipe where <commands> is a separate line would skip the final
+# `docker compose stop` when <commands> fails (leaking the running container);
+# instead the stop is chained after $1 on the same shell line via
+# `st=$?; ...; exit $st`, so stop runs even on failure while the target still
+# reports the original failure status.
+# Use only inside recipe lines.
+define DB_WRAP
+docker compose up -d postgres
+$(WAIT_PG)
+$1; st=$$?; docker compose stop postgres; exit $$st
+endef
+
 .PHONY: all help check fmt fmt-check clippy test test-fast test-integration test-strict test-strict-perf test-strict-ci build release install uninstall doc run clean web-check web-test web-lint
 
 # Quick pre-commit checks
@@ -47,13 +62,12 @@ clippy:
 # DbExclusiveGuard (cross-process lockfile + in-process slot), and
 # smoke_migration_drift_detection (tests/integration.rs) now runs in a
 # dedicated temp DB it drops instead of tampering the shared
-# schema_migrations. The --test-threads=1 flags still present on the local
-# dev targets (test / test-integration / test-strict*) are valid but no
-# longer required; the CI and test-strict-ci gates now run parallel.
+# schema_migrations. Every target here (local and CI) therefore runs with the
+# default parallel --test-threads.
 test:
 	$(CARGO) test --lib --bins --test wiremock
 	$(CARGO) test --doc
-	$(CARGO) test --test integration -- --test-threads=1 --nocapture
+	$(CARGO) test --test integration -- --nocapture
 
 test-fast:
 	$(CARGO) test --lib --bins
@@ -62,38 +76,30 @@ test-fast:
 # down). Idempotent — safe against an existing dev DB. This target requires
 # docker.
 test-integration:
-	docker compose up -d postgres
-	$(WAIT_PG)
-	DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration -- --test-threads=1
-	docker compose stop postgres
+	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration --)
 
 # Strict integration: DB must be reachable or tests hard-fail.
 test-strict:
-	docker compose up -d postgres
-	$(WAIT_PG)
-	DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration -- --include-ignored --test-threads=1
-	docker compose stop postgres
+	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration -- --include-ignored)
 
 # DB-gated performance checks (seeds 100k rows, runs EXPLAIN (ANALYZE); slow).
 # Runs only the ignored perf tests, e.g. trgm_index_perf_check.
 test-strict-perf:
-	docker compose up -d postgres
-	$(WAIT_PG)
-	DATABASE_URL=$(DEV_DSN) $(CARGO) test --test integration trgm_index_perf_check -- --ignored
-	docker compose stop postgres
+	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) $(CARGO) test --test integration trgm_index_perf_check -- --ignored)
 
-# Mirrors the CI PR gate (P13): strict integration minus the slow 100k-row
-# perf test, so the perf guard never blocks the correctness gate. Both halves
-# run with the default parallel --test-threads: the lib's DB-gated tests and
-# the integration suite share one dev DB, but every DB-gated test is
-# serialized by DbExclusiveGuard (cross-process lockfile + in-process slot),
-# and the migration drift check now runs in a dedicated temp DB it drops.
+# Local mirror of the CI PR gate (P13): the test-db job in
+# .github/workflows/ci.yml is this target's CI twin — strict integration minus
+# the slow 100k-row perf test, so the perf guard never blocks the correctness
+# gate. The two must be kept in sync: any change to the selection of lib vs
+# integration halves (flags, --skip/--include-ignored) needs to land in both
+# this target and the CI job. Both halves run with the default parallel
+# --test-threads: the lib's DB-gated tests and the integration suite share one
+# dev DB, but every DB-gated test is serialized by DbExclusiveGuard
+# (cross-process lockfile + in-process slot), and the migration drift check
+# now runs in a dedicated temp DB it drops.
 test-strict-ci:
-	docker compose up -d postgres
-	$(WAIT_PG)
-	DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --lib
-	DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration -- --include-ignored --skip trgm_index_perf_check
-	docker compose stop postgres
+	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --lib && \
+	    DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration -- --include-ignored --skip trgm_index_perf_check)
 
 # JS syntax check for the embedded web UI (web/*.js + inline <script> blocks).
 # Requires node; skips with a warning when node is absent. Set
@@ -137,14 +143,15 @@ web-lint:
 	./node_modules/.bin/eslint web/common.js .web-lint-tmp/*.js
 	@echo "web-lint: OK"
 
-# Full pre-merge check suite (type-check, format check, lint, full test run)
+# Full pre-merge check suite: type-check, format check, lint, full test run,
+# and the web UI checks (syntax, unit tests, eslint).
 all: check fmt-check clippy test web-check web-test web-lint
 
 help:
 	@echo "zimservice — make targets"
 	@echo ""
 	@echo "  make              Default: runs 'make check' (cargo check). Use 'make all' for the full gate"
-	@echo "  make all          Full quality gate: check + fmt-check + clippy + test + web-check"
+	@echo "  make all          Full quality gate: check + fmt-check + clippy + test + web-check + web-test + web-lint"
 	@echo "  make check        cargo check (pre-commit)"
 	@echo "  make fmt          Format code"
 	@echo "  make fmt-check    Check formatting (CI)"
