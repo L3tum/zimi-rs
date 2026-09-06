@@ -72,16 +72,36 @@ jobs:
       - run: cargo test --doc
   coverage:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
+        env:
+          POSTGRES_USER: zimservice
+          POSTGRES_PASSWORD: zimservice
+          POSTGRES_DB: zimservice
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U zimservice"
+          --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with: { components: llvm-tools-preview }
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # DB-less coverage floor (ratchet): the DB-gated tests skip here (no DB),
-      # so this measures lib/bins/wiremock line coverage. Raise the floor in
-      # .github/coverage_floor.txt as coverage improves — the job fails if the
-      # measured coverage drops below it, so the floor can only effectively rise.
-      - run: cargo llvm-cov --all-features --lib --bins --test wiremock --fail-under-lines "$(cat .github/coverage_floor.txt)"
+      # DB-backed coverage floor (ratchet), same selection as `test-db`:
+      # lib/bins/wiremock plus the integration suite, with
+      # ZIMSERVICE_REQUIRE_DB=1 turning DB-gated skips into hard failures so
+      # poller DB writes, run_pipeline, and the whole integration suite all
+      # count toward the floor. Raise the floor in .github/coverage_floor.txt
+      # after the first DB-backed run to lock in the gain — the job fails if
+      # measured coverage drops below it, so the floor can only effectively
+      # rise.
+      - run: |
+          ZIMSERVICE_REQUIRE_DB=1 \
+          DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
+          cargo llvm-cov --all-features --lib --bins --test wiremock --test integration \
+            --fail-under-lines "$(cat .github/coverage_floor.txt)" \
+            -- --skip trgm_index_perf_check --include-ignored
   test-db:
     runs-on: ubuntu-latest
     services:
