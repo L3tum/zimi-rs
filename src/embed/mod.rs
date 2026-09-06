@@ -941,6 +941,10 @@ mod tests {
     #[test]
     fn record_batch_failure_and_success() {
         let _g = EMBED_TESTS_LOCK.lock().expect("embed tests lock poisoned");
+        // The 500-endpoint loop test (DB-gated) also mutates `EMBED_FAILS`
+        // via the pipeline's failure path — serialize on the shared DB
+        // guard so its exact-map assertions never race.
+        let _g = crate::testing::DbExclusiveGuard::acquire();
         reset_embed_fails();
         // Failure bumps the counter (per row).
         record_batch_failure(&[1, 2, 2]);
@@ -961,6 +965,7 @@ mod tests {
     #[test]
     fn poison_filter_drops_rows_at_max() {
         let _g = EMBED_TESTS_LOCK.lock().expect("embed tests lock poisoned");
+        let _g = crate::testing::DbExclusiveGuard::acquire();
         reset_embed_fails();
         // Fresh rows pass.
         assert_eq!(filter_poisoned_ids(&[1, 2, 3]), Some(vec![1, 2, 3]));
@@ -986,6 +991,7 @@ mod tests {
     #[test]
     fn poison_fail_open_above_cap() {
         let _g = EMBED_TESTS_LOCK.lock().expect("embed tests lock poisoned");
+        let _g = crate::testing::DbExclusiveGuard::acquire();
         reset_embed_fails();
         // Fill the map past the cap (all poison); the filter must log + clear
         // (fail-open) and treat a fresh id as clean.
@@ -1003,6 +1009,591 @@ mod tests {
         {
             let m = EMBED_FAILS.lock().unwrap();
             assert!(m.is_empty(), "over-cap map is cleared (fail-open)");
+        }
+    }
+
+    // ─── auto_embed_loop lifecycle (Tests Major #4) ─────────────────────────
+    //
+    // The loop's 60 s cadence is a plain `tokio::time::sleep`, so these tests
+    // run under `#[tokio::test(start_paused = true)]` (mock time — the code
+    // already supports it; no production restructuring). Two tokio
+    // auto-advance facts drive the plumbing below (verified against the
+    // tokio 1.53 runtime source *and* a scratch repro):
+    //
+    // 1. A parked worker with no ready tasks JUMPS the paused clock to the
+    //    next timer (no real time elapses); a real I/O event landing while
+    //    the worker is parked (or about to park) wins the race — the park
+    //    returns via that wake and no jump happens. So real loopback I/O
+    //    (DB probes, embed HTTP) always completes in real time, while pure
+    //    waits (the loop's 60 s tick, the poll sleeps) jump instantly.
+    // 2. While a `spawn_blocking` task runs, auto-advance is INHIBITED and
+    //    the clock stays frozen — so any `tokio::time` deadline inside a
+    //    `Handle::block_on` on a blocking thread can never fire. A connect
+    //    gate built on `spawn_blocking` + `Handle::block_on` therefore
+    //    *deadlocks* against a downed DB (sqlx's pool connect touches
+    //    timers internally), not "measures real time". That is why
+    //    `loop_pool_or_skip` uses the plain established pattern instead.
+    //
+    // Consequences the helpers rely on:
+    // - a real DB probe from the test task parks the worker with the loop's
+    //   60 s tick as the next timer; either the probe's loopback response
+    //   wins (no jump) or the park yields the 60 s jump — either way one
+    //   probe cycle ≈ one loop tick, in milliseconds of real time;
+    // - `loop_pool_or_skip` uses a plain `tokio::time::timeout(3 s, connect)`
+    //   (the repo's established DB-gate pattern): a downed DB yields a
+    //   skip in ~1 ms of real time, and a live DB's real handshake wins
+    //   the race against the virtual deadline;
+    // - `embedding.timeout_secs` is huge, so a virtual jump can never trip
+    //   an in-flight request's timeout.
+    //
+    // All three are DB-gated with the lib's established pattern
+    // (`DATABASE_URL` + 3 s connect timeout + `ZIMSERVICE_REQUIRE_DB`
+    // hard-fail) and serialize via `DbExclusiveGuard` like every other DB
+    // test in the crate. The 500-endpoint test also bumps the in-process
+    // `EMBED_FAILS` poison counters (via the pipeline's failure path), which
+    // the pure poison unit tests below assert on exactly — they take the
+    // guard as well, so the shared static never races.
+
+    const LOOP_ZIM: &str = "__embedloop__";
+    /// Real-time budget for polling a live condition. Ticks themselves are
+    /// virtual (milliseconds of real time); this bounds real I/O waits.
+    const LOOP_WAIT_BUDGET: Duration = Duration::from_secs(60);
+
+    /// DB gate for the loop tests — the lib's established pattern
+    /// (`smoke_single_instance_refusal` & co. and `tests/integration/common.rs`):
+    /// `DATABASE_URL` + 3 s connect timeout around the eager connect +
+    /// `ZIMSERVICE_REQUIRE_DB` hard-fail, then serialize via
+    /// `DbExclusiveGuard` like every other DB test in the crate.
+    ///
+    /// The timeout is a plain `tokio::time::timeout` in the test task — no
+    /// `spawn_blocking`/`Handle::block_on` indirection. That indirection is
+    /// a *deadlock* under the paused clock, not a real-time measurement:
+    /// while a blocking task runs, auto-advance is inhibited, so the virtual
+    /// 3 s deadline never fires and any connect path that touches a tokio
+    /// timer internally (sqlx pool connect does) hangs forever. The plain
+    /// timeout is safe under auto-advance: the clock only jumps when the
+    /// worker's park *times out* (no real I/O event within the window), so a
+    /// slow-but-live DB still completes its handshake in real time and wins
+    /// the race, while a refused/black-holed connect yields an error/timeout
+    /// within 3 s of real time.
+    async fn loop_pool_or_skip(test: &str) -> Option<Pool> {
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
+        });
+        let pool = match tokio::time::timeout(
+            Duration::from_secs(3),
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(8)
+                // Virtual-time guard: the paused clock can jump while the
+                // worker parks, so the (virtual) acquire timeout sits far
+                // away from any plausible tick window.
+                .acquire_timeout(Duration::from_secs(86_400))
+                .connect(&url),
+        )
+        .await {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return skip_loop_test(test, &url, &format!("connect failed: {e}")),
+            Err(_) => return skip_loop_test(test, &url, "connect timed out (3s)"),
+        };
+        if pool.acquire().await.is_err() {
+            return skip_loop_test(test, &url, "pool acquire failed");
+        }
+        Some(pool)
+    }
+
+    fn skip_loop_test(test: &str, url: &str, why: &str) -> Option<Pool> {
+        if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
+            panic!("{test}: ZIMSERVICE_REQUIRE_DB is set but cannot reach {url}: {why}");
+        }
+        eprintln!("skipping {test}: cannot reach {url} ({why})");
+        None
+    }
+
+    /// Current `articles.embedding` column dimension (pgvector stores it as
+    /// typmod - VARHDRSZ). Matching it keeps `ensure_vector_dimension` a
+    /// no-op, so the tests never ALTER the shared dev column.
+    async fn embedding_column_dim(pool: &Pool) -> u32 {
+        let typmod: i32 = raw::fetch_scalar_optional(
+            pool,
+            "SELECT atttypmod FROM pg_attribute
+             WHERE attrelid = 'articles'::regclass AND attname = 'embedding'",
+            |q| q,
+        )
+        .await
+        .expect("pg_attribute probe")
+        .expect("articles.embedding column present");
+        typmod.saturating_sub(4) as u32
+    }
+
+    /// Settings for the loop under test: endpoint at `endpoint`, enabled per
+    /// `enabled`, dimension matched to the live column, and a huge request
+    /// timeout (mock time — see section note).
+    async fn loop_settings(pool: &Pool, endpoint: &str, enabled: bool) -> SettingsCache {
+        let dim = embedding_column_dim(pool).await;
+        let mut values = crate::settings::default_settings();
+        values.insert(KEY_EMBEDDING_ENDPOINT.into(), serde_json::json!(endpoint));
+        values.insert(crate::settings::KEY_EMBEDDING_ENABLED.into(), serde_json::json!(enabled));
+        values.insert(KEY_EMBEDDING_MODEL.into(), serde_json::json!("test-model"));
+        values.insert(KEY_EMBEDDING_DIMENSION.into(), serde_json::json!(dim));
+        values.insert(KEY_EMBEDDING_TIMEOUT_SECS.into(), serde_json::json!(86_400));
+        SettingsCache::new_with_map(pool.clone(), values, std::collections::HashMap::new())
+    }
+
+    /// Live `AppState` for the loop (same shape as `testing::test_state`,
+    /// but with a real pool and real settings).
+    fn loop_state(pool: Pool, settings: SettingsCache) -> Arc<crate::AppState> {
+        Arc::new(crate::AppState {
+            zims: crate::zim::ZimManager::new(
+                std::path::PathBuf::from("/nonexistent-embedloop"),
+                pool.clone(),
+            ),
+            search: crate::search::SearchEngine::new(
+                pool.clone(),
+                settings.clone(),
+                crate::health::DegradationTracker::default(),
+            ),
+            db: pool,
+            settings,
+            torrent: crate::torrent::QbitClientCache::new(),
+            rate_limiter: std::sync::Arc::new(crate::serve::ratelimit::RateLimiterHandle::new()),
+            probes: crate::HealthProbes::default(),
+            auth_lockout: std::sync::Arc::new(Default::default()),
+            degradation: crate::health::DegradationTracker::default(),
+        })
+    }
+
+    /// Seed a fresh ready/embeddable ZIM (idempotent) and one unembedded
+    /// article in it; returns the article id.
+    async fn seed_zim_article(pool: &Pool, path: &str) -> i64 {
+        raw::execute(pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(LOOP_ZIM))
+            .await
+            .expect("delete zim");
+        let zim_id: i32 = raw::fetch_scalar_optional(
+            pool,
+            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                               index_status, indexed_entries, article_count)
+             VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1) RETURNING id",
+            |q| q.bind(LOOP_ZIM),
+        )
+        .await
+        .expect("insert zim")
+        .expect("zim row");
+        raw::fetch_scalar_optional(
+            pool,
+            "INSERT INTO articles (path, title, content_preview, snippet, search_vector,
+                                   language, namespace, zim_id)
+             VALUES ($1, $2, 'preview', 'snip', to_tsvector('simple', $2), 'en', 'C', $3)
+             RETURNING id",
+            |q| q.bind(path).bind(path).bind(zim_id),
+        )
+        .await
+        .expect("insert article")
+        .expect("article row")
+    }
+
+    /// One more unembedded article in the loop ZIM (no ZIM churn).
+    async fn seed_article(pool: &Pool, path: &str) -> i64 {
+        let zim_id: i32 = raw::fetch_scalar_optional(
+            pool,
+            "SELECT id FROM zims WHERE name = $1",
+            |q| q.bind(LOOP_ZIM),
+        )
+        .await
+        .expect("zim lookup")
+        .expect("zim row");
+        raw::fetch_scalar_optional(
+            pool,
+            "INSERT INTO articles (path, title, content_preview, snippet, search_vector,
+                                   language, namespace, zim_id)
+             VALUES ($1, $2, 'preview', 'snip', to_tsvector('simple', $2), 'en', 'C', $3)
+             RETURNING id",
+            |q| q.bind(path).bind(path).bind(zim_id),
+        )
+        .await
+        .expect("insert article")
+        .expect("article row")
+    }
+
+    async fn drop_loop_zim(pool: &Pool) {
+        let _ = raw::execute(pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(LOOP_ZIM)).await;
+    }
+
+    async fn article_embedded(pool: &Pool, id: i64) -> Option<bool> {
+        raw::fetch_scalar_optional(
+            pool,
+            "SELECT embedding IS NOT NULL FROM articles WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn article_unclaimed(pool: &Pool, id: i64) -> Option<bool> {
+        raw::fetch_scalar_optional(
+            pool,
+            "SELECT embed_at IS NULL FROM articles WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Valid `idx_articles_embedding` present (the same pg_catalog probe the
+    /// loop's `vector_index_state` runs).
+    async fn index_valid(pool: &Pool) -> Option<bool> {
+        vector_index_state(pool).await.ok().map(|(_, exists)| exists)
+    }
+
+    /// `pg_stat_user_tables.n_live_tup` for `articles`, forcing a stats
+    /// flush first (PG 15+), so the loop's O(1) pre-filter
+    /// (`index_build_worth_probing`) sees freshly inserted rows.
+    async fn articles_live_tup(pool: &Pool) -> Option<i64> {
+        if raw::execute(pool, "SELECT pg_stat_force_next_flush()", |q| q).await.is_err() {
+            return None;
+        }
+        raw::fetch_scalar_optional(
+            pool,
+            "SELECT COALESCE(n_live_tup, 0) FROM pg_stat_user_tables WHERE relname = 'articles'",
+            |q| q,
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// A 200 embed response with exactly one vector of `dim` dims — the
+    /// tests claim one row per pipeline run, so one entry per request.
+    fn embed_one_body(dim: u32) -> String {
+        let v = vec_of(dim, "0.1");
+        format!("{{\"data\":[{{\"index\":0,\"embedding\":[{}]}}]}}", v.join(","))
+    }
+
+    fn vec_of(n: u32, val: &str) -> Vec<String> {
+        (0..n).map(|_| val.to_string()).collect()
+    }
+
+    /// Poll `check` (real DB I/O) within a real-time budget. Each failed
+    /// probe parks the worker with the loop's 60 s tick as the next timer;
+    /// the µs park cycle is usually shorter than the loopback DB round-trip,
+    /// so auto-advance jumps 60 s of virtual time and the loop ticks —
+    /// one probe ≈ one loop tick, in milliseconds of real time. `None` from
+    /// a check (a failed probe) retries.
+    async fn wait_until<F, Fut>(mut check: F, what: &str)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<bool>>,
+    {
+        let deadline = std::time::Instant::now() + LOOP_WAIT_BUDGET;
+        loop {
+            if check().await.is_some_and(|b| b) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("loop test: timed out waiting for {what}");
+            }
+            // Virtual sleep: a `spawn_blocking` sleep would inhibit
+            // auto-advance and freeze the clock, so the loop could not tick
+            // while the poll waits.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Settle: run `n` probe cycles so the loop has (very likely) ticked at
+    /// least once per cycle — each real DB probe parks the worker with the
+    /// loop's 60 s tick as next timer, so a 60 s virtual jump (and a tick)
+    /// lands while the probe's response is in flight.
+    async fn settle_ticks(pool: &Pool, n: u32) {
+        for _ in 0..n {
+            // `std::result::Result` (not the module's `Result<T>` alias,
+            // pulled in by `use super::*`) with an inferred error type.
+            let r: std::result::Result<Option<i32>, _> =
+                raw::fetch_scalar_optional(pool, "SELECT 1", |q| q).await;
+            let _ = r;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// (1) Recurring tick: the loop is not a one-shot — it keeps ticking on
+    /// its cadence and re-evaluates its pre-conditions (`embedding_enabled`,
+    /// `list_embeddable_zims`) every tick, so work that appears *after* the
+    /// first successful pass is picked up on a later tick, with no config
+    /// change and no restart.
+    #[tokio::test(start_paused = true)]
+    async fn auto_embed_loop_repeats_ticks_and_picks_up_new_work() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pool = match loop_pool_or_skip("auto_embed_loop_repeats_ticks_and_picks_up_new_work")
+            .await
+        {
+            Some(p) => p,
+            None => return,
+        };
+        let _db_gate = crate::testing::DbExclusiveGuard::acquire();
+        crate::db::migrate::run_migrations(&pool).await.expect("migrations");
+
+        let server = MockServer::start().await;
+        let dim = embedding_column_dim(&pool).await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(embed_one_body(dim)))
+            .mount(&server)
+            .await;
+
+        let state = loop_state(pool.clone(), loop_settings(&pool, &server.uri(), true).await);
+        let first = seed_zim_article(&pool, "A/wave1").await;
+        let loop_task = tokio::spawn(auto_embed_loop(state));
+
+        // Wave 1: the first tick's pipeline pass embeds the seeded article.
+        wait_until(|| article_embedded(&pool, first), "wave-1 article embedded").await;
+
+        // Wave 2: new work appears while the loop is running (no setting
+        // change, no restart). Only a loop that re-runs `list_embeddable_zims`
+        // on later ticks embeds it — a one-shot would not.
+        let second = seed_article(&pool, "A/wave2").await;
+        wait_until(
+            || article_embedded(&pool, second),
+            "wave-2 article embedded on a later tick",
+        )
+        .await;
+
+        let n_reqs = server
+            .received_requests()
+            .await
+            .expect("wiremock requests")
+            .len();
+        assert!(
+            n_reqs >= 2,
+            "two separate pipeline runs must each call the endpoint (got {n_reqs} request(s))"
+        );
+
+        loop_task.abort();
+        drop_loop_zim(&pool).await;
+    }
+
+    /// (2) Config-change re-trigger: flipping `embedding.enabled` at runtime
+    /// through the production write path (persist + cache update) is picked
+    /// up by the already-running loop on its next tick — enabling starts a
+    /// pipeline pass, and re-disabling stops the loop from claiming new work
+    /// again (the setting is re-read every tick, never latched).
+    #[tokio::test(start_paused = true)]
+    async fn auto_embed_loop_re_evaluates_enabled_setting() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pool = match loop_pool_or_skip("auto_embed_loop_re_evaluates_enabled_setting").await {
+            Some(p) => p,
+            None => return,
+        };
+        let _db_gate = crate::testing::DbExclusiveGuard::acquire();
+        crate::db::migrate::run_migrations(&pool).await.expect("migrations");
+
+        let server = MockServer::start().await;
+        let dim = embedding_column_dim(&pool).await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(embed_one_body(dim)))
+            .mount(&server)
+            .await;
+
+        // Start disabled: the seeded article must sit untouched while the
+        // loop ticks (no claim, no HTTP).
+        let settings = loop_settings(&pool, &server.uri(), false).await;
+        let first = seed_zim_article(&pool, "A/phase-off").await;
+        let state = loop_state(pool.clone(), settings.clone());
+        let loop_task = tokio::spawn(auto_embed_loop(state));
+
+        // Let the loop tick a few times while disabled: each tick re-reads
+        // `embedding.enabled` and must skip — no claim, no HTTP.
+        settle_ticks(&pool, 5).await;
+        assert!(
+            article_unclaimed(&pool, first).await.unwrap_or(false),
+            "disabled loop must not claim the article"
+        );
+        assert_eq!(
+            server.received_requests().await.expect("wiremock requests").len(),
+            0,
+            "disabled loop must not call the embed endpoint"
+        );
+
+        // Enable at runtime (the production write path). The running loop
+        // re-reads the setting on a later tick and embeds the article.
+        let mut updates = std::collections::HashMap::new();
+        updates.insert(crate::settings::KEY_EMBEDDING_ENABLED.into(), serde_json::json!(true));
+        settings
+            .update(&updates, true)
+            .await
+            .expect("enable embedding");
+        wait_until(
+            || article_embedded(&pool, first),
+            "article embedded after runtime enable",
+        )
+        .await;
+        assert!(
+            !server.received_requests().await.expect("wiremock requests").is_empty(),
+            "enabling must trigger a pipeline pass"
+        );
+
+        // Disable again *before* any new work appears: later ticks must honor
+        // the new value — the new article is never claimed nor embedded, and
+        // the request count does not grow (nothing left to claim in the
+        // meantime, so it stays exactly at the one wave-1 request).
+        let mut updates = std::collections::HashMap::new();
+        updates.insert(
+            crate::settings::KEY_EMBEDDING_ENABLED.into(),
+            serde_json::json!(false),
+        );
+        settings
+            .update(&updates, true)
+            .await
+            .expect("disable embedding");
+        let second = seed_article(&pool, "A/phase-off2").await;
+        // Let the loop tick a few times with the setting re-read as disabled.
+        settle_ticks(&pool, 5).await;
+        assert!(
+            article_unclaimed(&pool, second).await.unwrap_or(false),
+            "re-disabled loop must not claim new work"
+        );
+        assert!(
+            !article_embedded(&pool, second).await.unwrap_or(true),
+            "re-disabled loop must not embed new work"
+        );
+        assert_eq!(
+            server.received_requests().await.expect("wiremock requests").len(),
+            1,
+            "re-disabled loop must send no further embed calls"
+        );
+
+        loop_task.abort();
+        // Leave the shared dev DB as found (the default value).
+        let mut updates = std::collections::HashMap::new();
+        updates.insert(crate::settings::KEY_EMBEDDING_ENABLED.into(), serde_json::json!(false));
+        settings
+            .update(&updates, true)
+            .await
+            .expect("restore embedding.enabled default");
+        drop_loop_zim(&pool).await;
+    }
+
+    /// (3) 10k early-build: once ≥ `MIN_INDEX_BUILD_ROWS` (10 000) vectors
+    /// exist and no valid index is present, the loop's tick spawns the
+    /// partial `idx_articles_embedding` build in the background and keeps
+    /// going (non-blocking) — per the loop's doc comment. The failing (500)
+    /// endpoint makes the attribution exact: `run_pipeline` returns early on
+    /// embed failure and never reaches its post-run build, so only the
+    /// loop's early-build path can have created the index.
+    #[tokio::test(start_paused = true)]
+    async fn auto_embed_loop_early_builds_index_at_10k() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let pool = match loop_pool_or_skip("auto_embed_loop_early_builds_index_at_10k").await {
+            Some(p) => p,
+            None => return,
+        };
+        let _db_gate = crate::testing::DbExclusiveGuard::acquire();
+        crate::db::migrate::run_migrations(&pool).await.expect("migrations");
+
+        // At/above the IVFFlat ceiling no build is attempted at all (the
+        // documented skip), so the test can only make sense below it.
+        let preexisting: i64 = raw::fetch_scalar_optional(
+            &pool,
+            "SELECT count(*) FROM articles WHERE embedding IS NOT NULL",
+            |q| q,
+        )
+        .await
+        .expect("embedded count")
+        .expect("row present");
+        if preexisting + 10_000 >= EMBED_DEFAULT_IVFFLAT_THRESHOLD {
+            eprintln!("skipping: dev DB already holds {preexisting} vectors (IVFFlat ceiling)");
+            return;
+        }
+
+        // Failing endpoint: the per-ZIM pipeline always errors out, so its
+        // post-run build is unreachable (see section note for why that is
+        // what makes this assertion airtight).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let dim = embedding_column_dim(&pool).await;
+        let settings = loop_settings(&pool, &server.uri(), true).await;
+
+        // Start from no valid index (the loop's `exists` gate).
+        let had_index = index_valid(&pool).await.unwrap_or(false);
+        raw::execute(&pool, "DROP INDEX IF EXISTS idx_articles_embedding", |q| q)
+            .await
+            .expect("drop index (setup)");
+
+        // One unembedded article keeps `list_embeddable_zims` non-empty, and
+        // 10 000 already-embedded rows cross `MIN_INDEX_BUILD_ROWS`.
+        let one = seed_zim_article(&pool, "A/live").await;
+        raw::execute(
+            &pool,
+            "WITH vec AS (
+                 SELECT '[' || (SELECT string_agg('0.1', ',') FROM generate_series(1, $2)) || ']' AS v
+             )
+             INSERT INTO articles (zim_id, path, title, content_preview, snippet,
+                                   search_vector, embedding, embed_model)
+             SELECT (SELECT id FROM zims WHERE name = $1),
+                    'E/' || g, 'Early ' || g, 'preview', 'snip',
+                    to_tsvector('simple', 'early'), vec.v::vector, 'test-early'
+             FROM generate_series(1, 10000) g, vec",
+            |q| q.bind(LOOP_ZIM).bind(dim as i32),
+        )
+        .await
+        .expect("seed 10k vectors");
+
+        // Make the stats pre-filter (`n_live_tup >= 10k`) see the new rows
+        // (the O(1) probe is a stats estimate; force a flush and poll).
+        wait_until(
+            || async { articles_live_tup(&pool).await.map(|t| t >= 10_000) },
+            "stats to reflect 10k live rows",
+        )
+        .await;
+
+        let state = loop_state(pool.clone(), settings);
+        let loop_task = tokio::spawn(auto_embed_loop(state));
+
+        // The early build lands as a valid index in the background.
+        wait_until(
+            || async { index_valid(&pool).await },
+            "early background index build",
+        )
+        .await;
+
+        // The loop did not block on the build: its tick proceeded to the
+        // per-ZIM pipeline and attempted an embed (which 500'd).
+        assert!(
+            !server.received_requests().await.expect("wiremock requests").is_empty(),
+            "loop must continue to the per-ZIM pipeline after spawning the build"
+        );
+        // The endpoint failed, so the article is still unembedded — the
+        // index came from the loop's early-build path, not from a
+        // post-success pipeline build.
+        assert!(
+            !article_embedded(&pool, one).await.unwrap_or(true),
+            "failing endpoint keeps the article unembedded (not a post-success build)"
+        );
+
+        loop_task.abort();
+        drop_loop_zim(&pool).await;
+        // Restore the pre-test index state when it was the migration's
+        // default (index present, HNSW-safe scale) and we removed it.
+        if had_index && preexisting < 1_000_000 {
+            raw::execute(
+                &pool,
+                "CREATE INDEX IF NOT EXISTS idx_articles_embedding ON articles
+                 USING hnsw (embedding vector_cosine_ops) WHERE embedding IS NOT NULL",
+                |q| q,
+            )
+            .await
+            .expect("restore index (cleanup)");
         }
     }
 }

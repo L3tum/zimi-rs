@@ -74,6 +74,11 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 libc = "0.2"
 
 [dev-dependencies]
+# test-util: `#[tokio::test(start_paused = true)]` mock time for the
+# auto_embed_loop lifecycle tests (the loop's cadence is a plain
+# tokio::time::sleep, so the paused clock fast-forwards its ticks; test-only —
+# dev-dependencies never enter the production build).
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
