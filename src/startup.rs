@@ -203,7 +203,10 @@ pub async fn build_state(
     // snapshot, so the two can never disagree about which vars were set.
     let env_get = |k: &str| std::env::var(k).ok();
     let env_locked = config.locked_env_settings(&env_get);
-    let env_snapshot = config.env_settings_snapshot(&env_get);
+    let mut env_snapshot = config.env_settings_snapshot(&env_get);
+    // M-1: non-loopback binds default `access.require_auth_for_reads` to
+    // true unless REQUIRE_AUTH_FOR_READS was set explicitly.
+    config.apply_require_reads_default(&mut env_snapshot);
     let settings = SettingsCache::load(pool.clone(), env_locked, env_snapshot).await?;
     settings.sync_from_config(config); // ARCH-1: general.* display keys <- Config
 
@@ -211,13 +214,29 @@ pub async fn build_state(
     // refuse to start instead. The placeholder is rejected in **both** modes:
     // a placeholder means unfinished setup (open mode with CHANGE_ME would
     // otherwise start unauthenticated without anyone noticing).
-    admin_password_startup_check(
-        &settings.access_mode(),
-        &settings
-            .get_typed::<String>(KEY_ACCESS_ADMIN_PASSWORD)
-            .unwrap_or_default(),
-    )
-    .map_err(anyhow::Error::msg)?;
+    let admin_password = settings
+        .get_typed::<String>(KEY_ACCESS_ADMIN_PASSWORD)
+        .unwrap_or_default();
+    admin_password_startup_check(&settings.access_mode(), &admin_password)
+        .map_err(anyhow::Error::msg)?;
+
+    // Legacy admin password (plaintext or sha2:) is still verifiable until
+    // the next successful auth — at which point it is transparently upgraded
+    // to argon2id. The operator may not know a plaintext secret still sits
+    // in the DB, so warn at serve startup (SEC L-3). One-shot CLI subcommands
+    // don't get it: they don't keep the credential warm for an operator to
+    // act on.
+    if mode == StartupMode::Serve
+        && legacy_password_startup_warn(&settings.access_mode(), &admin_password)
+    {
+        tracing::warn!(
+            "access.admin_password is stored in a legacy format (plaintext or \
+             sha2:): it still verifies, but a plaintext secret may sit in the \
+             database. It upgrades to argon2id on the next successful auth — \
+             rotate the password (set AUTH_PASSWORD to a new value) to upgrade \
+             it now."
+        );
+    }
 
     // Discover ZIMs on disk, load persisted index state from Postgres, then
     // (when `resync`) reconcile the cache + DB with the actual files. (The
@@ -428,6 +447,20 @@ pub struct MutatingGuard {
     lock_conn: PgConnection,
 }
 
+/// M1: whether this process started with the full single-instance opt-out
+/// (`ZIMSERVICE_ALLOW_MULTI_INSTANCE=1`) — the one place that reading of the
+/// env var lives so the guard sites, the `/health` flag, and the settings-
+/// divergence warnings all agree.
+///
+/// In that mode every instance keeps its own in-memory caches (settings,
+/// rate limiter, ZIM metadata) with **no cross-instance invalidation path**:
+/// a change persisted by one instance is invisible to the others until
+/// restart. The callers use this to surface the divergence continuously
+/// instead of only via the one startup `tracing::warn!`.
+pub fn multi_instance_allowed() -> bool {
+    matches!(std::env::var("ZIMSERVICE_ALLOW_MULTI_INSTANCE"), Ok(v) if v == "1")
+}
+
 /// H1: acquire a [`MutatingGuard`] for a mutating subcommand (`index`,
 /// `embed`, `list --sync`), before any mutation of the shared database.
 ///
@@ -447,7 +480,7 @@ pub struct MutatingGuard {
 /// different-database deployment on a shared zim_dir never holds *this*
 /// database's lock and must not silence the refusal.
 pub async fn acquire_mutating_guard(config: &Config) -> anyhow::Result<Option<MutatingGuard>> {
-    if matches!(std::env::var("ZIMSERVICE_ALLOW_MULTI_INSTANCE"), Ok(v) if v == "1") {
+    if multi_instance_allowed() {
         tracing::warn!(
             "ZIMSERVICE_ALLOW_MULTI_INSTANCE=1: this mutating command will run even \
              while a server holds this database's advisory lock — the server's \
@@ -744,6 +777,17 @@ pub fn admin_password_startup_check(mode: &str, password: &str) -> Result<(), St
     Ok(())
 }
 
+/// True when the serve-startup legacy-password warning should be emitted
+/// (SEC L-3): password mode with a configured password whose stored value
+/// is not a current argon2id hash — i.e. a legacy `sha2:` hash or legacy
+/// plaintext. Empty passwords are excluded: in password mode they are
+/// already a hard refusal via [`admin_password_startup_check`].
+pub(crate) fn legacy_password_startup_warn(mode: &str, password: &str) -> bool {
+    mode == crate::settings::ACCESS_MODE_PASSWORD
+        && !password.is_empty()
+        && crate::settings::is_legacy_password(password)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -768,6 +812,24 @@ mod tests {
         assert!(admin_password_startup_check("open", "").is_ok());
         // open mode, placeholder → refuse (unfinished setup must not start silently)
         assert!(admin_password_startup_check("open", "CHANGE_ME").is_err());
+    }
+
+    #[test]
+    fn legacy_password_startup_warn_matrix() {
+        // password mode + legacy plaintext → warn
+        assert!(legacy_password_startup_warn("password", "plainpw"));
+        // password mode + legacy sha2: hash → warn
+        let legacy = "sha2:100000$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(legacy_password_startup_warn("password", legacy));
+        // password mode + current argon2id hash → no warn
+        assert!(!legacy_password_startup_warn(
+            "password",
+            &crate::settings::hash_admin_password("s3cret")
+        ));
+        // open mode never warns (no credential involved)
+        assert!(!legacy_password_startup_warn("open", "plainpw"));
+        // password mode + empty → no warn (hard refusal above already covers it)
+        assert!(!legacy_password_startup_warn("password", ""));
     }
 
     // ── H1: PID lock + liveness unit tests (no Postgres) ─────────────────
@@ -1198,5 +1260,389 @@ mod tests {
         // Dropping the connections closes the sockets, releasing any held lock.
         drop(verify);
         drop(server_conn);
+    }
+
+    /// M1: `multi_instance_allowed` mirrors the process env exactly.
+    /// Mutating the process env in a parallel test would race every other
+    /// test, so (like the DB-gated tests above) this asserts against the
+    /// env as found: the unset/non-`1` arm unconditionally, the `1` arm
+    /// only when a developer has exported the opt-out.
+    #[test]
+    fn multi_instance_allowed_mirrors_env() {
+        match std::env::var("ZIMSERVICE_ALLOW_MULTI_INSTANCE") {
+            Ok(v) if v == "1" => {
+                assert!(multi_instance_allowed(), "the `1` opt-out must be honored")
+            }
+            _ => assert!(
+                !multi_instance_allowed(),
+                "unset (or non-`1`) must mean single-instance mode"
+            ),
+        }
+    }
+}
+
+/// M4: core of the background-task supervisor — unit-testable in isolation.
+/// (M4: moved here out of the binary's `cmd_serve` so the whole post-serve
+/// sequence — supervisor core + shutdown protocol — lives in the lib and is
+/// testable under `--lib`. Behavior unchanged.)
+///
+/// Polls the named `JoinHandle`s every `poll_interval` and reports the first
+/// one that finishes — a panic (surfaced as `Err(JoinError)`) **or** a normal
+/// early return (`Ok(value)`), since both mean the task will not keep the
+/// pipeline alive for the server's lifetime. `is_finished()` is non-consuming,
+/// so only the one handle that actually finished is `await`ed (consumed).
+///
+/// Returns the reported task plus the **remaining** handles untouched, so
+/// the caller (the shutdown path) can still abort/await them. Returns
+/// `None` (with all handles handed back) if the `stop` watch is set first,
+/// which bounds the wait during clean shutdown. Never calls
+/// `process::exit` — the caller decides how to react.
+pub async fn wait_for_task_failure<T: Send + 'static>(
+    tasks: Vec<(&'static str, tokio::task::JoinHandle<T>)>,
+    poll_interval: std::time::Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> (
+    Option<(&'static str, Result<T, tokio::task::JoinError>)>,
+    Vec<(&'static str, tokio::task::JoinHandle<T>)>,
+) {
+    let mut tasks = tasks;
+    loop {
+        // First finished task wins. `is_finished()` is non-consuming.
+        if let Some(i) = tasks.iter().position(|(_, handle)| handle.is_finished()) {
+            let (name, handle) = tasks.remove(i);
+            let result = handle.await; // consumes only the finished handle
+            return (Some((name, result)), tasks);
+        }
+        // Sleep until the next poll or until the stop flag is set (clean
+        // shutdown — hand the still-alive handles back without reporting).
+        tokio::select! {
+            _ = tokio::time::sleep(poll_interval) => {}
+            _ = stop.changed() => {
+                if *stop.borrow() {
+                    return (None, tasks);
+                }
+            }
+        }
+    }
+}
+
+/// M4: the post-`axum::serve` shutdown protocol, extracted out of the binary
+/// `cmd_serve` so the wiring is a library fn unit-testable with dummy
+/// handles (which handle is stopped/aborted, which failure kind wins, and
+/// that cleanup always runs — the old `?.await` could bail before the
+/// task-abort block on a low-level network error, S3).
+///
+/// `axum::serve` resolves to `Result<(), std::io::Error>` in axum 0.8
+/// (listener-level failures surface as I/O errors), hence the concrete
+/// error type below.
+///
+/// Protocol (identical to the inlined `cmd_serve` sequence it replaced):
+/// 1. stop the supervisor (so it hands back the still-alive handles),
+/// 2. await the supervisor — a panicked supervisor is logged and treated as
+///    "no survivors" (it only polls finished handles, so this is impossible
+///    in practice; the shutdown must continue either way),
+/// 3. abort every survivor, then await them under a bounded drain timeout,
+///    logging a non-cancelled `JoinError` (a task that died in the narrow
+///    window between the supervisor's last poll and the abort) and skipping
+///    cancelled ones (we just aborted them — not a death),
+/// 4. classify: `axum::serve` error wins (S3 ordering — it surfaced first in
+///    the inlined code), else the supervisor's die flag (H2 fail-closed),
+///    else a clean exit.
+///
+/// Never calls `process::exit` — the caller maps the outcome to its exit
+/// code. All four background tasks return `()`, hence the concrete
+/// `JoinHandle<()>` survivor type (the supervisor's `wait_for_task_failure`
+/// is generic, but `cmd_serve`'s tasks are all unit-returning).
+#[derive(Debug)]
+pub enum ServeFailure {
+    /// `axum::serve` returned a low-level error (not just Ctrl-C). Cleanup
+    /// has already completed; the error is surfaced to the operator.
+    Serve(std::io::Error),
+    /// The supervisor observed a background task finish early (panic or
+    /// early return) — the download→verify→index pipeline is broken,
+    /// so the process must exit non-zero (H2).
+    BackgroundTaskDied,
+}
+
+impl std::fmt::Display for ServeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The `Display` here is the operator-facing exit message — keep
+            // it in sync with the `cmd_serve` mapping (which formats it
+            // verbatim into the `anyhow` error).
+            Self::Serve(e) => write!(f, "server error: {e}"),
+            Self::BackgroundTaskDied => {
+                f.write_str("background task died (see log above); exiting non-zero")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ServeFailure {}
+
+/// M4: run the post-serve shutdown protocol and report the exit kind. See
+/// the module-level doc on [`ServeFailure`] for the exact sequence. `Ok(())`
+/// is a clean exit (exit 0); `Err(ServeFailure)` is a non-zero exit.
+pub async fn finalize_serve_shutdown(
+    serve_result: Result<(), std::io::Error>,
+    sup_stop_tx: tokio::sync::watch::Sender<bool>,
+    supervisor: tokio::task::JoinHandle<Vec<(&'static str, tokio::task::JoinHandle<()>)>>,
+    died_check: &tokio::sync::watch::Receiver<bool>,
+    drain_timeout: std::time::Duration,
+) -> Result<(), ServeFailure> {
+    // Graceful shutdown: stop the supervisor (so it hands back the still-
+    // alive handles), abort those tasks, and wait briefly for them to drain.
+    // Reached on **both** Ok and Err of `axum::serve` (S3).
+    let _ = sup_stop_tx.send(true);
+    // The supervisor returns the survivors; a JoinError here means the
+    // supervisor itself panicked (it only polls + awaits finished handles,
+    // so this should be impossible — log and continue the shutdown).
+    let survivors = match supervisor.await {
+        Ok(s) => s,
+        Err(join_err) => {
+            tracing::error!("background-task supervisor died: {join_err}");
+            Vec::new()
+        }
+    };
+
+    tracing::info!("shutting down background tasks");
+    for (_, handle) in &survivors {
+        handle.abort();
+    }
+
+    // H2: the supervisor already `tracing::error!`-logged any task that died
+    // and consumed that handle, so the survivors it hands back are only the
+    // rest. A *cancelled* JoinError is expected (we just aborted it) and is
+    // skipped so it does not masquerade as a death.
+    let _ = tokio::time::timeout(drain_timeout, async move {
+        for (name, handle) in survivors {
+            if let Err(join_err) = handle.await {
+                if !join_err.is_cancelled() {
+                    tracing::error!(
+                        "background task '{name}' died just before shutdown: {join_err}"
+                    );
+                }
+            }
+        }
+    })
+    .await;
+
+    // Surface the serve error (if any) after cleanup completes (S3 ordering:
+    // it won over the H2 die flag in the inlined sequence, so it wins here).
+    if let Err(e) = serve_result {
+        return Err(ServeFailure::Serve(e));
+    }
+    if *died_check.borrow() {
+        return Err(ServeFailure::BackgroundTaskDied);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod serve_shutdown_tests {
+    use super::wait_for_task_failure;
+    use super::{finalize_serve_shutdown, ServeFailure};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Drop flag: a task that drops this while running proves it was
+    /// actually aborted/cancelled (not just "reported as a survivor").
+    struct DropFlag(&'static AtomicBool);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A task that runs until aborted and flips `flag` on drop.
+    fn long_task(flag: &'static AtomicBool) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let _flag = DropFlag(flag);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+    }
+
+    /// Supervisor dummy: reports nothing, stops when `stop_rx` flips, and
+    /// hands `tasks` back as survivors (mirrors the real supervisor's
+    /// clean-shutdown path).
+    async fn stop_supervisor(
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+        tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
+    ) -> Vec<(&'static str, tokio::task::JoinHandle<()>)> {
+        let _ = stop_rx.wait_for(|s: &bool| *s).await;
+        tasks
+    }
+
+    /// Supervisor dummy: uses the real `wait_for_task_failure` core, so a
+    /// task that finishes early is reported and the die flag is tripped —
+    /// exactly the real supervisor's failure path.
+    async fn dying_supervisor(
+        stop_rx: tokio::sync::watch::Receiver<bool>,
+        died_tx: tokio::sync::watch::Sender<bool>,
+        tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
+    ) -> Vec<(&'static str, tokio::task::JoinHandle<()>)> {
+        let (report, survivors) =
+            wait_for_task_failure(tasks, std::time::Duration::from_millis(10), stop_rx).await;
+        if let Some((name, result)) = report {
+            // Same log as the real supervisor (keeps the test honest about
+            // what the operator would see in the log above the exit).
+            match result {
+                Err(join_err) => tracing::error!("background task '{name}' died: {join_err}"),
+                Ok(()) => {
+                    tracing::error!(
+                        "background task '{name}' returned before shutdown \n                         (it must run for the lifetime of the server)"
+                    )
+                }
+            }
+            let _ = died_tx.send(true);
+        }
+        survivors
+    }
+
+    /// Clean shutdown: no serve error, no die flag → `Ok(())`, and every
+    /// survivor the supervisor handed back was genuinely aborted.
+    #[tokio::test]
+    async fn clean_shutdown_aborts_all_survivors() {
+        static A: AtomicBool = AtomicBool::new(false);
+        static B: AtomicBool = AtomicBool::new(false);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let supervisor = tokio::spawn(stop_supervisor(
+            stop_rx,
+            vec![
+                ("zim-watcher", long_task(&A)),
+                ("trgm-probe", long_task(&B)),
+            ],
+        ));
+        let (_died_tx, died_rx) = tokio::sync::watch::channel(false);
+
+        let result = finalize_serve_shutdown(
+            Ok(()),
+            stop_tx,
+            supervisor,
+            &died_rx,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+
+        assert!(result.is_ok(), "clean shutdown must be Ok(()): {result:?}");
+        assert!(
+            A.load(Ordering::SeqCst),
+            "survivor A must have been aborted"
+        );
+        assert!(
+            B.load(Ordering::SeqCst),
+            "survivor B must have been aborted"
+        );
+    }
+
+    /// S3 path: `axum::serve` returned `Err` → cleanup still runs (both
+    /// tasks aborted) and the failure kind is `Serve` with the error
+    /// preserved.
+    #[tokio::test]
+    async fn serve_error_still_runs_cleanup_and_reports_serve() {
+        static A: AtomicBool = AtomicBool::new(false);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let supervisor = tokio::spawn(stop_supervisor(
+            stop_rx,
+            vec![("zim-watcher", long_task(&A))],
+        ));
+        let (_died_tx, died_rx) = tokio::sync::watch::channel(false);
+        let err = std::io::Error::other("listen socket closed");
+
+        let result = finalize_serve_shutdown(
+            Err(err),
+            stop_tx,
+            supervisor,
+            &died_rx,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+
+        match result {
+            Err(ServeFailure::Serve(e)) => {
+                assert!(
+                    e.to_string().contains("listen socket closed"),
+                    "the axum error must be preserved: {e}"
+                );
+            }
+            other => panic!("expected ServeFailure::Serve, got {other:?}"),
+        }
+        assert!(
+            A.load(Ordering::SeqCst),
+            "cleanup must abort tasks even on serve error"
+        );
+    }
+
+    /// H2 path: a background task finished early, the supervisor tripped the
+    /// die flag, no serve error → `BackgroundTaskDied` (fail-closed).
+    #[tokio::test]
+    async fn early_task_death_reports_background_task_died() {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (died_tx, died_rx) = tokio::sync::watch::channel(false);
+        let early = tokio::spawn(async {}); // returns immediately
+        let supervisor = tokio::spawn(dying_supervisor(stop_rx, died_tx, vec![("early", early)]));
+
+        let result = finalize_serve_shutdown(
+            Ok(()),
+            stop_tx,
+            supervisor,
+            &died_rx,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+
+        match result {
+            Err(ServeFailure::BackgroundTaskDied) => {}
+            other => panic!("expected BackgroundTaskDied, got {other:?}"),
+        }
+    }
+
+    /// S3 ordering: a serve error **and** a tripped die flag → `Serve` wins
+    /// (the inlined `cmd_serve` surfaced the serve error first; keep it so).
+    #[tokio::test]
+    async fn serve_error_wins_over_die_flag() {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (died_tx, died_rx) = tokio::sync::watch::channel(false);
+        let early = tokio::spawn(async {});
+        let supervisor = tokio::spawn(dying_supervisor(stop_rx, died_tx, vec![("early", early)]));
+        let err = std::io::Error::other("boom");
+
+        let result = finalize_serve_shutdown(
+            Err(err),
+            stop_tx,
+            supervisor,
+            &died_rx,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ServeFailure::Serve(_))),
+            "the serve error must win over the die flag: {result:?}"
+        );
+    }
+
+    /// A panicked supervisor is logged and treated as "no survivors" — the
+    /// shutdown completes as a clean exit (nothing else failed).
+    #[tokio::test]
+    async fn panicked_supervisor_does_not_abort_shutdown() {
+        let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
+        let supervisor = tokio::spawn(async { panic!("supervisor boom") });
+        let (_died_tx, died_rx) = tokio::sync::watch::channel(false);
+
+        let result = finalize_serve_shutdown(
+            Ok(()),
+            stop_tx,
+            supervisor,
+            &died_rx,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a dead supervisor with no other failure is a clean exit: {result:?}"
+        );
     }
 }

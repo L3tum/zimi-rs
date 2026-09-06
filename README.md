@@ -28,7 +28,7 @@ AUTH_PASSWORD='<a real admin password>' docker compose up -d
 
 > A `.dockerignore` keeps the build context lean (excludes `target/`, `.git/`, `plans/`, `docs/`, etc.) so the image build doesn't ship build artifacts or VCS state.
 >
-> **Production:** the dev compose exposes Postgres at `127.0.0.1:5432` with fixed dev credentials (`zimservice`/`zimservice`) for convenience only. For production, set `POSTGRES_PASSWORD` via `.env`, restrict the port mapping accordingly, and update the `DATABASE_URL` used by `make test-integration` (Makefile) and `tests/integration.rs` (`DEFAULT_URL`) — both currently hardcode the dev credentials.
+> **Production:** the dev compose exposes Postgres at `127.0.0.1:5432` with fixed dev credentials (`zimservice`/`zimservice`) for convenience only. For production, set `POSTGRES_PASSWORD` via `.env`, restrict the port mapping accordingly, and update the `DATABASE_URL` used by `make test-integration` (Makefile) and `tests/integration/common.rs` (`DEFAULT_URL`) — both currently hardcode the dev credentials.
 
 ### Manual
 
@@ -111,6 +111,7 @@ managed via the web UI at `/settings.html` — they change without a restart.
 | `LOG_LEVEL` | `info` | `tracing` level (or `RUST_LOG`) |
 | `AUTH_PASSWORD` | (none) | Sets the admin password; locks `access.admin_password` |
 | `ACCESS_MODE` | (none) | Sets `access.mode` (`open` or `password`) |
+| `REQUIRE_AUTH_FOR_READS` | (none) | Sets `access.require_auth_for_reads`. Without it, the startup default is bind-based: `true` on a non-loopback `HOST` (reads gated), `false` on loopback (reads open) |
 | `QBITTORRENT_URL` | (disabled) | qBittorrent WebUI URL; its presence enables torrent support |
 | `QBITTORRENT_USER` | (none) | qBittorrent username (optional; some installs run without auth) |
 | `QBITTORRENT_PASS` | (none) | qBittorrent password (optional; some installs run without auth) |
@@ -119,8 +120,8 @@ managed via the web UI at `/settings.html` — they change without a restart.
 | `EMBEDDING_MODEL` | (none) | Seeds `embedding.model` |
 | `EMBEDDING_DIM` | (none) | Seeds `embedding.dimension` |
 
-`AUTH_PASSWORD`, `ACCESS_MODE`, and the `EMBEDDING_*` vars seed the corresponding
-settings at startup (the env value wins) and lock them in the UI.
+`AUTH_PASSWORD`, `ACCESS_MODE`, `REQUIRE_AUTH_FOR_READS`, and the `EMBEDDING_*` vars seed the
+corresponding settings at startup (the env value wins) and lock them in the UI.
 
 `DATABASE_URL` accepts `postgres+tls://` / `postgresql+tls://` and the `sslmode`
 parameter for readability; the `+tls` scheme is rewritten to the plain form the
@@ -148,13 +149,16 @@ listed origins, the methods `GET/POST/PUT/DELETE/OPTIONS`, and the headers
 
 ### Security model
 
-zimservice follows a **public-read / private-write** trust model. In both access modes,
-all GET reads (including raw ZIM content via `/read` and `/w`) are publicly accessible
-by design — this keeps the web UI and any read-only client working without
-authentication. Writes and mutations are what the access mode controls. In
-password mode, public reads are the **deliberate default**
-(`access.require_auth_for_reads = false`), not an oversight: read content is
-treated as non-sensitive; enable the flag to gate reads.
+zimservice follows a **public-read on loopback / private-write** trust model. On a
+**loopback** bind (the default), all GET reads (including raw ZIM content via `/read`
+and `/w`) are publicly accessible by design — this keeps the web UI and any read-only
+client working without authentication. On a **non-loopback** bind in password mode,
+reads are **gated by default** (M-1 hardening): `access.require_auth_for_reads`
+defaults to `true` there, since an open network-facing read would expose full
+article content plus unauthenticated expensive work (a DoS vector). Writes and
+mutations are what the access mode controls; set `REQUIRE_AUTH_FOR_READS=false`
+to restore open reads on a network bind (a deliberate choice, e.g. a read-only
+public mirror behind your reverse proxy).
 
 The server binds to **`127.0.0.1` (loopback) by default**. This is a deliberate
 security choice: with no authentication in open mode, only local processes can reach
@@ -171,8 +175,9 @@ the API.
   qBittorrent/embedding endpoints and credentials) is **forbidden with 403 while
   unauthenticated** — those require password mode.
 - **`access.mode = "password"`**: mutating requests (POST/PUT/PATCH/DELETE) require the
-  admin password; all reads (GET/HEAD/OPTIONS) remain open so the web UI and read-only
-  clients can load without a token — by design (see Threat model). A blank password in password mode is a **startup
+  admin password; reads (GET/HEAD/OPTIONS) are open by default on a **loopback** bind
+  but **gated by default on a non-loopback** bind (`access.require_auth_for_reads`
+  startup default — see Threat model). A blank password in password mode is a **startup
   error** (fail closed).
 
 **Admin password storage.** `access.admin_password` is stored as an **argon2id**
@@ -200,14 +205,22 @@ Be explicit about what each access mode protects:
 - **Open mode** — the listener is trusted: every endpoint, including all writes,
 is reachable by any network peer. Open mode is rejected at startup on a
   non-loopback bind for exactly this reason.
-- **Password mode (default read behavior)** — only **mutating** requests are
-  gated. All `GET`/`HEAD`/`OPTIONS` are readable by anyone who can reach the
-  listener: ZIM article content, article text, `/w/` raw content, and the
+- **Password mode, loopback bind (default read behavior)** — only **mutating**
+  requests are gated. All `GET`/`HEAD`/`OPTIONS` are readable by any *local*
+  process: ZIM article content, article text, `/w/` raw content, and the
   settings topology (secrets and internal endpoints redacted, but the *shape*
   of the configuration — models, batch sizes, category names — is visible).
-  Treat the network position of the listener as the trust boundary. Public
-  reads are the documented default (`access.require_auth_for_reads = false`);
-  set it to `true` to gate them.
+  Open reads are the documented loopback default
+  (`access.require_auth_for_reads = false`); set it to `true` to gate them.
+- **Password mode, non-loopback bind (M-1 default)** — reads are **gated by
+  default**: `access.require_auth_for_reads` starts as `true` on non-loopback
+  binds (override with `REQUIRE_AUTH_FOR_READS=false` to expose open reads
+  deliberately). An open network-facing read would otherwise hand full ZIM
+  article content — plus unauthenticated expensive work (search, `/read`
+  range requests) — to any network peer. When reads *are* open (explicit
+  `false`), treat the network position of the listener as the trust boundary:
+  ZIM article content, article text, `/w/` raw content, and the redacted
+  settings topology are visible to anyone who can reach it.
 - **Password mode + `access.require_auth_for_reads = true`** (M1) — reads are
   gated too. Consequences:
   - **Known limitation:** the web UI's article links are plain `<a href="/w/…">`
@@ -218,7 +231,8 @@ is reachable by any network peer. Open mode is rejected at startup on a
     still load, and every JS data call attaches the token from sessionStorage
     (with a 401 re-prompt fallback).
   - Third-party clients that read-only-scrape the API break by design — that
-    is the flag's purpose. Default-off keeps existing deployments unchanged.
+    is the flag's purpose. It is now the default on non-loopback binds; loopback
+    deployments keep the historical default-off behavior.
 - **Token-verification cache (M3)** — a successfully verified token is cached
   for 60s to avoid re-running the 100k-iteration hash per request. The cache
   is cleared on `reload()` (env/config change — the only realistic password
@@ -281,6 +295,20 @@ Direct `.zim` downloads and torrent fetches are guarded against SSRF:
   served**: there is no end-to-end byte authentication, so trust = pinned
   sources + (https) TLS. Trust the download sources (torrent trackers, OPDS
   URL, user-supplied URLs) the way you would trust a browser download.
+- **M-2: pin content by size + hash when tampering matters.** Since the
+  server cannot verify integrity itself, high-trust deployments should keep a
+  known-good **SHA-256** (and expected size) for every ZIM they expect and
+  check downloads against it out-of-band — e.g. a wrapper script or cron job
+  that `sha256sum`s fresh files in the ZIM directory against a pinned list
+  before/after an install, or a reverse-proxy rule that only serves
+  pre-fetched files. This applies to **OPDS auto-updates** as well: the feed
+  URL is trusted, but the bytes it points at are only as trustworthy as the
+  feed endpoint (see the TLS recommendation below).
+- **Plaintext `http` direct downloads are the operator's risk.** The SSRF
+  guard validates *where* a download goes, not *what comes back* — over
+  plaintext http a network-positioned attacker can substitute the bytes
+  entirely. Prefer https endpoints wherever the source offers them; if a
+  source is http-only, treat its content as untrusted and pin it by hash.
 
 ### Served content
 
@@ -293,11 +321,12 @@ served article must not run same-origin JavaScript (it could read the admin
 token from `sessionStorage` and call the settings API); inline styles and
 data-URI images keep rendering.
 
-The embedded Web UI pages (`/`, `/search.html`, `/settings.html`,
-`/common.js`) set their own permissive baseline (they use inline
-scripts/styles by design): `Content-Security-Policy` (`default-src 'self'`
-with `'unsafe-inline'`), `X-Frame-Options: DENY`, `Referrer-Policy:
-no-referrer`.
+The embedded Web UI pages (`/`, `/search.html`, `/settings.html` + their
+`web/*.js` scripts) set their own baseline: `Content-Security-Policy`
+(`default-src 'self'; script-src 'self'` — all scripts are external embedded
+files, no inline `<script>` blocks, so no `'unsafe-inline'` or `sha256-`
+hashes are needed; the `pages_have_no_inline_scripts` unit test guards that),
+`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`.
 
 ### ZIM content trust boundary
 
@@ -305,7 +334,10 @@ no-referrer`.
 ZIM). It does NOT verify content provenance: no cryptographic signature is
 checked. Your trust boundary is the **source** (OPDS feed URL, torrent
 tracker), not the file itself. For high-trust deployments, pin torrents by
-hash and/or verify the OPDS feed over TLS with a known-good endpoint.
+hash and/or verify the OPDS feed over TLS with a known-good endpoint — and
+pin the downloaded artifacts themselves by **size + SHA-256** (a pinned list
+checked out-of-band, per the Download SSRF section) since the server performs
+no content-integrity verification of its own.
 
 ### TLS termination
 
@@ -322,8 +354,12 @@ e.g. `10.0.0.0/8,192.168.1.0/24`) or the `TRUSTED_PROXY_CIDRS` env var to the
 proxy's source range. When set, the auth lockout walks the
 `X-Forwarded-For` header right-to-left, skipping trusted CIDRs, to identify
 the real client IP. Without this setting, the lockout keys on the proxy IP
-(everyone shares one bucket). This is a config-only setting (restart
-required).
+(everyone shares one bucket). The server **refuses to start** if the list
+contains an all-zero CIDR (`0.0.0.0/0` or `::/0`) — such a list trusts every
+`X-Forwarded-For` value, letting a distributed attacker rotate the header and
+defeat the per-IP lockout (M-3); over-broad (but not all-zero) CIDRs (≥ /8
+IPv4, ≥ /56 IPv6) still warn at startup. This is a config-only setting
+(restart required).
 
 ### Index checkpoints
 
@@ -418,12 +454,6 @@ Postgres instance are skipped gracefully when the database is unreachable. Use
 `make test-strict` (which sets `ZIMSERVICE_REQUIRE_DB=1`) to make a missing
 database a **hard failure** — this is the gate for CI pipelines with a database
 service available.
-
-`make test-strict-perf` runs the DB-gated performance guards (e.g.
-`trgm_index_perf_check`): these seed 100k rows and run `EXPLAIN (ANALYZE)` to
-catch query-plan regressions (e.g. an accidental seq scan replacing an index
-scan). They are `#[ignore]`d by default so the correctness gate
-(`test-strict-ci`) stays fast. Run them in a nightly job, not per-PR.
 
 The OpenAPI spec can also be dumped standalone for review or diffing:
 

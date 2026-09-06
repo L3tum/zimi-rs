@@ -132,6 +132,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/search.html", axum::routing::get(handlers::web_search))
         .route("/settings.html", axum::routing::get(handlers::web_settings))
         .route("/common.js", axum::routing::get(handlers::web_common_js))
+        .route("/index.js", axum::routing::get(handlers::web_index_js))
+        .route("/search.js", axum::routing::get(handlers::web_search_js))
+        .route(
+            "/settings.js",
+            axum::routing::get(handlers::web_settings_js),
+        )
         // OpenAPI
         .route("/openapi.json", axum::routing::get(openapi::openapi_json))
         // Collections

@@ -506,7 +506,16 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_ACCESS_REQUIRE_AUTH_FOR_READS,
             default: serde_json::json!(false),
             json_type: JsonType::Bool,
-            policy: SettingPolicy::default(),
+            policy: SettingPolicy {
+                // M-1: env-backed (`REQUIRE_AUTH_FOR_READS`) so an explicit
+                // operator value is re-applied on every reload and locks the
+                // UI key; the *bind-based startup default* (non-loopback ⇒
+                // true) is injected into the env snapshot by
+                // `config::Config::apply_require_reads_default` — the seed
+                // default above stays `false` (loopback ergonomics).
+                env_locked: true,
+                ..Default::default()
+            },
         },
         SettingDef {
             key: KEY_GENERAL_TRUSTED_PROXY_CIDRS,
@@ -523,6 +532,16 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
 /// Look up a setting's policy row by key (`None` = unknown key).
 pub fn def(key: &str) -> Option<&SettingDef> {
     SETTING_DEFS.iter().find(|d| d.key == key)
+}
+
+/// M-1: whether reads should be gated by default when the operator did not
+/// set `REQUIRE_AUTH_FOR_READS` explicitly: a non-loopback bind gates reads
+/// by default (an open network-facing read exposes full article content plus
+/// unauthenticated expensive work — a DoS vector), while a loopback bind
+/// leaves the historical open-reads seed default (`false`) standing so
+/// local-dev ergonomics are unchanged.
+pub fn require_reads_startup_default(host: &str) -> bool {
+    !matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 /// The set of all known setting keys (identical to the `default_settings()`

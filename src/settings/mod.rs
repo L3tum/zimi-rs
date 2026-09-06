@@ -19,10 +19,10 @@ mod snapshots;
 pub use auth::{hash_admin_password, is_legacy_password, verify_admin_password};
 pub use cache::SettingsCache;
 pub use defs::{
-    def, default_settings, is_security_sensitive, known_keys, JsonType, SettingDef, SettingPolicy,
-    ACCESS_MODE_OPEN, ACCESS_MODE_PASSWORD, DEFAULT_MAX_BYTES, EMBED_DEFAULT_DIMENSION,
-    EMBED_DEFAULT_HNSW_THRESHOLD, EMBED_DEFAULT_IVFFLAT_THRESHOLD, EMBED_DEFAULT_MODEL,
-    SETTING_DEFS,
+    def, default_settings, is_security_sensitive, known_keys, require_reads_startup_default,
+    JsonType, SettingDef, SettingPolicy, ACCESS_MODE_OPEN, ACCESS_MODE_PASSWORD, DEFAULT_MAX_BYTES,
+    EMBED_DEFAULT_DIMENSION, EMBED_DEFAULT_HNSW_THRESHOLD, EMBED_DEFAULT_IVFFLAT_THRESHOLD,
+    EMBED_DEFAULT_MODEL, SETTING_DEFS,
 };
 // Setting-key string constants (single source of truth for key strings).
 pub use defs::{

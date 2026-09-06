@@ -172,16 +172,13 @@ pub(crate) async fn read_article_payload(
             raw_capped,
         ),
         Err(zim_err) => {
-            let db_row: Option<(String, Option<String>)> = sqlx::query_as(
-                "SELECT a.title, a.content_preview FROM articles a
-                 JOIN zims z ON z.id = a.zim_id
-                 WHERE z.name = $1 AND a.path = $2",
-            )
-            .bind(zim_name)
-            .bind(path)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(crate::error::Error::Database)?;
+            let db_row: Option<(String, Option<String>)> =
+                sqlx::query_as("SELECT a.title, a.content_preview FROM articles a JOIN zims z ON z.id = a.zim_id WHERE z.name = $1 AND a.path = $2") // RAW-OK: fallback DB point-lookup (title + preview) on ZIM-read failure — a two-table JOIN the entity path doesn't express here
+                .bind(zim_name)
+                .bind(path)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(crate::error::Error::Database)?;
             match db_row {
                 Some((db_title, Some(preview))) => (preview, "db".to_string(), db_title, false),
                 _ => return Err(zim_err),

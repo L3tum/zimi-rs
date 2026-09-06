@@ -12,6 +12,11 @@ jobs:
         with: { components: rustfmt, clippy }
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # M2: raw-SQL boundary lint — flags sqlx::query* call sites outside
+      # src/db/ (the sanctioned db::raw escape hatch) that lack a
+      # `// RAW-OK: <reason>` marker, so the SeaORM-vs-raw boundary stops
+      # being doc-comment-only. POSIX sh, no dependencies.
+      - run: make raw-sql-lint
       # JS syntax check for the embedded web UI (dependency-free, ~seconds).
       # Strict because `make web-check` skips silently without node; CI always
       # has node, so a missing-node must fail the gate, not pass it.
@@ -25,10 +30,11 @@ jobs:
       - run: make web-test
         env:
           ZIMSERVICE_WEB_CHECK_STRICT: "1"
-  # Real JS lint (eslint) of the embedded web UI: web/common.js + the inline
-  # <script> blocks (extracted by tests/web/extract-inline.mjs). Kept as a
-  # separate job (not folded into `lint`) so lint findings in the pre-existing
-  # web UI JS establish a baseline without blocking the core gates.
+  # Real JS lint (eslint) of the embedded web UI: web/common.js + the
+  # per-page scripts (web/index.js, web/search.js, web/settings.js). Kept as
+  # a separate job (not folded into `lint`) so lint findings in the
+  # pre-existing web UI JS establish a baseline without blocking the core
+  # gates.
   web-lint:
     runs-on: ubuntu-latest
     steps:
@@ -67,7 +73,7 @@ jobs:
       # shared process state (per-test tempdirs, ephemeral-port MockServers,
       # read-only tests/fixtures) and its DB-gated tests skip — this job has
       # no Postgres service. The DB-backed `test-db` job below stays pinned
-      # (single shared dev DB; see tests/integration.rs:5-8).
+      # (single shared dev DB; see tests/integration/main.rs:5-15).
       - run: cargo test --lib --bins --test wiremock
       - run: cargo test --doc
   coverage:
@@ -100,8 +106,7 @@ jobs:
           ZIMSERVICE_REQUIRE_DB=1 \
           DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
           cargo llvm-cov --all-features --lib --bins --test wiremock --test integration \
-            --fail-under-lines "$(cat .github/coverage_floor.txt)" \
-            -- --skip trgm_index_perf_check --include-ignored
+            --fail-under-lines "$(cat .github/coverage_floor.txt)"
   test-db:
     runs-on: ubuntu-latest
     services:
@@ -136,29 +141,7 @@ jobs:
       - run: |
           ZIMSERVICE_REQUIRE_DB=1 \
           DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
-          cargo test --test integration -- --skip trgm_index_perf_check --include-ignored
-  test-db-perf:
-    if: github.event_name == 'push'   # main only; PRs stay fast
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: zimservice
-          POSTGRES_PASSWORD: zimservice
-          POSTGRES_DB: zimservice
-        ports: ["5433:5432"]
-        options: >-
-          --health-cmd "pg_isready -U zimservice"
-          --health-interval 2s --health-timeout 3s --health-retries 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: |
-          ZIMSERVICE_REQUIRE_DB=1 \
-          DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
-          cargo test --test integration trgm_index_perf_check -- --ignored
+          cargo test --test integration
   # Cross-platform smoke: the crate builds and its DB-less unit tests pass on
   # macOS and Windows (DB-gated tests skip — no Postgres service here). Catches
   # platform-specific compile/link issues a Linux-only CI would miss.

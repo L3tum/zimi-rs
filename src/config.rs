@@ -8,10 +8,10 @@ use std::path::PathBuf;
 
 use crate::error::{Error, Result};
 use crate::settings::{
-    KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_MODE, KEY_EMBEDDING_API_KEY, KEY_EMBEDDING_DIMENSION,
-    KEY_EMBEDDING_ENDPOINT, KEY_EMBEDDING_MODEL, KEY_GENERAL_HOST, KEY_GENERAL_PORT,
-    KEY_GENERAL_TRUSTED_PROXY_CIDRS, KEY_GENERAL_ZIM_DIR, KEY_TORRENT_PASSWORD, KEY_TORRENT_URL,
-    KEY_TORRENT_USERNAME,
+    KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_MODE, KEY_ACCESS_REQUIRE_AUTH_FOR_READS,
+    KEY_EMBEDDING_API_KEY, KEY_EMBEDDING_DIMENSION, KEY_EMBEDDING_ENDPOINT, KEY_EMBEDDING_MODEL,
+    KEY_GENERAL_HOST, KEY_GENERAL_PORT, KEY_GENERAL_TRUSTED_PROXY_CIDRS, KEY_GENERAL_ZIM_DIR,
+    KEY_TORRENT_PASSWORD, KEY_TORRENT_URL, KEY_TORRENT_USERNAME,
 };
 
 /// Application configuration, loaded from env + compiled-in defaults.
@@ -60,11 +60,11 @@ impl Default for Config {
 /// `env_settings_snapshot` (the in-snapshot keys with non-empty values) derive
 /// from this single table (L5), so the two can't drift.
 ///
-/// The 12 settings-table rows set `policy.env_locked = true` in
+/// The 13 settings-table rows set `policy.env_locked = true` in
 /// `settings::SETTING_DEFS` (static eligibility only); `database.url` is the
 /// documented 1-entry exception — it is process config, not a settings-table
 /// row, so it has no `SETTING_DEFS` row and stays here.
-const ENV_SETTING_KEYS: [(&str, &str, bool); 14] = [
+const ENV_SETTING_KEYS: [(&str, &str, bool); 15] = [
     (KEY_GENERAL_ZIM_DIR, "ZIM_DIR", false),
     (KEY_GENERAL_PORT, "PORT", false),
     (KEY_GENERAL_HOST, "HOST", false),
@@ -79,6 +79,11 @@ const ENV_SETTING_KEYS: [(&str, &str, bool); 14] = [
     (KEY_EMBEDDING_DIMENSION, "EMBEDDING_DIM", true),
     (KEY_ACCESS_MODE, "ACCESS_MODE", true),
     (KEY_ACCESS_ADMIN_PASSWORD, "AUTH_PASSWORD", true),
+    (
+        KEY_ACCESS_REQUIRE_AUTH_FOR_READS,
+        "REQUIRE_AUTH_FOR_READS",
+        true,
+    ),
 ];
 
 impl Config {
@@ -137,17 +142,20 @@ impl Config {
 
     /// List of (key, env_var) pairs that lock settings in the UI.
     ///
-    /// `get` is the env getter (injected for testability — L14); a set
-    /// variable (even empty) locks the key, matching the old
-    /// `std::env::var(...).is_ok()` semantics. Derived from
-    /// [`ENV_SETTING_KEYS`] (L5).
+    /// `get` is the env getter (injected for testability — L14); a variable
+    /// set to a non-empty value locks the key. A set-but-empty var is
+    /// treated as unset — consistent with [`env_settings_snapshot`], which
+    /// also skips empty values: the snapshot never re-applies an empty var,
+    /// so locking the UI key for it would be misleading. The rule applies
+    /// uniformly to every key in [`ENV_SETTING_KEYS`]. Derived from that
+    /// table (L5).
     pub fn locked_env_settings(
         &self,
         get: &dyn Fn(&str) -> Option<String>,
     ) -> HashMap<String, String> {
         let mut locked = HashMap::new();
         for (key, var, _in_snapshot) in ENV_SETTING_KEYS {
-            if get(var).is_some() {
+            if get(var).is_some_and(|v| !v.is_empty()) {
                 locked.insert(key.to_string(), var.to_string());
             }
         }
@@ -176,6 +184,22 @@ impl Config {
             }
         }
         snap
+    }
+
+    /// M-1: apply the startup default for `access.require_auth_for_reads` to
+    /// a reload snapshot: when the operator did **not** set
+    /// `REQUIRE_AUTH_FOR_READS` (key absent) and the bind is non-loopback,
+    /// inject `"true"` so reads are gated by default on network-facing
+    /// deployments; a loopback bind injects nothing (the open-reads seed
+    /// default stands). An explicit value (key present) always overrides the
+    /// bind-based default in both directions. Pure and DB-free, like the
+    /// other snapshot helpers.
+    pub(crate) fn apply_require_reads_default(&self, snapshot: &mut HashMap<String, String>) {
+        if !snapshot.contains_key(KEY_ACCESS_REQUIRE_AUTH_FOR_READS)
+            && crate::settings::require_reads_startup_default(&self.host)
+        {
+            snapshot.insert(KEY_ACCESS_REQUIRE_AUTH_FOR_READS.into(), "true".to_string());
+        }
     }
 }
 
@@ -226,7 +250,8 @@ mod tests {
     #[test]
     fn locked_env_settings_injected() {
         // The env getter is injected (L14): only the vars the getter reports
-        // as set lock their keys. A set-but-empty var still locks (is_some).
+        // as set to a non-empty value lock their keys. A set-but-empty var
+        // does NOT lock (treated as unset — the snapshot skips it too).
         let c = Config::default();
         let get = |k: &str| match k {
             "ZIM_DIR" => Some("/custom".to_string()),
@@ -236,14 +261,17 @@ mod tests {
         };
         let locked = c.locked_env_settings(&get);
         assert!(locked.contains_key(KEY_GENERAL_ZIM_DIR));
-        assert!(locked.contains_key(KEY_GENERAL_PORT));
+        assert!(
+            !locked.contains_key(KEY_GENERAL_PORT),
+            "set-but-empty PORT must not lock (treated as unset)"
+        );
         assert!(locked.contains_key(KEY_EMBEDDING_DIMENSION));
         assert!(!locked.contains_key(KEY_GENERAL_HOST));
         assert!(!locked.contains_key("database.url"));
         // The getter, not the process env, drives the result.
-        assert_eq!(locked.len(), 3);
+        assert_eq!(locked.len(), 2);
 
-        // env_settings_snapshot returns only the six reload keys, non-empty only.
+        // env_settings_snapshot returns only the eight reload keys, non-empty only.
         let snap = c.env_settings_snapshot(&get);
         assert!(!snap.contains_key(KEY_ACCESS_MODE));
         assert!(!snap.contains_key(KEY_ACCESS_ADMIN_PASSWORD));
@@ -336,5 +364,70 @@ mod tests {
         let env = env_from(&[("PORT", "99999")]); // > 65535
         let result = c.apply_env(&env);
         assert!(result.is_err(), "PORT > 65535 must produce an error");
+    }
+
+    // ── M-1: bind-based startup default for access.require_auth_for_reads ──
+
+    #[test]
+    fn require_reads_default_loopback_keeps_reads_open() {
+        // loopback bind ⇒ no injection; the seed default (false, open reads)
+        // stands and local-dev ergonomics are unchanged.
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            let c = Config {
+                host: host.into(),
+                ..Config::default()
+            };
+            let mut snap = HashMap::new();
+            c.apply_require_reads_default(&mut snap);
+            assert!(
+                !snap.contains_key(KEY_ACCESS_REQUIRE_AUTH_FOR_READS),
+                "{host}: loopback must not inject a read-gating default"
+            );
+        }
+    }
+
+    #[test]
+    fn require_reads_default_non_loopback_gates_reads() {
+        for host in ["0.0.0.0", "::", "10.0.0.5"] {
+            let c = Config {
+                host: host.into(),
+                ..Config::default()
+            };
+            let mut snap = HashMap::new();
+            c.apply_require_reads_default(&mut snap);
+            assert_eq!(
+                snap.get(KEY_ACCESS_REQUIRE_AUTH_FOR_READS),
+                Some(&"true".to_string()),
+                "{host}: non-loopback must default reads to gated"
+            );
+        }
+    }
+
+    #[test]
+    fn require_reads_default_explicit_value_overrides_both_ways() {
+        // Explicit false on a non-loopback bind: honored (reads stay open).
+        let c = Config {
+            host: "0.0.0.0".into(),
+            ..Config::default()
+        };
+        let mut snap = HashMap::new();
+        snap.insert(
+            KEY_ACCESS_REQUIRE_AUTH_FOR_READS.into(),
+            "false".to_string(),
+        );
+        c.apply_require_reads_default(&mut snap);
+        assert_eq!(
+            snap.get(KEY_ACCESS_REQUIRE_AUTH_FOR_READS),
+            Some(&"false".to_string())
+        );
+        // Explicit true on a loopback bind: honored (reads gated).
+        let c2 = Config::default(); // 127.0.0.1
+        let mut snap2 = HashMap::new();
+        snap2.insert(KEY_ACCESS_REQUIRE_AUTH_FOR_READS.into(), "true".to_string());
+        c2.apply_require_reads_default(&mut snap2);
+        assert_eq!(
+            snap2.get(KEY_ACCESS_REQUIRE_AUTH_FOR_READS),
+            Some(&"true".to_string())
+        );
     }
 }

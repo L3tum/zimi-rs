@@ -3,8 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "extract-inline": "node tests/web/extract-inline.mjs",
-    "lint": "node tests/web/extract-inline.mjs && eslint web/common.js .web-lint-tmp/*.js"
+    "lint": "eslint web/common.js web/index.js web/search.js web/settings.js"
   },
   "devDependencies": {
     "@eslint/js": "^9",

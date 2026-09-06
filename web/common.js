@@ -1,3 +1,4 @@
+/* exported apiFetch, apiJson, esc, fmtBytes, fmtEta, fmtNum, snippetHtml, toast */
 'use strict';
 
 // ── HTML escape ──────────────────────────────────────────────────────────

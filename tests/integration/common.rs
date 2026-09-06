@@ -32,8 +32,9 @@ pub static SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// [`zimservice::testing::DbExclusiveGuard`], which serializes the shared-
 /// fixture mutation across concurrent `cargo test` processes. **Do not build a
 /// pool directly in a test** — that would bypass the guard and reintroduce the
-/// fixture-interleaving the single-threaded `--test-threads=1` gate exists to
-/// prevent (Tests Minor #7).
+/// fixture-interleaving the `DbExclusiveGuard` exists to prevent
+/// (Tests Minor #7; `migrations.rs` is the one exception: a private temp DB,
+/// guarded).
 pub async fn pool_or_skip() -> Option<(Pool, zimservice::testing::DbExclusiveGuard)> {
     let url_explicit = std::env::var("DATABASE_URL").is_ok();
     let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.into());
@@ -248,9 +249,8 @@ pub async fn fixture_state(pool: Pool) -> AppState {
 
 /// Boot `app` on an ephemeral loopback port. Real TCP ⇒ real
 /// `ConnectInfo` (the per-IP lockout needs it; oneshot tests can't carry it).
-/// Returns (base URL, graceful-shutdown trigger). Port 0 +
-/// --test-threads=1 ⇒ sequential tests each own an ephemeral port; no
-/// collisions.
+/// Returns (base URL, graceful-shutdown trigger). Port 0 ⇒ the OS assigns a
+/// unique ephemeral port per listener, so even parallel tests never collide.
 pub async fn boot_server(app: axum::Router) -> (String, tokio::sync::oneshot::Sender<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

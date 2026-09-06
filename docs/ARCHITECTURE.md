@@ -267,9 +267,15 @@ Explicitly declared out of scope:
   (`src/torrent/files.rs`, `README.md`).
 - **TLS in-process.** The server speaks plain HTTP; terminate TLS at a reverse
   proxy (`README.md`; startup warning in `src/main.rs`).
-- **Public reads.** In password mode all `GET`/`HEAD`/`OPTIONS` are open by
-  default (`access.require_auth_for_reads = false`); reads are treated as
-  non-sensitive (`README.md` "Security model").
+- **Unauthenticated reads on network-facing binds.** In password mode, reads
+  are open by default on a **loopback** bind (local trust), but **gated by
+  default on non-loopback binds**: `access.require_auth_for_reads` starts as
+  `true` there unless `REQUIRE_AUTH_FOR_READS` is set explicitly (M-1
+  hardening — the bind-based startup default is injected into the env
+  snapshot in `src/startup.rs` via
+  `config::Config::apply_require_reads_default`; the all-zero CIDR refusal
+  (M-3) for `general.trusted_proxy_cidrs` is enforced in `src/main.rs`).
+  `README.md` "Security model".
 - **Public API stability.** The crate is 0.x: no stable public API; `testing`
   is internal test support (`src/lib.rs`).
 
@@ -291,12 +297,8 @@ Explicitly declared out of scope:
 - **wiremock.** `tests/wiremock.rs` exercises the qBittorrent client against
   `MockServer` instances on loopback (the SSRF guard admits loopback for
   this); no real qBittorrent is needed.
-- **Performance guards.** DB-gated plan-regression tests (e.g.
-  `trgm_index_perf_check`: seed 100 k rows, `EXPLAIN (ANALYZE)`) are
-  `#[ignore]`d by default so the correctness gate stays fast; `make
-  test-strict-perf` runs them in a nightly-style job.
 - **CI mirror.** `make test-strict-ci` is the local twin of the CI test-db
-  job (strict integration minus the slow perf test); the Makefile requires
+  job (strict integration); the Makefile requires
   the two selections to stay in sync.
 - **Coverage ratchet.** The CI `coverage` job runs `cargo llvm-cov` against a
   Postgres service (`.github/workflows/ci.yml`) over the same selection as

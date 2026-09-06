@@ -189,6 +189,10 @@ pub async fn create_pool(config: &Config) -> Result<Pool> {
         .min_connections(1)
         // Fast 503 under pool exhaustion instead of deadpool's 30 s default.
         .acquire_timeout(Duration::from_secs(10))
+        // Recycle long-lived connections (ops hardening, Perf #8): NAT and
+        // firewall devices silently drop idle TCP, so a connection held
+        // across such a drop fails with a bare network error on first reuse.
+        .max_lifetime(Duration::from_secs(30 * 60))
         .connect_with(opts)
         .await
         .map_err(Error::Database)?;

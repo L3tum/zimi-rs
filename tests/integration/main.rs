@@ -28,8 +28,9 @@
 //! behavior was actually verified.
 //!
 //! The harness is idempotent: migrations are applied in place, fixtures use a
-//! dedicated ZIM name that is cleaned up, and the drift check runs in a temp
-//! DB it drops — so it is safe to run against an existing dev database.
+//! dedicated ZIM name that is cleaned up, and the migration checks (drift +
+//! legacy refusal, `migrations.rs`) run in temp DBs they drop — so it is safe
+//! to run against an existing dev database.
 
 mod common;
 mod embedding;

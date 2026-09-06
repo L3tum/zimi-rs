@@ -10,8 +10,10 @@ use crate::db::pool::Pool;
 use crate::db::raw;
 use crate::error::{Error, Result};
 
-/// Numbering is historical: 005 was removed/superseded. Do NOT renumber —
-/// migrations are tracked by filename + content hash. New migrations: 013, 014, …
+/// Numbering is historical: 005 was removed/superseded and is RESERVED/VOID
+/// — never add a `005_*.sql` (it would silently apply before 006). Do NOT
+/// renumber — migrations are tracked by filename + content hash. New
+/// migrations: 014, 015, …
 const MIGRATIONS: &[(&str, &str)] = &[
     (
         "001_initial.sql",
@@ -255,6 +257,24 @@ mod tests {
             assert!(
                 LEGACY_SCHEMA_MSG.contains(needle),
                 "message missing needle: {needle:?}"
+            );
+        }
+    }
+
+    /// The DDL path runs every migration file through
+    /// `raw::split_statements`; the splitter intentionally does NOT support
+    /// E-strings (a backslash has no escape meaning in its plain-string
+    /// rule), so the committed corpus must contain no `E'…'` literals —
+    /// this guard is the net that keeps the plain-string rule sound for
+    /// every migration. Cheap regression net (no DB needed).
+    #[test]
+    fn committed_migrations_contain_no_e_string_literals() {
+        for (name, sql) in MIGRATIONS {
+            assert!(
+                !sql.contains("E'"),
+                "migration {name} contains an E-string literal — the DDL \
+                 splitter does not support E-strings (see `split_statements`); \
+                 rewrite the literal as a plain string or a dollar-quoted body"
             );
         }
     }

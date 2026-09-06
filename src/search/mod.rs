@@ -136,29 +136,70 @@ impl SearchEngine {
     /// effectively infinite when `true` (no reason to re-probe a positive).
     const TRGM_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-    /// Whether the `pg_trgm` extension is available, resolved with a TTL-based
-    /// cache (WI-5). A `false` result is re-probed after 60 s so the trgm arms
-    /// recover when the extension is installed at runtime. A `true` result is
-    /// cached permanently (no reason to re-probe).
+    /// Whether the `pg_trgm` extension is available, resolved with a
+    /// TTL-based cache (WI-5). A `false` result is re-probed after 60 s so
+    /// the trgm arms recover when the extension is installed at runtime. A
+    /// `true` result is cached permanently (no reason to re-probe).
+    ///
+    /// Acquires a pool connection for the probe — use [`ensure_trgm_on`] from
+    /// a code path that already holds a connection (the `search()`/`suggest()`
+    /// arms): a second nested checkout stalls the full `acquire_timeout` when
+    /// `DB_POOL_SIZE=1`.
     pub async fn ensure_trgm(&self) -> bool {
-        // Fast path: check the cached value under a short sync lock.
-        {
-            let g = self.trgm_ready.lock().expect("trgm_ready lock poisoned");
-            if let Some((val, ts)) = *g {
-                if val || self.trgm_ready_fresh(ts) {
-                    return val;
-                }
-            }
+        if let Some(val) = self.trgm_cached_if_fresh() {
+            return val;
         }
-        // Slow path: probe the DB. Raw SQL (catalog probe — `pg_extension`
-        // has no SeaORM entity; plain SELECT, no special operators).
+        // Slow path: probe the DB on a checked-out connection.
         let ok = match self.pool.acquire().await {
-            Ok(mut client) => sqlx::query("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
-                .fetch_optional(&mut *client)
-                .await
-                .is_ok(),
+            Ok(mut client) => self.trgm_probe(&mut *client).await,
             Err(_) => false,
         };
+        self.trgm_store(ok)
+    }
+
+    /// [`ensure_trgm`] for callers that already hold a pooled connection
+    /// (the `search()`/`suggest()` arms): probes **through** the passed
+    /// executor instead of taking a second checkout — at `DB_POOL_SIZE=1`
+    /// a nested `pool.acquire()` would stall the full `acquire_timeout`
+    /// (10 s) before soft-disabling the trgm arms.
+    pub async fn ensure_trgm_on<'e, E>(&self, executor: E) -> bool
+    where
+        E: Executor<'e, Database = sqlx::Postgres>,
+    {
+        if let Some(val) = self.trgm_cached_if_fresh() {
+            return val;
+        }
+        self.trgm_store(self.trgm_probe(executor).await)
+    }
+
+    /// The `pg_trgm` catalog probe on any executor. Raw SQL (catalog probe —
+    /// `pg_extension` has no SeaORM entity; plain SELECT, no special
+    /// operators).
+    async fn trgm_probe<'e, E>(&self, executor: E) -> bool
+    where
+        E: Executor<'e, Database = sqlx::Postgres>,
+    {
+        sqlx::query("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'") // RAW-OK: catalog probe of pg_extension — no SeaORM entity exists for catalog tables (sanctioned class per the db::raw doc)
+            .fetch_optional(executor)
+            .await
+            .is_ok()
+    }
+
+    /// Fast path: the cached trgm value, if still fresh (see the `trgm_ready`
+    /// field for the TTL semantics).
+    fn trgm_cached_if_fresh(&self) -> Option<bool> {
+        let g = self.trgm_ready.lock().expect("trgm_ready lock poisoned");
+        if let Some((val, ts)) = *g {
+            if val || self.trgm_ready_fresh(ts) {
+                return Some(val);
+            }
+        }
+        None
+    }
+
+    /// Record a probe outcome (a failure feeds the degradation tracker) and
+    /// refresh the cache with it.
+    fn trgm_store(&self, ok: bool) -> bool {
         if !ok {
             self.degradation.record_failure("pg_trgm_probe");
         }
@@ -391,9 +432,11 @@ impl SearchEngine {
                 };
                 // WI-37: resolve the `pg_trgm` extension once (cached). A
                 // missing extension (or a pool blip) soft-disables all three
-                // trgm arms below; FTS always runs regardless.
+                // trgm arms below; FTS always runs regardless. Probed on the
+                // arm's own connection (no second pool checkout — see
+                // `ensure_trgm_on`).
                 let trgm_ok = if run_trgm {
-                    self.ensure_trgm().await
+                    self.ensure_trgm_on(&mut *client).await
                 } else {
                     false
                 };
@@ -561,8 +604,9 @@ impl SearchEngine {
         };
         // WI-37: resolve the `pg_trgm` extension once (cached). Suggest is a
         // pure-trgm op, so a missing extension soft-disables every arm (the
-        // whole result is empty rather than a partial).
-        let trgm_ok = self.ensure_trgm().await;
+        // whole result is empty rather than a partial). Probed on the arm's
+        // own connection (no second pool checkout — see `ensure_trgm_on`).
+        let trgm_ok = self.ensure_trgm_on(&mut *client).await;
         let r_prefix = if trgm_ok {
             run_sql_on(
                 &mut *client,
@@ -633,7 +677,7 @@ pub async fn run_sql_on<'e, E>(
 where
     E: Executor<'e, Database = sqlx::Postgres>,
 {
-    let mut query = sqlx::query_as::<_, SearchRow>(&sq.sql);
+    let mut query = sqlx::query_as::<_, SearchRow>(&sq.sql); // RAW-OK: runtime-built FTS/vector hybrid branch query (dynamic SQL + dynamic `$n` binds) — unexpressible via the db::raw helpers or the SeaORM builder
     for p in &sq.params {
         query = query.bind(p);
     }
@@ -785,6 +829,36 @@ mod tests {
             !engine.ensure_trgm().await,
             "second call reuses the cached `false`"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_trgm_on_probes_through_provided_executor() {
+        use crate::settings::{default_settings, SettingsCache};
+        // The search/suggest arms hold the ONLY pool connection they have
+        // (`DB_POOL_SIZE` may be 1): `ensure_trgm_on` must probe through the
+        // passed executor and never take a nested checkout (a nested
+        // `pool.acquire()` would stall the full acquire_timeout at size 1).
+        // The dead pool itself is used as the executor: `&PgPool` implements
+        // `Executor`, so this exercises the held-connection code path with
+        // no extra connection held at all.
+        let pool = crate::testing::dead_pool();
+        let settings = SettingsCache::new_with_map(
+            pool.clone(),
+            default_settings(),
+            std::collections::HashMap::new(),
+        );
+        let engine = SearchEngine::new(
+            pool.clone(),
+            settings,
+            crate::health::DegradationTracker::default(),
+        );
+        // Dead pool → probe fails → `false`; cache set, second call cached.
+        assert!(!engine.ensure_trgm_on(&pool).await);
+        assert!(
+            engine.trgm_ready.lock().unwrap().is_some(),
+            "trgm cache must be set after the first (failed) probe"
+        );
+        assert!(!engine.ensure_trgm_on(&pool).await);
     }
 
     #[test]

@@ -87,6 +87,12 @@ pub(crate) struct SettingsInner {
     /// (not `std::sync::Mutex`) because the guard is held across `.await` in
     /// `update()` (the transaction + cache-update block).
     pub(crate) write_guard: tokio::sync::Mutex<()>,
+    /// M1: whether this process started with the multi-instance opt-out
+    /// (`ZIMSERVICE_ALLOW_MULTI_INSTANCE=1`), captured at construction time —
+    /// it is a process startup decision, same philosophy as `env_snapshot`
+    /// (a mid-process env mutation must not change behavior). Drives the
+    /// post-commit divergence warning (`warn_multi_instance_divergence`).
+    multi_instance: bool,
 }
 
 impl SettingsInner {
@@ -126,6 +132,8 @@ impl SettingsCache {
             token_cache: RwLock::new(VerifiedTokenCache::default()),
             generation: std::sync::atomic::AtomicU64::new(0),
             write_guard: tokio::sync::Mutex::new(()),
+            // M1: the opt-out is a process startup decision — capture it now.
+            multi_instance: crate::startup::multi_instance_allowed(),
         });
 
         let cache = Self {
@@ -152,6 +160,9 @@ impl SettingsCache {
                 token_cache: RwLock::new(VerifiedTokenCache::default()),
                 generation: std::sync::atomic::AtomicU64::new(0),
                 write_guard: tokio::sync::Mutex::new(()),
+                // M1: same capture as `load` — the field is the process
+                // startup decision (see the struct doc).
+                multi_instance: crate::startup::multi_instance_allowed(),
             }),
         }
     }
@@ -580,9 +591,29 @@ impl SettingsCache {
             // cached token verifies must not outlive it.
             self.invalidate_token_cache();
             self.inner.bump_generation();
+            // M1: re-surface the cross-instance divergence for every
+            // committed write (no-op in single-instance mode).
+            self.warn_multi_instance_divergence();
         }
 
         Ok(errors)
+    }
+
+    /// M1: re-surface the cross-instance settings divergence when this
+    /// process runs with the multi-instance opt-out. The startup opt-out
+    /// warning is one-shot, but a committed change stays invisible to every
+    /// other instance until it restarts (there is no cross-instance
+    /// invalidation path), so [`Self::update`] calls this after **every**
+    /// successful commit. No-op in single-instance mode. The `/health`
+    /// `multi_instance` field exposes the mode to monitors in the meantime.
+    fn warn_multi_instance_divergence(&self) {
+        if self.inner.multi_instance {
+            tracing::warn!(
+                "multi-instance mode (ZIMSERVICE_ALLOW_MULTI_INSTANCE=1): settings \
+                 written — other instances keep their cached copies until \
+                 restarted (no cross-instance invalidation)"
+            );
+        }
     }
 
     /// Get per-ZIM settings from the zims table.
@@ -716,9 +747,11 @@ impl SettingsCache {
     typed_getter!(access_mode, KEY_ACCESS_MODE, String);
 
     /// Whether **read** (GET/HEAD/OPTIONS) requests also require auth in
-    /// password mode (M1). Default off: in password mode only mutating verbs
-    /// are gated, and all GETs stay readable (ZIM content, redacted settings
-    /// topology). Turning this on gates reads too — **including `/w/` raw
+    /// password mode (M1). Seed default off — but the *startup* default is
+    /// bind-based (M-1): non-loopback binds inject `true` into the env
+    /// snapshot unless `REQUIRE_AUTH_FOR_READS` is set explicitly, so
+    /// network-facing deployments gate reads by default while loopback keeps
+    /// open reads. Turning this on gates reads too — **including `/w/` raw
     /// content** — which breaks the web UI's plain-anchor article links
     /// (documented in the README threat-model section). See
     /// `auth_required` for the exact verb matrix.
@@ -759,6 +792,7 @@ mod tests {
                 token_cache: RwLock::new(VerifiedTokenCache::default()),
                 generation: std::sync::atomic::AtomicU64::new(0),
                 write_guard: tokio::sync::Mutex::new(()),
+                multi_instance: false,
             }),
         }
     }
@@ -1513,5 +1547,94 @@ mod tests {
         }
         // The old plaintext no longer verifies against the hashed value.
         assert!(!cache.token_verify_cached("legacy"));
+    }
+
+    // ── M1: multi-instance divergence warning ──────────────────────────────
+
+    /// `tracing_subscriber::fmt::writer::MakeWriter` over an in-memory
+    /// buffer, so a scoped subscriber can capture event text without
+    /// depending on harness log output (and without touching stdout).
+    #[derive(Clone)]
+    struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_warnings<F: FnOnce()>(test: F) -> String {
+        let buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(CapturingWriter(buf.clone()))
+            .finish();
+        // Thread-local: the capture cannot leak into other test threads.
+        let _guard = tracing::subscriber::set_default(sub);
+        test();
+        let text = {
+            let buf = buf.lock().unwrap_or_else(|p| p.into_inner());
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        text
+    }
+
+    /// M1: the divergence warning trigger. A cache built in multi-instance
+    /// mode must warn on a committed settings write; one built in
+    /// single-instance mode (the default — `cache_with_locks` sets the flag
+    /// explicitly, so the test is independent of the developer's env) must
+    /// stay silent. The flag is captured at construction (process startup
+    /// decision), so the assertions hold under any process env.
+    #[test]
+    fn multi_instance_divergence_warns_only_when_flag_set() {
+        // Multi-instance: the warn fires, naming the mode and the restart
+        // requirement.
+        let text = capture_warnings(|| {
+            let cache = SettingsCache {
+                inner: Arc::new(SettingsInner {
+                    cache: RwLock::new(HashMap::new()),
+                    env_locked: RwLock::new(HashMap::new()),
+                    env_snapshot: HashMap::new(),
+                    pool: dead_pool(),
+                    token_cache: RwLock::new(VerifiedTokenCache::default()),
+                    generation: std::sync::atomic::AtomicU64::new(0),
+                    write_guard: tokio::sync::Mutex::new(()),
+                    multi_instance: true,
+                }),
+            };
+            cache.warn_multi_instance_divergence();
+        });
+        assert!(
+            text.contains("multi-instance mode"),
+            "multi-instance mode must warn — got: {text:?}"
+        );
+        assert!(
+            text.contains("restarted"),
+            "the warn must state the restart requirement — got: {text:?}"
+        );
+
+        // Single-instance (flag explicitly off): no warn at all.
+        let text = capture_warnings(|| {
+            let cache = cache_with_locks(HashMap::new(), HashMap::new());
+            cache.warn_multi_instance_divergence();
+        });
+        assert!(
+            text.trim().is_empty(),
+            "single-instance mode must stay silent — got: {text:?}"
+        );
     }
 }

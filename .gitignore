@@ -30,5 +30,4 @@ test-data/
 
 # JS tooling (npm / eslint)
 node_modules/
-.web-lint-tmp/
 __pycache__

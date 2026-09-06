@@ -296,8 +296,9 @@ pub(crate) fn cidrs_contains(cidrs: &str, ip: &std::net::IpAddr) -> bool {
 
 /// SEC-M3: parse one comma-separated entry of a `general.trusted_proxy_cidrs`
 /// value into `(network address, prefix length)`. Shared by the request-time
-/// containment check (`cidrs_contains`) and the startup over-broad guard
-/// (`has_over_broad_cidr`) so the two can never drift apart (S1).
+/// containment check (`cidrs_contains`), the startup over-broad guard
+/// (`has_over_broad_cidr`), and the startup all-zero refusal
+/// (`has_all_zero_cidr`) so the three can never drift apart (S1).
 ///
 /// Returns `None` for an empty entry or a plain (prefix-less) IP literal.
 pub fn parse_cidr_entry(s: &str) -> Option<(std::net::IpAddr, u32)> {
@@ -320,7 +321,8 @@ pub fn parse_cidr_entry(s: &str) -> Option<(std::net::IpAddr, u32)> {
 /// `0.0.0.0/0` and `::/0`. An over-broad list lets a distributed attacker
 /// rotate `X-Forwarded-For` values and get a fresh lockout bucket per
 /// attempt, defeating the per-IP auth-failure lockout. Checked once at
-/// startup (warning) so the parser stays in one place with `cidrs_contains`.
+/// startup (warning); the all-zero subclass is **refused** instead — see
+/// [`has_all_zero_cidr`] (M-3).
 pub fn has_over_broad_cidr(cidrs: &str) -> bool {
     if cidrs.trim().is_empty() {
         return false;
@@ -329,6 +331,27 @@ pub fn has_over_broad_cidr(cidrs: &str) -> bool {
         Some((std::net::IpAddr::V4(_), prefix)) => prefix <= 8,
         Some((std::net::IpAddr::V6(_), prefix)) => prefix <= 56,
         None => false,
+    })
+}
+
+/// M-3: true when any entry of a `general.trusted_proxy_cidrs` value is an
+/// all-zero CIDR — `0.0.0.0/0` (IPv4) or `::/0` (IPv6), i.e. "every possible
+/// address". Such a list trusts *all* `X-Forwarded-For` values
+/// unconditionally, so a distributed attacker can rotate the header and
+/// defeat the per-IP auth-failure lockout entirely. **Refused at startup**
+/// (`cmd_serve` bails); the narrower over-broad class still only warns
+/// (`has_over_broad_cidr`).
+///
+/// Shares [`parse_cidr_entry`] with the request-time check so the two can
+/// never drift apart (S1).
+pub fn has_all_zero_cidr(cidrs: &str) -> bool {
+    if cidrs.trim().is_empty() {
+        return false;
+    }
+    cidrs.split(',').any(|s| match parse_cidr_entry(s) {
+        Some((std::net::IpAddr::V4(net), 0)) => net.is_unspecified(),
+        Some((std::net::IpAddr::V6(net), 0)) => net.is_unspecified(),
+        _ => false,
     })
 }
 
@@ -378,7 +401,9 @@ fn is_read_verb(method: &str) -> bool {
 /// When `require_reads` is true (the `access.require_auth_for_reads` option,
 /// M1), reads are gated too — the operator has accepted that the web UI's
 /// plain-anchor article links (`/w/...`) will 401 until they're refetched via
-/// the token-attached `apiFetch`. See the README threat-model section.
+/// the token-attached `apiFetch`. The option's *startup* default is
+/// bind-based (M-1): non-loopback binds start with it `true`, loopback keeps
+/// it `false`. See the README threat-model section.
 fn auth_required(
     method: &str,
     access_mode: &str,
@@ -905,6 +930,25 @@ mod tests {
         // IPv6
         assert!(cidrs_test("::1/128", &ipp("::1")));
         assert!(!cidrs_test("::1/128", &ipp("::2")));
+    }
+
+    #[test]
+    fn all_zero_cidr_refused() {
+        // M-3: all-zero CIDRs are refused at startup; the over-broad class
+        // (still warn-only) and normal proxy ranges must not trigger the
+        // refusal.
+        assert!(has_all_zero_cidr("0.0.0.0/0"));
+        assert!(has_all_zero_cidr("::/0"));
+        assert!(has_all_zero_cidr("10.0.0.0/8, 0.0.0.0/0"));
+        assert!(has_all_zero_cidr("  ::/0  "));
+        // Normal (and over-broad-but-not-all-zero) ranges: not refused.
+        assert!(!has_all_zero_cidr("10.0.0.0/8"));
+        assert!(!has_all_zero_cidr("192.168.1.0/24"));
+        assert!(!has_all_zero_cidr("::1/128"));
+        assert!(!has_all_zero_cidr("10.0.0.0/8,192.168.1.0/24"));
+        // Empty / unset.
+        assert!(!has_all_zero_cidr(""));
+        assert!(!has_all_zero_cidr("  "));
     }
 
     #[test]

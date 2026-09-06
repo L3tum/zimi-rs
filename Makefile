@@ -33,13 +33,13 @@ $(WAIT_PG)
 $1; st=$$?; docker compose stop postgres; exit $$st
 endef
 
-.PHONY: all help check fmt fmt-check clippy test test-fast test-integration test-strict test-strict-perf test-strict-ci build release install uninstall doc run clean web-check web-test web-lint
+.PHONY: all help check fmt fmt-check clippy raw-sql-lint test test-fast test-integration test-strict test-strict-ci build release install uninstall doc run clean web-check web-fmt web-test web-lint
 
 # Quick pre-commit checks
 check:
 	$(CARGO) check --all-targets --all-features
 
-fmt:
+fmt: web-fmt
 	$(CARGO) fmt --all
 
 fmt-check:
@@ -47,6 +47,13 @@ fmt-check:
 
 clippy:
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
+
+# M2: raw-SQL boundary lint — flags sqlx::query*/query_as/query_scalar call
+# sites outside src/db/ (the module owning the sanctioned db::raw escape
+# hatch) that lack a `// RAW-OK: <reason>` marker on the call line. POSIX sh
+# + grep only so it runs on the dev box and in CI alike.
+raw-sql-lint:
+	@sh scripts/check-raw-sql.sh
 
 # The integration half skips cleanly with no Postgres; `--nocapture` surfaces
 # the one-shot "DB unreachable — suite skipped" banner (a fully-skipped run
@@ -60,7 +67,7 @@ clippy:
 # database (see src/testing.rs). The integration half is *safe* under the
 # default parallel --test-threads: every DB-gated test is serialized by
 # DbExclusiveGuard (cross-process lockfile + in-process slot), and
-# smoke_migration_drift_detection (tests/integration.rs) now runs in a
+# smoke_migration_drift_detection (tests/integration/migrations.rs) now runs in a
 # dedicated temp DB it drops instead of tampering the shared
 # schema_migrations. Every target here (local and CI) therefore runs with the
 # default parallel --test-threads.
@@ -80,39 +87,31 @@ test-integration:
 
 # Strict integration: DB must be reachable or tests hard-fail.
 test-strict:
-	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration -- --include-ignored)
-
-# DB-gated performance checks (seeds 100k rows, runs EXPLAIN (ANALYZE); slow).
-# Runs only the ignored perf tests, e.g. trgm_index_perf_check.
-test-strict-perf:
-	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) $(CARGO) test --test integration trgm_index_perf_check -- --ignored)
+	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration)
 
 # Local mirror of the CI PR gate (P13): the test-db job in
-# .github/workflows/ci.yml is this target's CI twin — strict integration minus
-# the slow 100k-row perf test, so the perf guard never blocks the correctness
-# gate. The two must be kept in sync: any change to the selection of lib vs
-# integration halves (flags, --skip/--include-ignored) needs to land in both
-# this target and the CI job. Both halves run with the default parallel
-# --test-threads: the lib's DB-gated tests and the integration suite share one
-# dev DB, but every DB-gated test is serialized by DbExclusiveGuard
-# (cross-process lockfile + in-process slot), and the migration drift check
+# .github/workflows/ci.yml is this target's CI twin — strict integration. The
+# two must be kept in sync: any change to the selection of lib vs integration
+# halves (flags) needs to land in both this target and the CI job. Both halves
+# run with the default parallel --test-threads: the lib's DB-gated tests and
+# the integration suite share one dev DB, but every DB-gated test is
+# serialized by DbExclusiveGuard (cross-process lockfile + in-process slot),
+# and the migration drift check
 # now runs in a dedicated temp DB it drops.
 test-strict-ci:
 	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --lib --bins && \
-	    DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration -- --include-ignored --skip trgm_index_perf_check)
+	    DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration)
 
-# JS syntax check for the embedded web UI (web/*.js + inline <script> blocks).
-# Requires node; skips with a warning when node is absent. Set
-# ZIMSERVICE_WEB_CHECK_STRICT=1 to fail without node.
+# JS syntax check for the embedded web UI (web/*.js — the pages carry no
+# inline <script> blocks; the `pages_have_no_inline_scripts` Rust unit test
+# guards that). Requires node; skips with a warning when node is absent.
+# Set ZIMSERVICE_WEB_CHECK_STRICT=1 to fail without node.
 web-check:
 	@command -v node >/dev/null 2>&1 || { \
 	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
 	    echo "web-check: node not found (strict mode)" >&2; exit 1; \
 	  fi; echo "web-check: node not found — skipping JS syntax checks"; exit 0; }
-	@node --check web/common.js
-	@for f in web/index.html web/search.html web/settings.html; do \
-	  node -e 'const fs=require("fs"),vm=require("vm");const s=fs.readFileSync(process.argv[1],"utf8");const re=/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;let m,n=0;while((m=re.exec(s))){n++;try{new vm.Script(m[1])}catch(e){console.error(process.argv[1]+" script#"+n+": "+e.message);process.exit(1)}}if(!n){console.error(process.argv[1]+": no inline scripts found");process.exit(1)}console.log(process.argv[1]+": "+n+" inline script(s) OK");' "$$f" \
-	  || exit 1; done
+	@node --check web/common.js web/index.js web/search.js web/settings.js
 	@echo "web-check: OK"
 
 # Behavioral unit tests for the pure helpers in web/common.js (node --test,
@@ -126,8 +125,8 @@ web-test:
 	  fi; echo "web-test: node not found — skipping web UI unit tests"; exit 0; }
 	node --test tests/web/*.test.mjs
 
-# Real lint (eslint) of the embedded web UI: web/common.js + the inline
-# <script> blocks extracted by tests/web/extract-inline.mjs. Requires
+# Real lint (eslint) of the embedded web UI: web/common.js + the per-page
+# scripts (web/index.js, web/search.js, web/settings.js). Requires
 # `npm install` first (populates node_modules). Skips with a warning when
 # eslint isn't installed; strict mode (CI) fails instead.
 web-lint:
@@ -139,13 +138,30 @@ web-lint:
 	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
 	    echo "web-lint: eslint not installed (run: npm install; strict mode)" >&2; exit 1; \
 	  fi; echo "web-lint: eslint not installed (npm install) — skipping JS lint"; exit 0; }
-	node tests/web/extract-inline.mjs
-	./node_modules/.bin/eslint web/common.js .web-lint-tmp/*.js
+	./node_modules/.bin/eslint web/common.js web/index.js web/search.js web/settings.js
 	@echo "web-lint: OK"
+
+# eslint --fix for the embedded web UI (the JS half of `make fmt`): auto-fixes
+# fixable rules in web/common.js and the per-page scripts — all real files,
+# so fixes are written back. Same prerequisites/policy as web-lint: needs
+# node + `npm install` (node_modules); skips with a warning when eslint
+# isn't installed. Set ZIMSERVICE_WEB_CHECK_STRICT=1 to fail without
+# node/eslint.
+web-fmt:
+	@command -v node >/dev/null 2>&1 || { \
+	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
+	    echo "web-fmt: node not found (strict mode)" >&2; exit 1; \
+	  fi; echo "web-fmt: node not found — skipping JS auto-fix"; exit 0; }
+	@[ -x node_modules/.bin/eslint ] || { \
+	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
+	    echo "web-fmt: eslint not installed (run: npm install; strict mode)" >&2; exit 1; \
+	  fi; echo "web-fmt: eslint not installed (npm install) — skipping JS auto-fix"; exit 0; }
+	./node_modules/.bin/eslint --fix web/common.js web/index.js web/search.js web/settings.js
+	@echo "web-fmt: OK"
 
 # Full pre-merge check suite: type-check, format check, lint, full test run,
 # and the web UI checks (syntax, unit tests, eslint).
-all: check fmt-check clippy test web-check web-test web-lint
+all: check fmt-check clippy raw-sql-lint test web-check web-test web-lint
 
 help:
 	@echo "zimservice — make targets"
@@ -153,17 +169,18 @@ help:
 	@echo "  make              Default: runs 'make check' (cargo check). Use 'make all' for the full gate"
 	@echo "  make all          Full quality gate: check + fmt-check + clippy + test + web-check + web-test + web-lint"
 	@echo "  make check        cargo check (pre-commit)"
-	@echo "  make fmt          Format code"
+	@echo "  make fmt          Format Rust (cargo fmt) + JS (eslint --fix; see web-fmt)"
 	@echo "  make fmt-check    Check formatting (CI)"
 	@echo "  make clippy       Lint (warnings as errors)"
+	@echo "  make raw-sql-lint  Flag unmarked raw sqlx::query* sites outside src/db/ (M2)"
 	@echo "  make test         Run full test suite"
 	@echo "  make test-fast    Run unit tests only (lib + bins; no integration/doctests)"
 	@echo "  make test-integration  Boot compose Postgres, run DB integration tests"
-	@echo "  make test-strict      Strict mode: DB required, run ignored tests too"
-	@echo "  make test-strict-perf  DB-gated perf checks (EXPLAIN, 100k rows; slow)"
-	@echo "  make test-strict-ci    Mirrors the CI PR gate: strict integration minus the perf test"
-	@echo "  make web-check    JS syntax check of embedded web UI (needs node; skips if absent)"
+	@echo "  make test-strict      Strict mode: DB required (missing DB is a hard failure)"
+	@echo "  make test-strict-ci    Mirrors the CI PR gate: strict integration (DB required)"
+	@echo "  make web-check    JS syntax check of the embedded web UI (web/*.js; needs node; skips if absent)"
 	@echo "  make web-test     Behavioral unit tests for web/common.js helpers (node --test; skips if absent)"
+	@echo "  make web-fmt      eslint --fix for the web UI (JS half of make fmt; needs npm install; skips if absent)"
 	@echo "  make web-lint     JS lint of web UI via eslint (needs npm install; skips if absent)"
 	@echo "  make doc          Build docs"
 	@echo "  make build        Build (debug)"

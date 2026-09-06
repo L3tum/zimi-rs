@@ -21,6 +21,12 @@ pub struct HealthResponse {
     pub articles_count: i64,
     pub db_connected: bool,
     pub qbit_connected: bool,
+    /// True when this process started with `ZIMSERVICE_ALLOW_MULTI_INSTANCE=1`
+    /// (M1): its in-memory caches (settings, rate limiter, ZIM metadata) have
+    /// no cross-instance invalidation, so settings edits made via another
+    /// instance are invisible here until a restart. Monitors polling several
+    /// instances can surface the mode from this field.
+    pub multi_instance: bool,
     /// Branches with ≥ 3 consecutive failures (WI-5).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<String>,
@@ -65,6 +71,9 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
             articles_count: total_articles,
             db_connected,
             qbit_connected,
+            // M1: process-level startup decision (env-var opt-out), so it is
+            // read the same way `cmd_serve` reads it — no state field.
+            multi_instance: crate::startup::multi_instance_allowed(),
             degraded: state
                 .degradation
                 .degraded_snapshot()

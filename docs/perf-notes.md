@@ -8,8 +8,11 @@ at realistic scale (100k rows), or degrades to a sequential scan.
 **Resolved (DEC-5, Step 4.2):** the single `LIKE … OR similarity() > t`
 predicate was split into three concurrently-run, individually indexable
 queries (btree prefix, GIN contains, GiST similarity), merged by the existing
-`merge_results`. The harness test `trgm_index_perf_check` now asserts none of
-the three falls back to a `Seq Scan` over `articles`.
+`merge_results`. Note: the repo contains **no automated plan-regression
+harness** — earlier CI/docs referenced a `trgm_index_perf_check` test that
+did not exist, and those references were removed. The index usage below must
+be verified manually at scale (recipe further down) if the plan shape is ever
+in doubt.
 
 ### The predicate
 
@@ -43,9 +46,8 @@ would indicate the OR predicate is not index-friendly at this scale.
 
 ### How to capture the actual plan
 
-The harness test `trgm_index_perf_check` (`tests/integration.rs`) seeds a
-dedicated ZIM (`__itrge__`) with 100k rows and runs `EXPLAIN (ANALYZE)`
-against each of the three split predicates:
+Manual recipe: seed a dedicated ZIM (`__itrge__`) with 100k rows in the dev
+DB, then run `EXPLAIN (ANALYZE)` against each of the three split predicates:
 
 ```sql
 -- Q1 prefix (btree)
@@ -56,17 +58,11 @@ EXPLAIN (ANALYZE, BUFFERS) SELECT a.id … WHERE a.title_lower LIKE '%art 42%' E
 EXPLAIN (ANALYZE, BUFFERS) SELECT a.id … WHERE similarity(a.title_lower, 'art 42') > 0.3
 ```
 
-and asserts none of the three contains `Seq Scan on articles`.
+The regression-relevant result is that none of the three contains `Seq Scan
+on articles`. There is no automated harness — run the statements by hand
+(e.g. `psql`) and paste the plans below.
 
-Run it against a live DB and paste the printed plans below:
-
-```sh
-make test-strict-perf   # or:
-DATABASE_URL=postgres://zimservice:zimservice@127.0.0.1:5432/zimservice \
-  cargo test --test integration trgm_index_perf_check -- --include-ignored --nocapture
-```
-
-### Result (fill in after `make test-strict-perf`)
+### Result (fill in after a manual run)
 
 _Plane captured on: ______ (Postgres version, row count, `pg_trgm` similarity
 threshold)._
@@ -75,9 +71,8 @@ threshold)._
 (paste the EXPLAIN (ANALYZE, BUFFERS) output for Q1/Q2/Q3 here)
 ```
 
-**Verdict:** the split is implemented (DEC-5); the harness asserts each branch
-is index-driven (btree / GIN / GiST) with **no** sequential scan over
-`articles`.
+**Verdict:** the split is implemented (DEC-5); there is no automated harness —
+plan capture is pending a manual measurement.
 
 ---
 
@@ -88,9 +83,10 @@ btree `idx_articles_title_prefix`, but `gin_trgm_ops` (the GIN trgm index) can
 serve `LIKE 'q%'` too. Is the btree redundant — can we drop it (migration 013)
 and let the GIN index cover the prefix shape as well?
 
-**How it is measured.** `trgm_index_perf_check` (`tests/integration.rs`,
-`#[ignore]`, run via `make test-strict-perf` against the 100k-row `__itrge__`
-fixture) EXPLAINs five shapes and prints each plan's node:
+**How it is measured (manual).** Seed the 100k-row `__itrge__` fixture in the
+dev DB and EXPLAIN (ANALYZE) the five shapes below, printing each plan's node
+(the `trgm_index_perf_check` harness referenced here previously did not exist
+in the repo and its references were removed):
 
 | Shape | Predicate / ordering | Index it may use |
 |-------|----------------------|------------------|
@@ -100,10 +96,10 @@ fixture) EXPLAINs five shapes and prints each plan's node:
 | SUG | prefix arm (weight 1.0) | btree prefix *or* GIN |
 | Q5 | `ORDER BY title_lower ASC LIMIT 20` (no predicate) | btree (ordering) |
 
-Q1/Q2/Q3/SUG are regression-gated: none may fall back to a `Seq Scan on
-articles` at 100k rows. Q5 is recorded for the decision but is **not**
-seq-scan-gated — a seq-scan+top-N for a pure ordering is a legal planner choice
-that this decision weighs.
+Q1/Q2/Q3/SUG are the regression-relevant shapes: none should fall back to a
+`Seq Scan on articles` at 100k rows. Q5 is recorded for the decision but is
+**not** seq-scan-gated — a seq-scan+top-N for a pure ordering is a legal
+planner choice that this decision weighs.
 
 **Decision rule (fixed, no judgment).**
 - **DROP** `idx_articles_title_prefix` (emit
@@ -116,17 +112,19 @@ that this decision weighs.
 - **Else KEEP** it and record the reason here.
 
 After a drop the GIN trgm index serves the prefix shape; the Q1 no-seq-scan
-assertion is the regression net — re-run and confirm Q1 is still not a seq
-scan. Precedent for the drop statement: `009:4`
+shape check is the regression net — re-measure and confirm Q1 is still not a
+seq scan. Precedent for the drop statement: `009:4`
 `DROP INDEX IF EXISTS idx_articles_title_lower`. Non-`CONCURRENTLY` (single
 transaction migrate harness; `010:16` precedent).
 
-**Outcome.** _PENDING CI-DB MEASUREMENT._ The measurement needs Postgres (the
-100k-row fixture + `EXPLAIN ANALYZE`), which is not available locally, so the
-keep/drop call is deferred to `make test-strict-perf` (or the test-db-perf push
-job). **Default is KEEP** — migration 013 is created *only* in the drop branch,
+**Outcome.** _PENDING MANUAL MEASUREMENT._ The measurement needs Postgres (the
+100k-row fixture + `EXPLAIN ANALYZE`). The keep/drop call is deferred to a
+manual measurement run — CI has no perf job (the former `test-db-perf` push
+job referenced a test that did not exist and was removed). **Default is KEEP**
+— migration 013 is created *only* in the drop branch,
 and that branch is not reached until the rule's drop condition is
-measured-confirmed. _To fill in after the CI-DB run:_ paste the five plan nodes
+measured-confirmed. _To fill in after the measurement run:_ paste the five plan
+nodes
 here, tick the decision rule, and either create migration 013 (drop) or record
 KEEP with the reason.
 

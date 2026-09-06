@@ -11,6 +11,7 @@ use zimservice::zim::index;
 
 use zimservice::settings::{KEY_ACCESS_ADMIN_PASSWORD, KEY_GENERAL_TRUSTED_PROXY_CIDRS};
 use zimservice::startup;
+use zimservice::startup::wait_for_task_failure;
 
 /// Interval between background re-probes of a degraded pg_trgm (WI-5).
 const TRGM_REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -91,7 +92,7 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
     // DELETE/INSERT cycle on the shared database that two concurrently-
     // starting instances must not interleave. The guards need only `Config`
     // (DSN + zim_dir), so they can come first.
-    let allow_multi = matches!(std::env::var("ZIMSERVICE_ALLOW_MULTI_INSTANCE"), Ok(v) if v == "1");
+    let allow_multi = startup::multi_instance_allowed();
     let allow_multi_db =
         !allow_multi && matches!(std::env::var("ZIMSERVICE_ALLOW_MULTI_DB"), Ok(v) if v == "1");
     let guard = if allow_multi {
@@ -151,17 +152,51 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
              See the README 'Security' section.",
             host = config.host,
         );
+
+        // M-1: state the effective read-gating decision for network-facing
+        // password-mode binds. `access.require_auth_for_reads` defaults to
+        // true on non-loopback binds (an open network-facing read exposes
+        // full article content plus unauthenticated expensive work); the
+        // operator can override it via REQUIRE_AUTH_FOR_READS (persistent)
+        // or the settings API (runtime, reverts to the bind-based default
+        // on restart).
+        if state.settings.require_auth_for_reads() {
+            tracing::warn!(
+                "access.require_auth_for_reads is effective-true on non-loopback bind \
+                 ({host}): GET/HEAD/OPTIONS require the admin password (M-1 \
+                 default). Set REQUIRE_AUTH_FOR_READS=false to restore open \
+                 reads — see the README 'Security' section.",
+                host = config.host,
+            );
+        } else {
+            tracing::info!(
+                "access.require_auth_for_reads is false on non-loopback bind ({host}): \
+                 reads (GET/HEAD/OPTIONS) stay open — full article content is \
+                 exposed to any network peer. Set REQUIRE_AUTH_FOR_READS=true \
+                 to gate reads.",
+                host = config.host,
+            );
+        }
     }
 
-    // SEC-M3 guardrail: warn at startup if the trusted-proxy CIDR list is
-    // over-broad (shared with the request-time check in serve::middleware).
-    // An over-broad list lets a distributed attacker rotate X-Forwarded-For
-    // values and get a fresh lockout bucket per attempt, defeating the
-    // per-IP auth-failure lockout.
+    // M-3: refuse to start when the trusted-proxy CIDR list is all-zero
+    // (`0.0.0.0/0` / `::/0`): it would trust every X-Forwarded-For value,
+    // so a distributed attacker could rotate the header and get a fresh
+    // lockout bucket per attempt, defeating the per-IP auth-failure
+    // lockout. Same fail-closed precedent as the open-mode non-loopback
+    // refusal above; the narrower over-broad class (≥ /8 IPv4 / ≥ /56
+    // IPv6) still only warns below.
     let cidrs_raw = state
         .settings
         .get_typed::<String>(KEY_GENERAL_TRUSTED_PROXY_CIDRS)
         .unwrap_or_default();
+    if serve::middleware::has_all_zero_cidr(&cidrs_raw) {
+        anyhow::bail!(
+            "general.trusted_proxy_cidrs contains an all-zero CIDR (0.0.0.0/0 or ::/0): \
+             it would trust every X-Forwarded-For value and defeat the per-IP \
+             auth-failure lockout. Restrict the list to your actual proxy IPs."
+        );
+    }
     if serve::middleware::has_over_broad_cidr(&cidrs_raw) {
         tracing::warn!(
             "general.trusted_proxy_cidrs contains an over-broad CIDR (≥ /8 IPv4 or ≥ /56 IPv6): \
@@ -289,105 +324,25 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
         })
         .await;
 
-    // Graceful shutdown: stop the supervisor (so it hands back the still-
-    // alive handles), abort those tasks, and wait briefly for them to drain.
-    // Reached on **both** Ok and Err of `axum::serve` (S3).
-    //
-    // H2: the supervisor already `tracing::error!`-logged any task that died
-    // and consumed that handle, so the survivors it hands back are only the
-    // rest. Awaiting a survivor that panicked in the narrow window between
-    // the supervisor's last poll and our abort is the "died, noticed only at
-    // shutdown" case — log it. A *cancelled* JoinError is expected (we just
-    // aborted it) and is skipped so it does not masquerade as a death.
-    let _ = sup_stop_tx.send(true);
-    // The supervisor returns the survivors; a JoinError here means the
-    // supervisor itself panicked (it only polls + awaits finished handles,
-    // so this should be impossible — log and continue the shutdown).
-    let survivors = match supervisor_handle.await {
-        Ok(s) => s,
-        Err(join_err) => {
-            tracing::error!("background-task supervisor died: {join_err}");
-            Vec::new()
-        }
-    };
-
-    tracing::info!("shutting down background tasks");
-    for (_, handle) in &survivors {
-        handle.abort();
-    }
-
-    let shutdown_timeout = SHUTDOWN_TIMEOUT;
-    let _ = tokio::time::timeout(shutdown_timeout, async move {
-        for (name, handle) in survivors {
-            if let Err(join_err) = handle.await {
-                if !join_err.is_cancelled() {
-                    tracing::error!(
-                        "background task '{name}' died just before shutdown: {join_err}"
-                    );
-                }
-            }
-        }
-    })
-    .await;
-
-    // Surface the serve error (if any) after cleanup completes.
-    serve_result.map_err(|e| anyhow::anyhow!("server error: {e}"))?;
-
-    // H2: die flag set means the supervisor observed a background task
-    // finishing early (panic or early return). Exit non-zero so the broken
-    // download→verify→index pipeline is visible to operators and monitoring
-    // (fail-closed); a plain Ctrl-C shutdown must still exit 0.
-    if *died_check.borrow() {
-        anyhow::bail!("background task died (see log above); exiting non-zero");
-    }
+    // M4: the post-serve shutdown protocol (stop supervisor → abort
+    // survivors → bounded drain → exit-kind classification) is a lib fn —
+    // reached on **both** Ok and Err of `axum::serve` (S3), unit-tested in
+    // `startup::serve_shutdown_tests` with dummy handles.
+    startup::finalize_serve_shutdown(
+        serve_result,
+        sup_stop_tx,
+        supervisor_handle,
+        &died_check,
+        SHUTDOWN_TIMEOUT,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     tracing::info!("zimservice shut down cleanly");
     // `guard` drops here: advisory lock released (connection closed) +
     // `.zimservice.lock` unlinked (S1 + S2).
     drop(guard);
     Ok(())
-}
-
-/// H2: core of the background-task supervisor — unit-testable in isolation.
-///
-/// Polls the named `JoinHandle`s every `poll_interval` and reports the first
-/// one that finishes — a panic (surfaced as `Err(JoinError)`) **or** a normal
-/// early return (`Ok(value)`), since both mean the task will not keep the
-/// pipeline alive for the server's lifetime. `is_finished()` is non-consuming,
-/// so only the one handle that actually finished is `await`ed (consumed).
-///
-/// Returns the reported task plus the **remaining** handles untouched, so
-/// the caller (the shutdown path) can still abort/await them. Returns
-/// `None` (with all handles handed back) if the `stop` watch is set first,
-/// which bounds the wait during clean shutdown. Never calls
-/// `process::exit` — the caller decides how to react.
-async fn wait_for_task_failure<T: Send + 'static>(
-    tasks: Vec<(&'static str, tokio::task::JoinHandle<T>)>,
-    poll_interval: std::time::Duration,
-    mut stop: tokio::sync::watch::Receiver<bool>,
-) -> (
-    Option<(&'static str, Result<T, tokio::task::JoinError>)>,
-    Vec<(&'static str, tokio::task::JoinHandle<T>)>,
-) {
-    let mut tasks = tasks;
-    loop {
-        // First finished task wins. `is_finished()` is non-consuming.
-        if let Some(i) = tasks.iter().position(|(_, handle)| handle.is_finished()) {
-            let (name, handle) = tasks.remove(i);
-            let result = handle.await; // consumes only the finished handle
-            return (Some((name, result)), tasks);
-        }
-        // Sleep until the next poll or until the stop flag is set (clean
-        // shutdown — hand the still-alive handles back without reporting).
-        tokio::select! {
-            _ = tokio::time::sleep(poll_interval) => {}
-            _ = stop.changed() => {
-                if *stop.borrow() {
-                    return (None, tasks);
-                }
-            }
-        }
-    }
 }
 
 async fn cmd_list(config: Config, sync: bool) -> anyhow::Result<()> {

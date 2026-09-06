@@ -51,6 +51,31 @@ mod tests {
         assert_eq!(v["status"], "degraded");
     }
 
+    /// M1: `/health` carries the multi-instance mode as an additive field so
+    /// a monitor polling several instances can see which one is running with
+    /// the single-instance guards disabled. The value is the process-level
+    /// env opt-out, so the assertion is self-consistent under either state
+    /// (a developer's export must not break the test).
+    #[tokio::test]
+    async fn health_reports_multi_instance_flag() {
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(
+            v["multi_instance"],
+            crate::startup::multi_instance_allowed(),
+            "the /health flag must mirror the process-level opt-out"
+        );
+    }
+
     /// AppState like `test_state()` (dead pool) but with the rate limiter
     /// tightened to `rps=1, burst=1` so the second request of the same burst
     /// is throttled. A fresh `RateLimiterHandle` starts with `burst` tokens.

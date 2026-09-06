@@ -41,7 +41,7 @@ impl HealthProbes {
     /// possible probe and `/health` is rate-limit-exempt (ratelimit.rs:190).
     pub async fn probe_db(&self, db: &db::Pool) -> bool {
         match db.acquire().await {
-            Ok(mut pg) => sqlx::query("SELECT 1").execute(&mut *pg).await.is_ok(),
+            Ok(mut pg) => sqlx::query("SELECT 1").execute(&mut *pg).await.is_ok(), // RAW-OK: `SELECT 1` liveness probe — the cheapest possible statement, run on a raw pooled connection (db::raw helpers are for query builders, not a one-word probe)
             Err(_) => false,
         }
     }
