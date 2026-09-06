@@ -213,7 +213,10 @@ fn sqlx_error_status_message(e: &sqlx::Error) -> (axum::http::StatusCode, String
     use axum::http::StatusCode;
 
     if matches!(e, sqlx::Error::PoolTimedOut) {
-        (StatusCode::SERVICE_UNAVAILABLE, "database unavailable".into())
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database unavailable".into(),
+        )
     } else if let Some(db) = e.as_database_error() {
         // This sqlx build's `DatabaseError::code()` yields `Option<Cow<str>>`
         // that does not outlive the call — own it before the `&str` comparisons.
@@ -235,7 +238,10 @@ fn sqlx_error_status_message(e: &sqlx::Error) -> (axum::http::StatusCode, String
             )
         }
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "database connection closed".into())
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database connection closed".into(),
+        )
     }
 }
 
@@ -250,9 +256,10 @@ fn sea_orm_status_message(e: &sea_orm::DbErr) -> (axum::http::StatusCode, String
     use axum::http::StatusCode;
 
     match e {
-        sea_orm::DbErr::ConnectionAcquire(_) => {
-            (StatusCode::SERVICE_UNAVAILABLE, "database unavailable".into())
-        }
+        sea_orm::DbErr::ConnectionAcquire(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database unavailable".into(),
+        ),
         _ => match sqlx_error_from_db_err(e) {
             Some(sqlx_err) => sqlx_error_status_message(sqlx_err),
             None => {
@@ -272,12 +279,11 @@ fn sqlx_error_from_db_err(e: &sea_orm::DbErr) -> Option<&sqlx::Error> {
     use sea_orm::RuntimeErr;
 
     match e {
-        sea_orm::DbErr::Conn(rt) | sea_orm::DbErr::Exec(rt) | sea_orm::DbErr::Query(rt) => {
-            match rt {
-                RuntimeErr::SqlxError(e) => Some(e),
-                RuntimeErr::Internal(_) => None,
-            }
-        }
+        sea_orm::DbErr::Conn(rt) | sea_orm::DbErr::Exec(rt) | sea_orm::DbErr::Query(rt) => match rt
+        {
+            RuntimeErr::SqlxError(e) => Some(e),
+            RuntimeErr::Internal(_) => None,
+        },
         _ => None,
     }
 }
@@ -409,18 +415,18 @@ mod tests {
     fn sea_orm_error_maps_like_sqlx_and_does_not_leak() {
         // A SeaORM query error wrapping a pool timeout behaves exactly like
         // the raw sqlx error (SQLSTATE/status mapping is shared).
-        let err = Error::SeaOrm(sea_orm::DbErr::Query(
-            sea_orm::RuntimeErr::SqlxError(sqlx::Error::PoolTimedOut),
-        ));
+        let err = Error::SeaOrm(sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(
+            sqlx::Error::PoolTimedOut,
+        )));
         let (status, msg) = err.status_and_message();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(msg, "database unavailable");
 
         // A SeaORM-internal error (no sqlx driver error to unwrap) is a 503
         // and its raw detail never reaches the client.
-        let err = Error::SeaOrm(sea_orm::DbErr::Conn(
-            sea_orm::RuntimeErr::Internal("secret detail".into()),
-        ));
+        let err = Error::SeaOrm(sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
+            "secret detail".into(),
+        )));
         let (status, msg) = err.status_and_message();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(msg, "database error");

@@ -526,7 +526,13 @@ async fn tool_article_languages(state: &AppState, args: &Value) -> Result<Value,
 async fn tool_list_collections(state: &AppState) -> Value {
     let rows = match sqlx::query_as::<
         _,
-        (String, String, bool, chrono::DateTime<chrono::Utc>, Vec<String>),
+        (
+            String,
+            String,
+            bool,
+            chrono::DateTime<chrono::Utc>,
+            Vec<String>,
+        ),
     >(
         "SELECT c.name, c.label, c.is_favorite, c.created_at,
                 COALESCE(ARRAY_AGG(z.name) FILTER (WHERE z.id IS NOT NULL), '{}')

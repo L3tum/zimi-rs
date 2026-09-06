@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::SystemTime;
 
-use crate::db::{entities::zims, pool::Pool, sea_orm_db, raw};
+use crate::db::{entities::zims, pool::Pool, raw, sea_orm_db};
 use crate::error::{Error, Result};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 

@@ -380,20 +380,16 @@ impl DownloadPoller {
             .filter(
                 Column::Status
                     .eq(crate::torrent::DownloadStatus::Queued.as_str())
-                    .or(
-                        Column::Status
-                            .eq(crate::torrent::DownloadStatus::Downloading.as_str())
-                            .and(Expr::cust(format!(
-                                "({pred}) NOT LIKE '%.zim'",
-                                pred = ZIM_URL_PREDICATE
-                            ))),
-                    )
+                    .or(Column::Status
+                        .eq(crate::torrent::DownloadStatus::Downloading.as_str())
+                        .and(Expr::cust(format!(
+                            "({pred}) NOT LIKE '%.zim'",
+                            pred = ZIM_URL_PREDICATE
+                        ))))
                     .or(Column::Status.eq(crate::torrent::DownloadStatus::Seeding.as_str()))
-                    .or(
-                        Column::Status
-                            .eq(crate::torrent::DownloadStatus::Cancelled.as_str())
-                            .and(Column::Hash.is_not_null()),
-                    ),
+                    .or(Column::Status
+                        .eq(crate::torrent::DownloadStatus::Cancelled.as_str())
+                        .and(Column::Hash.is_not_null())),
             )
             .into_tuple()
             .one(&db)
@@ -620,9 +616,7 @@ impl DownloadPoller {
             let n: i64 = Entity::find()
                 .select_only()
                 .column_as(Expr::col(Column::Id).count(), "n")
-                .filter(Column::Status.eq(
-                    crate::torrent::DownloadStatus::Downloading.as_str(),
-                ))
+                .filter(Column::Status.eq(crate::torrent::DownloadStatus::Downloading.as_str()))
                 .filter(Expr::cust(format!(
                     "({pred}) LIKE '%.zim'",
                     pred = ZIM_URL_PREDICATE
@@ -1564,14 +1558,14 @@ mod tests {
                     );
                     let (status, progress, speed, eta, ratio, up, seeds): StatusStatsTuple =
                         raw::fetch_optional(
-                        &mut *c,
-                        "SELECT status, progress, speed_bps, eta_secs, ratio, \
+                            &mut *c,
+                            "SELECT status, progress, speed_bps, eta_secs, ratio, \
                         up_speed_bps, num_seeds FROM downloads WHERE id = $1",
-                        |q| q.bind(id),
-                    )
-                    .await
-                    .expect("read row")
-                    .expect("row present");
+                            |q| q.bind(id),
+                        )
+                        .await
+                        .expect("read row")
+                        .expect("row present");
                     assert_eq!(status, "seeding", "status stays seeding");
                     assert_eq!(progress, 1.0, "progress stays 1.0");
                     assert_eq!(speed, None, "speed_bps stays NULL");
@@ -1843,11 +1837,9 @@ mod tests {
                 |q| q,
             )
             .await;
-            let _ = raw::execute(
-                &mut *c,
-                "DELETE FROM zims WHERE name = $1",
-                |q| q.bind("__it_inflight__b4"),
-            )
+            let _ = raw::execute(&mut *c, "DELETE FROM zims WHERE name = $1", |q| {
+                q.bind("__it_inflight__b4")
+            })
             .await;
 
             // Two same-named rows: A bound to a stale (non-matching) hash, B
@@ -1964,8 +1956,7 @@ mod tests {
             // Row A (bound to a stale, non-matching hash): must NOT fall back to
             // the name match — still `downloading`, hash untouched, no file.
             assert_eq!(
-                row_a.0,
-                "downloading",
+                row_a.0, "downloading",
                 "hash-bound row must not name-fallback to the same-named torrent"
             );
             assert_eq!(
@@ -1974,16 +1965,14 @@ mod tests {
                 "hash-bound row's hash must not be rebound to the matched torrent"
             );
             assert_eq!(
-                row_a.2,
-                None,
+                row_a.2, None,
                 "hash-bound row must not run handle_complete (no file installed)"
             );
 
             // Row B (hash NULL): matched by the name fallback — completed, hash
             // bound to the torrent's real hash, one file installed.
             assert_eq!(
-                row_b.0,
-                "complete",
+                row_b.0, "complete",
                 "hash-NULL row must complete via the name fallback"
             );
             assert_eq!(
@@ -2049,11 +2038,9 @@ mod tests {
                 |q| q.bind(id_a).bind(id_b),
             )
             .await;
-            let _ = raw::execute(
-                &mut *c2,
-                "DELETE FROM zims WHERE name = $1",
-                |q| q.bind("__it_inflight__b4"),
-            )
+            let _ = raw::execute(&mut *c2, "DELETE FROM zims WHERE name = $1", |q| {
+                q.bind("__it_inflight__b4")
+            })
             .await;
             let _ = (tmp, content_tmp);
         }
@@ -2313,11 +2300,9 @@ mod tests {
 
             let _ = pool.acquire().await; // keep pool alive for cleanup
             let mut c2 = pool.acquire().await.expect("conn");
-            let _ = raw::execute(
-                &mut *c2,
-                "DELETE FROM downloads WHERE id = $1",
-                |q| q.bind(id),
-            )
+            let _ = raw::execute(&mut *c2, "DELETE FROM downloads WHERE id = $1", |q| {
+                q.bind(id)
+            })
             .await;
             let _ = tmp;
         }
@@ -2367,7 +2352,10 @@ mod tests {
             let _ka: i32 = raw::fetch_scalar_optional(
                 &mut *c,
                 "INSERT INTO downloads (name, url, status) VALUES ($1, $2, 'queued') RETURNING id",
-                |q| q.bind("it-keepalive").bind("http://127.0.0.1:9/keepalive.zim"),
+                |q| {
+                    q.bind("it-keepalive")
+                        .bind("http://127.0.0.1:9/keepalive.zim")
+                },
             )
             .await
             .expect("insert keepalive")
@@ -2693,14 +2681,12 @@ mod tests {
 
             // Sweep leftovers from a crashed prior run (shared dev DB).
             let mut c = pool.acquire().await.expect("conn");
-            let _ = raw::execute(
-                &mut *c,
-                "DELETE FROM downloads WHERE name = $1",
-                |q| q.bind(ZIM),
-            )
+            let _ = raw::execute(&mut *c, "DELETE FROM downloads WHERE name = $1", |q| {
+                q.bind(ZIM)
+            })
             .await;
-            let _ = raw::execute(&mut *c, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
-                .await;
+            let _ =
+                raw::execute(&mut *c, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM)).await;
 
             // Stage the torrent content: a real (structurally valid)
             // `tiny.zim` copy at the path qBittorrent would report as
@@ -2744,8 +2730,7 @@ mod tests {
 
             // (a) The in-flight row, as the qB-enqueue step would have left
             // it: `downloading`, hash bound, fresh `updated_at`.
-            let id = it_insert_row(&pool, ZIM, Some(HASH), "downloading", 0.99, None, None)
-                .await;
+            let id = it_insert_row(&pool, ZIM, Some(HASH), "downloading", 0.99, None, None).await;
 
             // What qBittorrent reports this tick: the torrent is complete
             // (`uploading` @ 1.0) and its content is staged on disk.
@@ -2990,14 +2975,12 @@ mod tests {
             assert!(!v["chunks"][0]["text"].as_str().unwrap_or("").is_empty());
 
             // Cleanup (shared dev DB; articles/qid rows cascade off zims).
-            let _ = raw::execute(
-                &mut *c,
-                "DELETE FROM downloads WHERE id = $1",
-                |q| q.bind(id),
-            )
+            let _ = raw::execute(&mut *c, "DELETE FROM downloads WHERE id = $1", |q| {
+                q.bind(id)
+            })
             .await;
-            let _ = raw::execute(&mut *c, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
-                .await;
+            let _ =
+                raw::execute(&mut *c, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM)).await;
             let _ = tmp;
         }
     }
@@ -3156,11 +3139,9 @@ mod tests {
             .expect("row present");
             assert_eq!(status, "error", "orphan past grace → error");
 
-            let _ = raw::execute(
-                &mut *c,
-                "DELETE FROM downloads WHERE id = $1",
-                |q| q.bind(id),
-            )
+            let _ = raw::execute(&mut *c, "DELETE FROM downloads WHERE id = $1", |q| {
+                q.bind(id)
+            })
             .await;
             let _ = tmp;
         }
@@ -3213,11 +3194,9 @@ mod tests {
             .expect("row present");
             assert_eq!(hash, "newhash999", "hash rebound to qB torrent");
 
-            let _ = raw::execute(
-                &mut *c,
-                "DELETE FROM downloads WHERE id = $1",
-                |q| q.bind(id),
-            )
+            let _ = raw::execute(&mut *c, "DELETE FROM downloads WHERE id = $1", |q| {
+                q.bind(id)
+            })
             .await;
             let _ = tmp;
         }
@@ -3274,11 +3253,9 @@ mod tests {
             assert_eq!(status, "queued", "interrupted direct download → queued");
             assert_eq!(fp, None, "file_path cleared");
 
-            let _ = raw::execute(
-                &mut *c,
-                "DELETE FROM downloads WHERE id = $1",
-                |q| q.bind(id),
-            )
+            let _ = raw::execute(&mut *c, "DELETE FROM downloads WHERE id = $1", |q| {
+                q.bind(id)
+            })
             .await;
             let _ = tmp;
         }
@@ -3356,11 +3333,9 @@ mod tests {
             .expect("row present");
             assert_eq!(status, "complete", "seeding row settled to complete");
 
-            let _ = raw::execute(
-                &mut *c,
-                "DELETE FROM downloads WHERE id = $1",
-                |q| q.bind(id),
-            )
+            let _ = raw::execute(&mut *c, "DELETE FROM downloads WHERE id = $1", |q| {
+                q.bind(id)
+            })
             .await;
             let _ = tmp;
         }

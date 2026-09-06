@@ -41,7 +41,9 @@ pub async fn pool_or_skip() -> Option<(Pool, zimservice::testing::DbExclusiveGua
     // `tokio::time::timeout` around the eager connect instead.
     let pool = match tokio::time::timeout(
         Duration::from_secs(3),
-        sqlx::postgres::PgPoolOptions::new().max_connections(4).connect(&url),
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url),
     )
     .await
     {
@@ -119,13 +121,9 @@ pub async fn seed_search_fixture(pool: &Pool) -> SearchEngine {
         .await
         .expect("migrations (fixture tables must exist)");
 
-    zimservice::db::raw::execute(
-        pool,
-        "DELETE FROM zims WHERE name = $1",
-        |q| q.bind(ZIM),
-    )
-    .await
-    .unwrap();
+    zimservice::db::raw::execute(pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+        .await
+        .unwrap();
     zimservice::db::raw::execute(
         pool,
         "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,

@@ -305,11 +305,9 @@ mod tests {
         crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
             .await
             .unwrap();
-        crate::db::raw::execute(
-            &pool,
-            "DELETE FROM zims WHERE name = $1",
-            |q| q.bind("utiny"),
-        )
+        crate::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| {
+            q.bind("utiny")
+        })
         .await
         .unwrap();
     }
@@ -413,15 +411,14 @@ mod tests {
             "second call must be a no-op: no rename (inode/mtime/size unchanged)"
         );
 
-        let (status, file_path) =
-            crate::db::raw::fetch_optional::<(String, Option<String>), _, _>(
-                &pool,
-                "SELECT status, file_path FROM downloads WHERE id = $1",
-                |q| q.bind(id),
-            )
-            .await
-            .expect("read row")
-            .expect("row must exist");
+        let (status, file_path) = crate::db::raw::fetch_optional::<(String, Option<String>), _, _>(
+            &pool,
+            "SELECT status, file_path FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .expect("read row")
+        .expect("row must exist");
         assert_eq!(status, "complete");
         assert_eq!(file_path, Some(installed.display().to_string()));
 
@@ -429,11 +426,9 @@ mod tests {
         crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
             .await
             .unwrap();
-        crate::db::raw::execute(
-            &pool,
-            "DELETE FROM zims WHERE name = $1",
-            |q| q.bind("utiny"),
-        )
+        crate::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| {
+            q.bind("utiny")
+        })
         .await
         .unwrap();
     }

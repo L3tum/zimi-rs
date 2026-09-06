@@ -635,14 +635,13 @@ impl SettingsCache {
         }
 
         // Verify the ZIM exists before mutating (B6: return 404 for unknown names).
-        let exists: i64 =
-            raw::fetch_scalar_optional(
-                &self.inner.pool,
-                "SELECT COUNT(*) FROM zims WHERE name = $1",
-                |q| q.bind(zim_name),
-            )
-            .await?
-            .unwrap_or(0);
+        let exists: i64 = raw::fetch_scalar_optional(
+            &self.inner.pool,
+            "SELECT COUNT(*) FROM zims WHERE name = $1",
+            |q| q.bind(zim_name),
+        )
+        .await?
+        .unwrap_or(0);
         if exists == 0 {
             return Err(Error::NotFound(format!("ZIM '{zim_name}' not found")));
         }

@@ -23,7 +23,9 @@ use crate::settings::{
 };
 
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{
+    ColumnTrait, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+};
 
 /// Minimum number of embedded vectors before `run_pipeline` attempts a
 /// vector-index build on completion (H2). Kept at 1 to preserve the original
@@ -1090,7 +1092,8 @@ mod tests {
                 .acquire_timeout(Duration::from_secs(86_400))
                 .connect(&url),
         )
-        .await {
+        .await
+        {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => return skip_loop_test(test, &url, &format!("connect failed: {e}")),
             Err(_) => return skip_loop_test(test, &url, "connect timed out (3s)"),
@@ -1132,7 +1135,10 @@ mod tests {
         let dim = embedding_column_dim(pool).await;
         let mut values = crate::settings::default_settings();
         values.insert(KEY_EMBEDDING_ENDPOINT.into(), serde_json::json!(endpoint));
-        values.insert(crate::settings::KEY_EMBEDDING_ENABLED.into(), serde_json::json!(enabled));
+        values.insert(
+            crate::settings::KEY_EMBEDDING_ENABLED.into(),
+            serde_json::json!(enabled),
+        );
         values.insert(KEY_EMBEDDING_MODEL.into(), serde_json::json!("test-model"));
         values.insert(KEY_EMBEDDING_DIMENSION.into(), serde_json::json!(dim));
         values.insert(KEY_EMBEDDING_TIMEOUT_SECS.into(), serde_json::json!(86_400));
@@ -1165,9 +1171,11 @@ mod tests {
     /// Seed a fresh ready/embeddable ZIM (idempotent) and one unembedded
     /// article in it; returns the article id.
     async fn seed_zim_article(pool: &Pool, path: &str) -> i64 {
-        raw::execute(pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(LOOP_ZIM))
-            .await
-            .expect("delete zim");
+        raw::execute(pool, "DELETE FROM zims WHERE name = $1", |q| {
+            q.bind(LOOP_ZIM)
+        })
+        .await
+        .expect("delete zim");
         let zim_id: i32 = raw::fetch_scalar_optional(
             pool,
             "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
@@ -1193,14 +1201,13 @@ mod tests {
 
     /// One more unembedded article in the loop ZIM (no ZIM churn).
     async fn seed_article(pool: &Pool, path: &str) -> i64 {
-        let zim_id: i32 = raw::fetch_scalar_optional(
-            pool,
-            "SELECT id FROM zims WHERE name = $1",
-            |q| q.bind(LOOP_ZIM),
-        )
-        .await
-        .expect("zim lookup")
-        .expect("zim row");
+        let zim_id: i32 =
+            raw::fetch_scalar_optional(pool, "SELECT id FROM zims WHERE name = $1", |q| {
+                q.bind(LOOP_ZIM)
+            })
+            .await
+            .expect("zim lookup")
+            .expect("zim row");
         raw::fetch_scalar_optional(
             pool,
             "INSERT INTO articles (path, title, content_preview, snippet, search_vector,
@@ -1215,7 +1222,10 @@ mod tests {
     }
 
     async fn drop_loop_zim(pool: &Pool) {
-        let _ = raw::execute(pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(LOOP_ZIM)).await;
+        let _ = raw::execute(pool, "DELETE FROM zims WHERE name = $1", |q| {
+            q.bind(LOOP_ZIM)
+        })
+        .await;
     }
 
     async fn article_embedded(pool: &Pool, id: i64) -> Option<bool> {
@@ -1243,14 +1253,20 @@ mod tests {
     /// Valid `idx_articles_embedding` present (the same pg_catalog probe the
     /// loop's `vector_index_state` runs).
     async fn index_valid(pool: &Pool) -> Option<bool> {
-        vector_index_state(pool).await.ok().map(|(_, exists)| exists)
+        vector_index_state(pool)
+            .await
+            .ok()
+            .map(|(_, exists)| exists)
     }
 
     /// `pg_stat_user_tables.n_live_tup` for `articles`, forcing a stats
     /// flush first (PG 15+), so the loop's O(1) pre-filter
     /// (`index_build_worth_probing`) sees freshly inserted rows.
     async fn articles_live_tup(pool: &Pool) -> Option<i64> {
-        if raw::execute(pool, "SELECT pg_stat_force_next_flush()", |q| q).await.is_err() {
+        if raw::execute(pool, "SELECT pg_stat_force_next_flush()", |q| q)
+            .await
+            .is_err()
+        {
             return None;
         }
         raw::fetch_scalar_optional(
@@ -1267,7 +1283,10 @@ mod tests {
     /// tests claim one row per pipeline run, so one entry per request.
     fn embed_one_body(dim: u32) -> String {
         let v = vec_of(dim, "0.1");
-        format!("{{\"data\":[{{\"index\":0,\"embedding\":[{}]}}]}}", v.join(","))
+        format!(
+            "{{\"data\":[{{\"index\":0,\"embedding\":[{}]}}]}}",
+            v.join(",")
+        )
     }
 
     fn vec_of(n: u32, val: &str) -> Vec<String> {
@@ -1325,14 +1344,15 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let pool = match loop_pool_or_skip("auto_embed_loop_repeats_ticks_and_picks_up_new_work")
-            .await
-        {
-            Some(p) => p,
-            None => return,
-        };
+        let pool =
+            match loop_pool_or_skip("auto_embed_loop_repeats_ticks_and_picks_up_new_work").await {
+                Some(p) => p,
+                None => return,
+            };
         let _db_gate = crate::testing::DbExclusiveGuard::acquire();
-        crate::db::migrate::run_migrations(&pool).await.expect("migrations");
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
 
         let server = MockServer::start().await;
         let dim = embedding_column_dim(&pool).await;
@@ -1342,7 +1362,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let state = loop_state(pool.clone(), loop_settings(&pool, &server.uri(), true).await);
+        let state = loop_state(
+            pool.clone(),
+            loop_settings(&pool, &server.uri(), true).await,
+        );
         let first = seed_zim_article(&pool, "A/wave1").await;
         let loop_task = tokio::spawn(auto_embed_loop(state));
 
@@ -1388,7 +1411,9 @@ mod tests {
             None => return,
         };
         let _db_gate = crate::testing::DbExclusiveGuard::acquire();
-        crate::db::migrate::run_migrations(&pool).await.expect("migrations");
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
 
         let server = MockServer::start().await;
         let dim = embedding_column_dim(&pool).await;
@@ -1413,7 +1438,11 @@ mod tests {
             "disabled loop must not claim the article"
         );
         assert_eq!(
-            server.received_requests().await.expect("wiremock requests").len(),
+            server
+                .received_requests()
+                .await
+                .expect("wiremock requests")
+                .len(),
             0,
             "disabled loop must not call the embed endpoint"
         );
@@ -1421,7 +1450,10 @@ mod tests {
         // Enable at runtime (the production write path). The running loop
         // re-reads the setting on a later tick and embeds the article.
         let mut updates = std::collections::HashMap::new();
-        updates.insert(crate::settings::KEY_EMBEDDING_ENABLED.into(), serde_json::json!(true));
+        updates.insert(
+            crate::settings::KEY_EMBEDDING_ENABLED.into(),
+            serde_json::json!(true),
+        );
         settings
             .update(&updates, true)
             .await
@@ -1432,7 +1464,11 @@ mod tests {
         )
         .await;
         assert!(
-            !server.received_requests().await.expect("wiremock requests").is_empty(),
+            !server
+                .received_requests()
+                .await
+                .expect("wiremock requests")
+                .is_empty(),
             "enabling must trigger a pipeline pass"
         );
 
@@ -1461,7 +1497,11 @@ mod tests {
             "re-disabled loop must not embed new work"
         );
         assert_eq!(
-            server.received_requests().await.expect("wiremock requests").len(),
+            server
+                .received_requests()
+                .await
+                .expect("wiremock requests")
+                .len(),
             1,
             "re-disabled loop must send no further embed calls"
         );
@@ -1469,7 +1509,10 @@ mod tests {
         loop_task.abort();
         // Leave the shared dev DB as found (the default value).
         let mut updates = std::collections::HashMap::new();
-        updates.insert(crate::settings::KEY_EMBEDDING_ENABLED.into(), serde_json::json!(false));
+        updates.insert(
+            crate::settings::KEY_EMBEDDING_ENABLED.into(),
+            serde_json::json!(false),
+        );
         settings
             .update(&updates, true)
             .await
@@ -1494,7 +1537,9 @@ mod tests {
             None => return,
         };
         let _db_gate = crate::testing::DbExclusiveGuard::acquire();
-        crate::db::migrate::run_migrations(&pool).await.expect("migrations");
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
 
         // At/above the IVFFlat ceiling no build is attempted at all (the
         // documented skip), so the test can only make sense below it.
@@ -1570,7 +1615,11 @@ mod tests {
         // The loop did not block on the build: its tick proceeded to the
         // per-ZIM pipeline and attempted an embed (which 500'd).
         assert!(
-            !server.received_requests().await.expect("wiremock requests").is_empty(),
+            !server
+                .received_requests()
+                .await
+                .expect("wiremock requests")
+                .is_empty(),
             "loop must continue to the per-ZIM pipeline after spawning the build"
         );
         // The endpoint failed, so the article is still unembedded — the

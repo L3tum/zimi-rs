@@ -387,9 +387,7 @@ async fn queue_opds_updates(db: &Pool, updates: &[opds::OpdsUpdate]) -> Result<(
         let result = Entity::insert(ActiveModel {
             name: ActiveValue::Set(u.catalog_name.clone()),
             url: ActiveValue::Set(u.download_url.clone()),
-            status: ActiveValue::Set(
-                crate::torrent::DownloadStatus::Queued.as_str().to_owned(),
-            ),
+            status: ActiveValue::Set(crate::torrent::DownloadStatus::Queued.as_str().to_owned()),
             ..Default::default()
         })
         .exec(&db)

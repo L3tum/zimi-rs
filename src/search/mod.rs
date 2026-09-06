@@ -32,7 +32,17 @@ pub(crate) fn trgm_arms_enabled(query: &str) -> bool {
 /// One search-branch row, in the fixed column order every branch SELECT
 /// emits (id, zim_id, path, title, snippet, content_preview, language,
 /// zim_name, score).
-type SearchRow = (i64, i32, String, String, String, Option<String>, String, String, f64);
+type SearchRow = (
+    i64,
+    i32,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    f64,
+);
 
 /// Merge the three suggest branches into the final list, preserving the old
 /// single-query `ORDER BY CASE WHEN prefix THEN 0 ELSE 1 END, similarity

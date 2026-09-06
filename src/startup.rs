@@ -163,7 +163,10 @@ pub async fn build_state(
     // `ZIMSERVICE_ALLOW_MULTI_INSTANCE=1` opt-out, where they proceed and
     // the warning is the only signal that they are staling a live server.
     if !advisory_lock_held {
-        let mut conn = pool.acquire().await.map_err(|e| anyhow::anyhow!("pool: {e}"))?;
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|e| anyhow::anyhow!("pool: {e}"))?;
         // Raw escape hatch (db::raw): `pg_locks` catalog probe — the SeaORM
         // builder only sees application tables.
         let held = db::raw::fetch_scalar_optional(
@@ -364,9 +367,10 @@ async fn connect_and_try_instance_lock(config: &Config) -> anyhow::Result<(PgCon
         .await
         .map_err(|e| anyhow::anyhow!("advisory-lock connect: {e}"))?;
 
-    let acquired: Option<bool> = db::raw::fetch_scalar_optional(&mut conn, INSTANCE_LOCK_SQL, |q| q)
-        .await
-        .map_err(|e| anyhow::anyhow!("advisory lock: {e}"))?;
+    let acquired: Option<bool> =
+        db::raw::fetch_scalar_optional(&mut conn, INSTANCE_LOCK_SQL, |q| q)
+            .await
+            .map_err(|e| anyhow::anyhow!("advisory lock: {e}"))?;
 
     Ok((conn, acquired.unwrap_or(false)))
 }
@@ -487,9 +491,7 @@ pub async fn acquire_mutating_guard(config: &Config) -> anyhow::Result<Option<Mu
         );
     }
 
-    Ok(Some(MutatingGuard {
-        lock_conn: client,
-    }))
+    Ok(Some(MutatingGuard { lock_conn: client }))
 }
 
 /// How often the advisory-lock liveness monitor probes the lock connection
@@ -921,19 +923,14 @@ mod tests {
         let mut helper = crate::db::pool::connect_dedicated(&url)
             .await
             .expect("helper conn");
-        let pid: i32 = crate::db::raw::fetch_scalar_optional(
-            &mut conn,
-            "SELECT pg_backend_pid()",
-            |q| q,
-        )
-        .await
-        .expect("backend pid")
-        .expect("row");
-        let _ = crate::db::raw::execute(
-            &mut helper,
-            "SELECT pg_terminate_backend($1)",
-            |q| q.bind(pid),
-        )
+        let pid: i32 =
+            crate::db::raw::fetch_scalar_optional(&mut conn, "SELECT pg_backend_pid()", |q| q)
+                .await
+                .expect("backend pid")
+                .expect("row");
+        let _ = crate::db::raw::execute(&mut helper, "SELECT pg_terminate_backend($1)", |q| {
+            q.bind(pid)
+        })
         .await;
         drop(helper);
         let fired = Arc::new(AtomicBool::new(false));
@@ -971,14 +968,18 @@ mod tests {
                 if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
                     panic!("ZIMSERVICE_REQUIRE_DB set but cannot reach {url}: {e}");
                 }
-                eprintln!("skipping liveness_monitor_stays_quiet_while_alive: cannot reach {url} ({e})");
+                eprintln!(
+                    "skipping liveness_monitor_stays_quiet_while_alive: cannot reach {url} ({e})"
+                );
                 return;
             }
             Err(_) => {
                 if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
                     panic!("ZIMSERVICE_REQUIRE_DB set but timed out reaching {url}");
                 }
-                eprintln!("skipping liveness_monitor_stays_quiet_while_alive: timed out reaching {url}");
+                eprintln!(
+                    "skipping liveness_monitor_stays_quiet_while_alive: timed out reaching {url}"
+                );
                 return;
             }
         };
@@ -1037,18 +1038,12 @@ mod tests {
         // The first instance takes the advisory lock (and keeps the
         // connection alive so the lock stays open).
         let mut holder = first;
-        let held: bool = crate::db::raw::fetch_scalar_optional(
-            &mut holder,
-            INSTANCE_LOCK_SQL,
-            |q| q,
-        )
-        .await
-        .expect("first connection must hold the lock")
-        .unwrap();
-        assert!(
-            held,
-            "setup: first connection must acquire the lock"
-        );
+        let held: bool =
+            crate::db::raw::fetch_scalar_optional(&mut holder, INSTANCE_LOCK_SQL, |q| q)
+                .await
+                .expect("first connection must hold the lock")
+                .unwrap();
+        assert!(held, "setup: first connection must acquire the lock");
 
         // A second `serve` against the same DB must be refused. The advisory
         // lock check fails first, so this returns Ok(None) without touching the
@@ -1122,18 +1117,12 @@ mod tests {
         // The "server" takes the advisory lock and keeps the connection open
         // so the lock stays open for the test.
         let mut server_conn = server;
-        let held: bool = crate::db::raw::fetch_scalar_optional(
-            &mut server_conn,
-            INSTANCE_LOCK_SQL,
-            |q| q,
-        )
-        .await
-        .expect("server-sim must hold the lock")
-        .unwrap();
-        assert!(
-            held,
-            "setup: server-sim must acquire the lock"
-        );
+        let held: bool =
+            crate::db::raw::fetch_scalar_optional(&mut server_conn, INSTANCE_LOCK_SQL, |q| q)
+                .await
+                .expect("server-sim must hold the lock")
+                .unwrap();
+        assert!(held, "setup: server-sim must acquire the lock");
 
         let tmp = tempfile::tempdir().unwrap();
         let config = Config {
@@ -1166,10 +1155,7 @@ mod tests {
         .await
         .expect("unlock must run")
         .unwrap();
-        assert!(
-            released,
-            "setup: server-sim must release the lock"
-        );
+        assert!(released, "setup: server-sim must release the lock");
         let guard = acquire_mutating_guard(&config)
             .await
             .expect("a free lock must be acquirable")

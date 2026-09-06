@@ -91,15 +91,15 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     // lock is tied to the session, so it must live on a connection we hold
     // until we explicitly unlock.
     let mut conn = pool.acquire().await.map_err(Error::Database)?;
-    raw::execute(&mut *conn, "SELECT pg_advisory_lock($1)", |q| q.bind(MIGRATION_LOCK_KEY))
-        .await?;
+    raw::execute(&mut *conn, "SELECT pg_advisory_lock($1)", |q| {
+        q.bind(MIGRATION_LOCK_KEY)
+    })
+    .await?;
     let result = run_migrations_on(&mut conn).await;
     // Best-effort release; the lock also drops if the connection closes.
-    let _ = raw::execute(
-        &mut *conn,
-        "SELECT pg_advisory_unlock($1)",
-        |q| q.bind(MIGRATION_LOCK_KEY),
-    )
+    let _ = raw::execute(&mut *conn, "SELECT pg_advisory_unlock($1)", |q| {
+        q.bind(MIGRATION_LOCK_KEY)
+    })
     .await;
     result
 }

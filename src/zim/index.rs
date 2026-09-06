@@ -474,15 +474,17 @@ async fn index_body(
     // (The old `query_one` panicked on a vanished row; the row is written
     // by `persist_to_db`/`update_zim_status` before this point, so this is
     // the same invariant, returned as an error instead of a panic.)
-    let zim_id: i32 = raw::fetch_scalar_optional(
-        pool,
-        "SELECT id FROM zims WHERE name = $1",
-        |q| q.bind(&meta.name),
-    )
-    .await?
-    .ok_or_else(|| {
-        Error::Internal(anyhow::anyhow!("ZIM '{}' row vanished before indexing", meta.name))
-    })?;
+    let zim_id: i32 =
+        raw::fetch_scalar_optional(pool, "SELECT id FROM zims WHERE name = $1", |q| {
+            q.bind(&meta.name)
+        })
+        .await?
+        .ok_or_else(|| {
+            Error::Internal(anyhow::anyhow!(
+                "ZIM '{}' row vanished before indexing",
+                meta.name
+            ))
+        })?;
     // Staging cleanup is scoped to this zim_id so a concurrent run's
     // staging is untouched.
     {
@@ -885,7 +887,10 @@ async fn bulk_insert(
     // Build the whole chunk's payload in one buffer and send it in a single
     // `copy.send()` — one await per 10k-row chunk instead of one per row.
     let copy_sql = "COPY articles_staging (path, title, content_preview, snippet, language, namespace, zim_id) FROM STDIN WITH (FORMAT text)";
-    let mut copy = client.copy_in_raw(copy_sql).await.map_err(Error::Database)?;
+    let mut copy = client
+        .copy_in_raw(copy_sql)
+        .await
+        .map_err(Error::Database)?;
 
     let mut buf = String::with_capacity(rows.len() * 2304); // ~2.2 KB/row with 2000-char previews
     for row in rows {
@@ -1003,11 +1008,17 @@ async fn update_zim_status(
     zims::Entity::update_many()
         .col_expr(zims::Column::DisplayTitle, Expr::val(title).into())
         .col_expr(zims::Column::Language, Expr::val(language).into())
-        .col_expr(zims::Column::Description, Expr::val(description.clone()).into())
+        .col_expr(
+            zims::Column::Description,
+            Expr::val(description.clone()).into(),
+        )
         .col_expr(zims::Column::Creator, Expr::val(creator.clone()).into())
         .col_expr(zims::Column::Publisher, Expr::val(publisher.clone()).into())
         .col_expr(zims::Column::Date, Expr::val(date.as_ref().cloned()).into())
-        .col_expr(zims::Column::ArticleCount, Expr::val(article_count_i64).into())
+        .col_expr(
+            zims::Column::ArticleCount,
+            Expr::val(article_count_i64).into(),
+        )
         .col_expr(zims::Column::IndexStatus, Expr::val("indexing").into())
         .col_expr(zims::Column::IndexProgress, Expr::val(0.0f32).into())
         .col_expr(zims::Column::UpdatedAt, Expr::cust("now()"))
@@ -1030,8 +1041,14 @@ async fn update_progress(
     zims::Entity::update_many()
         // `index_progress` is `REAL`: the old code bound the `f64` and let
         // Postgres cast float8→real; the Rust `as f32` is the same rounding.
-        .col_expr(zims::Column::IndexProgress, Expr::val(progress as f32).into())
-        .col_expr(zims::Column::IndexedEntries, Expr::val(completed_i64).into())
+        .col_expr(
+            zims::Column::IndexProgress,
+            Expr::val(progress as f32).into(),
+        )
+        .col_expr(
+            zims::Column::IndexedEntries,
+            Expr::val(completed_i64).into(),
+        )
         .col_expr(zims::Column::UpdatedAt, Expr::cust("now()"))
         .filter(zims::Column::Name.eq(meta.name.clone()))
         .exec(&db)
@@ -1505,11 +1522,9 @@ mod tests {
         {
             let mut conn = pool.acquire().await.expect("connection");
             for name in [A, B] {
-                crate::db::raw::execute(
-                    &mut *conn,
-                    "DELETE FROM zims WHERE name = $1",
-                    |q| q.bind(name),
-                )
+                crate::db::raw::execute(&mut *conn, "DELETE FROM zims WHERE name = $1", |q| {
+                    q.bind(name)
+                })
                 .await
                 .unwrap();
             }
@@ -1544,8 +1559,7 @@ mod tests {
         let before_b = fetch_row(&db, B).await;
 
         // The corrupt ZIM's failure is recorded against its own name only.
-        let meta =
-            crate::zim::ZimMeta::stub(A.to_string(), format!("/nonexistent/{A}.zim"), 2048);
+        let meta = crate::zim::ZimMeta::stub(A.to_string(), format!("/nonexistent/{A}.zim"), 2048);
         mark_index_error(&pool, &meta).await;
 
         let after_a = fetch_row(&db, A).await;
@@ -1554,7 +1568,10 @@ mod tests {
         // The corrupt ZIM's row is marked: status flipped to `error`, the
         // timestamp bumped (>=: Postgres `now()` may land on the same
         // microsecond), and no other column touched.
-        assert_eq!(after_a.index_status, "error", "corrupt ZIM must be marked error");
+        assert_eq!(
+            after_a.index_status, "error",
+            "corrupt ZIM must be marked error"
+        );
         assert!(
             after_a.updated_at >= before_a.updated_at,
             "updated_at must not move backwards on the marked row"
@@ -1571,11 +1588,9 @@ mod tests {
         // Cleanup (best-effort; the clean-slate DELETE above handles reruns).
         let mut conn = pool.acquire().await.expect("connection");
         for name in [A, B] {
-            let _ = crate::db::raw::execute(
-                &mut *conn,
-                "DELETE FROM zims WHERE name = $1",
-                |q| q.bind(name),
-            )
+            let _ = crate::db::raw::execute(&mut *conn, "DELETE FROM zims WHERE name = $1", |q| {
+                q.bind(name)
+            })
             .await;
         }
     }

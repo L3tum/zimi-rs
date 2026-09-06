@@ -106,14 +106,16 @@ async fn bounds_cached(
         }
     }
     let row = match zim_filter {
-        Some(zim) => raw::fetch_optional::<(Option<i64>, Option<i64>), _, _>(
-            pool,
-            BOUNDS_SQL_OPT,
-            |q| q.bind(zim),
-        )
-        .await,
-        None => raw::fetch_optional::<(Option<i64>, Option<i64>), _, _>(pool, BOUNDS_SQL_GLOBAL, |q| q)
-            .await,
+        Some(zim) => {
+            raw::fetch_optional::<(Option<i64>, Option<i64>), _, _>(pool, BOUNDS_SQL_OPT, |q| {
+                q.bind(zim)
+            })
+            .await
+        }
+        None => {
+            raw::fetch_optional::<(Option<i64>, Option<i64>), _, _>(pool, BOUNDS_SQL_GLOBAL, |q| q)
+                .await
+        }
     };
     let (min_id, max_id) = match row {
         Ok(Some((Some(min_id), Some(max_id)))) => (min_id, max_id),
@@ -136,14 +138,16 @@ async fn seek(pool: &Pool, target: i64, zim_filter: Option<&str>) -> Result<Opti
         Some(zim) => raw::fetch_optional(pool, SEEK_SQL_OPT, |q| q.bind(target).bind(zim)).await,
         None => raw::fetch_optional(pool, SEEK_SQL_GLOBAL, |q| q.bind(target)).await,
     }?;
-    Ok(row.map(|(id, zim_id, path, title, snippet, zim)| RandomArticle {
-        id,
-        zim_id,
-        path,
-        title,
-        snippet,
-        zim,
-    }))
+    Ok(
+        row.map(|(id, zim_id, path, title, snippet, zim)| RandomArticle {
+            id,
+            zim_id,
+            path,
+            title,
+            snippet,
+            zim,
+        }),
+    )
 }
 
 /// Fetch a random article using an O(1) index-seek strategy.

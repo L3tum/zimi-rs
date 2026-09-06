@@ -44,18 +44,14 @@ async fn reindex_prunes_removed_articles() {
 
     {
         // Clean slate in case a prior run left rows.
-        zimservice::db::raw::execute(
-            &pool,
-            "DELETE FROM articles WHERE zim_id = $1",
-            |q| q.bind(zim_id),
-        )
+        zimservice::db::raw::execute(&pool, "DELETE FROM articles WHERE zim_id = $1", |q| {
+            q.bind(zim_id)
+        })
         .await
         .unwrap();
-        zimservice::db::raw::execute(
-            &pool,
-            "DELETE FROM qid_index WHERE zim_id = $1",
-            |q| q.bind(zim_id),
-        )
+        zimservice::db::raw::execute(&pool, "DELETE FROM qid_index WHERE zim_id = $1", |q| {
+            q.bind(zim_id)
+        })
         .await
         .unwrap();
         for p in ["A/keep-1", "A/keep-2", "A/removed"] {
@@ -83,14 +79,11 @@ async fn reindex_prunes_removed_articles() {
     // untouched (its `updated_at` stays old). The stale row is pruned once, at
     // finalize, via `updated_at < index_started_at` (exact `finalize_zim`
     // statements).
-    let index_started_at: String = zimservice::db::raw::fetch_scalar_optional(
-        &pool,
-        "SELECT now()::text",
-        |q| q,
-    )
-    .await
-    .unwrap()
-    .expect("row present");
+    let index_started_at: String =
+        zimservice::db::raw::fetch_scalar_optional(&pool, "SELECT now()::text", |q| q)
+            .await
+            .unwrap()
+            .expect("row present");
     {
         // (PERF 1) no up-front `DELETE FROM articles`. Staging pre-clean +
         // re-stage the 2 survivors:
@@ -293,19 +286,18 @@ async fn search_does_not_hold_pool_connection_during_embed() {
     // sqlx connects eagerly (no lazy build); `acquire_timeout` replaces the
     // old deadpool `wait_timeout`, and `tokio::time::timeout` replaces
     // deadpool's `connect_with_timeout`.
-    let small =
-        match tokio::time::timeout(
-            Duration::from_secs(3),
-            sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(Duration::from_secs(1))
-                .connect(&url),
-        )
-        .await
-        {
-            Ok(Ok(p)) => p,
-            Ok(Err(_)) | Err(_) => return skip_midtest("single-connection probe pool build failed"),
-        };
+    let small = match tokio::time::timeout(
+        Duration::from_secs(3),
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(1))
+            .connect(&url),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) | Err(_) => return skip_midtest("single-connection probe pool build failed"),
+    };
     if small.acquire().await.is_err() {
         return skip_midtest("single-connection probe pool connect failed");
     }
@@ -412,8 +404,8 @@ async fn embed_pipeline_embeds_then_guard_skips() {
     run_migrations(&pool).await.expect("migrations");
     const ZIM: &str = "__itest_embed__";
     const DIM: u32 = 1536; // == baseline articles.embedding dimension → no ALTER
-    // Build a `{data:[{index,embedding:[…]}]}` body with one vector per
-    // requested index (values distinct per index so the mapping is real).
+                           // Build a `{data:[{index,embedding:[…]}]}` body with one vector per
+                           // requested index (values distinct per index so the mapping is real).
     let embed_body = |indices: &[usize]| -> String {
         let data: Vec<String> = indices
             .iter()
@@ -740,14 +732,11 @@ async fn reindex_prune_keeps_live_rows_and_drops_stale() {
     }
 
     // Run start (what finalize_zim captures). Stale rows are well below it.
-    let index_started_at: String = zimservice::db::raw::fetch_scalar_optional(
-        &pool,
-        "SELECT now()::text",
-        |q| q,
-    )
-    .await
-    .unwrap()
-    .expect("row present");
+    let index_started_at: String =
+        zimservice::db::raw::fetch_scalar_optional(&pool, "SELECT now()::text", |q| q)
+            .await
+            .unwrap()
+            .expect("row present");
 
     // Simulate the reindex: A + B re-upserted (updated_at bumped to now()), D
     // inserted (default updated_at = now()). C is NOT re-upserted → stale.

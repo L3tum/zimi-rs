@@ -40,20 +40,19 @@ use sqlx::postgres::PgConnection;
 /// Read a row's status, fail-open: a transient DB blip must not abort an
 /// in-flight download (the next periodic check re-runs). Returns `Some(status)`.
 pub async fn status_of(client: &mut PgConnection, id: i32) -> Option<String> {
-    let status: Option<String> =
-        match raw::fetch_scalar_optional(
-            client,
-            "SELECT status FROM downloads WHERE id = $1",
-            |q| q.bind(id),
-        )
-        .await
-        {
-            Ok(status) => status,
-            Err(e) => {
-                tracing::warn!("status check for download {id} failed: {e}");
-                return None;
-            }
-        };
+    let status: Option<String> = match raw::fetch_scalar_optional(
+        client,
+        "SELECT status FROM downloads WHERE id = $1",
+        |q| q.bind(id),
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::warn!("status check for download {id} failed: {e}");
+            return None;
+        }
+    };
     status
 }
 
@@ -61,12 +60,11 @@ pub async fn status_of(client: &mut PgConnection, id: i32) -> Option<String> {
 /// row — the caller is deciding cancel/finalize and a vanished row must not
 /// silently pass) — for the site where a DB blip must not mask a cancel.
 pub async fn status_checked(pool: &Pool, id: i32) -> Result<String> {
-    let status: Option<String> = raw::fetch_scalar_optional(
-        pool,
-        "SELECT status FROM downloads WHERE id = $1",
-        |q| q.bind(id),
-    )
-    .await?;
+    let status: Option<String> =
+        raw::fetch_scalar_optional(pool, "SELECT status FROM downloads WHERE id = $1", |q| {
+            q.bind(id)
+        })
+        .await?;
     status.ok_or_else(|| Error::NotFound(format!("download {id} does not exist")))
 }
 
@@ -106,7 +104,10 @@ pub async fn status_no_longer_downloading(client: &mut PgConnection, id: i32) ->
 pub async fn claim_direct(pool: &Pool, id: i32, part: &str) -> Result<u64> {
     let db = sea_orm_db(pool);
     let updated = Entity::update_many()
-        .col_expr(Column::Status, Expr::val(DownloadStatus::Downloading.as_str()).into())
+        .col_expr(
+            Column::Status,
+            Expr::val(DownloadStatus::Downloading.as_str()).into(),
+        )
         .col_expr(Column::FilePath, Expr::val(part).into())
         .col_expr(Column::UpdatedAt, Expr::cust("now()"))
         .filter(Column::Id.eq(id))
@@ -125,7 +126,10 @@ pub async fn claim_direct(pool: &Pool, id: i32, part: &str) -> Result<u64> {
 pub async fn mark_error(pool: &Pool, id: i32, msg: &str) {
     let db = sea_orm_db(pool);
     let _ = Entity::update_many()
-        .col_expr(Column::Status, Expr::val(DownloadStatus::Error.as_str()).into())
+        .col_expr(
+            Column::Status,
+            Expr::val(DownloadStatus::Error.as_str()).into(),
+        )
         .col_expr(Column::Error, Expr::val(msg).into())
         .col_expr(Column::UpdatedAt, Expr::cust("now()"))
         .filter(Column::Id.eq(id))
@@ -148,7 +152,10 @@ pub async fn mark_fatal_error(pool: &Pool, id: i32, msg: &str) -> Result<()> {
     let db = sea_orm_db(pool);
     best_effort(
         Entity::update_many()
-            .col_expr(Column::Status, Expr::val(DownloadStatus::Error.as_str()).into())
+            .col_expr(
+                Column::Status,
+                Expr::val(DownloadStatus::Error.as_str()).into(),
+            )
             .col_expr(Column::Error, Expr::val(msg).into())
             .col_expr(Column::UpdatedAt, Expr::cust("now()"))
             .filter(Column::Id.eq(id))
@@ -166,7 +173,10 @@ pub async fn requeue_stale_errors(pool: &Pool, ids: &[i32]) -> Result<u64> {
     }
     let db = sea_orm_db(pool);
     let updated = Entity::update_many()
-        .col_expr(Column::Status, Expr::val(DownloadStatus::Queued.as_str()).into())
+        .col_expr(
+            Column::Status,
+            Expr::val(DownloadStatus::Queued.as_str()).into(),
+        )
         .col_expr(Column::Error, Expr::val(None::<String>).into())
         .col_expr(Column::UpdatedAt, Expr::cust("now()"))
         .filter(Column::Id.is_in(ids.to_vec()))
@@ -185,7 +195,10 @@ pub async fn requeue_stale_errors(pool: &Pool, ids: &[i32]) -> Result<u64> {
 pub async fn finalize_direct(pool: &Pool, id: i32, dst: &str) -> Result<u64> {
     let db = sea_orm_db(pool);
     let updated = Entity::update_many()
-        .col_expr(Column::Status, Expr::val(DownloadStatus::Complete.as_str()).into())
+        .col_expr(
+            Column::Status,
+            Expr::val(DownloadStatus::Complete.as_str()).into(),
+        )
         .col_expr(Column::Progress, Expr::val(1.0f32).into())
         .col_expr(Column::FilePath, Expr::val(dst).into())
         .col_expr(Column::UpdatedAt, Expr::cust("now()"))
@@ -246,11 +259,13 @@ pub async fn mark_complete(
         .set(model)
         .col_expr(Column::UpdatedAt, Expr::cust("now()"))
         .filter(Column::Id.eq(id))
-        .filter(Column::Status.is_in(
-            completion_guard_statuses()
-                .into_iter()
-                .map(|s| s.as_str().to_owned()),
-        ))
+        .filter(
+            Column::Status.is_in(
+                completion_guard_statuses()
+                    .into_iter()
+                    .map(|s| s.as_str().to_owned()),
+            ),
+        )
         .exec(&db)
         .await
         .map_err(Error::from)?
@@ -289,7 +304,10 @@ pub async fn mark_downloading(pool: &Pool, id: i32) -> Result<()> {
     let db = sea_orm_db(pool);
     best_effort(
         Entity::update_many()
-            .col_expr(Column::Status, Expr::val(DownloadStatus::Downloading.as_str()).into())
+            .col_expr(
+                Column::Status,
+                Expr::val(DownloadStatus::Downloading.as_str()).into(),
+            )
             .col_expr(Column::UpdatedAt, Expr::cust("now()"))
             .filter(Column::Id.eq(id))
             .exec(&db)
@@ -347,7 +365,10 @@ pub async fn drain_cancelled_hashes(pool: &Pool) -> Result<u64> {
 pub async fn settle_seeding(pool: &Pool, id: i32, error: Option<&str>) -> Result<()> {
     let db = sea_orm_db(pool);
     let mut stmt = Entity::update_many()
-        .col_expr(Column::Status, Expr::val(DownloadStatus::Complete.as_str()).into())
+        .col_expr(
+            Column::Status,
+            Expr::val(DownloadStatus::Complete.as_str()).into(),
+        )
         .col_expr(Column::UpdatedAt, Expr::cust("now()"))
         .filter(Column::Id.eq(id))
         .filter(Column::Status.eq(DownloadStatus::Seeding.as_str()));
@@ -411,7 +432,10 @@ pub async fn retry_interrupted_directs(pool: &Pool) -> Result<u64> {
     let db = sea_orm_db(pool);
     let pred = crate::db::downloads::ZIM_URL_PREDICATE;
     let updated = Entity::update_many()
-        .col_expr(Column::Status, Expr::val(DownloadStatus::Queued.as_str()).into())
+        .col_expr(
+            Column::Status,
+            Expr::val(DownloadStatus::Queued.as_str()).into(),
+        )
         .col_expr(Column::FilePath, Expr::val(None::<String>).into())
         .col_expr(Column::Error, Expr::val(None::<String>).into())
         .col_expr(Column::UpdatedAt, Expr::cust("now()"))

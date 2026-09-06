@@ -111,9 +111,8 @@ fn normalize_sslmode(dsn: &str) -> String {
 /// against it (no hostname check — same effective level as before the
 /// driver swap).
 fn connect_options(dsn: &str, tls_mode: TlsMode) -> Result<PgConnectOptions> {
-    let mut opts = PgConnectOptions::from_str(&normalize_sslmode(&driver_dsn(dsn))).map_err(
-        |e| Error::Internal(anyhow::anyhow!("db connect options: {e}")),
-    )?;
+    let mut opts = PgConnectOptions::from_str(&normalize_sslmode(&driver_dsn(dsn)))
+        .map_err(|e| Error::Internal(anyhow::anyhow!("db connect options: {e}")))?;
     match tls_mode {
         TlsMode::None => opts = opts.ssl_mode(PgSslMode::Disable),
         TlsMode::Tls => opts = opts.ssl_mode(PgSslMode::VerifyCa),
@@ -227,7 +226,10 @@ mod tests {
         assert_eq!(effective_pool_size(100), 100);
         // A huge (or misconfigured) value is capped at the ceiling, not passed
         // through — it must never open more connections than Postgres allows.
-        assert_eq!(effective_pool_size(POOL_SIZE_CEILING + 1), POOL_SIZE_CEILING);
+        assert_eq!(
+            effective_pool_size(POOL_SIZE_CEILING + 1),
+            POOL_SIZE_CEILING
+        );
         assert_eq!(effective_pool_size(u32::MAX), POOL_SIZE_CEILING);
     }
 

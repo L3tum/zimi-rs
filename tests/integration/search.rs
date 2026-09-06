@@ -194,7 +194,11 @@ async fn search_branch_soft_fail_keeps_other_branches() {
         "fts",
     )
     .await;
-    assert_eq!(r2.len(), 1, "healthy branch on the same client must still work");
+    assert_eq!(
+        r2.len(),
+        1,
+        "healthy branch on the same client must still work"
+    );
     assert_eq!(r2[0].0, 1);
 
     // And a broken branch again (idempotent degradation).
@@ -583,7 +587,9 @@ async fn chunks_live_returns_chunked_article() {
     assert!(!chunks[0]["text"].as_str().unwrap_or("").is_empty());
 
     // Cleanup: drop the fixture's zims row so the harness stays idempotent.
-    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind("tiny"))
-        .await
-        .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| {
+        q.bind("tiny")
+    })
+    .await
+    .unwrap();
 }

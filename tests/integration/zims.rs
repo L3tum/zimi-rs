@@ -282,11 +282,9 @@ async fn settings_update_roundtrip() {
 
     // 4) Cleanup: drop the seeded row so the next reload falls back to the
     //    seed default (leaves the dev DB as we found it).
-    zimservice::db::raw::execute(
-        &pool,
-        "DELETE FROM settings WHERE key = $1",
-        |q| q.bind("embedding.model"),
-    )
+    zimservice::db::raw::execute(&pool, "DELETE FROM settings WHERE key = $1", |q| {
+        q.bind("embedding.model")
+    })
     .await
     .unwrap();
 }
@@ -392,11 +390,9 @@ async fn cleanup_rand(pool: &Pool, zim_a: &str, zim_b: &str) {
     )
     .await
     .unwrap();
-    zimservice::db::raw::execute(
-        pool,
-        "DELETE FROM zims WHERE name IN ($1,$2)",
-        |q| q.bind(zim_a).bind(zim_b),
-    )
+    zimservice::db::raw::execute(pool, "DELETE FROM zims WHERE name IN ($1,$2)", |q| {
+        q.bind(zim_a).bind(zim_b)
+    })
     .await
     .unwrap();
 }
@@ -629,9 +625,11 @@ async fn active_download_unique_race() {
     run_migrations(&pool).await.expect("migrations");
     const NAME: &str = "__itest_race__";
     const URL: &str = "http://seed.example/__itest_race__.zim";
-    zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(URL))
-        .await
-        .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| {
+        q.bind(URL)
+    })
+    .await
+    .unwrap();
 
     let (r1, r2) = tokio::join!(
         insert_download(&pool, NAME, URL, "queued"),
@@ -673,9 +671,11 @@ async fn active_download_unique_race() {
     .expect("row present");
     assert_eq!(n, 1, "exactly one active row should remain");
 
-    zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(URL))
-        .await
-        .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| {
+        q.bind(URL)
+    })
+    .await
+    .unwrap();
 }
 
 /// PERF 5 (was M-poller-n1 / PONY-S4): the batched stats flush writes every
@@ -785,9 +785,11 @@ async fn seeding_rows_not_constrained_and_visible() {
     run_migrations(&pool).await.expect("migrations");
     const NAME: &str = "__itest_race_seed__";
     const URL: &str = "http://seed.example/__itest_race_seed__.zim";
-    zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(URL))
-        .await
-        .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| {
+        q.bind(URL)
+    })
+    .await
+    .unwrap();
 
     // (a) Two seeding rows, same URL — both insert (no false 23505).
     let a = insert_download(&pool, NAME, URL, "seeding")
@@ -819,9 +821,11 @@ async fn seeding_rows_not_constrained_and_visible() {
     assert_eq!(up_speed_bps, Some(1024));
     assert_eq!(num_seeds, Some(7));
 
-    zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(URL))
-        .await
-        .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| {
+        q.bind(URL)
+    })
+    .await
+    .unwrap();
 }
 
 /// `collections` CRUD happy path: create → appears in list → delete → absent.
@@ -835,9 +839,11 @@ async fn collections_crud() {
     run_migrations(&pool).await.expect("migrations");
     const NAME: &str = "__itest_coll__";
     const LABEL: &str = "ITest Coll";
-    zimservice::db::raw::execute(&pool, "DELETE FROM collections WHERE name = $1", |q| q.bind(NAME))
-        .await
-        .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM collections WHERE name = $1", |q| {
+        q.bind(NAME)
+    })
+    .await
+    .unwrap();
 
     let state = live_state(pool.clone()).await;
     use zimservice::serve::handlers::{

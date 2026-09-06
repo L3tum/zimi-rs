@@ -54,8 +54,7 @@ pub mod raw {
     use sqlx::{Database, Decode, Executor, FromRow, Type};
 
     /// Raw Postgres query with the default (bindable) argument list.
-    pub type PgQuery<'q> =
-        sqlx::query::Query<'q, Postgres, <Postgres as Database>::Arguments<'q>>;
+    pub type PgQuery<'q> = sqlx::query::Query<'q, Postgres, <Postgres as Database>::Arguments<'q>>;
 
     /// Raw Postgres query whose rows decode as `R` (tuple or `FromRow` struct).
     pub type PgQueryAs<'q, R> =
@@ -82,14 +81,21 @@ pub mod raw {
     }
 
     /// Fetch at most one row, decoding it as `R` (tuple or `FromRow` struct).
-    pub async fn fetch_optional<'q, 'c, R, E, B>(executor: E, sql: &'q str, bind: B) -> Result<Option<R>>
+    pub async fn fetch_optional<'q, 'c, R, E, B>(
+        executor: E,
+        sql: &'q str,
+        bind: B,
+    ) -> Result<Option<R>>
     where
         R: for<'r> FromRow<'r, PgRow> + Unpin + Send,
         E: Executor<'c, Database = Postgres>,
         B: FnOnce(PgQueryAs<'q, R>) -> PgQueryAs<'q, R>,
     {
         let query = bind(sqlx::query_as::<_, R>(sql));
-        query.fetch_optional(executor).await.map_err(Error::Database)
+        query
+            .fetch_optional(executor)
+            .await
+            .map_err(Error::Database)
     }
 
     /// Fetch all rows, decoding each as `R` (tuple or `FromRow` struct).

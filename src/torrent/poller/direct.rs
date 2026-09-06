@@ -615,11 +615,9 @@ mod tests {
         crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
             .await
             .unwrap();
-        crate::db::raw::execute(
-            &pool,
-            "DELETE FROM zims WHERE name = $1",
-            |q| q.bind("utiny"),
-        )
+        crate::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| {
+            q.bind("utiny")
+        })
         .await
         .unwrap();
     }

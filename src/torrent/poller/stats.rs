@@ -87,19 +87,15 @@ pub async fn apply_stats_batch(pool: &Pool, changed: &[StatsRow]) -> Result<()> 
     // Raw escape hatch (db::raw): the SeaORM query builder cannot express a
     // single `UPDATE … FROM unnest(…)` batch — the typed array parameters
     // bind as the same `$1::int[] … $7::bigint[]` placeholders as before.
-    crate::db::raw::execute(
-        pool,
-        STATS_SQL,
-        |q| {
-            q.bind(&ids)
-                .bind(&progress)
-                .bind(&speed_bps)
-                .bind(&eta_secs)
-                .bind(&ratio)
-                .bind(&up_speed_bps)
-                .bind(&num_seeds)
-        },
-    )
+    crate::db::raw::execute(pool, STATS_SQL, |q| {
+        q.bind(&ids)
+            .bind(&progress)
+            .bind(&speed_bps)
+            .bind(&eta_secs)
+            .bind(&ratio)
+            .bind(&up_speed_bps)
+            .bind(&num_seeds)
+    })
     .await?;
     Ok(())
 }
