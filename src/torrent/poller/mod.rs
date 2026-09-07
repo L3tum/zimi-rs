@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,9 @@ use tokio::time::sleep;
 use crate::db::downloads::DownloadRecord;
 use crate::db::Pool;
 use crate::error::{Error, Result, TorrentKind};
-use crate::netguard::{assert_host_not_blocked, resolve_download_host, validate_download_url};
+use crate::netguard::{
+    assert_host_not_blocked, follow_pinned_get, validate_download_url, PinnedResponse,
+};
 use crate::settings::SettingsCache;
 use crate::torrent::files::{install_zim, locate_torrent_zim, validate_download_name, verify_zim};
 use crate::torrent::{
@@ -37,6 +39,7 @@ use crate::torrent::{
 mod complete;
 mod direct;
 mod inflight;
+mod opds;
 mod reconcile;
 mod stats;
 
@@ -67,9 +70,27 @@ const REQUEUE_ERROR_PATTERN: &str = "connect|timeout|refused|unreachable|connect
 /// re-login is the fix, not a human.
 const REQUEUE_GIVE_UP_AFTER: u32 = 3;
 /// Hard cap on the BUG-6 guard map (one entry per row id cycling transient
-/// errors; entries are removed when the guard gives up, so normal growth is
-/// bounded by churn — the cap only stops pathological pile-up).
+/// errors). Entries are removed when the guard gives up and lazily evicted
+/// when the cap is reached (rows that leave `error` by other means — e.g. a
+/// manual re-queue — keep their entry until that sweep runs), so the cap
+/// only stops pathological pile-up.
 const MAX_LAST_ERROR_TRACKED: usize = 10_000;
+/// BUG-6 guard lazy-eviction window, in requeue passes: when the map hits
+/// `MAX_LAST_ERROR_TRACKED`, entries not observed as error rows for this
+/// many passes are swept before a new entry is admitted.
+const GUARD_STALE_AFTER_PASSES: u64 = 100;
+
+/// Whether an error message is an auth/session-expiry (HTTP 401/403).
+/// Checks the token with word-boundary semantics (non-alphanumeric
+/// boundaries) — a plain substring check would misclassify port numbers
+/// or IDs ("connection refused: port 40152") as auth and exempt them
+/// from the requeue give-up guard.
+fn is_auth_error(msg: &str) -> bool {
+    ["401", "403"].iter().any(|code| {
+        msg.split(|c: char| !c.is_alphanumeric())
+            .any(|tok| tok == *code)
+    })
+}
 
 /// BUG-6 requeue guard (pure): given the row's previous guard entry
 /// (`Some((previous_message, consecutive_count))`) and the row's current
@@ -86,6 +107,37 @@ fn should_give_up(prev: Option<(&str, u32)>, msg: &str, is_auth: bool) -> bool {
         return false;
     }
     matches!(prev, Some((pm, n)) if pm == msg && n >= REQUEUE_GIVE_UP_AFTER - 1)
+}
+
+/// One entry of the BUG-6 requeue guard (keyed by row id in
+/// [`DownloadPoller::last_error`]): the last transient error message
+/// observed for the row, how many times in a row, and the requeue pass it
+/// was last observed on (the lazy-eviction timestamp for rows that leave
+/// `error` by other means — give-up is the only other removal path).
+#[derive(Debug, Clone)]
+struct GuardEntry {
+    prev_msg: String,
+    count: u32,
+    /// Requeue pass (monotonic counter, see [`DownloadPoller::requeue_passes`])
+    /// on which the row was last observed as an error row.
+    last_seen: u64,
+}
+
+/// BUG-6 guard lazy eviction (pure): remove entries not observed as error
+/// rows within the last `GUARD_STALE_AFTER_PASSES` requeue passes and
+/// return how many were evicted. Called only when the map hits
+/// `MAX_LAST_ERROR_TRACKED`, so a recently-observed entry is never swept.
+fn sweep_stale_guard_entries(guard: &mut HashMap<i32, GuardEntry>, pass: u64) -> usize {
+    let horizon = pass.saturating_sub(GUARD_STALE_AFTER_PASSES);
+    let stale: Vec<i32> = guard
+        .iter()
+        .filter(|(_, e)| e.last_seen < horizon)
+        .map(|(&id, _)| id)
+        .collect();
+    for id in &stale {
+        guard.remove(id);
+    }
+    stale.len()
 }
 use crate::zim::{index, ZimManager};
 
@@ -128,11 +180,17 @@ pub struct DownloadPoller {
     /// Cooperative shutdown for [`run`](Self::run): set via
     /// [`cancel`](Self::cancel) and polled between ticks (BUG-5).
     stopping: Arc<AtomicBool>,
-    /// BUG-6 requeue guard, keyed by row id: `(error message, consecutive
-    /// count)` of the last transient error. Replaced (count reset) when the
-    /// message changes, removed when the guard gives up, capped at
-    /// [`MAX_LAST_ERROR_TRACKED`].
-    last_error: Arc<std::sync::Mutex<HashMap<i32, (String, u32)>>>,
+    /// BUG-6 requeue guard, keyed by row id: the last transient error
+    /// message, its consecutive count, and the pass on which the row was
+    /// last observed as an error row ([`GuardEntry`]). Replaced (count
+    /// reset) when the message changes, removed when the guard gives up or
+    /// when lazy eviction sweeps an entry whose row left `error` by other
+    /// means (e.g. a manual re-queue); capped at [`MAX_LAST_ERROR_TRACKED`].
+    last_error: Arc<std::sync::Mutex<HashMap<i32, GuardEntry>>>,
+    /// BUG-6 requeue pass counter (the lazy-eviction clock for the guard
+    /// map): incremented once per `requeue_stale_errors` pass and compared
+    /// against [`GuardEntry::last_seen`] by the cap sweep.
+    requeue_passes: AtomicU64,
 }
 
 impl DownloadPoller {
@@ -146,12 +204,13 @@ impl DownloadPoller {
         torrent_password: String,
     ) -> Self {
         // Transfer profile: this shared client streams `.zim` bodies when the
-        // host is an IP literal (pin = None in direct_download). A builder
+        // host is an IP literal (pin = None → no DNS, nothing to pin in
+        // direct_download). A builder
         // failure must not crash serve startup (rare and recoverable-per-tick)
         // — but the client stays `None`, and every use site fails with a clear
         // error instead of silently falling back to an unguarded default
         // client (which would drop the SSRF redirect policy and timeouts).
-        let http = match build_download_client(&settings, ClientProfile::Transfer, None) {
+        let http = match build_download_client(ClientProfile::Transfer, None) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!("download HTTP client build failed: {e}; direct downloads and OPDS checks will fail until restart");
@@ -169,6 +228,7 @@ impl DownloadPoller {
             http,
             stopping: Arc::new(AtomicBool::new(false)),
             last_error: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            requeue_passes: AtomicU64::new(0),
         }
     }
 
@@ -189,7 +249,10 @@ impl DownloadPoller {
     /// and rebuilds the cached client only when the connection fingerprint
     /// changed (e.g. after a `PUT /settings`). Connect + auth run outside the
     /// cache's short lock. Returns `None` when qBittorrent is effectively
-    /// disabled (no URL) or the current connect failed.
+    /// disabled (no URL) or the current connect failed — the cache stores
+    /// nothing on a failed connect, so `None` is NOT by itself "not
+    /// configured": callers needing the split use
+    /// [`Self::qbit_configured`].
     async fn resolve_torrent(&self, p: &crate::settings::PollerParams) -> Option<Arc<QbitClient>> {
         let inputs = resolve_qbit_inputs(
             p.qbit_url.as_deref(),
@@ -208,6 +271,24 @@ impl DownloadPoller {
                 connect_qbit(&url, &user, &pass, allow_private).await
             })
             .await
+    }
+
+    /// Whether qBittorrent is *configured* for this cycle: an effective URL
+    /// (env override or the runtime `torrent.url` setting) is present and
+    /// non-blank. Deliberately independent of [`Self::resolve_torrent`]
+    /// returning `Some` — a configured-but-unreachable qB (wrong port, qB
+    /// restarting, LAN blip) also resolves to `None`. Callers use this to
+    /// keep the two apart: "not configured" is fatal for queued torrent
+    /// rows and drains cancelled hash bindings; "down" is not — those rows
+    /// stay put and the next tick retries once qB recovers.
+    fn qbit_configured(&self, p: &crate::settings::PollerParams) -> bool {
+        resolve_qbit_inputs(
+            p.qbit_url.as_deref(),
+            &self.torrent_url_override,
+            &self.torrent_username,
+            &self.torrent_password,
+        )
+        .is_some()
     }
 
     /// The shared transfer client, or a clear error if the startup build failed.
@@ -301,18 +382,31 @@ impl DownloadPoller {
         // Resolve the effective qBittorrent client for this cycle (rebuilds
         // the cache only when the connection fingerprint changed — ARCH M3).
         let qbit = self.resolve_torrent(&p).await;
+        // "Configured" is checked separately: `qbit == None` also happens
+        // when qB IS configured but the connect failed this tick (wrong
+        // port, qB restarting, LAN blip — the cache stores nothing on a
+        // failed connect). See [`Self::qbit_configured`].
+        let qb_configured = self.qbit_configured(&p);
+
+        // Bounded error-row retry (BUG-6): re-queue stale connection-level
+        // errors with a bounded retry guard. This runs BEFORE the early-exit
+        // below on purpose: `should_skip_tick` does not count stale `error`
+        // rows, so a single failed download with an otherwise-idle queue
+        // would never be requeued if the skip ran first (the 10-minute
+        // bounded retry would be dead in the most common case). The pass is
+        // pure DB work (a stale-row SELECT + a guarded UPDATE) with no qB
+        // fetch, so it is cheap when nothing matches.
+        self.requeue_stale_errors().await?;
 
         // Cheap early-exit: skip the costly qBittorrent HTTP fetch when there
         // is nothing this tick actually processes (no queued rows, no in-flight
         // qB torrent rows, no cancellations to clean up). reconcile() and
-        // opds_check() run on their own schedule and are unaffected.
+        // opds_check() run on their own schedule and are unaffected. Rows
+        // requeued above now count as `queued`, so a non-empty requeue
+        // defeats the skip and they are enqueued in this same tick.
         if self.should_skip_tick().await? {
             return Ok(());
         }
-
-        // Bounded error-row retry (BUG-6): re-queue stale connection-level
-        // errors with a bounded retry guard.
-        self.requeue_stale_errors().await?;
 
         let (torrents, qb_available) = self.fetch_qb_state(qbit.as_ref()).await?;
         let by_hash: HashMap<&str, &super::TorrentInfo> =
@@ -326,10 +420,10 @@ impl DownloadPoller {
         // no connection is held across the qBittorrent HTTP calls (q.delete /
         // q.add_torrent) or handle_complete (file copy + resync + qB).
         // 1) Cancelled rows: drop the torrent from qBittorrent (files too).
-        self.process_cancelled(qbit.as_ref()).await?;
+        self.process_cancelled(qbit.as_ref(), qb_configured).await?;
 
         // 2) Enqueue queued rows, subject to the active-download budget.
-        self.process_queued(qbit.as_ref(), qb_available, &p, &torrents)
+        self.process_queued(qbit.as_ref(), qb_available, qb_configured, &p, &torrents)
             .await?;
 
         // 3) In-flight torrent rows (downloading) and seeding rows: bind
@@ -396,6 +490,10 @@ impl DownloadPoller {
     /// cycling forever. A 401/403 session expiry is always exempt — the next
     /// re-login is the fix, not a human.
     async fn requeue_stale_errors(&self) -> Result<()> {
+        // Lazy-eviction clock: count every pass (also the timestamp stamped
+        // on entries observed below), so "not seen for N passes" is measured
+        // in real passes even during quiet stretches.
+        let pass = self.requeue_passes.fetch_add(1, Ordering::SeqCst) + 1;
         // Raw SQL (db::raw): the case-insensitive regex match `error ~* $1`
         // has no `db::raw` helper shape (the guarded UPDATE lives in
         // `downloads_lifecycle::requeue_stale_errors`).
@@ -420,8 +518,8 @@ impl DownloadPoller {
             let mut requeue = Vec::new();
             let mut guard = self.last_error.lock().expect("last_error lock");
             for (id, msg) in &stale {
-                let is_auth = msg.contains("401") || msg.contains("403");
-                let prev = guard.get(id).map(|(m, n)| (m.as_str(), *n));
+                let is_auth = is_auth_error(msg);
+                let prev = guard.get(id).map(|e| (e.prev_msg.as_str(), e.count));
                 if should_give_up(prev, msg, is_auth) {
                     tracing::warn!(
                         download_id = id,
@@ -431,8 +529,27 @@ impl DownloadPoller {
                     continue;
                 }
                 let count = prev.filter(|(m, _)| *m == *msg).map_or(1, |(_, n)| n + 1);
-                if guard.len() < MAX_LAST_ERROR_TRACKED || guard.contains_key(id) {
-                    guard.insert(*id, (msg.clone(), count));
+                let entry = GuardEntry {
+                    prev_msg: msg.clone(),
+                    count,
+                    last_seen: pass,
+                };
+                if let Some(existing) = guard.get_mut(id) {
+                    *existing = entry;
+                } else if guard.len() >= MAX_LAST_ERROR_TRACKED {
+                    // Cap reached: sweep entries whose rows stopped
+                    // appearing as error rows (left `error` by other means,
+                    // e.g. a manual re-queue) more than
+                    // `GUARD_STALE_AFTER_PASSES` passes ago, then admit the
+                    // new entry if the sweep freed a slot. If nothing was
+                    // stale, fail open as before: the row retries without a
+                    // guard entry (and without give-up protection).
+                    sweep_stale_guard_entries(&mut guard, pass);
+                    if guard.len() < MAX_LAST_ERROR_TRACKED {
+                        guard.insert(*id, entry);
+                    }
+                } else {
+                    guard.insert(*id, entry);
                 }
                 if count >= 2 {
                     tracing::warn!(
@@ -505,19 +622,31 @@ impl DownloadPoller {
     /// cancelled torrents from qBittorrent (files too), clearing the stale
     /// `hash` binding once removal is confirmed.
     ///
-    /// BUG-21: without qBittorrent nothing else clears `hash` on cancelled
-    /// rows, so the early-exit count stays > 0 and every tick re-runs the full
-    /// bookkeeping queries. Drain them: once the hash is NULL the row
-    /// early-exits.
-    async fn process_cancelled(&self, qbit: Option<&Arc<QbitClient>>) -> Result<()> {
+    /// BUG-21: with qBittorrent not configured nothing else clears `hash` on
+    /// cancelled rows, so the early-exit count stays > 0 and every tick
+    /// re-runs the full bookkeeping queries. Drain them: once the hash is
+    /// NULL the row early-exits. A *configured-but-unreachable* qB is NOT
+    /// drained (see the gate below) — the kept bindings are what make the
+    /// per-tick removal retry visible.
+    async fn process_cancelled(
+        &self,
+        qbit: Option<&Arc<QbitClient>>,
+        qb_configured: bool,
+    ) -> Result<()> {
         let cancelled: Vec<(i32, Option<String>)> = crate::db::raw::fetch_all(
             &self.db,
             "SELECT id, hash FROM downloads WHERE status = $1 AND hash IS NOT NULL",
             |q| q.bind(crate::torrent::DownloadStatus::Cancelled.as_str()),
         )
         .await?;
-        // BUG-21: no qB → drain the hash bindings so the rows early-exit.
-        if qbit.is_none() {
+        // BUG-21: qB NOT configured → drain the hash bindings so the rows
+        // early-exit. `qbit == None` also covers a configured-but-unreachable
+        // qB (wrong port, qB restarting, LAN blip) — there the bindings are
+        // KEPT: draining would orphan a still-alive torrent that the next
+        // restart's reconcile re-adopts as a brand-new `downloading` row (a
+        // cancelled download resurrects). The loop below retries the removal
+        // each tick until qB is back.
+        if qbit.is_none() && !qb_configured {
             let n = crate::db::downloads_lifecycle::drain_cancelled_hashes(&self.db)
                 .await
                 .unwrap_or(0);
@@ -554,10 +683,17 @@ impl DownloadPoller {
     /// the budget with in-flight direct downloads. Per-row write failures are
     /// swallowed (the row stays `queued`/`error` and is retried next tick);
     /// only the initial SELECT and the direct-download claim propagate.
+    ///
+    /// A torrent URL requires qB to be *configured*; when it is configured
+    /// but unreachable this tick the row is left `queued` (like
+    /// `!qb_available`) instead of marked `error` — the "not configured"
+    /// message does not match `REQUEUE_ERROR_PATTERN`, so a fatal mark there
+    /// would stick the row in `error` even after qB recovers.
     async fn process_queued(
         &self,
         qbit: Option<&Arc<QbitClient>>,
         qb_available: bool,
+        qb_configured: bool,
         p: &crate::settings::PollerParams,
         torrents: &[super::TorrentInfo],
     ) -> Result<()> {
@@ -661,9 +797,28 @@ impl DownloadPoller {
             }
 
             let Some(q) = qbit else {
-                let msg =
-                    "qBittorrent not configured — only direct .zim URLs are supported".to_string();
-                crate::db::downloads_lifecycle::mark_fatal_error(&self.db, id, &msg).await?;
+                if !qb_configured {
+                    let msg = "qBittorrent not configured — only direct .zim URLs are supported"
+                        .to_string();
+                    let marked =
+                        crate::db::downloads_lifecycle::mark_fatal_error(&self.db, id, &msg)
+                            .await?;
+                    if marked == 0 {
+                        tracing::info!(
+                            download_id = id,
+                            "skipping fatal error mark: row no longer queued/downloading"
+                        );
+                    }
+                    continue;
+                }
+                // Configured but the connect failed this tick (wrong port,
+                // qB restarting, LAN blip): leave the row `queued` (same
+                // treatment as `!qb_available`) so it enqueues normally
+                // once qB recovers.
+                tracing::warn!(
+                    download_id = id,
+                    "qBittorrent configured but unreachable — leaving row queued for the next tick"
+                );
                 continue;
             };
 
@@ -674,38 +829,108 @@ impl DownloadPoller {
             }
 
             if budget <= 0 {
-                break; // no capacity for more active downloads this tick
+                // No capacity for more active downloads this tick: skip the
+                // enqueue, but KEEP processing the remaining queued rows —
+                // an invalid URL must still get `mark_error`. A `break`
+                // here would leave it sitting in `queued` forever (it never
+                // enqueues while budget stays 0, and every queued row defeats
+                // the skip-tick gate — a qB fetch every tick, indefinitely).
+                // `continue` mirrors the direct-row budget check above.
+                continue;
             }
 
             match q.add_torrent(url, &p.category, &p.save_path).await {
-                Ok(_msg) => {
+                Ok(added) => {
                     // Any Ok response from qB add_torrent is success (B5).
                     // Do NOT update the name column — keep the user-provided display name.
-                    crate::db::downloads_lifecycle::mark_downloading(&self.db, id).await?;
+                    // The `AND status = 'queued'` guard makes the flip atomic
+                    // (a cancel landing during the add_torrent round-trip keeps
+                    // its terminal state).
+                    let claimed =
+                        crate::db::downloads_lifecycle::mark_downloading(&self.db, id).await?;
+                    if claimed == 0 {
+                        // The row changed state (a cancel won the race) — do NOT
+                        // mark error (the row is cancelled or otherwise
+                        // terminal) and do not consume budget. The torrent is
+                        // already in qB: remove it, or the next reconcile
+                        // adopts it as a fresh row.
+                        tracing::info!(
+                            download_id = id,
+                            "row no longer queued after add_torrent (cancel won the race) — removing just-added torrent"
+                        );
+                        self.remove_just_added_torrent(q, &added).await;
+                        continue;
+                    }
                     budget -= 1;
                 }
                 Err(e) => {
-                    crate::db::downloads_lifecycle::mark_fatal_error(&self.db, id, &e.to_string())
-                        .await?;
+                    let marked = crate::db::downloads_lifecycle::mark_fatal_error(
+                        &self.db,
+                        id,
+                        &e.to_string(),
+                    )
+                    .await?;
+                    if marked == 0 {
+                        tracing::info!(
+                            download_id = id,
+                            "skipping fatal error mark: row no longer queued/downloading"
+                        );
+                    }
                 }
             }
         }
         Ok(())
     }
+
+    /// Compensating removal after a [`mark_downloading`](crate::db::downloads_lifecycle::mark_downloading)
+    /// guard miss in the enqueue path: the torrent was just added to qB but
+    /// the row is no longer `queued` (a cancel won the race). `add_torrent`
+    /// returns the qB torrent name (not a hash), so re-fetch the list and
+    /// delete by the matched hash (case-insensitive name match — the same
+    /// convention as the in-flight name fallback). Best-effort: a failed
+    /// lookup/removal is logged; a leftover is at worst re-adopted by the
+    /// next reconcile.
+    async fn remove_just_added_torrent(&self, q: &Arc<QbitClient>, added_name: &str) {
+        let wanted = added_name.to_lowercase();
+        let torrents = match q.get_torrents("all").await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    "compensating removal: torrent list fetch failed: {e} (leftover may be re-adopted on next reconcile)"
+                );
+                return;
+            }
+        };
+        match torrents.iter().find(|t| t.name.to_lowercase() == wanted) {
+            Some(t) => match q.delete(&t.hash, true).await {
+                Ok(()) => {
+                    tracing::info!(
+                        "removed just-added torrent {} from qBittorrent (row no longer queued)",
+                        t.hash
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "compensating removal failed for torrent {}: {e}",
+                        t.hash
+                    )
+                }
+            },
+            None => tracing::warn!(
+                "compensating removal: no torrent matching {wanted:?} in qBittorrent (already gone?)"
+            ),
+        }
+    }
 }
 
-/// RAII guard that removes a `.part` file if it still exists when dropped
-/// without being disabled. A failed or cancelled download must not leave a
-/// partial file behind; a successful one renames it into place first and then
-/// calls `disable()`.
 /// RAII marker for a `.part` file. Since PERF-11 a dropped guard does NOT
 /// delete the partial file: failed/interrupted downloads keep their bytes
 /// so a later attempt (restart/reclaim) can resume via `Range: bytes=S-`.
 /// Removal is explicit — success renames the file into place and calls
 /// `disable()`; cancel paths remove the file then call `disable()`;
 /// leftovers of terminal-state rows are reclaimed by the reconcile sweep.
-/// The `Drop` impl logs at debug level to make the keep-for-resume intent
-/// visible in traces.
+/// The `Drop` impl keeps the file (unless `disable()` was called) and logs
+/// at debug level to make the keep-for-resume intent visible in traces.
 struct PartGuard {
     path: Option<std::path::PathBuf>,
 }
@@ -791,11 +1016,6 @@ mod tests {
         Option<i64>,
     );
 
-    /// WI-10: count of DB-gated test skips in the lib test suite.
-    /// Read by the `#[dtor::dtor]` exit summary at process end.
-    pub(super) static LIB_SKIPPED: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
-
     pub(crate) mod state {
         use super::*;
 
@@ -872,9 +1092,60 @@ mod tests {
         }
     }
 
+    /// BUG-A/B: the configured-vs-down split must track the *effective URL*
+    /// (override beats the `torrent.url` setting; blank disables), not
+    /// `resolve_torrent`'s `Option` — which is also `None` while a
+    /// configured qB is unreachable (wrong port, qB restarting, LAN blip).
+    mod qbit_configured {
+        fn poller_with_override(override_url: Option<String>) -> super::super::DownloadPoller {
+            let dir =
+                std::env::temp_dir().join(format!("zimi-qbit-configured-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let zims = crate::zim::ZimManager::new(dir, crate::testing::dead_pool());
+            super::super::DownloadPoller::new(
+                crate::testing::dead_pool(),
+                super::download::download_settings(),
+                zims,
+                crate::torrent::QbitClientCache::new(),
+                override_url,
+                "user".into(),
+                "pass".into(),
+            )
+        }
+
+        #[test]
+        fn effective_override_url_is_configured() {
+            let p = poller_with_override(Some("http://qb:8080".into()));
+            let snap = p.settings.poller_params_snapshot();
+            assert!(p.qbit_configured(&snap));
+        }
+
+        #[test]
+        fn no_url_is_not_configured() {
+            // `default_settings` seeds `torrent.url` as empty → `qbit_url`
+            // None → not configured with no override.
+            let p = poller_with_override(None);
+            let snap = p.settings.poller_params_snapshot();
+            assert!(!p.qbit_configured(&snap));
+        }
+
+        #[test]
+        fn blank_override_is_not_configured() {
+            // Whitespace URL: `resolve_qbit_inputs` selects the override
+            // then disables on blank (same rule as the connect path).
+            let p = poller_with_override(Some("   ".into()));
+            let snap = p.settings.poller_params_snapshot();
+            assert!(!p.qbit_configured(&snap));
+        }
+    }
+
     pub(crate) mod download {
         use super::*;
         use crate::db::raw;
+        // Re-exported so existing `tests::download::test_pool` importers
+        // (direct/complete/reconcile test modules) keep working unchanged;
+        // the helper itself now lives in `crate::testing` (A-1).
+        pub(crate) use crate::testing::test_pool;
 
         pub(crate) fn download_settings() -> crate::settings::SettingsCache {
             crate::settings::SettingsCache::new_with_map(
@@ -932,6 +1203,52 @@ mod tests {
             assert!(!super::super::should_give_up(None, AUTH, true));
         }
 
+        /// BUG-6 lazy eviction: the sweep removes only entries not observed
+        /// as error rows within the last `GUARD_STALE_AFTER_PASSES` requeue
+        /// passes (rows that left `error` by other means — e.g. a manual
+        /// re-queue — otherwise leak until the cap); the horizon saturates to
+        /// 0 before the window has ever been filled, sweeping nothing.
+        #[test]
+        fn guard_sweep_evicts_only_unobserved_entries() {
+            use super::super::sweep_stale_guard_entries;
+            use super::super::GuardEntry;
+            let entry = |last_seen: u64| GuardEntry {
+                prev_msg: "m".into(),
+                count: 1,
+                last_seen,
+            };
+            let mut guard: std::collections::HashMap<i32, GuardEntry> =
+                std::collections::HashMap::new();
+            guard.insert(1, entry(399)); // 101 passes stale → swept
+            guard.insert(2, entry(400)); // exactly at the horizon → kept
+            guard.insert(3, entry(450)); // recent → kept
+            let n = sweep_stale_guard_entries(&mut guard, 500);
+            assert_eq!(n, 1, "only the 101-pass-stale entry is swept");
+            assert!(!guard.contains_key(&1));
+            assert!(guard.contains_key(&2));
+            assert!(guard.contains_key(&3));
+
+            // Fewer total passes than the window: nothing is swept.
+            let mut fresh: std::collections::HashMap<i32, GuardEntry> =
+                std::collections::HashMap::new();
+            fresh.insert(9, entry(1));
+            assert_eq!(sweep_stale_guard_entries(&mut fresh, 50), 0);
+            assert!(fresh.contains_key(&9));
+        }
+
+        /// Auth detection must use word boundaries: port numbers/IDs that
+        /// merely CONTAIN "401"/"403" ("port 40152") are not session
+        /// expiry and must NOT be exempt from the give-up guard.
+        #[test]
+        fn is_auth_error_requires_word_boundaries() {
+            assert!(super::super::is_auth_error("connection failed: HTTP 401"));
+            assert!(super::super::is_auth_error("request failed: HTTP 403"));
+            assert!(!super::super::is_auth_error(
+                "connection refused: port 40152"
+            ));
+            assert!(!super::super::is_auth_error("download failed"));
+        }
+
         #[test]
         fn part_guard_retains_part_on_drop() {
             let dir = std::env::temp_dir().join(format!("zimi-part-{}-p1", std::process::id()));
@@ -960,43 +1277,6 @@ mod tests {
                 "disabled guard must not remove"
             );
             let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        /// DB-gated helper (mirrors `tests/integration.rs::pool_or_skip`): build a
-        /// live pool from `DATABASE_URL` (default: the compose URL), or `None`
-        /// when `ZIMSERVICE_REQUIRE_DB` is unset so `cargo test --lib` stays green
-        /// on a DB-less machine. Migrations are applied by the caller.
-        pub(crate) async fn test_pool() -> Option<(Pool, crate::testing::DbExclusiveGuard)> {
-            let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
-            });
-            let config = crate::config::Config {
-                database_url: url.clone(),
-                db_pool_size: 4,
-                ..Default::default()
-            };
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                crate::db::pool::create_pool(&config),
-            )
-            .await
-            {
-                Ok(Ok(pool)) => Some((pool, crate::testing::DbExclusiveGuard::acquire())),
-                Ok(Err(e)) => test_pool_skip(&url, &e.to_string()),
-                Err(_) => test_pool_skip(&url, "timed out connecting"),
-            }
-        }
-
-        fn test_pool_skip(
-            url: &str,
-            why: &str,
-        ) -> Option<(Pool, crate::testing::DbExclusiveGuard)> {
-            if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
-                panic!("ZIMSERVICE_REQUIRE_DB is set but cannot reach {url}: {why}");
-            }
-            super::LIB_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("skipping test: cannot reach {url} ({why})");
-            None
         }
 
         /// T2: drive one real `tick()` end-to-end against a live Postgres and a
@@ -1628,6 +1908,56 @@ mod tests {
             .await;
         }
 
+        /// 8b) Inflight-1: a `downloading` row whose `updated_at` is stale
+        /// (11 min — past `MISSING_TORRENT_GRACE`) but whose torrent IS
+        /// visible must NOT be errored: the visibility touch
+        /// (`touch_downloading`) refreshes `updated_at` while the torrent is
+        /// visible, so the grace clock measures invisibility, not the gap
+        /// since the last stats write. Regression: a stalled torrent with
+        /// unchanged stats (no `stats_changed` writes) carried an exhausted
+        /// clock the moment it vanished and was errored immediately with the
+        /// non-requeueable "torrent not found in qBittorrent" note.
+        #[tokio::test]
+        async fn it_inflight_visible_stale_row_is_touched_not_errored() {
+            it_inflight_case(
+                "__it_inflight__touch1",
+                Some("tou1hash"),
+                "downloading",
+                0.5,
+                None,
+                None,
+                true,         // stale: past MISSING_TORRENT_GRACE
+                "tou1hash",   // the row's torrent IS in qB
+                it_torrent("tou1hash", "touch1-row", "downloading", 0.5, 0, 0, 0.0, 0),
+                |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
+                    let mut c = pool.acquire().await.expect("conn");
+                    assert!(
+                        changed.is_empty(),
+                        "an unchanged torrent must not queue a stats write"
+                    );
+                    let (status, error, age_secs): (String, Option<String>, i64) =
+                        raw::fetch_optional(
+                            &mut *c,
+                            "SELECT status, error, \n                             EXTRACT(EPOCH FROM (now() - updated_at))::bigint \n                             FROM downloads WHERE id = $1",
+                            |q| q.bind(id),
+                        )
+                        .await
+                        .expect("read row")
+                        .expect("row present");
+                    assert_eq!(
+                        (status.as_str(), error.as_deref()),
+                        ("downloading", None),
+                        "a stale-but-visible row must not be judged missing"
+                    );
+                    assert!(
+                        age_secs < 5,
+                        "the visibility touch must refresh updated_at (it was 11 min old), age: {age_secs}s"
+                    );
+                },
+            )
+            .await;
+        }
+
         /// 9) A `seeding` row whose torrent left qB past the grace period is
         /// settled by `settle_seeding` (the `SeedingAction::Done` DB-effect
         /// arm): `seeding → complete` with `error` NULL, the seed stats
@@ -2016,6 +2346,157 @@ mod tests {
             let _ = (tmp, content_tmp);
         }
 
+        /// Inflight-2: two same-named `downloading` rows whose `hash` is
+        /// NULL in BOTH must not double-bind one qB torrent in a single
+        /// tick — the local snapshot maps are not updated by `bind_hash`, so
+        /// without the per-tick consumed set both rows would match the same
+        /// entry by name, bind the same hash, and (once complete) double-
+        /// `handle_complete` (double verify/install + double qB delete).
+        /// Exactly one row must bind; the other stays `downloading`, hash
+        /// NULL, within grace, un-errored.
+        #[tokio::test]
+        async fn it_inflight_two_null_hash_same_name_rows_single_bind() {
+            let Some((pool, _db_gate)) = test_pool().await else {
+                return;
+            };
+            crate::db::migrate::run_migrations(&pool)
+                .await
+                .expect("migrations");
+            let mut c = pool.acquire().await.expect("conn");
+            // Sweep leftovers from a crashed run (shared single-DB suite).
+            let _ = raw::execute(
+                &mut *c,
+                "DELETE FROM downloads WHERE name LIKE '__it_inflight__%'",
+                |q| q,
+            )
+            .await;
+
+            // Two same-named rows, both `hash IS NULL` (the double-bind
+            // exposure). Fresh `downloading` (no grace expiry).
+            let id_a = it_insert_row(
+                &pool,
+                "__it_inflight__n2dup",
+                None,
+                "downloading",
+                0.5,
+                None,
+                None,
+            )
+            .await;
+            let id_b = it_insert_row(
+                &pool,
+                "__it_inflight__n2dup",
+                None,
+                "downloading",
+                0.5,
+                None,
+                None,
+            )
+            .await;
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
+            let poller = super::super::DownloadPoller::new(
+                pool.clone(),
+                download_settings(),
+                zims,
+                crate::torrent::QbitClientCache::new(),
+                Some("http://127.0.0.1:9/qb".into()),
+                "user".into(),
+                "pass".into(),
+            );
+            let qbit = std::sync::Arc::new(
+                crate::torrent::QbitClient::new(
+                    "http://127.0.0.1:9/qb",
+                    "user",
+                    "pass",
+                    false,
+                    None,
+                )
+                .expect("qbit client build (no network needed)"),
+            );
+            // One live (not complete, not fatal) qB torrent with the rows' name.
+            let t = TorrentInfo {
+                hash: "n2realhash".into(),
+                name: "__it_inflight__n2dup".into(),
+                progress: 0.5,
+                state: "downloading".into(),
+                dlspeed: 0,
+                upspeed: 0,
+                ratio: 0.0,
+                category: None,
+                save_path: None,
+                content_path: None,
+                size: 0,
+                downloaded: 0,
+                num_seeds: 0,
+                err_str: None,
+            };
+            let hash_key: &str = "n2realhash";
+            let by_hash = std::collections::HashMap::from([(hash_key, &t)]);
+            let by_name = std::collections::HashMap::from([(t.name.to_lowercase(), &t)]);
+
+            let rows = poller
+                .fetch_inflight_rows()
+                .await
+                .expect("rows")
+                .into_iter()
+                .filter(|r| r.name.starts_with(IT_INFLIGHT_PREFIX))
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 2, "both same-named rows must be in-flight");
+            let changed = poller
+                .process_inflight(
+                    &by_hash,
+                    &by_name,
+                    Some(qbit),
+                    true,
+                    &download_settings().poller_params_snapshot(),
+                    rows,
+                )
+                .await
+                .expect("process_inflight");
+            poller.flush_stats(&changed).await;
+
+            let row_a: (String, Option<String>, Option<String>) = raw::fetch_optional(
+                &mut *c,
+                "SELECT status, hash, error FROM downloads WHERE id = $1",
+                |q| q.bind(id_a),
+            )
+            .await
+            .expect("read row A")
+            .expect("row present");
+            let row_b: (String, Option<String>, Option<String>) = raw::fetch_optional(
+                &mut *c,
+                "SELECT status, hash, error FROM downloads WHERE id = $1",
+                |q| q.bind(id_b),
+            )
+            .await
+            .expect("read row B")
+            .expect("row present");
+            // Both rows must survive the tick (the torrent is present and
+            // not fatal; the unmatched row is within grace).
+            assert_eq!(row_a.0, "downloading", "row A must stay downloading");
+            assert_eq!(row_b.0, "downloading", "row B must stay downloading");
+            assert_eq!(row_a.2, None, "row A must not be errored");
+            assert_eq!(row_b.2, None, "row B must not be errored");
+            // Exactly ONE row may hold the torrent's hash — a double-bind is
+            // the regression (both would carry "n2realhash").
+            let a_bound = row_a.1.as_deref() == Some("n2realhash");
+            let b_bound = row_b.1.as_deref() == Some("n2realhash");
+            assert!(
+                a_bound ^ b_bound,
+                "exactly one NULL-hash row must bind the matched torrent (hashes: {:?}, {:?})",
+                row_a.1,
+                row_b.1
+            );
+
+            let _ = raw::execute(&mut *c, "DELETE FROM downloads WHERE id IN ($1, $2)", |q| {
+                q.bind(id_a).bind(id_b)
+            })
+            .await;
+            let _ = tmp;
+        }
+
         /// An unreachable qBittorrent this tick (`qb_available = false`) defers
         /// ALL missing-torrent judgments: a stale `downloading` row is not
         /// errored (the last `None` arm in `process_inflight`) and a stale
@@ -2283,6 +2764,11 @@ mod tests {
         /// row stays `error` with its message intact (a requeued row's `error`
         /// would be nulled) — while a fresh message and a 401 session-expiry
         /// message are both re-queued and enqueued in the same tick.
+        ///
+        /// No keep-alive queued row is needed: `requeue_stale_errors` runs
+        /// BEFORE the `should_skip_tick` early-exit, so the stale `error` rows
+        /// alone defeat the skip (requeued rows count as `queued`) — this is
+        /// exactly the idle-queue case that ordering used to get wrong.
         #[tokio::test]
         async fn tick_requeue_guard_stops_after_third_identical_error() {
             use wiremock::matchers::{method, path, query_param};
@@ -2317,20 +2803,6 @@ mod tests {
                 .await;
 
             let mut c = pool.acquire().await.expect("conn");
-            // Keep-alive queued row: the tick's early exit skips the requeue
-            // block when nothing else is pending, so one queued row keeps the
-            // cycle alive (its own outcome is never asserted).
-            let _ka: i32 = raw::fetch_scalar_optional(
-                &mut *c,
-                "INSERT INTO downloads (name, url, status) VALUES ($1, $2, 'queued') RETURNING id",
-                |q| {
-                    q.bind("it-keepalive")
-                        .bind("http://127.0.0.1:9/keepalive.zim")
-                },
-            )
-            .await
-            .expect("insert keepalive")
-            .expect("row present");
             // Three stale (>10 min) transient-error rows.
             // Already failed twice with this exact message (guard-seeded below).
             let guarded: i32 = raw::fetch_scalar_optional(
@@ -2390,9 +2862,14 @@ mod tests {
             // Seed the guard as if `guarded` and `auth` already failed twice
             // consecutively with their current messages.
             {
+                let entry = |msg: &str| super::super::GuardEntry {
+                    prev_msg: msg.into(),
+                    count: 2,
+                    last_seen: 1,
+                };
                 let mut g = poller.last_error.lock().expect("last_error lock");
-                g.insert(guarded, ("connection refused".into(), 2));
-                g.insert(auth, ("connection failed: HTTP 401".into(), 2));
+                g.insert(guarded, entry("connection refused"));
+                g.insert(auth, entry("connection failed: HTTP 401"));
             }
 
             poller.tick().await.expect("tick runs");
@@ -2439,8 +2916,8 @@ mod tests {
             let mut c2 = pool.acquire().await.expect("conn");
             let _ = raw::execute(
                 &mut *c2,
-                "DELETE FROM downloads WHERE id IN ($1, $2, $3, $4)",
-                |q| q.bind(_ka).bind(guarded).bind(fresh).bind(auth),
+                "DELETE FROM downloads WHERE id IN ($1, $2, $3)",
+                |q| q.bind(guarded).bind(fresh).bind(auth),
             )
             .await;
             let _ = tmp;
@@ -2485,17 +2962,7 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let mut c = pool.acquire().await.expect("conn");
-            // Keep-alive queued row (the early exit skips the requeue block when
-            // nothing else is pending).
-            let ka: i32 = raw::fetch_scalar_optional(
-                &mut *c,
-                "INSERT INTO downloads (name, url, status) VALUES ($1, $2, 'queued') RETURNING id",
-                |q| q.bind("wi23-ka").bind("http://127.0.0.1:9/keepalive3.zim"),
-            )
-            .await
-            .expect("insert keepalive")
-            .expect("row present");
+            let c = pool.acquire().await.expect("conn");
             let ins_row = |name: String, url: String, status: String, err: String| {
                 let pool = pool.clone();
                 async move {
@@ -2597,10 +3064,9 @@ mod tests {
             let mut c2 = pool.acquire().await.expect("conn");
             let _ = raw::execute(
                 &mut *c2,
-                "DELETE FROM downloads WHERE id IN ($1, $2, $3, $4, $5)",
+                "DELETE FROM downloads WHERE id IN ($1, $2, $3, $4)",
                 |q| {
-                    q.bind(ka)
-                        .bind(transient)
+                    q.bind(transient)
                         .bind(nontransient)
                         .bind(cancelled)
                         .bind(complete)
@@ -3064,6 +3530,86 @@ mod tests {
             let _ = tmp;
         }
 
+        /// Inflight-2 (reconcile): a tracked row with `hash IS NULL` whose
+        /// name matches a category qB torrent must not have that torrent
+        /// re-adopted as a second row — the seeding arm refreshes stats but
+        /// does not bind the hash, so the adoption's `NOT EXISTS (hash = …)`
+        /// guard cannot see the row's ownership; the per-pass consumed set is
+        /// what blocks the duplicate.
+        #[tokio::test]
+        async fn reconcile_null_hash_row_blocks_adopt_of_own_torrent() {
+            let Some((pool, _db_gate)) = test_pool().await else {
+                return;
+            };
+            crate::db::migrate::run_migrations(&pool)
+                .await
+                .expect("migrations");
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let server = MockServer::start().await;
+            let torrents_json = format!(
+                r#"[{{"hash":"own555hash","name":"reconcile_own.zim","progress":1.0,"state":"uploading","category":"{CATEGORY}"}}]"#
+            );
+            mount_qb_mocks(&server, &torrents_json).await;
+
+            let mut c = pool.acquire().await.expect("conn");
+            // Sweep leftovers from a crashed run (shared single-DB suite).
+            let _ = raw::execute(
+                &mut *c,
+                "DELETE FROM downloads WHERE name = 'reconcile_own.zim' OR hash = 'own555hash'",
+                |q| q,
+            )
+            .await;
+            let id: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, hash, status, progress, updated_at) \n                 VALUES ($1, $2, NULL, 'seeding', 1.0, now()) RETURNING id",
+                |q| {
+                    q.bind("reconcile_own.zim")
+                        .bind("magnet:?xt=urn:btih:own")
+                },
+            )
+            .await
+            .expect("insert")
+            .expect("row present");
+
+            let poller = make_poller(&pool, &tmp, &server).await;
+            let client = make_client(&server).await;
+            poller.reconcile(Some(client)).await.expect("reconcile");
+
+            // The tracked row survives the seeding refresh…
+            let status: String = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT status FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await
+            .expect("read")
+            .expect("row present");
+            assert_eq!(
+                status, "seeding",
+                "the tracked seeding row must survive reconcile"
+            );
+            // …and no adopted duplicate row exists for its torrent.
+            let count: i64 = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT count(*) FROM downloads WHERE hash = 'own555hash'",
+                |q| q,
+            )
+            .await
+            .expect("count")
+            .expect("count row");
+            assert_eq!(
+                count, 0,
+                "a NULL-hash tracked row's own torrent must not be re-adopted"
+            );
+
+            let _ = raw::execute(&mut *c, "DELETE FROM downloads WHERE id = $1", |q| {
+                q.bind(id)
+            })
+            .await;
+            let _ = tmp;
+        }
+
         /// WI-4 Orphan erroring: a `downloading` row whose hash doesn't match
         /// any qB torrent, past `MISSING_TORRENT_GRACE` → row set to `error`.
         #[tokio::test]
@@ -3259,6 +3805,80 @@ mod tests {
             let _ = tmp;
         }
 
+        /// PERF-11 (CI-DB): reconcile must NOT delete the `.part` of an
+        /// interrupted direct download it is about to re-queue for resume.
+        /// `retry_interrupted_directs` clears `file_path` before the sweep,
+        /// so the sweep's protect-set has to be built from the rows as they
+        /// were BEFORE the retry (derived `zim_dir/{name}.part`) — this
+        /// regression deleted the surviving `.part` milliseconds after
+        /// re-queueing, defeating restart-resume (full re-download of a
+        /// partially downloaded file on every restart). An orphan `.part`
+        /// in the same dir proves the sweep still runs.
+        #[tokio::test]
+        async fn reconcile_keeps_requeued_interrupted_part() {
+            let Some((pool, _db_gate)) = test_pool().await else {
+                return;
+            };
+            crate::db::migrate::run_migrations(&pool)
+                .await
+                .expect("migrations");
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            // The surviving `.part` the interrupted row resumes from.
+            let part_path = tmp.path().join("resume.zim.part");
+            std::fs::write(&part_path, b"partial data").unwrap();
+            // An orphan `.part` too: the sweep must still reclaim it.
+            let orphan = tmp.path().join("gone.zim.part");
+            std::fs::write(&orphan, b"partial data").unwrap();
+
+            let server = MockServer::start().await;
+            mount_qb_mocks(&server, "[]").await;
+
+            let mut c = pool.acquire().await.expect("conn");
+            let id: i32 = raw::fetch_scalar_optional(
+                &mut *c,
+                "INSERT INTO downloads (name, url, status, file_path) \
+                 VALUES ($1, $2, 'downloading', $3) RETURNING id",
+                |q| {
+                    q.bind("resume.zim")
+                        .bind("http://example.com/resume.zim")
+                        .bind(part_path.display().to_string())
+                },
+            )
+            .await
+            .expect("insert")
+            .expect("row present");
+
+            let poller = make_poller(&pool, &tmp, &server).await;
+            let client = make_client(&server).await;
+            poller.reconcile(Some(client)).await.expect("reconcile");
+
+            // The interrupted direct row was re-queued ...
+            let (status, fp): (String, Option<String>) = raw::fetch_optional(
+                &mut *c,
+                "SELECT status, file_path FROM downloads WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await
+            .expect("read")
+            .expect("row present");
+            assert_eq!(status, "queued", "interrupted direct download re-queued");
+            assert_eq!(fp, None, "file_path cleared for the re-claim");
+            // ... and its `.part` survived the sweep (resume intact), while
+            // the orphan was reclaimed.
+            assert!(
+                part_path.exists(),
+                "re-queued row's .part must survive the sweep"
+            );
+            assert!(!orphan.exists(), "orphan .part must still be deleted");
+
+            let _ = raw::execute(&mut *c, "DELETE FROM downloads WHERE id = $1", |q| {
+                q.bind(id)
+            })
+            .await;
+            let _ = tmp;
+        }
+
         /// WI-4 Seeding settlement: a `seeding` row whose torrent is gone
         /// from qB → row set to `complete`.
         #[tokio::test]
@@ -3411,7 +4031,7 @@ mod tests {
     /// Mirrors the pattern in `tests/integration.rs`.
     #[dtor::dtor]
     fn print_lib_skip_summary() {
-        let n = super::tests::LIB_SKIPPED.load(std::sync::atomic::Ordering::Relaxed);
+        let n = crate::testing::LIB_SKIPPED.load(std::sync::atomic::Ordering::Relaxed);
         if n > 0 {
             eprintln!(
                 "\n{n} lib test(s) SKIPPED (no database) — run with a \

@@ -6,12 +6,20 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::search::SearchParams;
 use crate::AppState;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
+
+/// Maximum length of a single MCP stdio line (bytes). `AsyncBufRead::read_line`
+/// grows its buffer without bound, so a malformed or malicious local peer
+/// could send one huge newline-less line and exhaust memory. A line longer
+/// than this cap gets a JSON-RPC parse error (`-32700`) and the serve loop
+/// stops — the peer's input is untrusted anyway, so there is no point
+/// draining it.
+const MCP_MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// Run the MCP server on stdio. Blocks until stdin is closed.
 pub async fn run(state: Arc<AppState>) -> crate::error::Result<()> {
@@ -55,18 +63,27 @@ where
     let mut reader = BufReader::new(reader);
     let mut writer = writer;
 
-    let mut line = String::new();
     loop {
-        line.clear();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| crate::error::Error::Mcp(format!("stdin read: {e}")))?;
-
-        if bytes_read == 0 {
+        let line = match read_capped_line(&mut reader, MCP_MAX_LINE_BYTES).await {
+            Ok(Some(line)) => line,
             // EOF — client disconnected
-            break;
-        }
+            Ok(None) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                // Oversized line (malformed/malicious local peer): reply with
+                // a parse error, then stop the serve loop — do not keep
+                // draining input from a compromised peer.
+                let err = json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": { "code": -32700, "message": format!("Parse error: line exceeds {MCP_MAX_LINE_BYTES} bytes") }
+                });
+                if let Err(e) = writer.write_all(format!("{err}\n").as_bytes()).await {
+                    tracing::debug!("MCP stdio: failed to send parse-error reply: {e}");
+                }
+                break;
+            }
+            Err(e) => return Err(crate::error::Error::Mcp(format!("stdin read: {e}"))),
+        };
 
         let line = line.trim();
         if line.is_empty() {
@@ -124,6 +141,53 @@ where
     }
 
     Ok(())
+}
+
+/// Read one newline-terminated line from `reader`, bounding the buffered
+/// length at `max_bytes`.
+///
+/// `AsyncBufRead::read_line`/`read_until` grow the buffer as needed, so a
+/// single huge line would be buffered in full (unbounded memory). This
+/// helper instead steps through the reader's internal chunks
+/// (`fill_buf`/`consume`) and returns `Err(InvalidData)` as soon as the
+/// accumulated length crosses `max_bytes` — memory stays bounded at
+/// `max_bytes` plus one reader chunk. Returns `Ok(None)` at clean EOF,
+/// `Ok(Some(line))` for a line (with the trailing newline when present).
+async fn read_capped_line<R>(reader: &mut R, max_bytes: usize) -> std::io::Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            // EOF: return the partial line (no trailing newline) if any.
+            return if buf.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+            };
+        }
+        // Consume up to and including the next newline (or the whole chunk
+        // when the line continues past it). A newline at the *end* of the
+        // chunk still completes the line.
+        let (end, complete) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        buf.extend_from_slice(&chunk[..end]);
+        reader.consume(end);
+        if buf.len() > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("line exceeds {max_bytes} bytes"),
+            ));
+        }
+        if complete {
+            // Newline reached: line complete.
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+    }
 }
 
 /// Dispatch a JSON-RPC method to its handler.
@@ -378,6 +442,9 @@ async fn tool_search(state: &AppState, args: &Value) -> Result<Value, (i32, Stri
 async fn tool_read(state: &AppState, args: &Value) -> Result<Value, (i32, String)> {
     let zim = req_str(args, "zim")?;
     let path = req_str(args, "path")?;
+    // `read_article_payload` clamps `max_length` at `content::MAX_READ_BYTES`
+    // (shared cap — the HTTP `GET /read` handler is bounded by the same
+    // constant, so the two front ends stay in parity).
     let max_len = args
         .get("max_length")
         .and_then(|l| l.as_u64())
@@ -771,5 +838,83 @@ mod tests {
         assert!(mcp_auth_ok("password", &hashed, Some("secret")).is_ok());
         // Wrong password against the hashed value still fails.
         assert!(mcp_auth_ok("password", &hashed, Some("wrong")).is_err());
+    }
+
+    // ── read_capped_line (MCP_MAX_LINE_BYTES) ─────────────────────────────
+
+    #[tokio::test]
+    async fn read_capped_line_short_lines_then_eof() {
+        let (a, mut b) = tokio::io::duplex(1024);
+        let mut reader = tokio::io::BufReader::new(a);
+        tokio::join!(
+            async {
+                b.write_all(b"hello\nworld\n").await.unwrap();
+                // `join!` keeps a completed arm's captures alive until the
+                // whole join resolves, so the write side must be dropped
+                // explicitly to signal EOF to the reader.
+                drop(b);
+            },
+            async {
+                let first = read_capped_line(&mut reader, 1024).await.unwrap().unwrap();
+                assert_eq!(first, "hello\n");
+                let second = read_capped_line(&mut reader, 1024).await.unwrap().unwrap();
+                assert_eq!(second, "world\n");
+                assert!(
+                    read_capped_line(&mut reader, 1024).await.unwrap().is_none(),
+                    "clean EOF must yield None"
+                );
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_partial_line_at_eof() {
+        let (a, mut b) = tokio::io::duplex(1024);
+        let mut reader = tokio::io::BufReader::new(a);
+        tokio::join!(
+            async {
+                b.write_all(b"no newline").await.unwrap();
+                drop(b);
+            },
+            async {
+                let line = read_capped_line(&mut reader, 1024).await.unwrap();
+                assert_eq!(line.as_deref(), Some("no newline"));
+                assert!(read_capped_line(&mut reader, 1024).await.unwrap().is_none());
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_rejects_oversized_line() {
+        // cap = 16; the peer sends a 40-byte newline-less line — the helper
+        // must stop at the cap (InvalidData) instead of buffering the line.
+        let (a, mut b) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(a);
+        b.write_all(&[b'x'; 40]).await.unwrap();
+        drop(b);
+        let err = read_capped_line(&mut reader, 16).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("16"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_exact_cap_ok_over_by_one_errs() {
+        // Exactly `cap` bytes (ending in a newline) is within the cap…
+        let (a, mut b) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(a);
+        let mut payload = vec![b'y'; 15];
+        payload.push(b'\n');
+        b.write_all(&payload).await.unwrap();
+        drop(b);
+        let line = read_capped_line(&mut reader, 16).await.unwrap().unwrap();
+        assert_eq!(line.len(), 16);
+
+        // …but `cap + 1` bytes crosses it.
+        let (a, mut b) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(a);
+        b.write_all(&[b'z'; 17]).await.unwrap();
+        drop(b);
+        let err = read_capped_line(&mut reader, 16).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

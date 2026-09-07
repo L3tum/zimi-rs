@@ -75,7 +75,7 @@ jobs:
       # Unit half runs with the default parallel --test-threads: it holds no
       # shared process state (per-test tempdirs, ephemeral-port MockServers,
       # read-only tests/fixtures) and its DB-gated tests skip — this job has
-      # no Postgres service. The DB-backed `test-db` job below stays pinned
+      # no Postgres service. The DB-backed `coverage` job below stays pinned
       # (single shared dev DB; see tests/integration/main.rs:5-15).
       - run: cargo test --lib --bins --test wiremock
       - run: cargo test --doc
@@ -97,54 +97,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.0
         with: { components: llvm-tools-preview }
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # DB-backed coverage floor (ratchet), same selection as `test-db`:
-      # lib/bins/wiremock plus the integration suite, with
-      # ZIMSERVICE_REQUIRE_DB=1 turning DB-gated skips into hard failures so
-      # poller DB writes, run_pipeline, and the whole integration suite all
-      # count toward the floor. Raise the floor in .github/coverage_floor.txt
-      # after the first DB-backed run to lock in the gain — the job fails if
-      # measured coverage drops below it, so the floor can only effectively
-      # rise.
+      # Single DB-backed job (merged from the former `test-db` job, which ran
+      # the same Postgres service and a subset of this selection — this
+      # llvm-cov run adds `--all-features` and the wiremock suite).
+      # DB-backed coverage floor (ratchet): lib/bins/wiremock plus the
+      # integration suite, with ZIMSERVICE_REQUIRE_DB=1 turning DB-gated skips
+      # into hard failures so poller DB writes, run_pipeline, and the whole
+      # integration suite all count toward the floor.
+      # `--bins` matters: the binary's DB-gated startup smoke tests
+      # (single-instance refusal + the mutating guard's refuse/acquire/release,
+      # src/startup.rs) run against a real Postgres. They are schema-free
+      # (advisory locks + pg_locks only) and serialize with every other DB test
+      # via DbExclusiveGuard (src/testing.rs: cross-process lockfile +
+      # in-process slot), so the default parallel --test-threads is safe; the
+      # migration drift check runs in a dedicated temp DB it drops instead of
+      # tampering the shared schema_migrations.
+      # Raise the floor in .github/coverage_floor.txt after a DB-backed run to
+      # lock in the gain — the job fails if measured coverage drops below it,
+      # so the floor can only effectively rise.
       - run: |
           ZIMSERVICE_REQUIRE_DB=1 \
           DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
           cargo llvm-cov --all-features --lib --bins --test wiremock --test integration \
             --fail-under-lines "$(cat .github/coverage_floor.txt)"
-  test-db:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
-        env:
-          POSTGRES_USER: zimservice
-          POSTGRES_PASSWORD: zimservice
-          POSTGRES_DB: zimservice
-        ports: ["5433:5432"]
-        options: >-
-          --health-cmd "pg_isready -U zimservice"
-          --health-interval 2s --health-timeout 3s --health-retries 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
-      # `--bins` here (not just in the DB-less `test` job): the binary's
-      # DB-gated startup smoke tests (single-instance refusal + the mutating
-      # guard's refuse/acquire/release, `src/startup.rs`) run against a real
-      # Postgres, and `ZIMSERVICE_REQUIRE_DB=1` turns a skip into a hard
-      # failure. They are schema-free (advisory locks + pg_locks only) and
-      # serialize with every other DB test via `DbExclusiveGuard`.
-      # Both DB-backed halves run with the default parallel --test-threads:
-      # they share one dev DB, but every DB-gated test is serialized by
-      # DbExclusiveGuard (src/testing.rs: cross-process lockfile + in-process
-      # slot), and the migration drift check now runs in a dedicated temp DB
-      # it drops instead of tampering the shared schema_migrations.
-      - run: |
-          ZIMSERVICE_REQUIRE_DB=1 \
-          DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
-          cargo test --lib --bins
-      - run: |
-          ZIMSERVICE_REQUIRE_DB=1 \
-          DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
-          cargo test --test integration
   # Cross-platform smoke: the crate builds and its DB-less unit tests pass on
   # macOS and Windows (DB-gated tests skip — no Postgres service here). Catches
   # platform-specific compile/link issues a Linux-only CI would miss.

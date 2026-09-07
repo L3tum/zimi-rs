@@ -217,7 +217,7 @@ Postgres-specific operators — `websearch_to_tsquery`/tsvector, pg_trgm
 casts). The SQLSTATE/HTTP mapping in `Error` redacts DB details; 23505
 unique-violations are domain duplicates (409), not DB faults (503).
 
-**Migrations.** Numbered `.sql` files in `migrations/` (001–013) are embedded
+**Migrations.** Numbered `.sql` files in `migrations/` (001–014) are embedded
 with `include_str!` and applied by `src/db/migrate.rs` at **every** startup,
 in every subcommand mode: tracked in `schema_migrations` by filename + content
 hash, idempotent, and serialized by a session-level advisory lock so
@@ -307,12 +307,14 @@ Explicitly declared out of scope:
 - **wiremock.** `tests/wiremock.rs` exercises the qBittorrent client against
   `MockServer` instances on loopback (the SSRF guard admits loopback for
   this); no real qBittorrent is needed.
-- **CI mirror.** `make test-strict-ci` is the local twin of the CI test-db
-  job (strict integration); the Makefile requires
-  the two selections to stay in sync.
-- **Coverage ratchet.** The CI `coverage` job runs `cargo llvm-cov` against a
-  Postgres service (`.github/workflows/ci.yml`) over the same selection as
-  `test-db` with `ZIMSERVICE_REQUIRE_DB=1`, so DB-gated code counts toward the
-  line-coverage floor in `.github/coverage_floor.txt`. The floor can only
-  effectively rise: the job fails if measured coverage drops below it, so it
-  should be bumped to the newly measured value after coverage gains land.
+- **CI mirror.** `make test-strict-ci` is the local twin of the CI `coverage`
+  job's strict-integration selection; the Makefile requires the two
+  selections to stay in sync.
+- **Coverage ratchet.** The CI `coverage` job — the single DB-backed CI job
+  (merged from the former `test-db` job) — runs `cargo llvm-cov` against a
+  Postgres service (`.github/workflows/ci.yml`) over its lib/bins/wiremock
+  plus integration selection with `ZIMSERVICE_REQUIRE_DB=1`, so DB-gated code
+  counts toward the line-coverage floor in `.github/coverage_floor.txt`. The
+  floor can only effectively rise: the job fails if measured coverage drops
+  below it, so it should be bumped to the newly measured value after coverage
+  gains land.

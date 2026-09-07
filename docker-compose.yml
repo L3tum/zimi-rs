@@ -21,10 +21,11 @@ services:
       - AUTH_PASSWORD=${AUTH_PASSWORD:?set a real admin password}
       - ZIM_DIR=/zims
       - LOG_LEVEL=info
-      # Uncomment to enable qBittorrent:
+      # Uncomment to enable qBittorrent (the `:?` placeholders fail fast
+      # with a clear message if the real values are not set):
       # - QBITTORRENT_URL=http://qbittorrent:8080
-      # - QBITTORRENT_USER=admin
-      # - QBITTORRENT_PASS=adminadmin
+      # - QBITTORRENT_USER=${QBITTORRENT_USER:?set a qBittorrent user}
+      # - QBITTORRENT_PASS=${QBITTORRENT_PASS:?set a qBittorrent password}
     depends_on:
       postgres:
         condition: service_healthy

@@ -1,14 +1,14 @@
 //! Download **lifecycle** state machine — the single home for every status
 //! (and hash / error / seed-stats) transition on the `downloads` table.
 //!
-//! The poller (`crate::torrent::poller`) drives this machine. Centralizing the
+//! The poller (`torrent::poller`) drives this machine. Centralizing the
 //! WHERE-guarded `UPDATE`s here (ARCH M-2/M-3) makes the transitions a
 //! reviewable, *enumerable* artifact: every place a row's status, hash, error,
 //! or seed stats changes lives in this module, and every status value is
 //! rendered from the `DownloadStatus` enum (never a raw literal). The intended
 //! graph is [`DownloadStatus::can_transition_to`]; the per-statement `WHERE
 //! status …` guards are the enforcement, and the read-side `IN (…)` filters
-//! render their sets through [`crate::torrent::in_list`].
+//! render their sets through [`in_list`].
 //!
 //! **Scope note:** read-only row fetches (in-flight / queued / reconcile
 //! selects, the skip-tick count, the orphan-`.part` path set) and the per-tick
@@ -21,8 +21,103 @@
 use crate::db::pool::Pool;
 use crate::db::raw;
 use crate::error::{Error, Result};
-use crate::torrent::DownloadStatus;
 use sqlx::postgres::PgConnection;
+
+// ── Status enum ────────────────────────────────────────────────────────────
+
+/// The download lifecycle — single source of truth for every value stored in
+/// `downloads.status` (ARCH-H1).
+///
+/// Previously the six status strings lived as ~55 hardcoded literals across
+/// the poller submodules, `opds.rs`, and the downloads handler; a lifecycle
+/// change touched 4–5 files of raw SQL and a wrong literal silently no-oped
+/// (an `UPDATE … WHERE status = '…'` that matches nothing is a success from
+/// the driver's point of view). All production SQL now renders status values
+/// through [`DownloadStatus::as_str`] / [`in_list`], so a typo is a compile
+/// error, and the intended state machine is pinned by
+/// `transition_table_matches_production_guards`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DownloadStatus {
+    Queued,
+    Downloading,
+    Complete,
+    Seeding,
+    Error,
+    Cancelled,
+}
+
+impl DownloadStatus {
+    /// Every status, in lifecycle order.
+    pub const ALL: [DownloadStatus; 6] = [
+        DownloadStatus::Queued,
+        DownloadStatus::Downloading,
+        DownloadStatus::Complete,
+        DownloadStatus::Seeding,
+        DownloadStatus::Error,
+        DownloadStatus::Cancelled,
+    ];
+
+    /// The value stored in `downloads.status`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DownloadStatus::Queued => "queued",
+            DownloadStatus::Downloading => "downloading",
+            DownloadStatus::Complete => "complete",
+            DownloadStatus::Seeding => "seeding",
+            DownloadStatus::Error => "error",
+            DownloadStatus::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parse a stored value. `None` for unknown values (defensive — the DB
+    /// contents are trusted, but callers must not panic on a legacy row).
+    #[cfg(test)]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|st| st.as_str() == s)
+    }
+
+    /// The intended state machine: may a row in `self` transition to
+    /// `target`? This is the documented spec that the production SQL guards
+    /// must agree with (pinned by `transition_table_matches_production_guards`;
+    /// the poller's per-row `WHERE status …` guards are the enforcement).
+    ///
+    /// Notable non-obvious edges:
+    /// - `Downloading → Queued` exists only for startup reconcile of
+    ///   interrupted *direct* downloads (`.part` resume, PERF-11) and the
+    ///   bounded 10-minute error retry.
+    /// - `Error → Queued` is the bounded error retry (tick);
+    ///   a repeated give-up error stays `error` for manual intervention.
+    /// - `Seeding → Complete` is settlement (torrent gone or fatal in qB).
+    /// - Nothing leaves `Cancelled` except manual DB surgery; cancelled rows
+    ///   are terminal from the poller's point of view.
+    pub fn can_transition_to(self, target: Self) -> bool {
+        use DownloadStatus::*;
+        matches!(
+            (self, target),
+            (Queued, Downloading | Error | Cancelled)
+                | (Downloading, Complete | Seeding | Error | Cancelled | Queued)
+                | (Error, Queued)
+                | (Seeding, Complete)
+        )
+    }
+}
+
+/// Render `statuses` as a SQL `IN` list: `('queued', 'downloading')`.
+///
+/// Used for the read-side filters (rows to inspect / count), where the set is
+/// "statuses of interest" rather than a transition guard; transition guards
+/// keep their per-site exact membership but render their values through this
+/// helper as well, so no status literal ever appears in the source.
+pub fn in_list(statuses: impl IntoIterator<Item = DownloadStatus>) -> String {
+    format!(
+        "({})",
+        statuses
+            .into_iter()
+            .map(|s| format!("'{}'", s.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
 
 // ── Status reads ───────────────────────────────────────────────────────────
 // The cancel-check core shared by every in-flight path. A row's status is
@@ -130,18 +225,43 @@ pub async fn mark_error(pool: &Pool, id: i32, msg: &str) {
     .await;
 }
 
-/// `downloading → error` (fatal torrent state / torrent vanished after the
-/// grace period / qB add failure). Unguarded on status by design: the caller
-/// has already established the row is a live in-flight row this tick.
+/// `queued | downloading → error` (fatal torrent state / torrent vanished
+/// after the grace period / qB add failure / qB not configured / install
+/// failure). The `AND status IN ('queued', 'downloading')` guard — exactly
+/// the statuses [`fatal_guard_statuses`] names — means a cancel (or a
+/// settlement to `complete`/`seeding`) landing between the row fetch and
+/// this update still wins: a racing failure mark never undoes a terminal
+/// state (the worst case was a multi-GB verify+install whose failure would
+/// flip a `cancelled` row back to `error`). Returns the row count (0 = the
+/// row changed state underneath us — or the write was swallowed below; the
+/// caller logs and takes no further compensating action).
 /// Propagates a pool-checkout failure (aborts the tick, as before) but
 /// swallows the write failure.
-pub async fn mark_fatal_error(pool: &Pool, id: i32, msg: &str) -> Result<()> {
-    execute_best_effort(
-        pool,
-        "UPDATE downloads SET status = $1, error = $2, updated_at = now() WHERE id = $3",
-        |q| q.bind(DownloadStatus::Error.as_str()).bind(msg).bind(id),
-    )
+pub async fn mark_fatal_error(pool: &Pool, id: i32, msg: &str) -> Result<u64> {
+    let sql = mark_fatal_error_sql();
+    execute_best_effort(pool, &sql, |q| {
+        q.bind(DownloadStatus::Error.as_str()).bind(msg).bind(id)
+    })
     .await
+}
+
+/// The guard set for [`mark_fatal_error`]: the only statuses a fatal mark is
+/// legitimate from — `queued` (the enqueue path) and `downloading` (the
+/// in-flight path). Every other status, in particular terminal `cancelled`,
+/// is excluded so a cancel always wins over a racing failure mark.
+pub fn fatal_guard_statuses() -> [DownloadStatus; 2] {
+    [DownloadStatus::Queued, DownloadStatus::Downloading]
+}
+
+/// The rendered SQL for [`mark_fatal_error`] (a `fn`, not a `const`, so the
+/// guard set renders through [`in_list`]). Pinned by
+/// `transition_table_matches_production_guards`.
+fn mark_fatal_error_sql() -> String {
+    format!(
+        "UPDATE downloads SET status = $1, error = $2, updated_at = now() \
+         WHERE id = $3 AND status IN {}",
+        in_list(fatal_guard_statuses())
+    )
 }
 
 /// `error → queued` (bounded stale-error retry). The `AND status = 'error'`
@@ -257,17 +377,32 @@ pub fn completion_guard_statuses() -> [DownloadStatus; 2] {
     [DownloadStatus::Downloading, DownloadStatus::Complete]
 }
 
-/// `queued → downloading` (a torrent row was added to qBittorrent this tick).
-/// Unguarded on status by design: the row was claimed `queued` at the top of
-/// the enqueue loop and the per-row budget gate prevents double-spawn.
+/// `queued → downloading` (a torrent row was added to qBittorrent this
+/// tick). The `AND status = 'queued'` guard mirrors [`claim_direct`]'s
+/// atomic-claim pattern: a cancel landing between the `queued` select and
+/// the qB `add_torrent` round-trip must win — an `cancelled` row is never
+/// silently flipped back to `downloading` and driven to completion.
+/// Returns the row count (0 = the row changed state mid-flight; the caller
+/// must remove the just-added torrent from qB and skip the rest of the row's
+/// processing — no error mark, the row is cancelled or otherwise terminal).
 /// Propagates a pool-checkout failure but swallows the write failure.
-pub async fn mark_downloading(pool: &Pool, id: i32) -> Result<()> {
-    execute_best_effort(
-        pool,
-        "UPDATE downloads SET status = $1, updated_at = now() WHERE id = $2",
-        |q| q.bind(DownloadStatus::Downloading.as_str()).bind(id),
-    )
+pub async fn mark_downloading(pool: &Pool, id: i32) -> Result<u64> {
+    let sql = mark_downloading_sql();
+    execute_best_effort(pool, &sql, |q| {
+        q.bind(DownloadStatus::Downloading.as_str()).bind(id)
+    })
     .await
+}
+
+/// The rendered SQL for [`mark_downloading`] (a `fn`, not a `const`, so the
+/// guard renders through [`DownloadStatus::as_str`]). Pinned by
+/// `transition_table_matches_production_guards`.
+fn mark_downloading_sql() -> String {
+    format!(
+        "UPDATE downloads SET status = $1, updated_at = now() \
+         WHERE id = $2 AND status = '{}'",
+        DownloadStatus::Queued.as_str()
+    )
 }
 
 /// Bind a row's torrent `hash` (rebind on a hash/name match). Propagates a
@@ -277,6 +412,25 @@ pub async fn bind_hash(pool: &Pool, id: i32, hash: &str) -> Result<()> {
         pool,
         "UPDATE downloads SET hash = $1, updated_at = now() WHERE id = $2",
         |q| q.bind(hash).bind(id),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Refresh a `downloading` row's `updated_at` to reflect torrent
+/// *visibility*, not just stat changes: the missing-torrent grace clock is
+/// measured from `updated_at`, but the row is only written when its stats
+/// actually change — so a stalled torrent (no progress/speed change for
+/// minutes) would sit with a stale `updated_at` and get errored the instant
+/// it leaves qBittorrent (grace already exhausted), rather than aging out
+/// after being genuinely *invisible* for the full grace window. Status-
+/// guarded like its siblings so a racing cancel/settlement wins; returns the
+/// row count (0 = the row left `downloading` in the meantime — harmless).
+pub async fn touch_downloading(pool: &Pool, id: i32) -> Result<u64> {
+    execute_best_effort(
+        pool,
+        "UPDATE downloads SET updated_at = now() WHERE id = $1 AND status = $2",
+        |q| q.bind(id).bind(DownloadStatus::Downloading.as_str()),
     )
     .await
 }
@@ -311,20 +465,19 @@ pub async fn drain_cancelled_hashes(pool: &Pool) -> Result<u64> {
 /// swallows the write failure.
 pub async fn settle_seeding(pool: &Pool, id: i32, error: Option<&str>) -> Result<()> {
     match error {
-        Some(msg) => {
-            execute_best_effort(
-                pool,
-                "UPDATE downloads SET status = $1, error = $2, updated_at = now() \
+        Some(msg) => execute_best_effort(
+            pool,
+            "UPDATE downloads SET status = $1, error = $2, updated_at = now() \
              WHERE id = $3 AND status = $4",
-                |q| {
-                    q.bind(DownloadStatus::Complete.as_str())
-                        .bind(msg)
-                        .bind(id)
-                        .bind(DownloadStatus::Seeding.as_str())
-                },
-            )
-            .await
-        }
+            |q| {
+                q.bind(DownloadStatus::Complete.as_str())
+                    .bind(msg)
+                    .bind(id)
+                    .bind(DownloadStatus::Seeding.as_str())
+            },
+        )
+        .await
+        .map(|_| ()),
         None => execute_best_effort(
             pool,
             "UPDATE downloads SET status = $1, updated_at = now() WHERE id = $2 AND status = $3",
@@ -334,7 +487,8 @@ pub async fn settle_seeding(pool: &Pool, id: i32, error: Option<&str>) -> Result
                     .bind(DownloadStatus::Seeding.as_str())
             },
         )
-        .await,
+        .await
+        .map(|_| ()),
     }
 }
 
@@ -363,6 +517,7 @@ pub async fn refresh_seeding_stats(
         },
     )
     .await
+    .map(|_| ())
 }
 
 /// Refresh an in-progress row's `progress` / `speed_bps` (the 2 s stream tick
@@ -378,6 +533,7 @@ pub async fn refresh_progress(pool: &Pool, id: i32, progress: f32, speed_bps: i6
         |q| q.bind(progress).bind(speed_bps).bind(id),
     )
     .await
+    .map(|_| ())
 }
 
 /// `downloading → queued` (startup reconcile of interrupted *direct* `.zim`
@@ -400,21 +556,23 @@ pub async fn retry_interrupted_directs(pool: &Pool) -> Result<u64> {
 }
 
 /// Best-effort over a raw [`raw::execute`] result: propagate a pool-acquire
-/// failure (aborts the tick, as before) but swallow write failures. sqlx
-/// folds acquire and execution into one `sqlx::Error`; acquire failures
-/// surface as `PoolTimedOut` / `PoolClosed`.
-async fn execute_best_effort<'q, B>(pool: &Pool, sql: &'q str, bind: B) -> Result<()>
+/// failure (aborts the tick, as before) but swallow write failures (a
+/// swallowed failure reports a row count of 0 — indistinguishable from a
+/// no-match, and the row is retried next tick anyway). Returns the row
+/// count. sqlx folds acquire and execution into one `sqlx::Error`; acquire
+/// failures surface as `PoolTimedOut` / `PoolClosed`.
+async fn execute_best_effort<'q, B>(pool: &Pool, sql: &'q str, bind: B) -> Result<u64>
 where
     B: FnOnce(raw::PgQuery<'q>) -> raw::PgQuery<'q>,
 {
     match raw::execute(pool, sql, bind).await {
-        Ok(_) => Ok(()),
+        Ok(n) => Ok(n),
         Err(Error::Database(e))
             if matches!(&e, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed) =>
         {
             Err(Error::Database(e))
         }
-        Err(_) => Ok(()),
+        Err(_) => Ok(0),
     }
 }
 
@@ -443,12 +601,108 @@ pub async fn adopt_torrent(
         },
     )
     .await
+    .map(|_| ())
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    use DownloadStatus::*;
+
+    #[test]
+    fn download_status_as_str_round_trips() {
+        for st in DownloadStatus::ALL {
+            assert_eq!(DownloadStatus::parse(st.as_str()), Some(st));
+        }
+        assert_eq!(DownloadStatus::parse("bogus"), None);
+    }
+
+    #[test]
+    fn in_list_renders_sql_list() {
+        assert_eq!(in_list([Queued, Downloading]), "('queued', 'downloading')");
+        assert_eq!(in_list([Cancelled]), "('cancelled')");
+    }
+
+    /// ARCH-H1: the intended state machine. These are the transitions the
+    /// poller's per-row `WHERE status …` guards enforce; any change to the
+    /// lifecycle must update this table AND the corresponding SQL guards.
+    #[test]
+    fn transition_table_is_intended_state_machine() {
+        // Forward happy path.
+        assert!(Queued.can_transition_to(Downloading));
+        assert!(Downloading.can_transition_to(Complete));
+        assert!(Downloading.can_transition_to(Seeding));
+        assert!(Seeding.can_transition_to(Complete));
+
+        // Cancellation wins from the active states.
+        assert!(Queued.can_transition_to(Cancelled));
+        assert!(Downloading.can_transition_to(Cancelled));
+
+        // Erroring from the active states.
+        assert!(Queued.can_transition_to(Error));
+        assert!(Downloading.can_transition_to(Error));
+
+        // The bounded retry edges.
+        assert!(Error.can_transition_to(Queued));
+        // Interrupted direct download restart (startup reconcile, PERF-11).
+        assert!(Downloading.can_transition_to(Queued));
+
+        // Terminal / invalid transitions must be rejected.
+        assert!(!Complete.can_transition_to(Queued));
+        assert!(!Complete.can_transition_to(Downloading));
+        assert!(!Cancelled.can_transition_to(Queued));
+        assert!(!Cancelled.can_transition_to(Downloading));
+        assert!(!Cancelled.can_transition_to(Error));
+        assert!(!Seeding.can_transition_to(Queued));
+        assert!(!Seeding.can_transition_to(Downloading));
+        assert!(!Error.can_transition_to(Complete));
+        // Nobody transitions into Cancelled except the active states.
+        assert!(!Complete.can_transition_to(Cancelled));
+        assert!(!Error.can_transition_to(Cancelled));
+        assert!(!Seeding.can_transition_to(Cancelled));
+    }
+
+    /// ARCH-H1 enforcement seam: the intended transition table and the
+    /// production guards on the two formerly-unguarded UPDATEs agree. The
+    /// string assertions pin the rendered guard SQL — a dropped/added guard
+    /// status would become a silent no-op in production, exactly the bug
+    /// class the lifecycle module was introduced to catch; the
+    /// `can_transition_to` assertions pin `cancelled` as terminal.
+    #[test]
+    fn transition_table_matches_production_guards() {
+        // Cancelled is terminal: the table rejects every transition out of
+        // it (in particular cancelled→downloading and cancelled→error).
+        for target in DownloadStatus::ALL {
+            assert!(
+                !Cancelled.can_transition_to(target),
+                "cancelled → {target:?} must be rejected by the table"
+            );
+        }
+
+        // mark_fatal_error: the guard covers exactly the statuses the table
+        // allows to transition to `error`.
+        let fatal = mark_fatal_error_sql();
+        for st in DownloadStatus::ALL {
+            assert_eq!(
+                fatal.contains(&format!("'{}'", st.as_str())),
+                st.can_transition_to(Error),
+                "fatal-error guard drifted at {st:?}: {fatal}"
+            );
+        }
+
+        // mark_downloading: the guard covers exactly the statuses the table
+        // allows to transition to `downloading` — `queued` only.
+        let downloading = mark_downloading_sql();
+        for st in DownloadStatus::ALL {
+            assert_eq!(
+                downloading.contains(&format!("status = '{}'", st.as_str())),
+                st.can_transition_to(Downloading),
+                "downloading guard drifted at {st:?}: {downloading}"
+            );
+        }
+    }
 
     /// The completion guard (B1) must cover BOTH `downloading` (the
     /// fresh-download path) and `complete` (the startup-recovery path that

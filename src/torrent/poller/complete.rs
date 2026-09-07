@@ -12,11 +12,31 @@ impl DownloadPoller {
     pub(super) async fn handle_complete(
         &self,
         id: i32,
+        name: &str,
         t: &TorrentInfo,
         qbit: Option<Arc<QbitClient>>,
         p: &crate::settings::PollerParams,
         file_path: Option<String>,
     ) -> Result<()> {
+        // Install-collision guard: dedup at enqueue only covers live rows, so
+        // an older terminal row with the same name can already own
+        // `zim_dir/{name}.zim` — an install on this row would overwrite it
+        // (and the `updated == 0` cancel-race discard below could delete it).
+        // Refuse to install over a live same-named row: mark this row
+        // `error` (status-guarded, so a cancel keeps winning) and return
+        // WITHOUT touching the destination file. A query failure propagates
+        // (fail closed — a swallowed blip could mask the collision and
+        // overwrite the other row's file).
+        if let Some(other) =
+            crate::db::downloads::find_same_name_live_row(&self.db, name, id).await?
+        {
+            let msg = format!(
+                "install skipped: same-named download already active/installed (row {other})"
+            );
+            tracing::info!("download {id}: {msg}");
+            mark_error(&self.db, id, &msg).await;
+            return Ok(());
+        }
         // Seeding: cap the ratio; the torrent stays in qBittorrent
         // (keep_completed means we simply never delete it).
         if let Some(q) = qbit.as_ref() {
@@ -260,7 +280,7 @@ mod tests {
         };
 
         poller
-            .handle_complete(id, &t, None, &p, None)
+            .handle_complete(id, "utiny", &t, None, &p, None)
             .await
             .expect("handle_complete");
 
@@ -390,7 +410,7 @@ mod tests {
         let before = fingerprint(&installed);
 
         poller
-            .handle_complete(id, &t, None, &p, Some(claimed.clone()))
+            .handle_complete(id, "utiny", &t, None, &p, Some(claimed.clone()))
             .await
             .expect("first handle_complete");
         let after_first = fingerprint(&installed);
@@ -402,7 +422,7 @@ mod tests {
         // The second pass — a requeued completion re-entering with the
         // file present: still no rename, row stable.
         poller
-            .handle_complete(id, &t, None, &p, Some(claimed))
+            .handle_complete(id, "utiny", &t, None, &p, Some(claimed))
             .await
             .expect("second handle_complete");
         let after_second = fingerprint(&installed);

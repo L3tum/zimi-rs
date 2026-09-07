@@ -45,99 +45,12 @@ pub fn is_direct_zim_url(url: &str) -> bool {
     strip_query_fragment(&trimmed).ends_with(".zim")
 }
 
-/// The download lifecycle — single source of truth for every value stored in
-/// `downloads.status` (ARCH-H1).
-///
-/// Previously the six status strings lived as ~55 hardcoded literals across
-/// the poller submodules, `opds.rs`, and the downloads handler; a lifecycle
-/// change touched 4–5 files of raw SQL and a wrong literal silently no-oped
-/// (an `UPDATE … WHERE status = '…'` that matches nothing is a success from
-/// the driver's point of view). All production SQL now renders status values
-/// through [`DownloadStatus::as_str`] / [`in_list`], so a typo is a compile
-/// error, and the intended state machine is pinned by
-/// `transition_table_matches_production_guards`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DownloadStatus {
-    Queued,
-    Downloading,
-    Complete,
-    Seeding,
-    Error,
-    Cancelled,
-}
-
-impl DownloadStatus {
-    /// Every status, in lifecycle order.
-    pub const ALL: [DownloadStatus; 6] = [
-        DownloadStatus::Queued,
-        DownloadStatus::Downloading,
-        DownloadStatus::Complete,
-        DownloadStatus::Seeding,
-        DownloadStatus::Error,
-        DownloadStatus::Cancelled,
-    ];
-
-    /// The value stored in `downloads.status`.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            DownloadStatus::Queued => "queued",
-            DownloadStatus::Downloading => "downloading",
-            DownloadStatus::Complete => "complete",
-            DownloadStatus::Seeding => "seeding",
-            DownloadStatus::Error => "error",
-            DownloadStatus::Cancelled => "cancelled",
-        }
-    }
-
-    /// Parse a stored value. `None` for unknown values (defensive — the DB
-    /// contents are trusted, but callers must not panic on a legacy row).
-    #[cfg(test)]
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|st| st.as_str() == s)
-    }
-
-    /// The intended state machine: may a row in `self` transition to
-    /// `target`? This is the documented spec that the production SQL guards
-    /// must agree with (pinned by `transition_table_matches_production_guards`;
-    /// the poller's per-row `WHERE status …` guards are the enforcement).
-    ///
-    /// Notable non-obvious edges:
-    /// - `Downloading → Queued` exists only for startup reconcile of
-    ///   interrupted *direct* downloads (`.part` resume, PERF-11) and the
-    ///   bounded 10-minute error retry.
-    /// - `Error → Queued` is the bounded error retry (tick);
-    ///   a repeated give-up error stays `error` for manual intervention.
-    /// - `Seeding → Complete` is settlement (torrent gone or fatal in qB).
-    /// - Nothing leaves `Cancelled` except manual DB surgery; cancelled rows
-    ///   are terminal from the poller's point of view.
-    pub fn can_transition_to(self, target: Self) -> bool {
-        use DownloadStatus::*;
-        matches!(
-            (self, target),
-            (Queued, Downloading | Error | Cancelled)
-                | (Downloading, Complete | Seeding | Error | Cancelled | Queued)
-                | (Error, Queued)
-                | (Seeding, Complete)
-        )
-    }
-}
-
-/// Render `statuses` as a SQL `IN` list: `('queued', 'downloading')`.
-///
-/// Used for the read-side filters (rows to inspect / count), where the set is
-/// "statuses of interest" rather than a transition guard; transition guards
-/// keep their per-site exact membership but render their values through this
-/// helper as well, so no status literal ever appears in the source.
-pub fn in_list(statuses: impl IntoIterator<Item = DownloadStatus>) -> String {
-    format!(
-        "({})",
-        statuses
-            .into_iter()
-            .map(|s| format!("'{}'", s.as_str()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
-}
+// A-1: the download lifecycle type and its SQL `IN`-list renderer live in
+// the persistence layer — `crate::db::downloads_lifecycle` is their home, so
+// the db → torrent edge stays one-way. Re-exported here so existing
+// `crate::torrent::{DownloadStatus, in_list}` call sites keep working
+// unchanged.
+pub use crate::db::downloads_lifecycle::{in_list, DownloadStatus};
 
 /// qBittorrent Web API client (raw `reqwest` against the HTTP API).
 pub struct QbitClient {
@@ -228,6 +141,11 @@ impl QbitClient {
         // admitted for local qBittorrent installs; SEC M-1 lets the operator
         // opt a LAN qB endpoint in via `allow_private`). Every redirect hop is
         // re-validated by the guarded client's policy with the same flag.
+        // Operator-configured endpoint: the built-in per-hop re-validation is
+        // accepted with its residual sub-second rebinding window on a
+        // redirect to a *different* host — user-influenced URLs (direct
+        // downloads, OPDS) instead follow redirects manually with per-hop
+        // resolve + pin (`netguard::follow_pinned_get`).
         let http = crate::netguard::build_guarded_client(
             trimmed,
             allow_private,
@@ -570,64 +488,9 @@ impl Default for QbitClientCache {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        in_list, is_auth_failure, is_direct_zim_url, qbit_fingerprint, resolve_qbit_inputs,
-        DownloadStatus, QbitClient, QbitClientCache, TorrentInfo,
+        is_auth_failure, is_direct_zim_url, qbit_fingerprint, resolve_qbit_inputs, QbitClient,
+        QbitClientCache, TorrentInfo,
     };
-
-    use DownloadStatus::*;
-
-    #[test]
-    fn download_status_as_str_round_trips() {
-        for st in DownloadStatus::ALL {
-            assert_eq!(DownloadStatus::parse(st.as_str()), Some(st));
-        }
-        assert_eq!(DownloadStatus::parse("bogus"), None);
-    }
-
-    #[test]
-    fn in_list_renders_sql_list() {
-        assert_eq!(in_list([Queued, Downloading]), "('queued', 'downloading')");
-        assert_eq!(in_list([Cancelled]), "('cancelled')");
-    }
-
-    /// ARCH-H1: the intended state machine. These are the transitions the
-    /// poller's per-row `WHERE status …` guards enforce; any change to the
-    /// lifecycle must update this table AND the corresponding SQL guards.
-    #[test]
-    fn transition_table_is_intended_state_machine() {
-        // Forward happy path.
-        assert!(Queued.can_transition_to(Downloading));
-        assert!(Downloading.can_transition_to(Complete));
-        assert!(Downloading.can_transition_to(Seeding));
-        assert!(Seeding.can_transition_to(Complete));
-
-        // Cancellation wins from the active states.
-        assert!(Queued.can_transition_to(Cancelled));
-        assert!(Downloading.can_transition_to(Cancelled));
-
-        // Erroring from the active states.
-        assert!(Queued.can_transition_to(Error));
-        assert!(Downloading.can_transition_to(Error));
-
-        // The bounded retry edges.
-        assert!(Error.can_transition_to(Queued));
-        // Interrupted direct download restart (startup reconcile, PERF-11).
-        assert!(Downloading.can_transition_to(Queued));
-
-        // Terminal / invalid transitions must be rejected.
-        assert!(!Complete.can_transition_to(Queued));
-        assert!(!Complete.can_transition_to(Downloading));
-        assert!(!Cancelled.can_transition_to(Queued));
-        assert!(!Cancelled.can_transition_to(Downloading));
-        assert!(!Cancelled.can_transition_to(Error));
-        assert!(!Seeding.can_transition_to(Queued));
-        assert!(!Seeding.can_transition_to(Downloading));
-        assert!(!Error.can_transition_to(Complete));
-        // Nobody transitions into Cancelled except the active states.
-        assert!(!Complete.can_transition_to(Cancelled));
-        assert!(!Error.can_transition_to(Cancelled));
-        assert!(!Seeding.can_transition_to(Cancelled));
-    }
 
     fn info(state: &str, progress: f64) -> TorrentInfo {
         TorrentInfo {

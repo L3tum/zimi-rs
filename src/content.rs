@@ -79,6 +79,15 @@ pub(crate) fn cap_read(b: &[u8]) -> (Vec<u8>, bool) {
     (b.get(..MAX_READ_BYTES).unwrap_or(b).to_vec(), capped)
 }
 
+/// Cap the `max_length` article-read argument at the raw-read cap
+/// (`MAX_READ_BYTES`): the available source text is itself bounded by that
+/// cap (via `cap_read`), so a larger request — e.g. `u64::MAX` — can never
+/// return more content. Shared by both front ends (HTTP `GET /read` and the
+/// MCP `read` tool) through `read_article_payload`, so they stay in parity.
+pub(crate) fn clamp_read_max_length(max_len: usize) -> usize {
+    max_len.min(MAX_READ_BYTES)
+}
+
 /// Decode an article's raw HTML bytes to text, tolerating non-UTF-8 input
 /// (BUG-12: the old `from_utf8(...).unwrap_or("")` dropped the whole body on
 /// a single bad byte; `from_utf8_lossy` keeps the decodable text).
@@ -151,6 +160,10 @@ pub(crate) async fn read_article_payload(
     path: &str,
     max_len: usize,
 ) -> crate::error::Result<ReadResponse> {
+    // Clamp uncapped client requests (e.g. `u64::MAX` via MCP) — see
+    // `clamp_read_max_length`; keeps the HTTP and MCP front ends in parity.
+    let max_len = clamp_read_max_length(max_len);
+
     state
         .zims
         .get(zim_name)

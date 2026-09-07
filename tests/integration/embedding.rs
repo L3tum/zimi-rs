@@ -240,13 +240,20 @@ async fn vector_index_is_partial_after_migration() {
     .unwrap()
     .expect("row present");
 
-    let (_count, runtime_exists) = zimservice::embed::vector_index_state(&pool)
+    let (_count, runtime_state) = zimservice::embed::vector_index_state(&pool)
         .await
         .expect("vector_index_state");
-    assert_eq!(
-        runtime_exists, db_exists,
-        "runtime exists flag must match pg_index"
-    );
+    // The shape-agnostic runtime check must agree with the catalog, now
+    // three-valued: a valid index → Present, an invalid entry (failed or
+    // in-progress CONCURRENTLY build) → PresentInvalid, nothing → Absent.
+    match (runtime_state, db_exists) {
+        (zimservice::embed::VectorIndexState::Present, true) => {}
+        (zimservice::embed::VectorIndexState::PresentInvalid, true) => {}
+        (zimservice::embed::VectorIndexState::Absent, false) => {}
+        other => {
+            panic!("runtime index state disagrees with catalog: {other:?} (db_exists={db_exists})")
+        }
+    }
     if db_exists {
         assert!(
             partial,

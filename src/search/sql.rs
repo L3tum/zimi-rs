@@ -282,6 +282,16 @@ pub(super) fn trgm_contains_sql(
 /// settings floor is 0.3, the GUC default, so `similarity > t` already
 /// implies `similarity >= 0.3`; the `%` conjunct is a superset pre-scan
 /// that lets the planner use the GiST index.
+///
+/// ⚠️ GUC coupling: the `%` prefilter is gated by the SERVER
+/// `pg_trgm.similarity_threshold` GUC (default 0.3), not by the settings
+/// `threshold` param. The equivalence holds only while that GUC is ≤ our
+/// `search.trgm_threshold` (which is floored at 0.3, so it always holds at
+/// the GUC default): `similarity > t (≥ 0.3)` ⇒ `similarity ≥ 0.3` ⇒ passes
+/// `%`. If an operator raises the server GUC above our threshold, the `%`
+/// conjunct **silently excludes** rows the `similarity > t` half would have
+/// kept. Don't raise that GUC — or drop the `%` prefilter from this
+/// predicate.
 pub(super) fn trgm_similarity_sql(
     query_lower: &str,
     threshold: f64,

@@ -2,14 +2,15 @@
 
 use super::*;
 
-/// Build the download HTTP client with a redirect-safe SSRF guard: reqwest
-/// follows redirects by default, and a 3xx to an internal host would bypass
-/// the initial-URL check, so re-validate every hop with the same rules
-/// (reading the live `downloads.allow_private_networks` setting per hop). A
-/// blocked hop aborts the whole request. `pin` optionally fixes a
-/// domain→addr resolution (validated up front to close the DNS-rebinding
-/// window).
-/// Timeout profile for poller HTTP clients.
+/// Build a download HTTP client. Redirects are **not** followed by this
+/// client (`Policy::none`): user-influenced URLs (direct `.zim` downloads,
+/// the OPDS catalog) follow redirects **manually** via
+/// [`crate::netguard::follow_pinned_get`] — every hop is re-validated,
+/// re-resolved, and pinned to the exact address that passed the check, so a
+/// sub-second DNS flip between check and CONNECT can't steer the fetch at a
+/// blocked host (SEC-1). `pin` optionally fixes a domain→addr resolution
+/// (validated up front by the caller) for this client; IP-literal hosts are
+/// passed with `pin = None` (no DNS → nothing to pin, no rebinding window).
 pub(crate) enum ClientProfile {
     /// Control-plane calls (OPDS catalog fetch): bounded end-to-end.
     Control,
@@ -37,18 +38,14 @@ fn client_timeouts(
 }
 
 pub(crate) fn build_download_client(
-    settings: &SettingsCache,
     profile: ClientProfile,
     pin: Option<(String, std::net::SocketAddr)>,
 ) -> Result<reqwest::Client> {
     let (total, connect, read) = client_timeouts(profile);
-    // ARCH-3: the private-range gate is a provider closure over the live
-    // settings cache, so netguard itself carries no settings dependency.
-    let settings = settings.clone();
-    let provider: std::sync::Arc<dyn Fn() -> bool + Send + Sync> =
-        std::sync::Arc::new(move || settings.downloads_allow_private_networks());
-    let mut builder =
-        reqwest::Client::builder().redirect(crate::netguard::redirect_policy(provider));
+    // SEC-1: never auto-follow — the manual redirect loop
+    // (netguard::follow_pinned_get) owns all following, with per-hop
+    // resolve + pin.
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
     if let Some(t) = total {
         builder = builder.timeout(t);
     }
@@ -83,6 +80,11 @@ struct StreamOutcome {
     /// Declared total size (Content-Length, or the FULL of
     /// Content-Range on 206), if the server gave one.
     total: Option<u64>,
+    /// A mid-stream cancel was observed: the row is `cancelled`, the staged
+    /// `.part` has already been removed (see [`observe_cancel`]), and the
+    /// caller must leave the row alone — no error mark, no finalize (the
+    /// same route as the [`finalize_direct_download`] cancel sites).
+    cancelled: bool,
 }
 
 /// Instantaneous speed from a byte window over its *actual* elapsed time
@@ -105,7 +107,31 @@ fn content_range_total(headers: &axum::http::HeaderMap) -> Option<u64> {
     val[slash + 1..].trim().parse().ok()
 }
 
-/// Stream HTTP body into `part`, with Range resume support (PERF-11).
+/// The in-loop cancel observation (the ~5 s check), factored out so the
+/// branch is testable without a multi-second stream: re-read the row's
+/// status; `None` while it is still `downloading` (keep streaming; fails
+/// open on a DB blip like [`status_if_changed`]). Once it has left
+/// `downloading`, a CANCEL removes the staged `.part` right here — a
+/// CANCEL always removes the staged file, at every cancel-observation
+/// site — because a plain `break` would leave it on disk: [`PartGuard`] keeps
+/// the file on drop (PERF-11 resume), and the post-loop truncation guard
+/// would return `Err` (typical mid-stream cancel: `received < total`) before
+/// the `finalize_direct_download` cancel sites — which DO remove the file —
+/// are ever reached, so a multi-GB `.part` would linger until the next
+/// startup reconcile sweep. Returns the new status.
+async fn observe_cancel(db: &Pool, id: i32, part: &Path) -> Option<String> {
+    let status = status_if_changed(db, id, "downloading").await?;
+    if status == crate::torrent::DownloadStatus::Cancelled.as_str() {
+        let _ = std::fs::remove_file(part);
+    }
+    Some(status)
+}
+
+/// Stream an in-flight HTTP body into `part`, with Range resume support
+/// (PERF-11). `resp` is the terminal (non-redirect) response of the manual
+/// redirect chain and `url`/`client` the pinned final hop that produced it
+/// (see [`direct_download`] / `netguard::follow_pinned_get`), so the 416
+/// fallback re-issues to the FINAL redirected URL with the pinned client.
 ///
 /// Response-shape dispatch:
 /// - **206 + Range sent** → append to the existing `.part`; `total` from
@@ -118,13 +144,18 @@ fn content_range_total(headers: &axum::http::HeaderMap) -> Option<u64> {
 /// - Anything else → `mark_error` + `Err`.
 ///
 /// In-loop: over-cap check (against `received`, which includes the resumed
-/// prefix), 2 s progress updates, ~5 s cancel check.
+/// prefix), 2 s progress updates, ~5 s cancel check — a CANCEL removes the
+/// staged `.part` there (see [`observe_cancel`]) so the post-loop guard can
+/// not strand it.
 /// Post-loop: truncation guard — a declared total that was not fully
-/// received means the body was cut short.
+/// received means the body was cut short (skipped for a row observed
+/// `cancelled` mid-stream: the file is already gone and the row must not be
+/// error-marked).
 #[allow(clippy::too_many_arguments)]
 async fn stream_part(
-    client: &reqwest::Client,
     url: &str,
+    client: &reqwest::Client,
+    resp: reqwest::Response,
     part: &Path,
     resume_from: Option<u64>,
     max_bytes: u64,
@@ -133,12 +164,6 @@ async fn stream_part(
 ) -> Result<StreamOutcome> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
-
-    let mut req = client.get(url);
-    if let Some(s) = resume_from {
-        req = req.header(axum::http::header::RANGE, format!("bytes={s}-"));
-    }
-    let resp = req.send().await?;
 
     // Determine the file open mode, the starting `received` offset, the
     // declared `total`, and the bytes stream to consume.
@@ -219,6 +244,7 @@ async fn stream_part(
     let mut window_bytes: u64 = 0;
     let mut window_start = Instant::now();
     let mut last_cancel_check = Instant::now();
+    let mut cancelled_observed = false;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -252,11 +278,16 @@ async fn stream_part(
         }
 
         // Periodic cancel check (every ~5 s): if the row is no longer
-        // 'downloading' (cancelled, errored, etc.), abort the stream.
+        // 'downloading' (cancelled, errored, etc.), abort the stream. A
+        // CANCEL removes the staged `.part` inside `observe_cancel` (a plain
+        // break would leave it behind — see that fn).
         if last_cancel_check.elapsed() >= Duration::from_secs(5) {
             last_cancel_check = Instant::now();
-            if let Some(status) = status_if_changed(db, id, "downloading").await {
+            if let Some(status) = observe_cancel(db, id, part).await {
                 tracing::info!("direct download {id} aborted: status changed to '{status}'");
+                if status == crate::torrent::DownloadStatus::Cancelled.as_str() {
+                    cancelled_observed = true;
+                }
                 break;
             }
         }
@@ -266,8 +297,11 @@ async fn stream_part(
 
     // Truncated-stream guard: a declared total that was not fully received
     // means the body was cut short (server lied / connection dropped).
+    // Skipped for a mid-stream cancel: the `.part` is already removed and
+    // the row must stay `cancelled` with no error mark — the same route as
+    // the `finalize_direct_download` cancel sites.
     if let Some(t) = total {
-        if received < t {
+        if received < t && !cancelled_observed {
             let msg = format!("stream ended at {received} of {t} bytes (truncated)");
             mark_error(db, id, &msg).await;
             return Err(Error::Torrent {
@@ -279,6 +313,7 @@ async fn stream_part(
     Ok(StreamOutcome {
         size: received,
         total,
+        cancelled: cancelled_observed,
     })
 }
 
@@ -286,10 +321,11 @@ async fn stream_part(
 /// hand off to [`finalize_direct_download`] (verify, atomic rename, resync,
 /// index).
 ///
-/// Cancel-coverage note (TEST-5): the in-loop cancel check in
-/// [`stream_part`] is covered only via the `finalize_direct_download` seam
-/// tests — wiremock binds 127.0.0.1 and netguard hard-blocks loopback, so it
-/// cannot drive the HTTP stream loop.
+/// Cancel-coverage note: the in-loop cancel observation
+/// ([`observe_cancel`]) is covered directly by the `observe_cancel_*` tests
+/// and end-to-end by `stream_part_cancel_mid_stream_removes_part` (a raw-TCP
+/// server holding the body back — wiremock's delay covers the whole
+/// response, which would move the in-loop clock with it).
 pub(super) async fn direct_download(
     http: &reqwest::Client,
     db: &Pool,
@@ -301,33 +337,85 @@ pub(super) async fn direct_download(
 ) -> Result<()> {
     // PERF-12: snapshot the two download settings we read up front.
     let dp = settings.poller_params_snapshot();
-    // SSRF guard before any network I/O.
+    // SSRF guard before any network I/O (the manual redirect chain below
+    // re-validates this URL as hop 0, and every later hop, the same way).
     let allow_private = dp.allow_private_networks;
     validate_download_url(url, allow_private)?;
 
-    // DNS-level SSRF guard: for named hosts, resolve up front, reject if any
-    // address is blocked, and pin the validated resolution so a rebinding
-    // answer can't reach an internal host mid-download. (Per-download client:
-    // downloads are infrequent, so building one is cheap.)
-    let client = match resolve_download_host(url, allow_private, false).await? {
-        Some((host, ip)) => {
-            tracing::debug!("pinned {host} -> {} for download", ip);
-            build_download_client(settings, ClientProfile::Transfer, Some((host, ip)))?
-        }
-        None => http.clone(),
-    };
-
-    // Keep the .part file on failure for resume (PERF-11). Disabled once
-    // the file is safely renamed into place or explicitly removed (inside
-    // [`finalize_direct_download`]).
-    let part_guard = PartGuard::new(part);
+    // SEC-1: redirects are followed manually (netguard::follow_pinned_get)
+    // instead of by a built-in reqwest policy: every hop — initial included
+    // — is validated, re-resolved, and the request goes out through a
+    // client pinned to the exact address(es) that passed the check, so a
+    // sub-second TTL flip between check and CONNECT can no longer steer
+    // the fetch at a blocked host. The shared unpinned client `http` is
+    // used only for IP-literal hosts (no DNS → nothing to pin).
+    // (Per-download clients: downloads are infrequent, so building one per
+    // hop is cheap.)
+    let settings = settings.clone();
+    let provider: std::sync::Arc<dyn Fn() -> bool + Send + Sync> =
+        std::sync::Arc::new(move || settings.downloads_allow_private_networks());
+    let shared = http.clone();
 
     let resume_from = resume_plan(part);
     if let Some(s) = resume_from {
         tracing::info!("direct download {id}: resuming from {s} bytes");
     }
+
+    let PinnedResponse {
+        url: final_url,
+        client,
+        response,
+    } = follow_pinned_get(
+        url,
+        provider,
+        &[],
+        &|pin| match pin {
+            Some((host, ip)) => {
+                tracing::debug!("pinned {host} -> {ip} for download");
+                build_download_client(ClientProfile::Transfer, Some((host, ip)))
+            }
+            // IP-literal host: reuse the shared Transfer client (built with
+            // the same profile and no pin).
+            None => Ok(shared.clone()),
+        },
+        &|c, u| {
+            let mut req = c.get(u);
+            if let Some(s) = resume_from {
+                req = req.header(axum::http::header::RANGE, format!("bytes={s}-"));
+            }
+            req
+        },
+    )
+    .await?;
+
+    // Keep the .part file on failure for resume (PERF-11). Disabled once
+    // the file is safely renamed into place or explicitly removed (inside
+    // [`finalize_direct_download`]).
+    let mut part_guard = PartGuard::new(part);
     let max_bytes = dp.max_bytes;
-    let outcome = stream_part(&client, url, part, resume_from, max_bytes, db, id).await?;
+    let outcome = stream_part(
+        &final_url,
+        &client,
+        response,
+        part,
+        resume_from,
+        max_bytes,
+        db,
+        id,
+    )
+    .await?;
+    if outcome.cancelled {
+        // Mid-stream cancel: the staged `.part` was already removed by the
+        // in-loop cancel observation ([`observe_cancel`]). Same route as the
+        // [`finalize_direct_download`] cancel sites: leave the `cancelled`
+        // row alone (no error mark, no verify/rename/index) and release the
+        // guard (the file is gone — nothing left to keep for resume).
+        tracing::info!(
+            "direct download {id} cancelled during transfer — staged part removed, leaving row cancelled"
+        );
+        part_guard.disable();
+        return Ok(());
+    }
     tracing::debug!(
         "direct download {id}: {} bytes (total: {:?})",
         outcome.size,
@@ -345,9 +433,10 @@ pub(super) async fn direct_download(
 /// guarded `status = 'downloading'` row update, and the auto-index.
 ///
 /// Cancel policy (RECONCILE with PERF-11 resume): a CANCEL always removes the
-/// staged file — at all three cancel-observation sites (pre-verify,
-/// pre-rename, post-rename `updated == 0`). Only transient network failures
-/// in the stream loop keep the `.part` for resume.
+/// staged file — at all four cancel-observation sites (the in-stream loop —
+/// [`observe_cancel`], and here: pre-verify, pre-rename, post-rename
+/// `updated == 0`). Only transient network failures in the stream loop keep
+/// the `.part` for resume.
 async fn finalize_direct_download(
     db: &Pool,
     zims: &Arc<ZimManager>,
@@ -442,13 +531,36 @@ async fn finalize_direct_download(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::super::tests::download::{download_settings, test_pool};
+    use super::super::tests::download::test_pool;
+    use super::{build_download_client, ClientProfile};
+    use crate::netguard::{follow_pinned_get, PinnedResponse};
     use crate::testing::dead_pool;
 
     // ── B5.4: download-client SSRF / redirect / pinning (wiremock) ───────────
     // In-module so the private `build_download_client` / `ClientProfile` are
     // reachable; the builder-failure path is covered by the `client_or_err`
     // unit test (propagation instead of the old silent `unwrap_or_default()`).
+
+    /// Drive the SEC-1 manual chain (netguard::follow_pinned_get) with a
+    /// Transfer-profile pinned client. `testhost` is mapped onto the local
+    /// mock socket via `host_pins` (the test seam for `pin_for_hop` —
+    /// production passes no pins and resolves real DNS).
+    async fn pinned_chain(
+        url: &str,
+        pins: &[(String, std::net::SocketAddr)],
+        allow_private: bool,
+        request: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder + Sync + 'static,
+    ) -> PinnedResponse {
+        follow_pinned_get(
+            url,
+            std::sync::Arc::new(move || allow_private),
+            pins,
+            &|pin| build_download_client(ClientProfile::Transfer, pin),
+            &request,
+        )
+        .await
+        .expect("chain must succeed")
+    }
 
     #[tokio::test]
     async fn download_client_happy_path_pinned() {
@@ -460,11 +572,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string("zimblob"))
             .mount(&server)
             .await;
-        let settings = download_settings();
         // Pin `testhost` (no real DNS) at the MockServer socket: the fetch of
         // `http://testhost:{port}` succeeds only if the client carries the pin.
         let client = super::build_download_client(
-            &settings,
             super::ClientProfile::Transfer,
             Some(("testhost".into(), *server.address())),
         )
@@ -480,12 +590,15 @@ mod tests {
         assert_eq!(body, "zimblob");
     }
 
+    /// SEC-1: a 3xx whose `Location` points at a blocked address is rejected
+    /// by the manual chain with the existing SSRF error class — before any
+    /// connection to the blocked target. (Pre-SEC-1 this was the built-in
+    /// policy test; the download clients no longer follow redirects at all,
+    /// so the chain — not the client — owns the refusal.)
     #[tokio::test]
-    async fn download_client_redirect_to_metadata_blocked() {
+    async fn follow_pinned_get_redirect_to_blocked_address() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        let settings = download_settings();
-
         // Redirect hops are re-validated with allow_loopback=false for
         // downloads, so both the link-local metadata IP and loopback are
         // refused even though the initial hop is a pinned local socket.
@@ -495,6 +608,7 @@ mod tests {
                 "http://127.0.0.1:9/x",
                 "loopback (downloads never allow it)",
             ),
+            ("http://10.0.0.5/x", "private (allow_private=false)"),
         ] {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -502,31 +616,216 @@ mod tests {
                 .respond_with(ResponseTemplate::new(302).append_header("Location", location))
                 .mount(&server)
                 .await;
-            let client = super::build_download_client(
-                &settings,
-                super::ClientProfile::Transfer,
-                Some(("testhost".into(), *server.address())),
+            let pins = [("testhost".to_string(), *server.address())];
+            let err = follow_pinned_get(
+                &format!("http://testhost:{}/hop", server.address().port()),
+                std::sync::Arc::new(|| false),
+                &pins,
+                &|pin| build_download_client(ClientProfile::Transfer, pin),
+                &|c, u| c.get(u),
             )
-            .expect("client builds");
-            let err = client
-                .get(format!("http://testhost:{}/hop", server.address().port()))
-                .send()
-                .await
-                .expect_err("redirect must be refused");
-            // The policy's message lives on the error's source chain (reqwest
-            // wraps it as a generic "error following redirect" kind).
-            let mut chain = Vec::new();
-            let mut cur: Option<&dyn std::error::Error> = Some(&err);
-            while let Some(e) = cur {
-                chain.push(e.to_string());
-                cur = e.source();
+            .await
+            .expect_err("redirect target must be refused");
+            // The existing SSRF error class: validate_download_url →
+            // assert_host_not_blocked → InvalidInput.
+            match err {
+                crate::error::Error::InvalidInput(msg) => assert!(
+                    msg.contains("blocked"),
+                    "{why}: expected a blocked-range message, got: {msg}"
+                ),
+                other => panic!("{why}: expected InvalidInput (SSRF class), got {other:?}"),
             }
-            let chain_text = chain.join(" | ");
-            assert!(
-                chain_text.contains("redirect target rejected"),
-                "{why}: expected redirect refusal, got: {chain_text}"
+            // The chain stopped at the redirect: the only request the mock
+            // ever saw was the initial /hop (no connection to the target).
+            let got = server.received_requests().await.unwrap_or_default();
+            assert_eq!(
+                got.len(),
+                1,
+                "{why}: no request may leave for the blocked target"
             );
+            assert_eq!(got[0].url.path(), "/hop");
         }
+    }
+
+    /// SEC-1: a direct download from URL A that 302-redirects to URL B
+    /// succeeds end-to-end at the chain level: the chain lands on the FINAL
+    /// URL with a pinned client, and `stream_part` writes B's body.
+    #[tokio::test]
+    async fn follow_pinned_get_redirect_302_downloads_final_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // /a 302 → /b (same host, different path — the common mirror case).
+        Mock::given(method("GET"))
+            .and(path("/a.zim"))
+            .respond_with(ResponseTemplate::new(302).append_header("Location", "/b.zim"))
+            .mount(&server)
+            .await;
+        let body: &[u8] = b"hello world!"; // 12 bytes
+        Mock::given(method("GET"))
+            .and(path("/b.zim"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.to_vec())
+                    .append_header("Content-Length", "12"),
+            )
+            .mount(&server)
+            .await;
+        let pins = [("testhost".to_string(), *server.address())];
+        let pr = pinned_chain(
+            &format!("http://testhost:{}/a.zim", server.address().port()),
+            &pins,
+            false,
+            |c, u| c.get(u),
+        )
+        .await;
+        assert!(
+            pr.url.ends_with("/b.zim"),
+            "the chain must land on the final redirected URL, got {}",
+            pr.url
+        );
+
+        // Feed the terminal response into the streamer (dead pool: a 12-byte
+        // body never touches the DB).
+        let dir = std::env::temp_dir().join(format!("zimi-sec1-302-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("a.zim.part");
+        let pool = dead_pool();
+        let outcome = super::stream_part(
+            &pr.url,
+            &pr.client,
+            pr.response,
+            &part,
+            None,
+            1024,
+            &pool,
+            999_999,
+        )
+        .await
+        .expect("stream_part ok");
+        assert_eq!(outcome.size, 12);
+        assert_eq!(
+            std::fs::read(&part).unwrap(),
+            body,
+            "B's body must be written"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-1: a redirect loop / chain longer than the hop cap must error out
+    /// cleanly — no hang, no infinite follow.
+    #[tokio::test]
+    async fn follow_pinned_get_redirect_loop_hits_cap() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // /a → /b → /a → … forever.
+        Mock::given(method("GET"))
+            .and(path("/a"))
+            .respond_with(ResponseTemplate::new(302).append_header("Location", "/b"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/b"))
+            .respond_with(ResponseTemplate::new(302).append_header("Location", "/a"))
+            .mount(&server)
+            .await;
+        let pins = [("testhost".to_string(), *server.address())];
+        let err = follow_pinned_get(
+            &format!("http://testhost:{}/a", server.address().port()),
+            std::sync::Arc::new(|| false),
+            &pins,
+            &|pin| build_download_client(ClientProfile::Transfer, pin),
+            &|c, u| c.get(u),
+        )
+        .await
+        .expect_err("a redirect loop must hit the hop cap");
+        match err {
+            crate::error::Error::InvalidInput(msg) => assert!(
+                msg.contains("too many redirects"),
+                "expected the hop-cap error, got: {msg}"
+            ),
+            other => panic!("expected InvalidInput (hop cap), got {other:?}"),
+        }
+        // Bounded: exactly 1 initial + MAX_REDIRECT_HOPS follows were sent.
+        let got = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            got.len(),
+            crate::netguard::MAX_REDIRECT_HOPS + 1,
+            "the chain must stop at the cap"
+        );
+    }
+
+    /// SEC-1 + PERF-11: the 416 fresh-start fallback still works AFTER a
+    /// redirect — the fallback re-issues to the FINAL redirected URL with the
+    /// pinned client (not a re-fetch of hop 1).
+    #[tokio::test]
+    async fn stream_part_416_fallback_after_redirect() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let body: &[u8] = b"hello world!"; // 12 bytes
+        let server = MockServer::start().await;
+        // /a 302 → /b.
+        Mock::given(method("GET"))
+            .and(path("/a.zim"))
+            .respond_with(ResponseTemplate::new(302).append_header("Location", "/b.zim"))
+            .mount(&server)
+            .await;
+        // /b with Range → 416 (stale .part / changed source).
+        Mock::given(method("GET"))
+            .and(path("/b.zim"))
+            .and(header("range", "bytes=6-"))
+            .respond_with(ResponseTemplate::new(416).append_header("Content-Range", "bytes */12"))
+            .mount(&server)
+            .await;
+        // /b without Range → 200 full body.
+        Mock::given(method("GET"))
+            .and(path("/b.zim"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.to_vec())
+                    .append_header("Content-Length", "12"),
+            )
+            .mount(&server)
+            .await;
+        let pins = [("testhost".to_string(), *server.address())];
+        // Hop 0 goes out WITH the Range header (resume_from = 6); the server
+        // answers 416, which is the terminal response of the chain.
+        let pr = pinned_chain(
+            &format!("http://testhost:{}/a.zim", server.address().port()),
+            &pins,
+            false,
+            |c, u| c.get(u).header("Range", "bytes=6-"),
+        )
+        .await;
+        assert!(pr.url.ends_with("/b.zim"));
+        assert_eq!(pr.response.status(), 416);
+
+        let dir = std::env::temp_dir().join(format!("zimi-sec1-416-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("a.zim.part");
+        std::fs::write(&part, b"stale!").unwrap();
+        let pool = dead_pool();
+        let outcome = super::stream_part(
+            &pr.url,
+            &pr.client,
+            pr.response,
+            &part,
+            Some(6),
+            1024,
+            &pool,
+            999_999,
+        )
+        .await
+        .expect("stream_part ok");
+        assert_eq!(outcome.size, 12);
+        assert_eq!(outcome.total, Some(12));
+        assert_eq!(
+            std::fs::read(&part).unwrap(),
+            body,
+            "file must be fresh after 416 fallback"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// TEST-5 (CI-DB): the post-stream finalize seam installs a valid part
@@ -755,20 +1054,22 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let settings = download_settings();
-        let client = super::build_download_client(
-            &settings,
-            super::ClientProfile::Transfer,
-            Some(("testhost".into(), *server.address())),
+        let pins = [("testhost".to_string(), *server.address())];
+        let pr = pinned_chain(
+            &format!("http://testhost:{}/x.zim", server.address().port()),
+            &pins,
+            false,
+            |c, u| c.get(u),
         )
-        .expect("client builds");
+        .await;
         let dir = std::env::temp_dir().join(format!("zimi-sp-fresh-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let part = dir.join("x.zim.part");
         let pool = dead_pool();
         let outcome = super::stream_part(
-            &client,
-            &format!("http://testhost:{}/x.zim", server.address().port()),
+            &pr.url,
+            &pr.client,
+            pr.response,
             &part,
             None,
             1024,
@@ -800,13 +1101,15 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let settings = download_settings();
-        let client = super::build_download_client(
-            &settings,
-            super::ClientProfile::Transfer,
-            Some(("testhost".into(), *server.address())),
+        let pins = [("testhost".to_string(), *server.address())];
+        // Hop 0 goes out with the Range header (resume_from = 6).
+        let pr = pinned_chain(
+            &format!("http://testhost:{}/x.zim", server.address().port()),
+            &pins,
+            false,
+            |c, u| c.get(u).header("Range", "bytes=6-"),
         )
-        .expect("client builds");
+        .await;
         let dir = std::env::temp_dir().join(format!("zimi-sp-resume-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let part = dir.join("x.zim.part");
@@ -814,8 +1117,9 @@ mod tests {
         std::fs::write(&part, b"hello ").unwrap();
         let pool = dead_pool();
         let outcome = super::stream_part(
-            &client,
-            &format!("http://testhost:{}/x.zim", server.address().port()),
+            &pr.url,
+            &pr.client,
+            pr.response,
             &part,
             Some(6),
             1024,
@@ -847,13 +1151,15 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let settings = download_settings();
-        let client = super::build_download_client(
-            &settings,
-            super::ClientProfile::Transfer,
-            Some(("testhost".into(), *server.address())),
+        let pins = [("testhost".to_string(), *server.address())];
+        // Hop 0 goes out with the Range header; the mock ignores it (200).
+        let pr = pinned_chain(
+            &format!("http://testhost:{}/x.zim", server.address().port()),
+            &pins,
+            false,
+            |c, u| c.get(u).header("Range", "bytes=6-"),
         )
-        .expect("client builds");
+        .await;
         let dir = std::env::temp_dir().join(format!("zimi-sp-ignored-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let part = dir.join("x.zim.part");
@@ -861,8 +1167,9 @@ mod tests {
         std::fs::write(&part, b"junkxx").unwrap();
         let pool = dead_pool();
         let outcome = super::stream_part(
-            &client,
-            &format!("http://testhost:{}/x.zim", server.address().port()),
+            &pr.url,
+            &pr.client,
+            pr.response,
             &part,
             Some(6),
             1024,
@@ -903,13 +1210,16 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let settings = download_settings();
-        let client = super::build_download_client(
-            &settings,
-            super::ClientProfile::Transfer,
-            Some(("testhost".into(), *server.address())),
+        let pins = [("testhost".to_string(), *server.address())];
+        // Hop 0 goes out with the Range header; the mock answers 416 (the
+        // terminal response of the chain).
+        let pr = pinned_chain(
+            &format!("http://testhost:{}/x.zim", server.address().port()),
+            &pins,
+            false,
+            |c, u| c.get(u).header("Range", "bytes=6-"),
         )
-        .expect("client builds");
+        .await;
         let dir = std::env::temp_dir().join(format!("zimi-sp-416-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let part = dir.join("x.zim.part");
@@ -917,8 +1227,9 @@ mod tests {
         std::fs::write(&part, b"stale!").unwrap();
         let pool = dead_pool();
         let outcome = super::stream_part(
-            &client,
-            &format!("http://testhost:{}/x.zim", server.address().port()),
+            &pr.url,
+            &pr.client,
+            pr.response,
             &part,
             Some(6),
             1024,
@@ -932,5 +1243,272 @@ mod tests {
         let on_disk = std::fs::read(&part).unwrap();
         assert_eq!(on_disk, body, "file must be fresh after 416 fallback");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Mid-stream cancel: the in-loop cancel observation ────────────────
+
+    /// `observe_cancel` with a DB blip must fail open like
+    /// `status_if_changed`: no change reported, the `.part` untouched
+    /// (kept for resume). Runs without a database (dead pool).
+    #[tokio::test]
+    async fn observe_cancel_db_blip_fails_open() {
+        let dir = std::env::temp_dir().join(format!("zimi-obs-blip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("x.zim.part");
+        std::fs::write(&part, b"partial bytes").unwrap();
+        let pool = dead_pool();
+        assert!(
+            super::observe_cancel(&pool, 999_999, &part).await.is_none(),
+            "a DB blip must not read as a status change (fail-open)"
+        );
+        assert!(part.exists(), "fail-open must keep the .part for resume");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CI-DB: the cancel-observation branch, driven directly. A CANCEL
+    /// removes the staged `.part` and leaves the row `cancelled` with no
+    /// error mark; a NON-cancelled status change (`error`) aborts the stream
+    /// but KEEPS the `.part` for resume (PERF-11); a row still `downloading`
+    /// reads `None` (keep streaming).
+    #[tokio::test]
+    async fn observe_cancel_removes_part_only_for_cancelled_rows() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let insert = |name: &'static str, status: &'static str| {
+            let pool = pool.clone();
+            async move {
+                crate::db::raw::fetch_scalar_optional(
+                    &pool,
+                    "INSERT INTO downloads (name, url, status) \
+                     VALUES ($1, 'http://example.net/x.zim', $2) RETURNING id",
+                    |q| q.bind(name).bind(status),
+                )
+                .await
+                .expect("insert row")
+                .unwrap()
+            }
+        };
+        let flip = |id: i32, status: &'static str| {
+            let pool = pool.clone();
+            async move {
+                crate::db::raw::execute(
+                    &pool,
+                    "UPDATE downloads SET status = $1 WHERE id = $2",
+                    |q| q.bind(status).bind(id),
+                )
+                .await
+                .expect("flip status")
+            }
+        };
+        let read = |id: i32| {
+            let pool = pool.clone();
+            async move {
+                crate::db::raw::fetch_optional(
+                    &pool,
+                    "SELECT status, error FROM downloads WHERE id = $1",
+                    |q| q.bind(id),
+                )
+                .await
+                .expect("read row")
+                .expect("row present")
+            }
+        };
+
+        let mut ids = Vec::new();
+
+        // 1) CANCEL: the staged `.part` is removed by the observation itself.
+        let id_c = insert("oc-cancelled", "downloading").await;
+        ids.push(id_c);
+        let part_c = dir.path().join("oc-cancelled.zim.part");
+        std::fs::write(&part_c, b"partial bytes").unwrap();
+        flip(id_c, "cancelled").await;
+        let status = super::observe_cancel(&pool, id_c, &part_c)
+            .await
+            .expect("cancelled row leaves 'downloading'");
+        assert_eq!(status, "cancelled");
+        assert!(
+            !part_c.exists(),
+            "cancelled .part must be removed in the loop"
+        );
+        let (st, err): (String, Option<String>) = read(id_c).await;
+        assert_eq!(st, "cancelled", "the row must stay cancelled");
+        assert_eq!(err, None, "a cancel must not be error-marked");
+
+        // 2) Non-cancelled change (error): the `.part` is KEPT for resume.
+        let id_e = insert("oc-errored", "downloading").await;
+        ids.push(id_e);
+        let part_e = dir.path().join("oc-errored.zim.part");
+        std::fs::write(&part_e, b"partial bytes").unwrap();
+        flip(id_e, "error").await;
+        let status = super::observe_cancel(&pool, id_e, &part_e)
+            .await
+            .expect("errored row leaves 'downloading'");
+        assert_eq!(status, "error");
+        assert!(
+            part_e.exists(),
+            "a non-cancelled status change must keep the .part for resume"
+        );
+
+        // 3) Still downloading: no change observed, nothing removed.
+        let id_d = insert("oc-downloading", "downloading").await;
+        ids.push(id_d);
+        let part_d = dir.path().join("oc-downloading.zim.part");
+        std::fs::write(&part_d, b"partial bytes").unwrap();
+        assert!(
+            super::observe_cancel(&pool, id_d, &part_d).await.is_none(),
+            "a row still downloading must not abort the stream"
+        );
+        assert!(part_d.exists());
+
+        // Cleanup (shared single-DB suite).
+        crate::db::raw::execute(
+            &pool,
+            "DELETE FROM downloads WHERE id IN ($1, $2, $3)",
+            |q| q.bind(id_c).bind(id_e).bind(id_d),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// CI-DB: mid-stream cancel, end-to-end. The row is `downloading` and
+    /// flips to `cancelled` 2 s after the request is in flight; the raw-TCP
+    /// server sends the headers immediately but holds the body back 7 s
+    /// (wiremock's delay covers the whole response, which would move the
+    /// in-loop clock with it), so the ~5 s in-loop cancel check fires on the
+    /// first chunk. The declared total (1000) exceeds the bytes received
+    /// (64) — the truncation guard must be SKIPPED for the cancelled row:
+    /// `stream_part` returns `Ok` with `cancelled = true`, the `.part` is
+    /// removed, and the row stays `cancelled` with `error` NULL. (Pre-fix:
+    /// the in-loop `break` hit the truncation guard's `Err` and the `.part`
+    /// lingered until the next startup reconcile sweep.)
+    #[tokio::test]
+    async fn stream_part_cancel_mid_stream_removes_part_no_error() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+
+        // Headers now, `SENT` body bytes after `BODY_DELAY_SECS`, then close.
+        const BODY_DELAY_SECS: u64 = 7;
+        const DECLARED: u64 = 1000;
+        const SENT: usize = 64;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            // Read the request head (everything up to the blank line).
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).await.expect("read head");
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = sock
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {DECLARED}\r\n\r\n").as_bytes(),
+                )
+                .await;
+            tokio::time::sleep(std::time::Duration::from_secs(BODY_DELAY_SECS)).await;
+            let _ = sock.write_all(&[0u8; SENT]).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let id: i32 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "INSERT INTO downloads (name, url, status) \
+             VALUES ('oc-midstream', 'http://example.net/x.zim', 'downloading') RETURNING id",
+            |q| q,
+        )
+        .await
+        .expect("insert downloading row")
+        .unwrap();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let part = tmp.path().join("x.zim.part");
+
+        // The cancel lands 2 s in: the request has been in flight since
+        // t≈0, the first chunk (hence the in-loop cancel check) arrives at
+        // t≈7 s — well past the 5 s window and well after the flip.
+        let flip_pool = pool.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            crate::db::raw::execute(
+                &flip_pool,
+                "UPDATE downloads SET status = 'cancelled' WHERE id = $1",
+                |q| q.bind(id),
+            )
+            .await
+            .expect("flip to cancelled");
+        });
+
+        // SEC-1 chain (no redirects here — the raw TCP server answers the
+        // single request directly): the pinned client lands on the same
+        // final URL and carries the terminal 200 response.
+        let pins = [("testhost".to_string(), addr)];
+        let pr = pinned_chain(
+            &format!("http://testhost:{}/x.zim", addr.port()),
+            &pins,
+            false,
+            |c, u| c.get(u),
+        )
+        .await;
+
+        let outcome = super::stream_part(
+            &pr.url,
+            &pr.client,
+            pr.response,
+            &part,
+            None,
+            10_000,
+            &pool,
+            id,
+        )
+        .await
+        .expect("a mid-stream cancel is Ok (no error mark), not an Err");
+        assert!(
+            outcome.cancelled,
+            "the in-loop cancel check must observe the cancelled row"
+        );
+        assert_eq!(outcome.size, SENT as u64);
+        assert_eq!(outcome.total, Some(DECLARED));
+        assert!(
+            !part.exists(),
+            "the cancelled .part must be removed mid-stream (no startup-sweep wait)"
+        );
+
+        let (status, error): (String, Option<String>) = crate::db::raw::fetch_optional(
+            &pool,
+            "SELECT status, error FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .expect("read row")
+        .expect("row present");
+        assert_eq!(status, "cancelled", "the row must stay cancelled");
+        assert_eq!(error, None, "a mid-stream cancel must not be error-marked");
+
+        // Cleanup (shared single-DB suite).
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
+            .await
+            .unwrap();
     }
 }

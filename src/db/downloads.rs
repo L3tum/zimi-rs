@@ -206,6 +206,34 @@ pub async fn list_downloads(pool: &Pool) -> Result<Vec<DownloadRow>> {
         .collect())
 }
 
+/// The id of another *live* row (`queued`/`downloading`/`complete`/`seeding`)
+/// that owns the same `name`, excluding `exclude_id` — or `None`. The
+/// install-collision guard for the completion path: enqueue dedup covers live
+/// rows only, so an older terminal row with the same name can already own
+/// `zim_dir/{name}.zim`; a fresh install on a new row would overwrite it (and
+/// the cancel-race discard could delete it). `exclude_id` tolerates the row
+/// being completed itself.
+pub async fn find_same_name_live_row(
+    pool: &Pool,
+    name: &str,
+    exclude_id: i32,
+) -> Result<Option<i32>> {
+    raw::fetch_scalar_optional(
+        pool,
+        "SELECT id FROM downloads \
+         WHERE name = $1 AND id != $2 AND status IN ($3, $4, $5, $6) LIMIT 1",
+        |q| {
+            q.bind(name)
+                .bind(exclude_id)
+                .bind(crate::db::downloads_lifecycle::DownloadStatus::Queued.as_str())
+                .bind(crate::db::downloads_lifecycle::DownloadStatus::Downloading.as_str())
+                .bind(crate::db::downloads_lifecycle::DownloadStatus::Complete.as_str())
+                .bind(crate::db::downloads_lifecycle::DownloadStatus::Seeding.as_str())
+        },
+    )
+    .await
+}
+
 /// Outcome of [`insert_download`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertOutcome {
@@ -233,8 +261,8 @@ pub async fn insert_download(pool: &Pool, name: &str, url: &str) -> Result<Inser
         |q| {
             q.bind(url)
                 .bind(name)
-                .bind(crate::torrent::DownloadStatus::Queued.as_str())
-                .bind(crate::torrent::DownloadStatus::Downloading.as_str())
+                .bind(crate::db::downloads_lifecycle::DownloadStatus::Queued.as_str())
+                .bind(crate::db::downloads_lifecycle::DownloadStatus::Downloading.as_str())
         },
     )
     .await?;
@@ -250,7 +278,7 @@ pub async fn insert_download(pool: &Pool, name: &str, url: &str) -> Result<Inser
         |q| {
             q.bind(name)
                 .bind(url)
-                .bind(crate::torrent::DownloadStatus::Queued.as_str())
+                .bind(crate::db::downloads_lifecycle::DownloadStatus::Queued.as_str())
         },
     )
     .await
@@ -290,10 +318,10 @@ pub async fn cancel_download(pool: &Pool, id: i32) -> Result<CancelOutcome> {
         "UPDATE downloads SET status = $1, updated_at = now() \
          WHERE id = $2 AND status IN ($3, $4)",
         |q| {
-            q.bind(crate::torrent::DownloadStatus::Cancelled.as_str())
+            q.bind(crate::db::downloads_lifecycle::DownloadStatus::Cancelled.as_str())
                 .bind(id)
-                .bind(crate::torrent::DownloadStatus::Queued.as_str())
-                .bind(crate::torrent::DownloadStatus::Downloading.as_str())
+                .bind(crate::db::downloads_lifecycle::DownloadStatus::Queued.as_str())
+                .bind(crate::db::downloads_lifecycle::DownloadStatus::Downloading.as_str())
         },
     )
     .await?;
@@ -317,7 +345,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-    use crate::torrent::poller::test_pool;
+    use crate::testing::test_pool;
 
     /// TEST #7 (Tests finding): the `list_downloads` 500-row cap, its newest-
     /// first ordering, and the row→struct column mapping are exercised

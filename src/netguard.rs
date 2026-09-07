@@ -12,9 +12,26 @@
 //! - private ranges (RFC1918, ULA `fc00::/7`) are blocked unless the
 //!   caller passes `allow_private = true` (from
 //!   `downloads.allow_private_networks`);
-//! - every redirect hop is re-validated (see `redirect_policy`), and named
-//!   hosts are resolved up front and pinned (see `resolve_download_host`)
-//!   to close the DNS-rebinding window.
+//! - redirects run in **two regimes** (SEC-1: a sub-second TTL flip between
+//!   a check and the CONNECT must not be able to steer a fetch at a blocked
+//!   host):
+//!   - *user-influenced URLs* (direct `.zim` downloads, the OPDS catalog)
+//!     are fetched with **manual, bounded redirect following**
+//!     ([`follow_pinned_get`]): every hop — including the first — is
+//!     validated, re-resolved, and pinned to the exact address(es) that
+//!     passed the check, and the request goes out through a client pinned
+//!     to that resolution (`Policy::none` clients never follow redirects
+//!     themselves). This closes the DNS-rebinding window that per-hop
+//!     *re-validation alone* leaves open: a hop to a *different* host would
+//!     otherwise be re-resolved by reqwest at CONNECT time, **after** the
+//!     policy's check.
+//!   - *operator-configured endpoints* (qBittorrent, embedding) use
+//!     reqwest's built-in following with the initial host pinned
+//!     ([`resolve_download_host`]) and every hop re-validated
+//!     ([`redirect_hop_ok`]). The residual sub-second rebinding window on
+//!     a redirect to a *different* host is accepted there: the operator
+//!     picked the endpoint, and the per-hop re-validation bounds the
+//!     damage.
 
 use std::net::{IpAddr, ToSocketAddrs};
 
@@ -224,21 +241,6 @@ fn redirect_policy_flags(allow_private: bool, allow_loopback: bool) -> reqwest::
     redirect_policy_with(move |url| redirect_hop_ok(url, allow_private, allow_loopback))
 }
 
-/// reqwest redirect policy that re-validates **every** hop, gating private
-/// ranges by a caller-supplied provider (typically
-/// `downloads.allow_private_networks`). The provider keeps netguard free of a
-/// settings dependency (ARCH-3); it is invoked per hop so a mid-process
-/// settings change is picked up on the next redirect.
-pub(crate) fn redirect_policy(
-    allow_private: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
-) -> reqwest::redirect::Policy {
-    redirect_policy_with(move |url| {
-        let allow_private = allow_private();
-        // Downloads never allow loopback (validate_download_url semantics).
-        redirect_hop_ok(url, allow_private, false)
-    })
-}
-
 /// Resolve a URL's hostname to concrete addresses, rejecting if **any**
 /// resolved address is in a blocked range (closes the
 /// "attacker domain points at an internal IP" bypass). Returns
@@ -277,6 +279,174 @@ pub(crate) async fn resolve_download_host(
         }
     }
     Ok(Some((host.to_string(), addrs[0])))
+}
+
+/// Maximum number of redirect *follows* performed by [`follow_pinned_get`]:
+/// the initial request is hop 0, the chain follows at most this many 3xx
+/// hops, and a (1 + MAX_REDIRECT_HOPS)-th consecutive redirect is an error
+/// (bounded: a hostile/looping redirect chain can neither hang the fetch
+/// nor pin-escalate us through more than a handful of fresh resolutions).
+pub(crate) const MAX_REDIRECT_HOPS: usize = 5;
+
+/// Terminal response of a manually followed redirect chain, plus the
+/// pinned client and final URL that produced it. `client` is still valid
+/// for follow-up requests to the *same* final URL (e.g. the 416 fresh-start
+/// re-issue) — it is pinned to the final hop's validated resolution.
+pub(crate) struct PinnedResponse {
+    /// The URL that produced `response` (the terminal hop of the chain).
+    pub url: String,
+    /// The pinned client that issued the terminal request.
+    pub client: reqwest::Client,
+    /// The non-redirect response (any other status is returned unchanged;
+    /// the caller interprets it).
+    pub response: reqwest::Response,
+}
+
+// `reqwest::Response` is not `Debug` — report the URL only.
+impl std::fmt::Debug for PinnedResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedResponse")
+            .field("url", &self.url)
+            .finish()
+    }
+}
+
+/// One decision step of the manual redirect chain.
+#[derive(Debug)]
+pub(crate) enum RedirectStep {
+    /// Terminal: this response is the final result for the caller (any
+    /// non-followable status — including a 3xx without a usable `Location`).
+    Final,
+    /// Follow: the next hop is this absolute URL (re-validated, re-resolved,
+    /// and re-pinned by the loop).
+    Follow(String),
+}
+
+/// Decide, for a response at `current`, whether the manual chain follows
+/// (pure — unit-testable without a server): only 301/302/303/307/308 with a
+/// non-empty, joinable `Location` header are followed; a relative
+/// `Location` is resolved against `current` (host change included).
+/// Anything else is terminal. The hop cap is enforced by the caller.
+pub(crate) fn redirect_step(
+    current: &str,
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> RedirectStep {
+    match status.as_u16() {
+        301 | 302 | 303 | 307 | 308 => {
+            let loc = match headers
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            {
+                Some(l) if !l.trim().is_empty() => l.trim().to_string(),
+                _ => return RedirectStep::Final,
+            };
+            match url::Url::parse(current)
+                .ok()
+                .and_then(|base| base.join(&loc).ok())
+            {
+                Some(next) => RedirectStep::Follow(next.into()),
+                // Unparseable base or `Location` → terminal; the caller
+                // returns the 3xx response as-is.
+                None => RedirectStep::Final,
+            }
+        }
+        _ => RedirectStep::Final,
+    }
+}
+
+/// The per-hop pin for the manual chain: IP-literal hosts need no pin
+/// (already range-checked by `validate_download_url`, no DNS → no
+/// rebinding window); a caller-provided `host_pins` entry maps that host to
+/// a fixed address with **no** DNS lookup (mirrors
+/// `ClientBuilder::resolve` semantics — a pinned host is never looked up
+/// again); any other named host goes through [`resolve_download_host`
+/// ] (all addresses resolved, rejected if ANY is blocked).
+///
+/// Production callers pass an empty `host_pins` — every pin there is a
+/// `resolve_download_host` output. Tests use it to map a fake hostname
+/// onto a local mock server without real DNS; a provided pin is trusted by
+/// the caller (production pins have already passed `is_blocked_ip`).
+async fn pin_for_hop(
+    url: &str,
+    allow_private: bool,
+    host_pins: &[(String, std::net::SocketAddr)],
+) -> Result<Option<(String, std::net::SocketAddr)>> {
+    let parsed =
+        url::Url::parse(url).map_err(|e| Error::InvalidInput(format!("invalid URL: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| Error::InvalidInput("URL has no host".into()))?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<IpAddr>().is_ok() {
+        return Ok(None);
+    }
+    if let Some((_, ip)) = host_pins.iter().find(|(h, _)| h.eq_ignore_ascii_case(host)) {
+        return Ok(Some((host.to_string(), *ip)));
+    }
+    // Downloads never allow loopback (validate_download_url semantics).
+    resolve_download_host(url, allow_private, false).await
+}
+
+/// Perform a GET through a **manual, bounded redirect chain** with
+/// per-hop resolve + pin (SEC-1). This is the fetch path for user-influenced
+/// URLs (direct `.zim` downloads, OPDS catalog).
+///
+/// Each hop — including the initial one:
+/// 1. `validate_download_url` (scheme + host checks, loopback never allowed);
+/// 2. resolve the target host ([`pin_for_hop`] → [`resolve_download_host`]:
+///    ALL addresses, rejected if ANY is blocked under the live
+///    `allow_private` flag);
+/// 3. build a client pinned to exactly that resolution via
+///    `ClientBuilder::resolve` (`build_client`), so reqwest connects to the
+///    pinned IP — there is **no** rebinding window between check and
+///    connect;
+/// 4. execute the request and inspect the status: 301/302/303/307/308 with
+///    a non-empty `Location` is followed (at most [`MAX_REDIRECT_HOPS`] times
+///    — a further redirect is an error, no hang); anything else is
+///    terminal and returned to the caller unchanged in [`PinnedResponse`].
+///
+/// `allow_private` is a live provider (typically over the settings cache)
+/// invoked per hop — netguard stays free of a settings dependency (ARCH-3).
+/// `host_pins` and `build_client` are documented on their parameters; `build_client`
+/// receives the hop's pin (`None` for IP-literal hosts) and is expected to
+/// use `Policy::none` (see `build_download_client`).
+pub(crate) async fn follow_pinned_get(
+    start_url: &str,
+    allow_private: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    host_pins: &[(String, std::net::SocketAddr)],
+    build_client: &(dyn Fn(Option<(String, std::net::SocketAddr)>) -> Result<reqwest::Client>
+          + Sync),
+    request: &(dyn Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder + Sync),
+) -> Result<PinnedResponse> {
+    let mut url = start_url.to_string();
+    let mut followed = 0usize;
+    loop {
+        let allow_private = allow_private();
+        validate_download_url(&url, allow_private)?;
+        let pin = pin_for_hop(&url, allow_private, host_pins).await?;
+        let client = build_client(pin)?;
+        let response = request(&client, &url).send().await.map_err(Error::Http)?;
+        match redirect_step(&url, response.status(), response.headers()) {
+            RedirectStep::Final => {
+                return Ok(PinnedResponse {
+                    url,
+                    client,
+                    response,
+                })
+            }
+            RedirectStep::Follow(next) => {
+                if followed >= MAX_REDIRECT_HOPS {
+                    return Err(Error::InvalidInput(format!(
+                        "too many redirects: {url} still redirecting after {MAX_REDIRECT_HOPS} hops"
+                    )));
+                }
+                followed += 1;
+                tracing::debug!("manual redirect {followed}/{MAX_REDIRECT_HOPS}: {url} → {next}");
+                url = next;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -407,6 +577,75 @@ mod tests {
         assert!(redirect_hop_ok(&priv4, true, true).is_ok());
     }
 
+    /// SEC-1: the pure redirect-step decision — no server, no DNS.
+    #[test]
+    fn redirect_step_decides_follow_or_final() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let loc = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(reqwest::header::LOCATION, HeaderValue::try_from(v).unwrap());
+            h
+        };
+        let empty = HeaderMap::new();
+        let base = "http://a.example:8080/dir/file";
+
+        // Only 301/302/303/307/308 with a non-empty Location are followed.
+        for code in [301, 302, 303, 307, 308] {
+            let st = axum::http::StatusCode::from_u16(code).unwrap();
+            assert!(
+                matches!(
+                    redirect_step(base, st, &loc("http://b.example/x")),
+                    RedirectStep::Follow(_)
+                ),
+                "{code} with Location must be followed"
+            );
+        }
+
+        // Every other status is terminal.
+        for code in [200, 204, 206, 300, 304, 404, 416, 500] {
+            let st = axum::http::StatusCode::from_u16(code).unwrap();
+            assert!(
+                matches!(
+                    redirect_step(base, st, &loc("http://b.example/x")),
+                    RedirectStep::Final
+                ),
+                "{code} must be terminal even with a Location"
+            );
+            assert!(
+                matches!(redirect_step(base, st, &empty), RedirectStep::Final),
+                "{code} without headers must be terminal"
+            );
+        }
+
+        // 3xx without a usable Location is terminal.
+        let st302 = axum::http::StatusCode::from_u16(302).unwrap();
+        assert!(matches!(
+            redirect_step(base, st302, &empty),
+            RedirectStep::Final
+        ));
+        let blank = loc("   ");
+        assert!(matches!(
+            redirect_step(base, st302, &blank),
+            RedirectStep::Final
+        ));
+
+        // Absolute Location is kept as-is; relative Location joins against
+        // the current URL (query/fragment of the base must not leak in).
+        match redirect_step(base, st302, &loc("http://b.example:9090/y?z=1")) {
+            RedirectStep::Follow(u) => assert_eq!(u, "http://b.example:9090/y?z=1"),
+            other => panic!("absolute Location must be followed: {other:?}"),
+        }
+        match redirect_step(base, st302, &loc("other.zim")) {
+            RedirectStep::Follow(u) => assert_eq!(u, "http://a.example:8080/dir/other.zim"),
+            other => panic!("relative Location must join: {other:?}"),
+        }
+        match redirect_step(base, st302, &loc("/root.zim")) {
+            RedirectStep::Follow(u) => assert_eq!(u, "http://a.example:8080/root.zim"),
+            other => panic!("root-relative Location must join: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn resolve_download_host_loopback_flag_gates() {
         // localhost resolves to a loopback address: admitted under
@@ -441,9 +680,10 @@ mod tests {
 
     #[test]
     fn redirect_policy_provider_gates_private_hop() {
-        // ARCH-3: `redirect_policy` wraps exactly this provider→hop closure in
-        // a reqwest policy; drive the closure directly with a live provider so
-        // a mid-process settings flip is picked up per hop.
+        // ARCH-3: `redirect_policy_flags` wraps exactly this provider→hop
+        // closure (around `redirect_hop_ok`) in a reqwest policy; drive the
+        // closure directly with a live provider so a mid-process settings flip
+        // is picked up per hop.
         let provider = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let check = {
             let p = provider.clone();

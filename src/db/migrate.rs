@@ -118,7 +118,11 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
 /// fatal, but the catalog probe and each drop are best-effort (a probe
 /// failure skips the cleanup, a failing drop is logged and retried on the
 /// next startup). `CONCURRENTLY` cannot run inside a transaction, so each
-/// drop is a standalone statement on its own pooled connection.
+/// drop is a standalone statement on its own pooled connection. Before
+/// splicing, each `relname` is validated as a plain SQL identifier (ASCII
+/// alphanumerics + underscore); a non-conforming name is anomalous (the
+/// probe only matches `idx_%`) and is skipped with a warning instead of
+/// being interpolated into the `DROP INDEX` statement.
 pub async fn drop_invalid_indexes(pool: &Pool) -> Result<()> {
     let mut conn = pool.acquire().await.map_err(Error::Database)?;
     let rows: Vec<(String,)> = match raw::fetch_all(
@@ -138,6 +142,19 @@ pub async fn drop_invalid_indexes(pool: &Pool) -> Result<()> {
         }
     };
     for (idx_name,) in rows {
+        // Identifier hygiene before splicing into the DDL: a name outside
+        // [A-Za-z0-9_] is anomalous (the probe only matches `idx_%`), so
+        // fail safe and skip it (residual risk only reachable with CREATE
+        // INDEX privilege).
+        if !idx_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            tracing::warn!(
+                "invalid-index cleanup: skipping non-conforming identifier {idx_name:?}"
+            );
+            continue;
+        }
         tracing::warn!("dropping invalid index {idx_name}");
         // Safe: identifier comes from the pg_class catalog, not user input.
         // `CONCURRENTLY` cannot run inside a transaction, so each drop is a

@@ -1,8 +1,9 @@
 //! Multi-engine article search (FTS + trigram + pgvector) with score merge.
 //!
-//! `SearchEngine` runs the configured branches, dedups by (zim, path) keeping
-//! the highest score, and interleaves results by score descending; the SQL
-//! builders are pure and unit-tested (placeholder shapes, not interpolated).
+//! `SearchEngine` runs the configured branches, dedups by `articles.id`
+//! keeping the highest score, and interleaves results by score descending;
+//! the SQL builders are pure and unit-tested (placeholder shapes, not
+//! interpolated).
 mod sql;
 
 use std::sync::{Arc, Mutex};
@@ -246,6 +247,14 @@ impl SearchEngine {
     /// must not serialize concurrent `search()` calls — then the guard is
     /// re-acquired and the fingerprint re-checked (another task may have
     /// filled the cache during the await).
+    ///
+    /// Cache write policy (re-checked after the await): the cache is written
+    /// only when it is EMPTY or holds the SAME fingerprint as ours (a
+    /// same-fingerprint entry is kept as-is — an equivalent client). A cache
+    /// holding a *different* fingerprint is left untouched: that writer
+    /// started after a settings change and is newer, so it wins; the next
+    /// request carrying our fingerprint rebuilds. Our own freshly-built
+    /// client serves this request regardless of the cache state.
     async fn embed_client_with(&self, fingerprint: &str) -> Option<EmbedClient> {
         {
             let guard = self
@@ -281,14 +290,19 @@ impl SearchEngine {
             .lock()
             .expect("embed client mutex poisoned");
         // Re-check: another task may have filled the cache during the await.
-        if guard
-            .as_ref()
-            .map(|(fp, _)| fp.as_str() != fingerprint)
-            .unwrap_or(true)
-        {
-            *guard = Some((fingerprint.to_string(), client));
+        // Write policy (see the method doc): insert into an empty cache;
+        // keep an existing same-fingerprint entry; NEVER clobber a different
+        // fingerprint — a concurrent newer writer wins, and the next request
+        // with our fingerprint rebuilds. Our own client serves this request
+        // regardless of what the cache ends up holding.
+        match guard.as_ref() {
+            None => {
+                *guard = Some((fingerprint.to_string(), client));
+                guard.as_ref().map(|(_, c)| c.clone())
+            }
+            Some((fp, _)) if fp == fingerprint => guard.as_ref().map(|(_, c)| c.clone()),
+            Some(_) => Some(client),
         }
-        guard.as_ref().map(|(_, c)| c.clone())
     }
 
     /// Perform a search using full-text (FTS) and/or trigram (fuzzy/prefix) engines.
@@ -397,114 +411,92 @@ impl SearchEngine {
         // p95 pool-checkout wait) — then move the arms to separate connections
         // (or pipelined queries in one transaction).
         let fingerprint = self.embed_fingerprint(&snap);
-        let query_for_embed = query.to_string();
-        let (query_vec, db_arm) = tokio::join!(
-            async move {
-                if run_vector {
-                    match self.embed_client_with(&fingerprint).await {
-                        Some(ec) => match ec.embed(&[query_for_embed]).await {
-                            Ok(vecs) => {
-                                self.degradation.record_success("vector_embed");
-                                vecs.first().map(|v| format_vector(v))
-                            }
-                            Err(e) => {
-                                self.degradation.record_failure("vector_embed");
-                                tracing::warn!("vector search disabled for this query: {e}");
-                                None
-                            }
-                        },
-                        None => None,
-                    }
-                } else {
-                    None
-                }
-            },
-            async {
-                let mut client = match self.pool.acquire().await {
-                    Ok(c) => c,
-                    Err(e) => return Err(e.into()),
-                };
-                // Q0: full-text search
-                let fts = if let Some(sq) = &fts_sq {
-                    run_sql_on(&mut *client, sq, "FTS", &self.degradation, "fts").await
-                } else {
-                    Vec::new()
-                };
-                // WI-37: resolve the `pg_trgm` extension once (cached). A
-                // missing extension (or a pool blip) soft-disables all three
-                // trgm arms below; FTS always runs regardless. Probed on the
-                // arm's own connection (no second pool checkout — see
-                // `ensure_trgm_on`).
-                let trgm_ok = if run_trgm {
-                    self.ensure_trgm_on(&mut *client).await
-                } else {
-                    false
-                };
-                // Q1: prefix match — uses btree index on title_lower
-                let prefix = if let Some(sq) = sq_prefix.as_ref().filter(|_| trgm_ok) {
-                    run_sql_on(
-                        &mut *client,
-                        sq,
-                        "trgm prefix query",
-                        &self.degradation,
-                        "trgm_prefix",
-                    )
-                    .await
-                } else {
-                    Vec::new()
-                };
-                // Q2: contains match — uses GIN trgm index
-                let contains = if let Some(sq) = sq_contains.as_ref().filter(|_| trgm_ok) {
-                    run_sql_on(
-                        &mut *client,
-                        sq,
-                        "trgm contains query",
-                        &self.degradation,
-                        "trgm_contains",
-                    )
-                    .await
-                } else {
-                    Vec::new()
-                };
-                // Q3: similarity threshold — uses GiST trgm index
-                let similarity = if let Some(sq) = sq_similarity.as_ref().filter(|_| trgm_ok) {
-                    run_sql_on(
-                        &mut *client,
-                        sq,
-                        "trgm similarity query",
-                        &self.degradation,
-                        "trgm_similarity",
-                    )
-                    .await
-                } else {
-                    Vec::new()
-                };
-                // Drop the pooled connection at the end of the arm so it is
-                // returned to the pool the moment the fast queries finish —
-                // NOT held across the slow embed round-trip (see the comment
-                // above the join). `tokio::join!` retains this arm's output
-                // until the embed arm completes, so leaving `client` in the
-                // return value would keep it checked out for the whole embed.
-                drop(client);
-                Ok::<_, Error>((fts, prefix, contains, similarity))
-            },
-        );
+        let embed_arm = VectorEmbedArm {
+            engine: self,
+            fingerprint,
+            query: query.to_string(),
+            enabled: run_vector,
+        };
+        let (query_vec, db_arm) = tokio::join!(embed_arm.run(), async {
+            let mut client = match self.pool.acquire().await {
+                Ok(c) => c,
+                Err(e) => return Err(e.into()),
+            };
+            // Q0: full-text search
+            let fts = if let Some(sq) = &fts_sq {
+                run_sql_on(&mut *client, sq, "FTS", &self.degradation, "fts").await
+            } else {
+                Vec::new()
+            };
+            // WI-37: resolve the `pg_trgm` extension once (cached). A
+            // missing extension (or a pool blip) soft-disables all three
+            // trgm arms below; FTS always runs regardless. Probed on the
+            // arm's own connection (no second pool checkout — see
+            // `ensure_trgm_on`).
+            let trgm_ok = if run_trgm {
+                self.ensure_trgm_on(&mut *client).await
+            } else {
+                false
+            };
+            // Q1: prefix match — uses btree index on title_lower
+            let prefix = if let Some(sq) = sq_prefix.as_ref().filter(|_| trgm_ok) {
+                run_sql_on(
+                    &mut *client,
+                    sq,
+                    "trgm prefix query",
+                    &self.degradation,
+                    "trgm_prefix",
+                )
+                .await
+            } else {
+                Vec::new()
+            };
+            // Q2: contains match — uses GIN trgm index
+            let contains = if let Some(sq) = sq_contains.as_ref().filter(|_| trgm_ok) {
+                run_sql_on(
+                    &mut *client,
+                    sq,
+                    "trgm contains query",
+                    &self.degradation,
+                    "trgm_contains",
+                )
+                .await
+            } else {
+                Vec::new()
+            };
+            // Q3: similarity threshold — uses GiST trgm index
+            let similarity = if let Some(sq) = sq_similarity.as_ref().filter(|_| trgm_ok) {
+                run_sql_on(
+                    &mut *client,
+                    sq,
+                    "trgm similarity query",
+                    &self.degradation,
+                    "trgm_similarity",
+                )
+                .await
+            } else {
+                Vec::new()
+            };
+            // Drop the pooled connection at the end of the arm so it is
+            // returned to the pool the moment the fast queries finish —
+            // NOT held across the slow embed round-trip (see the comment
+            // above the join). `tokio::join!` retains this arm's output
+            // until the embed arm completes, so leaving `client` in the
+            // return value would keep it checked out for the whole embed.
+            drop(client);
+            Ok::<_, Error>((fts, prefix, contains, similarity))
+        },);
         let (fts_rows, prefix_rows, contains_rows, similarity_rows) = db_arm?;
 
-        // ── Merge trgm branches: dedup by article id (first occurrence wins
-        // — Q1 prefix matches are generally the most relevant). ──
-        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        let mut trgm_results: Vec<SearchRow> = Vec::new();
-        for row in prefix_rows
-            .into_iter()
-            .chain(contains_rows)
-            .chain(similarity_rows)
-        {
-            let id: i64 = row.0;
-            if seen.insert(id) {
-                trgm_results.push(row);
-            }
-        }
+        // ── Merge trgm branches: dedup by article id, first-wins by arm
+        // order (Q1 prefix matches are generally the most relevant) — see
+        // `dedup_trgm_by_first` for the asymmetry vs the final merge. ──
+        let trgm_results: Vec<SearchRow> = dedup_trgm_by_first(
+            prefix_rows
+                .into_iter()
+                .chain(contains_rows)
+                .chain(similarity_rows),
+        );
 
         // ── Vector query (semantic) — runs after its embedding lands; the ANN
         // seek is fast, so it adds little to the concurrent phase above. A
@@ -655,6 +647,103 @@ impl SearchEngine {
 
         Ok(merge_suggest(prefix, others, limit))
     }
+}
+
+/// The vector (semantic) arm of [`SearchEngine::search`]: the embed HTTP
+/// call plus its `vector_embed` degradation recording, extracted from the
+/// join so `search()` reads uniformly as build branch queries → run branches
+/// (concurrently where designed) → merge.
+///
+/// `run()` resolves the engine's cached embed client for this request's
+/// `fingerprint` (via `embed_client_with`, which rebuilds it only on a
+/// settings change), embeds `query`, records `vector_embed`
+/// success/failure on the engine's degradation tracker (WI-5), and returns
+/// the `format_vector`-formatted vector string. Returns `None` when the
+/// branch is disabled (`enabled == false`) or unconfigured, or on a failed
+/// call (warned, degrades this branch only). An `Ok` response with **zero**
+/// embeddings (the provider answered `{"data": []}`) is likewise recorded as
+/// a `vector_embed` failure and returns `None` — see
+/// [`vector_from_response`].
+struct VectorEmbedArm<'a> {
+    /// The engine whose cached embed client, settings (client-rebuild path),
+    /// and degradation tracker the arm touches — nothing else.
+    engine: &'a SearchEngine,
+    /// Settings fingerprint computed once per request (`embed_fingerprint`).
+    fingerprint: String,
+    /// The query to embed (moved into the join — runs concurrently with the
+    /// DB arm).
+    query: String,
+    /// Whether the vector branch runs at all (the mode + embedding-enabled
+    /// gate computed in `search()`); `false` skips the embed HTTP entirely.
+    enabled: bool,
+}
+
+impl<'a> VectorEmbedArm<'a> {
+    /// Run the embed arm: cached client → embed → `format_vector`, with the
+    /// `vector_embed` success/failure degradation recording (the logic
+    /// previously inlined in the `tokio::join!` inside `search()`).
+    async fn run(self) -> Option<String> {
+        if self.enabled {
+            match self.engine.embed_client_with(&self.fingerprint).await {
+                Some(ec) => match ec.embed(&[self.query]).await {
+                    Ok(vecs) => vector_from_response(&self.engine.degradation, vecs),
+                    Err(e) => {
+                        self.engine.degradation.record_failure("vector_embed");
+                        tracing::warn!("vector search disabled for this query: {e}");
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        }
+    }
+}
+
+/// Decide the vector-branch outcome from a *successful* embed response,
+/// recording `vector_embed` on the degradation tracker (WI-5).
+///
+/// A response with **zero** embeddings is a FAILURE, not a success:
+/// `EmbedClient::embed` returns `Ok(vec![])` for a `{"data": []}` provider
+/// response (the index check is vacuous on an empty slice), and recording a
+/// success would leave the tracker reporting HEALTHY while the vector branch
+/// is silently off for the query — the same 0≠n reason the embed pipeline's
+/// `store_guard` rejects count mismatches. Extracted from
+/// [`VectorEmbedArm::run`] so the decision + degradation recording is
+/// unit-testable without HTTP.
+fn vector_from_response(
+    degradation: &crate::health::DegradationTracker,
+    vecs: Vec<Vec<f32>>,
+) -> Option<String> {
+    if vecs.is_empty() {
+        degradation.record_failure("vector_embed");
+        tracing::warn!(
+            "vector search disabled for this query: embed provider returned an empty embedding (no vectors in the response)"
+        );
+        return None;
+    }
+    degradation.record_success("vector_embed");
+    vecs.first().map(|v| format_vector(v))
+}
+
+/// Pre-merge dedup for the trgm arms: **first-wins by arm order** (prefix →
+/// contains → similarity), so a duplicate article id keeps the row from the
+/// EARLIEST arm — typically the prefix arm's row, even if a later arm scored
+/// it higher. This asymmetry against [`merge_results`], whose final dedup
+/// keeps the HIGHEST score, is deliberate (prefix matches are generally the
+/// most relevant — the old single-query semantics). A change to
+/// highest-score-wins here must be deliberate; the behavior is pinned by
+/// `trgm_pre_merge_dedup_first_wins_by_arm_order`.
+fn dedup_trgm_by_first(rows: impl Iterator<Item = SearchRow>) -> Vec<SearchRow> {
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut out: Vec<SearchRow> = Vec::new();
+    for row in rows {
+        if seen.insert(row.0) {
+            out.push(row);
+        }
+    }
+    out
 }
 
 /// Query on a *shared* pooled connection, warn-and-empty on failure (H3):
@@ -938,6 +1027,71 @@ mod tests {
     fn offset_past_end_returns_empty() {
         let out = merge_results(vec![mk(1, 1, "a", 1.0)], vec![], vec![], 10, 5);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn trgm_pre_merge_dedup_first_wins_by_arm_order() {
+        // Pin the PRE-merge trgm dedup: rows arrive in arm order prefix →
+        // contains → similarity, and a duplicate id keeps the EARLIEST
+        // arm's row even though a later arm scored it higher. (merge_results
+        // dedups by highest score instead — see
+        // dedups_by_zim_path_keeps_highest_score.)
+        let row = |id: i64, score: f64| {
+            (
+                id,
+                1,
+                "A/Paris".to_string(),
+                "Paris".to_string(),
+                String::new(),
+                None,
+                "en".to_string(),
+                "zim".to_string(),
+                score,
+            )
+        };
+        let out = dedup_trgm_by_first(vec![row(7, 0.4), row(7, 0.9), row(8, 0.5)].into_iter());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, 7);
+        assert!(
+            (out[0].8 - 0.4).abs() < f64::EPSILON,
+            "prefix arm's (lower) row wins, not the similarity arm's 0.9"
+        );
+        assert_eq!(out[1].0, 8, "a distinct id survives");
+    }
+
+    #[test]
+    fn vector_from_response_empty_records_failure() {
+        let tracker = crate::health::DegradationTracker::default();
+        // Three empty responses → the branch is degraded and reported.
+        for _ in 0..3 {
+            assert!(
+                vector_from_response(&tracker, Vec::new()).is_none(),
+                "zero-embedding response must yield no vector"
+            );
+        }
+        let degraded = tracker.degraded_snapshot();
+        assert!(
+            degraded
+                .iter()
+                .any(|(name, count)| name == "vector_embed" && *count == 3),
+            "empty embed response must be recorded as a vector_embed failure: {degraded:?}"
+        );
+    }
+
+    #[test]
+    fn vector_from_response_non_empty_records_success() {
+        let tracker = crate::health::DegradationTracker::default();
+        // A fresh failure streak is cleared by a real (non-empty) response.
+        tracker.record_failure("vector_embed");
+        tracker.record_failure("vector_embed");
+        tracker.record_failure("vector_embed");
+        assert!(!tracker.degraded_snapshot().is_empty());
+        let out = vector_from_response(&tracker, vec![vec![0.1, 0.2]]);
+        assert_eq!(out.as_deref(), Some("[0.1000000,0.2000000]"));
+        assert!(
+            tracker.degraded_snapshot().is_empty(),
+            "non-empty response must record success and clear the failure count"
+        );
     }
 
     #[test]

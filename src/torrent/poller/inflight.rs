@@ -23,6 +23,12 @@ impl DownloadPoller {
         // In-progress rows whose stats changed enough to write this tick;
         // flushed after the loop as per-row UPDATEs (M-poller-n1).
         let mut changed: Vec<StatsRow> = Vec::new();
+        // Inflight-2: qB entries already consumed by an earlier row this
+        // tick (identity = the torrent's hash, or its lowercased name while
+        // metadata is still pending and the hash is empty). `bind_hash` does
+        // not update the local snapshot maps, so this set is what stops two
+        // same-name NULL-hash rows from both matching the same entry.
+        let mut consumed: HashSet<String> = HashSet::new();
         for r in rows {
             let id = r.id;
             let name = r.name;
@@ -55,14 +61,17 @@ impl DownloadPoller {
             // this guard, two rows sharing a display name could both match
             // the same torrent via the name fallback and double-
             // `handle_complete` (double multi-GB verify/copy + auto-index).
-            let t = if let Some(h) = hash.as_deref() {
-                by_hash.get(h).copied()
-            } else {
-                by_name
-                    .get(name.to_lowercase().as_str())
-                    .or_else(|| by_name.get(url.to_lowercase().as_str()))
-                    .copied()
-            };
+            // Inflight-2: the name fallback additionally skips qB entries an
+            // earlier row already consumed this tick (two same-name NULL-hash
+            // rows would otherwise both match the same entry and bind the
+            // same hash).
+            let t =
+                match_inflight_torrent(hash.as_deref(), &name, &url, by_hash, by_name, &consumed);
+            // The row owns its matched entry for the rest of this tick:
+            // record the identity so a later same-name row skips it.
+            if let Some(t) = t {
+                consumed.insert(torrent_identity(t));
+            }
 
             // Seeding rows: the ZIM is already installed — only refresh the
             // per-torrent seeding stats, or settle the row once the torrent
@@ -122,6 +131,23 @@ impl DownloadPoller {
 
             match t {
                 Some(t) => {
+                    // Inflight-1: the missing-torrent grace clock is measured
+                    // from `updated_at`, which otherwise only advances on
+                    // stats writes — a stalled torrent with unchanged stats
+                    // would carry an exhausted grace clock the moment it
+                    // vanished. While the torrent IS visible, refresh the
+                    // clock when the row is stale (cheap: one guarded UPDATE
+                    // at most once per `VISIBILITY_TOUCH_AFTER` window).
+                    if visibility_touch_due(updated, chrono::Utc::now()) {
+                        let touched =
+                            crate::db::downloads_lifecycle::touch_downloading(&self.db, id).await?;
+                        if touched == 0 {
+                            tracing::debug!(
+                                download_id = id,
+                                "visibility touch: row no longer downloading"
+                            );
+                        }
+                    }
                     if hash.as_deref() != Some(t.hash.as_str()) {
                         crate::db::downloads_lifecycle::bind_hash(&self.db, id, &t.hash).await?;
                     }
@@ -130,19 +156,32 @@ impl DownloadPoller {
                             .err_str
                             .clone()
                             .unwrap_or_else(|| format!("torrent state: {}", t.state));
-                        crate::db::downloads_lifecycle::mark_fatal_error(&self.db, id, &msg)
-                            .await?;
+                        let marked =
+                            crate::db::downloads_lifecycle::mark_fatal_error(&self.db, id, &msg)
+                                .await?;
+                        if marked == 0 {
+                            tracing::info!(
+                                download_id = id,
+                                "skipping fatal error mark: row no longer queued/downloading"
+                            );
+                        }
                     } else if t.is_complete() {
                         if let Err(e) = self
-                            .handle_complete(id, t, qbit.clone(), p, file_path)
+                            .handle_complete(id, &name, t, qbit.clone(), p, file_path)
                             .await
                         {
-                            crate::db::downloads_lifecycle::mark_fatal_error(
+                            let marked = crate::db::downloads_lifecycle::mark_fatal_error(
                                 &self.db,
                                 id,
                                 &e.to_string(),
                             )
                             .await?;
+                            if marked == 0 {
+                                tracing::info!(
+                                    download_id = id,
+                                    "skipping fatal error mark: row no longer queued/downloading"
+                                );
+                            }
                         }
                     } else {
                         // M-poller-n1: skip the DB write when nothing
@@ -165,15 +204,25 @@ impl DownloadPoller {
                 }
                 // Torrent not visible yet. We only error after the grace
                 // period — `updated_at` is refreshed every time the torrent
-                // *is* visible, so a vanished torrent ages out naturally.
+                // *is* visible (the visibility touch: `touch_downloading`, at
+                // most one per `VISIBILITY_TOUCH_AFTER` window, in addition
+                // to the stats writes), so the grace window measures how long
+                // the torrent has been invisible, and a vanished torrent ages
+                // out naturally.
                 // (Skipped entirely when qB itself was unreachable this tick.)
                 None if qb_available && chrono::Utc::now() - updated > MISSING_TORRENT_GRACE => {
-                    crate::db::downloads_lifecycle::mark_fatal_error(
+                    let marked = crate::db::downloads_lifecycle::mark_fatal_error(
                         &self.db,
                         id,
                         "torrent not found in qBittorrent",
                     )
                     .await?;
+                    if marked == 0 {
+                        tracing::info!(
+                            download_id = id,
+                            "skipping fatal error mark: row no longer queued/downloading"
+                        );
+                    }
                 }
                 // qB was unreachable this tick — don't judge anything as
                 // missing; re-check next cycle.
@@ -193,5 +242,177 @@ impl DownloadPoller {
         if let Err(e) = apply_stats_batch(&self.db, changed).await {
             tracing::warn!("download stats write failed: {e}");
         }
+    }
+}
+
+// ── Pure decision helpers (unit-testable seams) ─────────────────────────────
+
+/// Inflight-1: how stale a row's `updated_at` must be before the
+/// visibility touch refreshes it. A no-op-cheap gate: while the row keeps
+/// getting stats writes (or is fresh from a bind), the touch never fires.
+pub(super) const VISIBILITY_TOUCH_AFTER: chrono::Duration = chrono::Duration::seconds(60);
+
+/// Inflight-1 (pure): should a row whose torrent is visible this tick get
+/// its `updated_at` refreshed? `true` once the row's last write is strictly
+/// older than [`VISIBILITY_TOUCH_AFTER`]. The touch is what makes the
+/// missing-torrent grace clock measure *invisibility* instead of the gap
+/// since the last stats write. (Clock skew — `updated_at` in the future —
+/// yields a negative age and never fires.)
+pub(super) fn visibility_touch_due(
+    updated_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    now.signed_duration_since(updated_at) > VISIBILITY_TOUCH_AFTER
+}
+
+/// Inflight-2 (pure): the per-tick identity of a qBittorrent entry for the
+/// consumed set — the torrent's hash when known, else a lowercased-name key
+/// (metadata-pending entries have no hash yet).
+pub(super) fn torrent_identity(t: &TorrentInfo) -> String {
+    if t.hash.is_empty() {
+        format!("name:{}", t.name.to_lowercase())
+    } else {
+        t.hash.clone()
+    }
+}
+
+/// Inflight-2 (pure): the hash-first / name-fallback match decision for one
+/// in-flight row. A row with a bound hash matches **only** by hash (BUG-B4);
+/// a `hash IS NULL` row falls back to the torrent name (or URL), skipping
+/// any qB entry in `consumed` — the entries an earlier row already matched
+/// this tick (the snapshot maps are not updated by `bind_hash`).
+pub(super) fn match_inflight_torrent<'a>(
+    hash: Option<&str>,
+    name: &str,
+    url: &str,
+    by_hash: &'a HashMap<&str, &TorrentInfo>,
+    by_name: &'a HashMap<String, &TorrentInfo>,
+    consumed: &HashSet<String>,
+) -> Option<&'a TorrentInfo> {
+    if let Some(h) = hash {
+        by_hash.get(h).copied()
+    } else {
+        by_name
+            .get(name.to_lowercase().as_str())
+            .or_else(|| by_name.get(url.to_lowercase().as_str()))
+            .filter(|t| !consumed.contains(&torrent_identity(t)))
+            .copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::state::tinfo;
+
+    use super::*;
+
+    /// A downloadable-state torrent with explicit hash/name.
+    fn ti(hash: &str, name: &str) -> TorrentInfo {
+        let mut t = tinfo("downloading", 0.5);
+        t.hash = hash.into();
+        t.name = name.into();
+        t
+    }
+
+    fn maps(t: &TorrentInfo) -> (HashMap<&str, &TorrentInfo>, HashMap<String, &TorrentInfo>) {
+        let hash_key = t.hash.as_str();
+        (
+            HashMap::from([(hash_key, t)]),
+            HashMap::from([(t.name.to_lowercase(), t)]),
+        )
+    }
+
+    #[test]
+    fn visibility_touch_due_only_when_stale() {
+        let now = chrono::Utc::now();
+        assert!(!visibility_touch_due(
+            now - chrono::Duration::seconds(59),
+            now
+        ));
+        // The boundary is strict: exactly 60 s old is not yet due.
+        assert!(!visibility_touch_due(
+            now - chrono::Duration::seconds(60),
+            now
+        ));
+        assert!(visibility_touch_due(
+            now - chrono::Duration::seconds(61),
+            now
+        ));
+        // Clock skew (updated_at in the future) must not panic or fire.
+        assert!(!visibility_touch_due(
+            now + chrono::Duration::seconds(5),
+            now
+        ));
+    }
+
+    #[test]
+    fn match_hash_bound_rows_by_hash_only() {
+        let t = ti("h1", "Dup Name");
+        let (by_hash, by_name) = maps(&t);
+        let consumed = HashSet::new();
+        // A bound hash matches by hash (even when the name would match too).
+        assert!(matches!(
+            match_inflight_torrent(Some("h1"), "Dup Name", "u", &by_hash, &by_name, &consumed),
+            Some(x) if x.hash == "h1"
+        ));
+        // A stale bound hash must NOT fall back to the name (BUG-B4).
+        assert!(match_inflight_torrent(
+            Some("stale"),
+            "Dup Name",
+            "u",
+            &by_hash,
+            &by_name,
+            &consumed
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn match_null_hash_same_name_skips_consumed() {
+        let t = ti("h1", "Dup Name");
+        let (by_hash, by_name) = maps(&t);
+        let mut consumed = HashSet::new();
+        // The first same-name NULL-hash row matches the entry…
+        let first = match_inflight_torrent(None, "Dup Name", "u", &by_hash, &by_name, &consumed)
+            .expect("first same-name row must match");
+        consumed.insert(torrent_identity(first));
+        // …and the second same-name row must skip it within the same tick.
+        assert!(
+            match_inflight_torrent(None, "Dup Name", "u", &by_hash, &by_name, &consumed).is_none(),
+            "second same-name NULL-hash row must not re-match the consumed entry"
+        );
+        // A row bound to the consumed entry's hash still matches by hash
+        // (hash match is authoritative; only the name fallback is guarded).
+        assert!(
+            match_inflight_torrent(Some("h1"), "Other", "u", &by_hash, &by_name, &consumed)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn match_consumed_entry_found_via_url_is_skipped_too() {
+        let t = ti("h1", "Dup Name");
+        let (by_hash, by_name) = maps(&t);
+        let mut consumed = HashSet::new();
+        // Name miss, URL hit: the URL fallback matches the same entry…
+        let via_url =
+            match_inflight_torrent(None, "other", "Dup Name", &by_hash, &by_name, &consumed)
+                .expect("url fallback must match");
+        assert_eq!(via_url.hash, "h1");
+        consumed.insert(torrent_identity(via_url));
+        // …so a later row hitting the entry by name now skips it.
+        assert!(
+            match_inflight_torrent(None, "Dup Name", "u", &by_hash, &by_name, &consumed).is_none()
+        );
+    }
+
+    #[test]
+    fn identity_uses_name_when_hash_pending() {
+        // Metadata-pending: empty hash → name key.
+        let pending = ti("", "Pending Name");
+        assert_eq!(torrent_identity(&pending), "name:pending name");
+        // Known hash → hash key.
+        let known = ti("h1", "Pending Name");
+        assert_eq!(torrent_identity(&known), "h1");
     }
 }

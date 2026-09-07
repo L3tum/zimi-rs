@@ -192,6 +192,18 @@ fn cap_read_flags_oversize() {
 }
 
 #[test]
+fn read_max_length_capped_at_read_cap() {
+    // The `max_length` read argument is clamped at `MAX_READ_BYTES` (the
+    // available source text is itself bounded by the raw-read cap), so
+    // uncapped requests like `u64::MAX` can never return more content —
+    // same bound for the HTTP and MCP front ends.
+    assert_eq!(clamp_read_max_length(8000), 8000);
+    assert_eq!(clamp_read_max_length(MAX_READ_BYTES), MAX_READ_BYTES);
+    assert_eq!(clamp_read_max_length(MAX_READ_BYTES + 1), MAX_READ_BYTES);
+    assert_eq!(clamp_read_max_length(usize::MAX), MAX_READ_BYTES);
+}
+
+#[test]
 fn html_to_text_keeps_decodable() {
     // A single bad byte must not drop the whole body (BUG-12): the decodable
     // text around it survives.

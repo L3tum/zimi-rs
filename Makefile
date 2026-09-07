@@ -89,10 +89,12 @@ test-integration:
 test-strict:
 	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration)
 
-# Local mirror of the CI PR gate (P13): the test-db job in
-# .github/workflows/ci.yml is this target's CI twin — strict integration. The
-# two must be kept in sync: any change to the selection of lib vs integration
-# halves (flags) needs to land in both this target and the CI job. Both halves
+# Local mirror of the CI PR gate (P13): the CI `coverage` job in
+# .github/workflows/ci.yml is this target's CI twin — strict integration, now
+# run under `cargo llvm-cov` as a superset of this selection (it adds
+# --all-features and the wiremock suite). Keep the two in sync: any change to
+# the selection of lib vs integration halves (flags) needs to land in both
+# this target and the CI job. Both halves
 # run with the default parallel --test-threads: the lib's DB-gated tests and
 # the integration suite share one dev DB, but every DB-gated test is
 # serialized by DbExclusiveGuard (cross-process lockfile + in-process slot),
