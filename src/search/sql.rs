@@ -2,19 +2,19 @@
 //! fragment/ARM assembly, column fragments). No DB access — this module
 //! builds SQL text only.
 //!
-//! **Why raw SQL and not SeaORM QueryBuilder:** every builder here contains
-//! a Postgres operator the SeaORM QueryBuilder cannot express, so all five
-//! stay on the raw-SQL escape hatch ([`crate::db::raw`] / `run_sql_on`):
+//! **Why raw SQL:** every query here contains a Postgres operator the
+//! `db::raw` helper shapes cannot take, so all five stay on the raw-SQL
+//! path ([`crate::db::raw`] / `run_sql_on`):
 //! - `fts_sql`: `websearch_to_tsquery`, the `@@` match operator, `ts_rank_cd`,
 //!   and `ts_headline` (full-text search).
 //! - `trgm_prefix_sql` / `trgm_contains_sql`: the pg_trgm `similarity()` score
-//!   (the `LIKE` filter alone would be builder-expressible, but the SELECT
+//!   (the `LIKE` filter alone would be helper-expressible, but the SELECT
 //!   score is not).
 //! - `trgm_similarity_sql`: the pg_trgm `%` "is similar" operator and
 //!   `similarity()`.
 //! - `vector_sql`: the pgvector `<=>` cosine-distance operator, used in both
 //!   the score and the ANN `ORDER BY` (an index-only ANN ordering the
-//!   builder cannot emit).
+//!   helpers cannot emit).
 use super::trgm_arms_enabled;
 
 /// Hard ceiling on `limit` regardless of `search.max_limit`, applied before the
@@ -176,7 +176,7 @@ fn score_query(
 /// Build the FTS search query. `$1` is always the query string.
 ///
 /// Raw SQL: `websearch_to_tsquery` / `@@` / `ts_rank_cd` / `ts_headline`
-/// have no SeaORM QueryBuilder equivalents.
+/// have no `db::raw` helper equivalents.
 pub(super) fn fts_sql(
     query: &str,
     highlight: bool,
@@ -222,8 +222,8 @@ pub(super) fn fts_sql(
 
 /// Build a trigram prefix-match query (btree index on `title_lower`).
 ///
-/// Raw SQL: the score is pg_trgm `similarity()`, which the SeaORM
-/// QueryBuilder cannot express (the `LIKE` filter alone would be).
+/// Raw SQL: the score is pg_trgm `similarity()`, which the `db::raw`
+/// helpers cannot express (the `LIKE` filter alone would be).
 pub(super) fn trgm_prefix_sql(
     query_lower: &str,
     zim: Option<&str>,
@@ -267,8 +267,8 @@ pub(super) fn trgm_contains_sql(
 
 /// Build a trigram similarity-threshold query (GiST trgm index on `title_lower`).
 ///
-/// Raw SQL: the pg_trgm `%` operator and `similarity()` have no SeaORM
-/// QueryBuilder equivalents.
+/// Raw SQL: the pg_trgm `%` operator and `similarity()` have no `db::raw`
+/// helper equivalents.
 ///
 /// BUG-1: the old `WHERE similarity(a.title_lower, $1) > $2` bound the
 /// threshold as `text` (`SqlQuery.params` is `Vec<String>`); `real > text`
@@ -304,7 +304,7 @@ pub(super) fn trgm_similarity_sql(
 /// Build the vector (semantic) search query. `$1` is the pgvector literal.
 ///
 /// Raw SQL: the pgvector `<=>` cosine-distance operator (score + ANN
-/// `ORDER BY`) has no SeaORM QueryBuilder equivalent.
+/// `ORDER BY`) has no `db::raw` helper equivalent.
 pub(super) fn vector_sql(
     vec_str: &str,
     zim: Option<&str>,

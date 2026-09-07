@@ -141,7 +141,7 @@ impl SearchEngine {
     /// the trgm arms recover when the extension is installed at runtime. A
     /// `true` result is cached permanently (no reason to re-probe).
     ///
-    /// Acquires a pool connection for the probe — use [`ensure_trgm_on`] from
+    /// Acquires a pool connection for the probe — use [`SearchEngine::ensure_trgm_on`] from
     /// a code path that already holds a connection (the `search()`/`suggest()`
     /// arms): a second nested checkout stalls the full `acquire_timeout` when
     /// `DB_POOL_SIZE=1`.
@@ -157,7 +157,7 @@ impl SearchEngine {
         self.trgm_store(ok)
     }
 
-    /// [`ensure_trgm`] for callers that already hold a pooled connection
+    /// [`SearchEngine::ensure_trgm`] for callers that already hold a pooled connection
     /// (the `search()`/`suggest()` arms): probes **through** the passed
     /// executor instead of taking a second checkout — at `DB_POOL_SIZE=1`
     /// a nested `pool.acquire()` would stall the full `acquire_timeout`
@@ -173,13 +173,13 @@ impl SearchEngine {
     }
 
     /// The `pg_trgm` catalog probe on any executor. Raw SQL (catalog probe —
-    /// `pg_extension` has no SeaORM entity; plain SELECT, no special
-    /// operators).
+    /// `pg_extension` is a catalog table with no `db::raw` helper; plain
+    /// SELECT, no special operators).
     async fn trgm_probe<'e, E>(&self, executor: E) -> bool
     where
         E: Executor<'e, Database = sqlx::Postgres>,
     {
-        sqlx::query("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'") // RAW-OK: catalog probe of pg_extension — no SeaORM entity exists for catalog tables (sanctioned class per the db::raw doc)
+        sqlx::query("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'") // RAW-OK: catalog probe of pg_extension — no db::raw helper exists for catalog tables (sanctioned class per the db::raw doc)
             .fetch_optional(executor)
             .await
             .is_ok()
@@ -677,7 +677,7 @@ pub async fn run_sql_on<'e, E>(
 where
     E: Executor<'e, Database = sqlx::Postgres>,
 {
-    let mut query = sqlx::query_as::<_, SearchRow>(&sq.sql); // RAW-OK: runtime-built FTS/vector hybrid branch query (dynamic SQL + dynamic `$n` binds) — unexpressible via the db::raw helpers or the SeaORM builder
+    let mut query = sqlx::query_as::<_, SearchRow>(&sq.sql); // RAW-OK: runtime-built FTS/vector hybrid branch query (dynamic SQL + dynamic `$n` binds) — unexpressible via the db::raw helpers
     for p in &sq.params {
         query = query.bind(p);
     }

@@ -93,8 +93,9 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
     // starting instances must not interleave. The guards need only `Config`
     // (DSN + zim_dir), so they can come first.
     let allow_multi = startup::multi_instance_allowed();
-    let allow_multi_db =
-        !allow_multi && matches!(std::env::var("ZIMSERVICE_ALLOW_MULTI_DB"), Ok(v) if v == "1");
+    // m-7 partial opt-out: parsed from `ZIMSERVICE_ALLOW_MULTI_DB` (exact "1")
+    // through `Config` at startup, like every other process concern.
+    let allow_multi_db = !allow_multi && config.allow_multi_db;
     let guard = if allow_multi {
         // Opt-out: skip both guards (the operator accepts multi-instance risk).
         tracing::warn!("ZIMSERVICE_ALLOW_MULTI_INSTANCE=1: single-instance guards disabled");
@@ -456,13 +457,14 @@ async fn cmd_mcp(config: Config) -> anyhow::Result<()> {
     let state = Arc::new(state);
 
     // DEC-2: In password mode, require MCP_AUTH_PASSWORD env var and verify
-    // against the configured admin password (fail-closed).
+    // against the configured admin password (fail-closed). The env var is
+    // read through `Config` at startup, like every other process concern.
     let access_mode = state.settings.access_mode();
     let configured_pw = state
         .settings
         .get_typed::<String>(KEY_ACCESS_ADMIN_PASSWORD)
         .unwrap_or_default();
-    let provided = std::env::var("MCP_AUTH_PASSWORD").ok();
+    let provided = config.mcp_auth_password;
     zimservice::mcp::mcp_auth_ok(&access_mode, &configured_pw, provided.as_deref()).map_err(
         |e| {
             eprintln!("MCP auth failed: {e}");

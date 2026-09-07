@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use tokio::time::sleep;
 
-use crate::db::entities::downloads::{Column, Entity, Model as DownloadRow};
+use crate::db::downloads::DownloadRecord;
 use crate::db::Pool;
 use crate::error::{Error, Result, TorrentKind};
 use crate::netguard::{assert_host_not_blocked, resolve_download_host, validate_download_url};
@@ -33,8 +33,6 @@ use crate::torrent::files::{install_zim, locate_torrent_zim, validate_download_n
 use crate::torrent::{
     connect_qbit, qbit_fingerprint, resolve_qbit_inputs, QbitClient, QbitClientCache,
 };
-use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect};
 
 mod complete;
 mod direct;
@@ -347,18 +345,15 @@ impl DownloadPoller {
     }
 
     /// LINT-2 extraction (verbatim `tick()` step-3 block 1): the in-flight
-    /// rows the tick body processes (downloading + seeding). Returning the
-    /// entity `Model` (owned values) is sound — no connection is involved.
-    async fn fetch_inflight_rows(&self) -> Result<Vec<DownloadRow>> {
-        let db = crate::db::sea_orm_db(&self.db);
-        Entity::find()
-            .filter(Column::Status.is_in([
-                crate::torrent::DownloadStatus::Downloading.as_str(),
-                crate::torrent::DownloadStatus::Seeding.as_str(),
-            ]))
-            .all(&db)
-            .await
-            .map_err(Error::from)
+    /// rows the tick body processes (downloading + seeding). Returning owned
+    /// [`DownloadRecord`] values is sound — no connection is involved.
+    async fn fetch_inflight_rows(&self) -> Result<Vec<DownloadRecord>> {
+        crate::db::downloads::fetch_downloads_by_statuses(
+            &self.db,
+            crate::torrent::DownloadStatus::Downloading.as_str(),
+            crate::torrent::DownloadStatus::Seeding.as_str(),
+        )
+        .await
     }
 
     /// LINT-2 extraction (verbatim `tick()` early-exit block): whether this
@@ -368,35 +363,29 @@ impl DownloadPoller {
     /// their own rows and are excluded), seeding rows, and cancellations with
     /// a live hash binding.
     async fn should_skip_tick(&self) -> Result<bool> {
-        let db = crate::db::sea_orm_db(&self.db);
         // `url NOT LIKE '%.zim'` (after stripping query **and** fragment) =
-        // torrent rows (inverse of `is_direct_zim_url`). The predicate
-        // fragment is `Expr::cust` — see `retry_interrupted_directs`.
-        // sea-orm 1.x dropped `Select::count`; a `count(id)` projection
-        // (id = the non-null PK) yields the same number.
-        let n: i64 = Entity::find()
-            .select_only()
-            .column_as(Expr::col(Column::Id).count(), "n")
-            .filter(
-                Column::Status
-                    .eq(crate::torrent::DownloadStatus::Queued.as_str())
-                    .or(Column::Status
-                        .eq(crate::torrent::DownloadStatus::Downloading.as_str())
-                        .and(Expr::cust(format!(
-                            "({pred}) NOT LIKE '%.zim'",
-                            pred = ZIM_URL_PREDICATE
-                        ))))
-                    .or(Column::Status.eq(crate::torrent::DownloadStatus::Seeding.as_str()))
-                    .or(Column::Status
-                        .eq(crate::torrent::DownloadStatus::Cancelled.as_str())
-                        .and(Column::Hash.is_not_null())),
-            )
-            .into_tuple()
-            .one(&db)
-            .await
-            .map_err(Error::from)?
-            .map(|(n,)| n)
-            .unwrap_or(0);
+        // torrent rows (inverse of `is_direct_zim_url`). `count(id)` (id =
+        // the non-null PK) is the skip-tick gate; the predicate fragment
+        // ([`ZIM_URL_PREDICATE`]) splices in verbatim.
+        let n: i64 = crate::db::raw::fetch_scalar_optional(
+            &self.db,
+            &format!(
+                "SELECT count(id) FROM downloads \
+                 WHERE status = $1 \
+                    OR (status = $2 AND ({pred}) NOT LIKE '%.zim') \
+                    OR status = $3 \
+                    OR (status = $4 AND hash IS NOT NULL)",
+                pred = ZIM_URL_PREDICATE
+            ),
+            |q| {
+                q.bind(crate::torrent::DownloadStatus::Queued.as_str())
+                    .bind(crate::torrent::DownloadStatus::Downloading.as_str())
+                    .bind(crate::torrent::DownloadStatus::Seeding.as_str())
+                    .bind(crate::torrent::DownloadStatus::Cancelled.as_str())
+            },
+        )
+        .await?
+        .unwrap_or(0);
         Ok(n == 0)
     }
 
@@ -407,10 +396,9 @@ impl DownloadPoller {
     /// cycling forever. A 401/403 session expiry is always exempt — the next
     /// re-login is the fix, not a human.
     async fn requeue_stale_errors(&self) -> Result<()> {
-        // Raw escape hatch (db::raw): the case-insensitive regex match
-        // `error ~* $1` — sea-query 0.32 has no regex operator, so the
-        // SELECT stays raw (the guarded UPDATE lives in
-        // `downloads_lifecycle::requeue_stale_errors`, builder-built).
+        // Raw SQL (db::raw): the case-insensitive regex match `error ~* $1`
+        // has no `db::raw` helper shape (the guarded UPDATE lives in
+        // `downloads_lifecycle::requeue_stale_errors`).
         let stale: Vec<(i32, String)> = crate::db::raw::fetch_all(
             &self.db,
             &format!(
@@ -522,19 +510,12 @@ impl DownloadPoller {
     /// bookkeeping queries. Drain them: once the hash is NULL the row
     /// early-exits.
     async fn process_cancelled(&self, qbit: Option<&Arc<QbitClient>>) -> Result<()> {
-        let cancelled: Vec<(i32, Option<String>)> = {
-            let db = crate::db::sea_orm_db(&self.db);
-            Entity::find()
-                .select_only()
-                .column(Column::Id)
-                .column(Column::Hash)
-                .filter(Column::Status.eq(crate::torrent::DownloadStatus::Cancelled.as_str()))
-                .filter(Column::Hash.is_not_null())
-                .into_tuple()
-                .all(&db)
-                .await
-                .map_err(Error::from)?
-        };
+        let cancelled: Vec<(i32, Option<String>)> = crate::db::raw::fetch_all(
+            &self.db,
+            "SELECT id, hash FROM downloads WHERE status = $1 AND hash IS NOT NULL",
+            |q| q.bind(crate::torrent::DownloadStatus::Cancelled.as_str()),
+        )
+        .await?;
         // BUG-21: no qB → drain the hash bindings so the rows early-exit.
         if qbit.is_none() {
             let n = crate::db::downloads_lifecycle::drain_cancelled_hashes(&self.db)
@@ -580,21 +561,16 @@ impl DownloadPoller {
         p: &crate::settings::PollerParams,
         torrents: &[super::TorrentInfo],
     ) -> Result<()> {
-        let queued: Vec<(i32, String, String)> = {
-            let db = crate::db::sea_orm_db(&self.db);
-            Entity::find()
-                .select_only()
-                .column(Column::Id)
-                .column(Column::Name)
-                .column(Column::Url)
-                .filter(Column::Status.eq(crate::torrent::DownloadStatus::Queued.as_str()))
-                .order_by(Column::Id, Order::Asc)
-                .limit(MAX_QUEUED_PER_TICK as u64)
-                .into_tuple()
-                .all(&db)
-                .await
-                .map_err(Error::from)?
-        };
+        let queued: Vec<(i32, String, String)> = crate::db::raw::fetch_all(
+            &self.db,
+            "SELECT id, name, url FROM downloads WHERE status = $1 \
+             ORDER BY id ASC LIMIT $2",
+            |q| {
+                q.bind(crate::torrent::DownloadStatus::Queued.as_str())
+                    .bind(MAX_QUEUED_PER_TICK as i64)
+            },
+        )
+        .await?;
         // Only torrents in OUR category count against the active budget — other
         // people's qBittorrent downloads must not starve ours.
         let category = p.category.clone();
@@ -607,28 +583,23 @@ impl DownloadPoller {
         // '%.zim'` (after stripping query and fragment) is the SQL form of
         // `is_direct_zim_url`.
         let direct_active: i32 = {
-            let db = crate::db::sea_orm_db(&self.db);
-            // The predicate fragment is `Expr::cust` (byte-stable, see
-            // `retry_interrupted_directs`). Query errors keep the budget
-            // whole: the count falls back to 0, as before. sea-orm 1.x
-            // dropped `Select::count`; a `count(id)` projection (id = the
-            // non-null PK) yields the same number.
-            let n: i64 = Entity::find()
-                .select_only()
-                .column_as(Expr::col(Column::Id).count(), "n")
-                .filter(Column::Status.eq(crate::torrent::DownloadStatus::Downloading.as_str()))
-                .filter(Expr::cust(format!(
-                    "({pred}) LIKE '%.zim'",
+            // The predicate fragment ([`ZIM_URL_PREDICATE`]) splices in
+            // verbatim (byte-stable, see `retry_interrupted_directs`). Query
+            // errors keep the budget whole: the count falls back to 0, as
+            // before. `count(id)` (id = the non-null PK) is the gate.
+            let n: i64 = crate::db::raw::fetch_scalar_optional(
+                &self.db,
+                &format!(
+                    "SELECT count(id) FROM downloads \
+                     WHERE status = $1 AND ({pred}) LIKE '%.zim' AND file_path IS NOT NULL",
                     pred = ZIM_URL_PREDICATE
-                )))
-                .filter(Column::FilePath.is_not_null())
-                .into_tuple()
-                .one(&db)
-                .await
-                .ok()
-                .flatten()
-                .map(|(n,)| n)
-                .unwrap_or(0);
+                ),
+                |q| q.bind(crate::torrent::DownloadStatus::Downloading.as_str()),
+            )
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
             n as i32
         };
         let mut budget = (self

@@ -167,8 +167,8 @@ pub async fn build_state(
             .acquire()
             .await
             .map_err(|e| anyhow::anyhow!("pool: {e}"))?;
-        // Raw escape hatch (db::raw): `pg_locks` catalog probe — the SeaORM
-        // builder only sees application tables.
+        // Raw SQL (db::raw): `pg_locks` catalog probe — the `db::raw`
+        // helpers only cover application tables.
         let held = db::raw::fetch_scalar_optional(
             &mut *conn,
             &format!(
@@ -457,6 +457,14 @@ pub struct MutatingGuard {
 /// a change persisted by one instance is invisible to the others until
 /// restart. The callers use this to surface the divergence continuously
 /// instead of only via the one startup `tracing::warn!`.
+///
+/// This is the **single, deliberate** reader of
+/// `ZIMSERVICE_ALLOW_MULTI_INSTANCE`, kept outside `Config` on purpose: it
+/// must stay re-readable at **any point after process start** (startup
+/// guards, `/health`, the settings-divergence warnings), not just at
+/// `Config::load()` time. Note that `SettingsCache` (`src/settings/cache.rs`)
+/// calls this at construction and **snapshots the result once** — callers
+/// that need the live value must call this fn directly, not the cached copy.
 pub fn multi_instance_allowed() -> bool {
     matches!(std::env::var("ZIMSERVICE_ALLOW_MULTI_INSTANCE"), Ok(v) if v == "1")
 }

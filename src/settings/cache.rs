@@ -27,6 +27,14 @@ use super::defs::{
 /// time are denied (safe: an unverified token is never admitted). Denied
 /// attempts are still recorded in the negative cache so a flood re-hits the
 /// cache rather than re-queuing.
+///
+/// **DI exception (deliberate):** `KDF_SEM` is a process-global
+/// `LazyLock` static — the one mutable global in an otherwise fully
+/// dependency-injected codebase. It is kept outside `SettingsCache`'s
+/// fields because the limit must hold *across the whole process* (every
+/// request handler, middleware layer, and background task verifies tokens
+/// through the same cap), not per-cache-instance; it is a constant
+/// (no config dependency) and nothing else may read or write it.
 const KDF_MAX_CONCURRENT: usize = 16;
 const KDF_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 static KDF_SEM: std::sync::LazyLock<tokio::sync::Semaphore> =

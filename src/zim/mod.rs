@@ -13,9 +13,8 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::SystemTime;
 
-use crate::db::{entities::zims, pool::Pool, raw, sea_orm_db};
+use crate::db::{pool::Pool, raw};
 use crate::error::{Error, Result};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
 /// Max simultaneously-open ZIM handles. Each open ZIM holds one mmap fd, so this
 /// bounds fd usage. Oldest (by insertion order) is evicted when the cap is hit.
@@ -56,6 +55,55 @@ struct CachedZim {
     /// Epoch-ms of the last `stat` for this handle. A recently-stat'd
     /// handle is trusted without re-statting (see `STAT_TTL_MS`).
     last_stat: AtomicU64,
+}
+
+/// One `zims` row as decoded by [`ZimManager::load_from_db`]. A named struct
+/// (decoded by column name) rather than a tuple: the SELECT lists 17
+/// columns, past sqlx's 16-tuple `FromRow` cap, and this sqlx build has the
+/// `derive` feature off.
+struct ZimRow {
+    id: i32,
+    name: String,
+    display_title: String,
+    description: Option<String>,
+    language: String,
+    creator: Option<String>,
+    publisher: Option<String>,
+    date: Option<chrono::NaiveDate>,
+    entry_count: i64,
+    article_count: i64,
+    file_path: String,
+    file_size: i64,
+    category: Option<String>,
+    index_status: String,
+    index_progress: f32,
+    indexed_entries: i64,
+    embed_enabled: bool,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ZimRow {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> std::result::Result<Self, sqlx::Error> {
+        use sqlx::Row as _;
+        Ok(Self {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            display_title: row.try_get("display_title")?,
+            description: row.try_get("description")?,
+            language: row.try_get("language")?,
+            creator: row.try_get("creator")?,
+            publisher: row.try_get("publisher")?,
+            date: row.try_get("date")?,
+            entry_count: row.try_get("entry_count")?,
+            article_count: row.try_get("article_count")?,
+            file_path: row.try_get("file_path")?,
+            file_size: row.try_get("file_size")?,
+            category: row.try_get("category")?,
+            index_status: row.try_get("index_status")?,
+            index_progress: row.try_get("index_progress")?,
+            indexed_entries: row.try_get("indexed_entries")?,
+            embed_enabled: row.try_get("embed_enabled")?,
+        })
+    }
 }
 
 /// Pure staleness predicate for a cached ZIM handle (WI-38 / PERF-6): a handle
@@ -249,13 +297,11 @@ impl ZimManager {
 
     /// Persist ZIM metadata to the database (upsert).
     ///
-    /// Raw (not the SeaORM builder): the statement binds `meta.date` as a
-    /// loose `Option<String>` straight into the `DATE` column, keeps
-    /// `file_mtime = now()` / `updated_at = now()` server-side, and the
-    /// `ON CONFLICT (name) DO UPDATE` arm re-writes `date = $7` — an explicit
-    /// `NULL` overwrite the builder's `NotSet`-skips-columns semantics
-    /// can't express (and `col = now()` in the DO UPDATE arm needs raw SQL
-    /// anyway).
+    /// Raw SQL: the statement binds `meta.date` as a loose `Option<String>`
+    /// straight into the `DATE` column, keeps `file_mtime = now()` /
+    /// `updated_at = now()` server-side, and the `ON CONFLICT (name) DO
+    /// UPDATE` arm re-writes `date = $7` — an explicit `NULL` overwrite that
+    /// needs raw SQL (as does `col = now()` in the DO UPDATE arm).
     async fn persist_to_db(&self, meta: &ZimMeta) -> Result<()> {
         let entry_count = meta.entry_count as i64;
         let article_count = meta.article_count as i64;
@@ -431,23 +477,24 @@ impl ZimManager {
     /// cache entries; an optional `resync()` then reconciles against the
     /// actual files (see `populate_zims` in main.rs).
     pub async fn load_from_db(&self) -> Result<()> {
-        // SeaORM entity select: `date` comes back as `Option<NaiveDate>`
-        // (the old `date::text` — `NaiveDate::to_string` is the identical
-        // `YYYY-MM-DD` text) and `index_progress` as `REAL`/`f32` (exact
-        // when widened to the `f64` ZimMeta carries).
-        let db = sea_orm_db(&self.db);
-        let models = zims::Entity::find()
-            .order_by_asc(zims::Column::Name)
-            .all(&db)
-            .await
-            .map_err(Error::SeaOrm)?;
+        let rows: Vec<ZimRow> = raw::fetch_all(
+            &self.db,
+            "SELECT id, name, display_title, description, language, creator, publisher, date, \
+             entry_count, article_count, file_path, file_size, category, index_status, \
+             index_progress, indexed_entries, embed_enabled \
+             FROM zims ORDER BY name",
+            |q| q,
+        )
+        .await?;
 
         let mut cache = self.cache.write().expect("zim cache lock poisoned");
-        for m in models {
-            let name = m.name;
+        for m in rows {
+            // `date` comes back as `Option<NaiveDate>` (`NaiveDate::to_string`
+            // is the identical `YYYY-MM-DD` text) and `index_progress` as
+            // `REAL`/`f32` (exact when widened to the `f64` ZimMeta carries).
             let meta = ZimMeta {
                 id: Some(m.id),
-                name: name.clone(),
+                name: m.name.clone(),
                 display_title: m.display_title,
                 description: m.description,
                 language: m.language,
@@ -464,7 +511,7 @@ impl ZimManager {
                 indexed_entries: count_u64(m.indexed_entries),
                 embed_enabled: m.embed_enabled,
             };
-            cache.insert(name, meta);
+            cache.insert(m.name, meta);
         }
         Ok(())
     }
@@ -614,12 +661,10 @@ impl ZimManager {
                 .write()
                 .expect("open-handles lock poisoned")
                 .remove(name);
-            let db = sea_orm_db(&self.db);
-            zims::Entity::delete_many()
-                .filter(zims::Column::Name.eq(name))
-                .exec(&db)
-                .await
-                .map_err(Error::SeaOrm)?;
+            raw::execute(&self.db, "DELETE FROM zims WHERE name = $1", |q| {
+                q.bind(name)
+            })
+            .await?;
             tracing::info!("resync: removed ZIM {name}");
             report.push(format!("{name} (removed)"));
         }

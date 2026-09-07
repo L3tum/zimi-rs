@@ -4,7 +4,7 @@
 //! the API can't override them, redacts secrets on unauthenticated reads, and
 //! caches expensive verifies (admin password / access token) behind a TTL.
 //!
-//! Admin-password hashing (KDF) and the verified-token cache live in [`auth`];
+//! Admin-password hashing (KDF) and the verified-token cache live in `auth`;
 //! they are re-exported so `crate::settings::hash_admin_password` etc. keep
 //! resolving (used by `mcp`).
 //!

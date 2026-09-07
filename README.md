@@ -26,7 +26,7 @@ AUTH_PASSWORD='<a real admin password>' docker compose up -d
 
 > **Note:** this service **requires the [pgvector](https://github.com/pgvector/pgvector) Postgres extension** — the initial migration (`CREATE EXTENSION vector`) runs unconditionally, so a stock `postgres` image fails at migration on first boot. The compose file uses the `pgvector/pgvector:pg16` image to provide it.
 
-> A `.dockerignore` keeps the build context lean (excludes `target/`, `.git/`, `plans/`, `docs/`, etc.) so the image build doesn't ship build artifacts or VCS state.
+> A `.dockerignore` keeps the build context lean (excludes `target/`, `.git/`, `docs/`, etc.) so the image build doesn't ship build artifacts or VCS state.
 >
 > **Production:** the dev compose exposes Postgres at `127.0.0.1:5432` with fixed dev credentials (`zimservice`/`zimservice`) for convenience only. For production, set `POSTGRES_PASSWORD` via `.env`, restrict the port mapping accordingly, and update the `DATABASE_URL` used by `make test-integration` (Makefile) and `tests/integration/common.rs` (`DEFAULT_URL`) — both currently hardcode the dev credentials.
 
@@ -399,8 +399,9 @@ make web-test    # behavioral unit tests for web/common.js helpers (node --test;
 make run         # build + run `zimservice serve`
 ```
 
-The `plans/` directory holds review / research / deep-plan process artifacts —
-the process record of design decisions and their rationale. It is not shipped in
+The `docs/reviews/` directory holds review / research / deep-plan process
+artifacts — the process record of design decisions and their rationale
+(previous home: `plans/`, retired 2026-09). It is not shipped in
 the binary: the build only embeds migrations via `include_str!` and the static
 `web/` UI.
 

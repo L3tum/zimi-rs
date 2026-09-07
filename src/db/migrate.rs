@@ -65,6 +65,11 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Number of embedded migrations. The integration suite
+/// (`tests/integration/migrations.rs`) asserts against this constant instead
+/// of a hand-copied count, so adding a migration needs no test-side edit.
+pub const MIGRATION_COUNT: usize = MIGRATIONS.len();
+
 /// Historical migration order for legacy databases (numbered 1..N sequentially
 /// before the 005 removal). Legacy versions 1..5 corresponded to the first
 /// five migrations (001, 002, 003, 004, 006 — 005 is the permanent gap).

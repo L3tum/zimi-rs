@@ -15,21 +15,13 @@
 //! stats `unnest` batch stay in the poller — they read or refresh columns
 //! without changing the row's *status*, so they are not state transitions.
 //!
-//! Query layer: the SeaORM query builder (`update_many` + `col_expr` /
-//! bound filters) over the shared pool via [`crate::db::sea_orm_db`].
-//! `updated_at = now()` stays a *server-side* timestamp via
-//! `Expr::cust("now()")`, so the SQL semantics match the old raw statements
-//! exactly. Statements stay in [`crate::db::raw`] because the SeaORM query
-//! builder cannot express them: the single-column status reads (the hot
-//! cancel-check path on a checked-out connection) and [`adopt_torrent`]
-//! (`INSERT … SELECT … WHERE NOT EXISTS`).
-use crate::db::entities::downloads::{ActiveModel, Column, Entity};
+//! Query layer: raw SQL via [`crate::db::raw`]. `updated_at = now()` stays
+//! a *server-side* timestamp (the SQL `now()`, never a Rust-side clock), so
+//! the SQL semantics match the old raw statements exactly.
 use crate::db::pool::Pool;
-use crate::db::{raw, sea_orm_db};
+use crate::db::raw;
 use crate::error::{Error, Result};
 use crate::torrent::DownloadStatus;
-use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, QueryFilter};
 use sqlx::postgres::PgConnection;
 
 // ── Status reads ───────────────────────────────────────────────────────────
@@ -102,21 +94,18 @@ pub async fn status_no_longer_downloading(client: &mut PgConnection, id: i32) ->
 /// cannot double-spawn the same download. Returns the row count (0 = someone
 /// else already claimed it).
 pub async fn claim_direct(pool: &Pool, id: i32, part: &str) -> Result<u64> {
-    let db = sea_orm_db(pool);
-    let updated = Entity::update_many()
-        .col_expr(
-            Column::Status,
-            Expr::val(DownloadStatus::Downloading.as_str()).into(),
-        )
-        .col_expr(Column::FilePath, Expr::val(part).into())
-        .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-        .filter(Column::Id.eq(id))
-        .filter(Column::Status.eq(DownloadStatus::Queued.as_str()))
-        .exec(&db)
-        .await
-        .map_err(Error::from)?
-        .rows_affected;
-    Ok(updated)
+    raw::execute(
+        pool,
+        "UPDATE downloads SET status = $1, file_path = $2, updated_at = now() \
+         WHERE id = $3 AND status = $4",
+        |q| {
+            q.bind(DownloadStatus::Downloading.as_str())
+                .bind(part)
+                .bind(id)
+                .bind(DownloadStatus::Queued.as_str())
+        },
+    )
+    .await
 }
 
 /// `* → error` (terminal-state guard). A failure is recorded without
@@ -124,23 +113,21 @@ pub async fn claim_direct(pool: &Pool, id: i32, part: &str) -> Result<u64> {
 /// Best-effort: a pool blip is logged and swallowed (the row is retried next
 /// tick / stays in its current state).
 pub async fn mark_error(pool: &Pool, id: i32, msg: &str) {
-    let db = sea_orm_db(pool);
-    let _ = Entity::update_many()
-        .col_expr(
-            Column::Status,
-            Expr::val(DownloadStatus::Error.as_str()).into(),
-        )
-        .col_expr(Column::Error, Expr::val(msg).into())
-        .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-        .filter(Column::Id.eq(id))
-        .filter(Column::Status.is_not_in([
-            DownloadStatus::Cancelled.as_str(),
-            DownloadStatus::Complete.as_str(),
-            DownloadStatus::Seeding.as_str(),
-            DownloadStatus::Error.as_str(),
-        ]))
-        .exec(&db)
-        .await;
+    let _ = raw::execute(
+        pool,
+        "UPDATE downloads SET status = $1, error = $2, updated_at = now() \
+         WHERE id = $3 AND status NOT IN ($4, $5, $6, $7)",
+        |q| {
+            q.bind(DownloadStatus::Error.as_str())
+                .bind(msg)
+                .bind(id)
+                .bind(DownloadStatus::Cancelled.as_str())
+                .bind(DownloadStatus::Complete.as_str())
+                .bind(DownloadStatus::Seeding.as_str())
+                .bind(DownloadStatus::Error.as_str())
+        },
+    )
+    .await;
 }
 
 /// `downloading → error` (fatal torrent state / torrent vanished after the
@@ -149,19 +136,12 @@ pub async fn mark_error(pool: &Pool, id: i32, msg: &str) {
 /// Propagates a pool-checkout failure (aborts the tick, as before) but
 /// swallows the write failure.
 pub async fn mark_fatal_error(pool: &Pool, id: i32, msg: &str) -> Result<()> {
-    let db = sea_orm_db(pool);
-    best_effort(
-        Entity::update_many()
-            .col_expr(
-                Column::Status,
-                Expr::val(DownloadStatus::Error.as_str()).into(),
-            )
-            .col_expr(Column::Error, Expr::val(msg).into())
-            .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-            .filter(Column::Id.eq(id))
-            .exec(&db)
-            .await,
+    execute_best_effort(
+        pool,
+        "UPDATE downloads SET status = $1, error = $2, updated_at = now() WHERE id = $3",
+        |q| q.bind(DownloadStatus::Error.as_str()).bind(msg).bind(id),
     )
+    .await
 }
 
 /// `error → queued` (bounded stale-error retry). The `AND status = 'error'`
@@ -171,21 +151,19 @@ pub async fn requeue_stale_errors(pool: &Pool, ids: &[i32]) -> Result<u64> {
     if ids.is_empty() {
         return Ok(0);
     }
-    let db = sea_orm_db(pool);
-    let updated = Entity::update_many()
-        .col_expr(
-            Column::Status,
-            Expr::val(DownloadStatus::Queued.as_str()).into(),
-        )
-        .col_expr(Column::Error, Expr::val(None::<String>).into())
-        .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-        .filter(Column::Id.is_in(ids.to_vec()))
-        .filter(Column::Status.eq(DownloadStatus::Error.as_str()))
-        .exec(&db)
-        .await
-        .map_err(Error::from)?
-        .rows_affected;
-    Ok(updated)
+    // The id list is bound as one `int[]` (`id = ANY($2)`) — equivalent to
+    // the `id IN (…)` list, dynamic length.
+    raw::execute(
+        pool,
+        "UPDATE downloads SET status = $1, error = NULL, updated_at = now() \
+         WHERE id = ANY($2) AND status = $3",
+        |q| {
+            q.bind(DownloadStatus::Queued.as_str())
+                .bind(ids)
+                .bind(DownloadStatus::Error.as_str())
+        },
+    )
+    .await
 }
 
 /// `downloading → complete` (direct-download finalize). The `AND status =
@@ -193,22 +171,18 @@ pub async fn requeue_stale_errors(pool: &Pool, ids: &[i32]) -> Result<u64> {
 /// this update still wins — never clobber a terminal state. Returns the row
 /// count (0 = cancelled mid-finalize; the caller discards the staged file).
 pub async fn finalize_direct(pool: &Pool, id: i32, dst: &str) -> Result<u64> {
-    let db = sea_orm_db(pool);
-    let updated = Entity::update_many()
-        .col_expr(
-            Column::Status,
-            Expr::val(DownloadStatus::Complete.as_str()).into(),
-        )
-        .col_expr(Column::Progress, Expr::val(1.0f32).into())
-        .col_expr(Column::FilePath, Expr::val(dst).into())
-        .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-        .filter(Column::Id.eq(id))
-        .filter(Column::Status.eq(DownloadStatus::Downloading.as_str()))
-        .exec(&db)
-        .await
-        .map_err(Error::from)?
-        .rows_affected;
-    Ok(updated)
+    raw::execute(
+        pool,
+        "UPDATE downloads SET status = $1, progress = 1.0, file_path = $2, updated_at = now() \
+         WHERE id = $3 AND status = $4",
+        |q| {
+            q.bind(DownloadStatus::Complete.as_str())
+                .bind(dst)
+                .bind(id)
+                .bind(DownloadStatus::Downloading.as_str())
+        },
+    )
+    .await
 }
 
 /// `downloading | complete → (complete | seeding)` (the torrent-completion
@@ -232,44 +206,44 @@ pub async fn mark_complete(
     up_speed_bps: Option<i64>,
     num_seeds: Option<i64>,
 ) -> Result<u64> {
-    let db = sea_orm_db(pool);
-    let model = match new_status {
-        DownloadStatus::Seeding => ActiveModel {
-            status: ActiveValue::Set(DownloadStatus::Seeding.as_str().to_owned()),
-            progress: ActiveValue::Set(1.0f32),
-            file_path: ActiveValue::Set(Some(dst.to_owned())),
-            ratio: ActiveValue::Set(ratio),
-            up_speed_bps: ActiveValue::Set(up_speed_bps),
-            num_seeds: ActiveValue::Set(num_seeds),
-            error: ActiveValue::Set(None),
-            ..Default::default()
-        },
-        _ => ActiveModel {
-            status: ActiveValue::Set(DownloadStatus::Complete.as_str().to_owned()),
-            progress: ActiveValue::Set(1.0f32),
-            file_path: ActiveValue::Set(Some(dst.to_owned())),
-            ratio: ActiveValue::Set(None),
-            up_speed_bps: ActiveValue::Set(None),
-            num_seeds: ActiveValue::Set(None),
-            error: ActiveValue::Set(None),
-            ..Default::default()
-        },
+    let [guard1, guard2] = completion_guard_statuses();
+    let updated = match new_status {
+        DownloadStatus::Seeding => {
+            raw::execute(
+                pool,
+                "UPDATE downloads SET status = $1, progress = 1.0, file_path = $2, \
+             ratio = $3, up_speed_bps = $4, num_seeds = $5, error = NULL, updated_at = now() \
+             WHERE id = $6 AND status IN ($7, $8)",
+                |q| {
+                    q.bind(DownloadStatus::Seeding.as_str())
+                        .bind(dst)
+                        .bind(ratio)
+                        .bind(up_speed_bps)
+                        .bind(num_seeds)
+                        .bind(id)
+                        .bind(guard1.as_str())
+                        .bind(guard2.as_str())
+                },
+            )
+            .await?
+        }
+        _ => {
+            raw::execute(
+                pool,
+                "UPDATE downloads SET status = $1, progress = 1.0, file_path = $2, \
+             ratio = NULL, up_speed_bps = NULL, num_seeds = NULL, error = NULL, \
+             updated_at = now() WHERE id = $3 AND status IN ($4, $5)",
+                |q| {
+                    q.bind(DownloadStatus::Complete.as_str())
+                        .bind(dst)
+                        .bind(id)
+                        .bind(guard1.as_str())
+                        .bind(guard2.as_str())
+                },
+            )
+            .await?
+        }
     };
-    let updated = Entity::update_many()
-        .set(model)
-        .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-        .filter(Column::Id.eq(id))
-        .filter(
-            Column::Status.is_in(
-                completion_guard_statuses()
-                    .into_iter()
-                    .map(|s| s.as_str().to_owned()),
-            ),
-        )
-        .exec(&db)
-        .await
-        .map_err(Error::from)?
-        .rows_affected;
     Ok(updated)
 }
 
@@ -283,78 +257,51 @@ pub fn completion_guard_statuses() -> [DownloadStatus; 2] {
     [DownloadStatus::Downloading, DownloadStatus::Complete]
 }
 
-/// Best-effort over a SeaORM update result: propagate a pool-acquire
-/// failure (aborts the tick, as before) but swallow write failures. sqlx
-/// folds acquire and execution into one `sqlx::Error`, and sea-orm maps a
-/// pool failure to [`sea_orm::DbErr::ConnectionAcquire`] — that variant
-/// distinguishes the two.
-fn best_effort(res: std::result::Result<sea_orm::UpdateResult, sea_orm::DbErr>) -> Result<()> {
-    match res {
-        Ok(_) => Ok(()),
-        Err(e) if matches!(e, sea_orm::DbErr::ConnectionAcquire(_)) => Err(Error::SeaOrm(e)),
-        Err(_) => Ok(()),
-    }
-}
-
 /// `queued → downloading` (a torrent row was added to qBittorrent this tick).
 /// Unguarded on status by design: the row was claimed `queued` at the top of
 /// the enqueue loop and the per-row budget gate prevents double-spawn.
 /// Propagates a pool-checkout failure but swallows the write failure.
 pub async fn mark_downloading(pool: &Pool, id: i32) -> Result<()> {
-    let db = sea_orm_db(pool);
-    best_effort(
-        Entity::update_many()
-            .col_expr(
-                Column::Status,
-                Expr::val(DownloadStatus::Downloading.as_str()).into(),
-            )
-            .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-            .filter(Column::Id.eq(id))
-            .exec(&db)
-            .await,
+    execute_best_effort(
+        pool,
+        "UPDATE downloads SET status = $1, updated_at = now() WHERE id = $2",
+        |q| q.bind(DownloadStatus::Downloading.as_str()).bind(id),
     )
+    .await
 }
 
 /// Bind a row's torrent `hash` (rebind on a hash/name match). Propagates a
 /// pool-checkout failure but swallows the write failure.
 pub async fn bind_hash(pool: &Pool, id: i32, hash: &str) -> Result<()> {
-    let db = sea_orm_db(pool);
-    best_effort(
-        Entity::update_many()
-            .col_expr(Column::Hash, Expr::val(hash).into())
-            .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-            .filter(Column::Id.eq(id))
-            .exec(&db)
-            .await,
+    execute_best_effort(
+        pool,
+        "UPDATE downloads SET hash = $1, updated_at = now() WHERE id = $2",
+        |q| q.bind(hash).bind(id),
     )
+    .await
 }
 
 /// Clear a row's stale `hash` binding (cancel cleanup, once the qB removal is
 /// confirmed).
 pub async fn clear_hash(pool: &Pool, id: i32) {
-    let db = sea_orm_db(pool);
-    let _ = Entity::update_many()
-        .col_expr(Column::Hash, Expr::val(None::<String>).into())
-        .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-        .filter(Column::Id.eq(id))
-        .exec(&db)
-        .await;
+    let _ = raw::execute(
+        pool,
+        "UPDATE downloads SET hash = NULL, updated_at = now() WHERE id = $1",
+        |q| q.bind(id),
+    )
+    .await;
 }
 
 /// Drain the `hash` bindings on all `cancelled` rows (no qB configured): once
 /// the hash is NULL the rows early-exit and stop re-running the per-tick
 /// bookkeeping queries (BUG-21). Returns the row count cleared.
 pub async fn drain_cancelled_hashes(pool: &Pool) -> Result<u64> {
-    let db = sea_orm_db(pool);
-    let updated = Entity::update_many()
-        .col_expr(Column::Hash, Expr::val(None::<String>).into())
-        .filter(Column::Status.eq(DownloadStatus::Cancelled.as_str()))
-        .filter(Column::Hash.is_not_null())
-        .exec(&db)
-        .await
-        .map_err(Error::from)?
-        .rows_affected;
-    Ok(updated)
+    raw::execute(
+        pool,
+        "UPDATE downloads SET hash = NULL WHERE status = $1 AND hash IS NOT NULL",
+        |q| q.bind(DownloadStatus::Cancelled.as_str()),
+    )
+    .await
 }
 
 /// `seeding → complete` (settle a seeding row: the torrent left qB after the
@@ -363,19 +310,32 @@ pub async fn drain_cancelled_hashes(pool: &Pool) -> Result<u64> {
 /// error note for the fatal arm. Propagates a pool-checkout failure but
 /// swallows the write failure.
 pub async fn settle_seeding(pool: &Pool, id: i32, error: Option<&str>) -> Result<()> {
-    let db = sea_orm_db(pool);
-    let mut stmt = Entity::update_many()
-        .col_expr(
-            Column::Status,
-            Expr::val(DownloadStatus::Complete.as_str()).into(),
+    match error {
+        Some(msg) => {
+            execute_best_effort(
+                pool,
+                "UPDATE downloads SET status = $1, error = $2, updated_at = now() \
+             WHERE id = $3 AND status = $4",
+                |q| {
+                    q.bind(DownloadStatus::Complete.as_str())
+                        .bind(msg)
+                        .bind(id)
+                        .bind(DownloadStatus::Seeding.as_str())
+                },
+            )
+            .await
+        }
+        None => execute_best_effort(
+            pool,
+            "UPDATE downloads SET status = $1, updated_at = now() WHERE id = $2 AND status = $3",
+            |q| {
+                q.bind(DownloadStatus::Complete.as_str())
+                    .bind(id)
+                    .bind(DownloadStatus::Seeding.as_str())
+            },
         )
-        .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-        .filter(Column::Id.eq(id))
-        .filter(Column::Status.eq(DownloadStatus::Seeding.as_str()));
-    if let Some(msg) = error {
-        stmt = stmt.col_expr(Column::Error, Expr::val(msg).into());
+        .await,
     }
-    best_effort(stmt.exec(&db).await)
 }
 
 /// Refresh a seeding row's per-torrent seed stats (ratio / up_speed / seeds /
@@ -389,19 +349,20 @@ pub async fn refresh_seeding_stats(
     num_seeds: i64,
     speed_bps: i64,
 ) -> Result<()> {
-    let db = sea_orm_db(pool);
-    best_effort(
-        Entity::update_many()
-            .col_expr(Column::Ratio, Expr::val(ratio).into())
-            .col_expr(Column::UpSpeedBps, Expr::val(up_speed_bps).into())
-            .col_expr(Column::NumSeeds, Expr::val(num_seeds).into())
-            .col_expr(Column::SpeedBps, Expr::val(speed_bps).into())
-            .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-            .filter(Column::Id.eq(id))
-            .filter(Column::Status.eq(DownloadStatus::Seeding.as_str()))
-            .exec(&db)
-            .await,
+    execute_best_effort(
+        pool,
+        "UPDATE downloads SET ratio = $1, up_speed_bps = $2, num_seeds = $3, \
+         speed_bps = $4, updated_at = now() WHERE id = $5 AND status = $6",
+        |q| {
+            q.bind(ratio)
+                .bind(up_speed_bps)
+                .bind(num_seeds)
+                .bind(speed_bps)
+                .bind(id)
+                .bind(DownloadStatus::Seeding.as_str())
+        },
     )
+    .await
 }
 
 /// Refresh an in-progress row's `progress` / `speed_bps` (the 2 s stream tick
@@ -411,41 +372,31 @@ pub async fn refresh_seeding_stats(
 /// status by design — the in-loop cancel check handles the terminal-state
 /// race; this only touches stat columns.
 pub async fn refresh_progress(pool: &Pool, id: i32, progress: f32, speed_bps: i64) -> Result<()> {
-    let db = sea_orm_db(pool);
-    best_effort(
-        Entity::update_many()
-            .col_expr(Column::Progress, Expr::val(progress).into())
-            .col_expr(Column::SpeedBps, Expr::val(speed_bps).into())
-            .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-            .filter(Column::Id.eq(id))
-            .exec(&db)
-            .await,
+    execute_best_effort(
+        pool,
+        "UPDATE downloads SET progress = $1, speed_bps = $2, updated_at = now() WHERE id = $3",
+        |q| q.bind(progress).bind(speed_bps).bind(id),
     )
+    .await
 }
 
 /// `downloading → queued` (startup reconcile of interrupted *direct* `.zim`
 /// downloads: clear `file_path`/`error` so the next tick re-claims them and
 /// resumes from a surviving `.part`, PERF-11). Returns the row count retried.
-/// The `.zim` predicate stays a shared SQL fragment ([`crate::db::downloads::ZIM_URL_PREDICATE`],
-/// also spliced into the poller's raw SQL) via `Expr::cust`.
+/// The `.zim` predicate stays a shared SQL fragment
+/// ([`crate::db::downloads::ZIM_URL_PREDICATE`], also spliced into the
+/// poller's raw SQL).
 pub async fn retry_interrupted_directs(pool: &Pool) -> Result<u64> {
-    let db = sea_orm_db(pool);
     let pred = crate::db::downloads::ZIM_URL_PREDICATE;
-    let updated = Entity::update_many()
-        .col_expr(
-            Column::Status,
-            Expr::val(DownloadStatus::Queued.as_str()).into(),
-        )
-        .col_expr(Column::FilePath, Expr::val(None::<String>).into())
-        .col_expr(Column::Error, Expr::val(None::<String>).into())
-        .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-        .filter(Column::Status.eq(DownloadStatus::Downloading.as_str()))
-        .filter(Expr::cust(format!("({pred}) LIKE '%.zim'")))
-        .exec(&db)
-        .await
-        .map_err(Error::from)?
-        .rows_affected;
-    Ok(updated)
+    let sql = format!(
+        "UPDATE downloads SET status = $1, file_path = NULL, error = NULL, updated_at = now() \
+         WHERE status = $2 AND ({pred}) LIKE '%.zim'"
+    );
+    raw::execute(pool, &sql, |q| {
+        q.bind(DownloadStatus::Queued.as_str())
+            .bind(DownloadStatus::Downloading.as_str())
+    })
+    .await
 }
 
 /// Best-effort over a raw [`raw::execute`] result: propagate a pool-acquire

@@ -1,14 +1,15 @@
 //! Database layer: migrations, connection pooling, and query helpers.
 //!
 //! The pool is a [`sqlx::PgPool`](sqlx::postgres::PgPool) (see
-//! [`pool`]); SeaORM is used on top of it — build a
-//! [`sea_orm::DatabaseConnection`] handle from the pool with [`sea_orm_db`]
-//! (cheap: it wraps the same pool) whenever an entity query is needed.
+//! [`pool`]), and [`raw`] is the data-access layer: every application
+//! query goes through the `raw` helpers (or through a module in `src/db/`
+//! that owns the raw helpers and is therefore exempt from the
+//! `scripts/check-raw-sql.sh` lint; everything else marks its
+//! `sqlx::query*` call sites `// RAW-OK`).
 
 pub mod collections;
 pub mod downloads;
 pub mod downloads_lifecycle;
-pub mod entities;
 pub mod migrate;
 pub mod pool;
 pub mod qid;
@@ -16,23 +17,10 @@ pub mod random_article;
 
 pub use pool::Pool;
 
-/// Build a SeaORM [`sea_orm::DatabaseConnection`] handle over the shared
-/// pool. Cheap: `PgPool` is an `Arc`-backed clone — no extra connections,
-/// and the SeaORM entity / query-builder API shares exactly the same pool
-/// (and its TLS mode and pool-size settings) as the [`raw`] escape hatch.
-///
-/// Note (sea-orm 1.x): `sea_orm::Database` is a unit-struct namespace, not a
-/// connection handle — the handle type is
-/// [`sea_orm::DatabaseConnection`](sea_orm::DatabaseConnection) (alias
-/// `sea_orm::DbConn`).
-pub fn sea_orm_db(pool: &Pool) -> sea_orm::DatabaseConnection {
-    sea_orm::DatabaseConnection::from(pool.clone())
-}
-
-/// Shared raw-SQL helper — the **sanctioned escape hatch** for SQL the
-/// SeaORM query builder cannot express: session-level advisory locks,
-/// batch DDL (multi-statement migration files, `DROP INDEX CONCURRENTLY`),
-/// and catalog probes.
+/// Shared raw-SQL helper — the data-access layer: every application query
+/// goes through these helpers, including SQL the generic helper shapes
+/// cannot take (session-level advisory locks, batch DDL — multi-statement
+/// migration files, `DROP INDEX CONCURRENTLY` — and catalog probes).
 ///
 /// Executor argument: pass `&pool` (`&Pool` implements `Executor`),
 /// `&mut conn` (a `&mut sqlx::PgConnection`), or `&mut *tx` / `&mut *conn`
@@ -44,8 +32,8 @@ pub fn sea_orm_db(pool: &Pool) -> sea_orm::DatabaseConnection {
 /// return it after chaining `.bind(...)` calls — `|q| q.bind(a).bind(b)`
 /// for bound parameters, `|q| q` when there are none.
 ///
-/// Batch DDL: iterate [`split_statements`] and run each statement through
-/// [`execute`] on the same executor — this is the replacement for the old
+/// Batch DDL: iterate [`raw::split_statements`] and run each statement
+/// through [`raw::execute`] on the same executor — this is the replacement for the old
 /// `tokio_postgres` `batch_execute` (sqlx has no multi-statement
 /// protocol call).
 pub mod raw {

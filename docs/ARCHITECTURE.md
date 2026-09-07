@@ -34,11 +34,10 @@ hardlink-based file sharing, an OpenAI-compatible embedding pipeline, and an MCP
 
 - **`src/db/`** — the persistence layer: `pool.rs` (the shared
   `sqlx::PgPool`, TLS mode from the DSN, 10 s acquire timeout), `migrate.rs`
-  (applies `migrations/*.sql`), `entities/` (hand-written SeaORM entities),
-  `raw/` (the raw-SQL escape hatch, see Persistence), and domain query
-  modules: `collections.rs`, `downloads.rs`, `downloads_lifecycle.rs` (the
-  download status state-machine row helpers), `qid.rs` (Wikidata Q-ID /
-  interlanguage lookups), `random_article.rs`.
+  (applies `migrations/*.sql`), `raw` (the raw-SQL data-access helpers, see
+  Persistence), and domain query modules: `collections.rs`, `downloads.rs`,
+  `downloads_lifecycle.rs` (the download status state-machine row helpers),
+  `qid.rs` (Wikidata Q-ID / interlanguage lookups), `random_article.rs`.
 
 - **`src/zim/`** — `ZimManager` (`mod.rs`): on-disk discovery, per-file
   (mtime, size) snapshots for resync early-out, an LRU cache of open ZIM
@@ -128,7 +127,7 @@ when `torrent.auto_update` is enabled. Every status write goes through the
 **Indexing.** `src/zim/index.rs`: open the ZIM, enumerate the C-namespace
 entry range, extract text/snippet/Q-ID per entry in rayon, then bulk-insert in
 chunks — **COPY** into the UNLOGGED `articles_staging` table (via
-`PgConnection::copy_in_raw`; SeaORM's bulk insert cannot express COPY), then
+`PgConnection::copy_in_raw`), then
 upsert staging rows into `articles`, with the `search_vector` tsvector
 computed in Postgres. A pid-scoped checkpoint file under the temp dir makes a
 run resumable; finalization prunes stale rows atomically with the
@@ -197,26 +196,26 @@ connections, 10 s acquire timeout, TLS mode derived from the DSN's `sslmode`
 or `+tls` scheme). All subsystems — HTTP API, poller, embedding, index COPY —
 share this one pool.
 
-**SeaORM over sqlx.** Application-table queries use SeaORM; a
-`sea_orm::DatabaseConnection` is built from the pool with `db::sea_orm_db`
-(`src/db/mod.rs`) — cheap, no extra connections, same pool and TLS mode as
-everything else. Entities in `src/db/entities/` are written by hand from the
-migrations (there is no sea-orm-migration crate in the build);
-`schema_migrations` and dropped tables have no entities. Postgres-specific
-column types have no first-class sqlx types: `articles.search_vector`
-(tsvector) and `articles.embedding` (pgvector) are modeled as `String` in the
-entities.
+**Pure sqlx.** Application-table queries go through the `db::raw` helpers
+(`src/db/mod.rs`) against the shared pool — no ORM, no extra connections, the
+same pool and TLS mode as everything else. The helper shapes (`execute`,
+`fetch_optional`, `fetch_all`, `fetch_scalar_optional`, `fetch_scalar_all`)
+take a plain SQL string, a `|q| q.bind(a).bind(b)` bind closure, and an
+executor (`&pool`, `&mut conn`, or `&mut *tx` for transactions). Postgres-
+specific column types have no first-class sqlx types: `articles.search_vector`
+(tsvector) and `articles.embedding` (pgvector) are bound/decoded as `String`.
 
-**Raw-SQL policy.** `db::raw` (`src/db/mod.rs`) is the *sanctioned* escape
-hatch for SQL the SeaORM builder cannot express. Legitimate uses: session-level
-advisory locks, batch DDL (migration files are multi-statement; sqlx has no
-`batch_execute`, so statements are split and executed individually), catalog
+**Raw-SQL policy.** All SQL is raw, but it is confined: application SQL lives
+in `src/db/` (which owns the `db::raw` helpers and is therefore exempt from
+`scripts/check-raw-sql.sh`); any other direct `sqlx::query*` call site must
+carry a `// RAW-OK: <reason>` marker on the call line (session-level advisory
+locks, batch DDL — migration files are multi-statement; sqlx has no
+`batch_execute`, so statements are split and executed individually —, catalog
 probes (`pg_locks`, `pg_stat_activity`), the `COPY` bulk insert, and
 Postgres-specific operators — `websearch_to_tsquery`/tsvector, pg_trgm
-`similarity()`, pgvector distance operators, and `$n::vector` /
-`::tsvector` casts. Anything expressible in the builder belongs in the
-builder; the SQLSTATE/HTTP mapping in `Error` treats raw and SeaORM errors
-identically.
+`similarity()`, pgvector distance operators, and `$n::vector` / `::tsvector`
+casts). The SQLSTATE/HTTP mapping in `Error` redacts DB details; 23505
+unique-violations are domain duplicates (409), not DB faults (503).
 
 **Migrations.** Numbered `.sql` files in `migrations/` (001–013) are embedded
 with `include_str!` and applied by `src/db/migrate.rs` at **every** startup,
@@ -238,8 +237,7 @@ path.
   deliberately has *no* `From<anyhow::Error>` impl, so anyhow errors from
   CLI/startup code cannot leak into the HTTP path; it always maps to a
   redacted `500 "internal server error"` with the detail logged only.
-- **SQLSTATE mapping** (shared by `Error::Database` and `Error::SeaOrm`, the
-  latter by unwrapping the wrapped sqlx error): `23505`/`23503` → 409 (the
+- **SQLSTATE mapping** (`Error::Database`): `23505`/`23503` → 409 (the
   23505 message is derived from the constraint name via `duplicate_field`,
   never raw DB text), `23502`/`23514` → 400, everything else → 503. Pool
   checkout timeouts → `503 "database unavailable"`; connection-level failures
@@ -276,6 +274,18 @@ Explicitly declared out of scope:
   `config::Config::apply_require_reads_default`; the all-zero CIDR refusal
   (M-3) for `general.trusted_proxy_cidrs` is enforced in `src/main.rs`).
   `README.md` "Security model".
+- **`?access_token=` query-string token transport.** Auth is a single shared
+  admin password presented as `Authorization: Bearer <password>` (preferred)
+  or `?access_token=<password>` — the query-string form is accepted **only on
+  read-only GET/HEAD/OPTIONS requests** (`src/serve/middleware.rs`, SEC-M3).
+  In-app request logs are sanitized (`sanitize_uri_for_logs` strips the token,
+  including percent-encoded forms), but that is in-app only: a fronting
+  **reverse proxy's access log, browser history, and `Referer` headers capture
+  the full query string**, which the app cannot control. Consequence:
+  `?access_token=` is a last-resort channel (it exists for same-tab anchor
+  navigations that cannot carry a header) — prefer `Authorization: Bearer`
+  wherever possible, and if a proxy fronts the service, configure it to
+  omit/scrub `access_token` from its access log. `README.md` "Security model".
 - **Public API stability.** The crate is 0.x: no stable public API; `testing`
   is internal test support (`src/lib.rs`).
 

@@ -2,8 +2,7 @@
 target
 .git
 
-# Repo docs/plans — not shipped.
-plans
+# Repo docs — not shipped.
 docs
 .github
 

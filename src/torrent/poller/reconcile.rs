@@ -4,9 +4,6 @@
 use crate::torrent::TorrentInfo;
 
 use super::*;
-use crate::db::entities::downloads::{Column, Entity};
-use sea_orm::sea_query::Expr;
-use sea_orm::{EntityTrait, QueryFilter};
 
 /// Download row snapshot used by reconcile:
 /// `(id, name, url, hash, status, file_path, updated_at)`.
@@ -39,29 +36,28 @@ impl DownloadPoller {
         // multi-GB re-download (B1). Only truly orphaned `.part`s (no live
         // row, or a terminal `cancelled`/`complete` row) are reclaimed.
         let active_paths: std::collections::HashSet<String> = {
-            let db = crate::db::sea_orm_db(&self.db);
             // Propagate a failed query — never default to an empty active-set:
             // an empty set makes the sweep below delete the `.part` files of
             // *live* downloads, so a poisoned query must abort the tick
             // (same propagation-instead-of-unwrap_or_default convention as the
-            // direct-download client builder in direct.rs).
-            let rows: Vec<String> = Entity::find()
-                .select_only()
-                .column(Column::FilePath)
-                .filter(Column::Status.is_in([
-                    crate::torrent::DownloadStatus::Queued.as_str(),
-                    crate::torrent::DownloadStatus::Downloading.as_str(),
-                    crate::torrent::DownloadStatus::Error.as_str(),
-                ]))
-                .filter(Expr::cust(format!(
-                    "({pred}) LIKE '%.zim'",
-                    pred = ZIM_URL_PREDICATE
-                )))
-                .filter(Column::FilePath.is_not_null())
-                .into_tuple()
-                .all(&db)
-                .await
-                .map_err(Error::from)?;
+            // direct-download client builder in direct.rs). The predicate
+            // fragment ([`ZIM_URL_PREDICATE`]) splices in verbatim.
+            let pred = ZIM_URL_PREDICATE;
+            let rows: Vec<String> = crate::db::raw::fetch_scalar_all(
+                &self.db,
+                &format!(
+                    "SELECT file_path FROM downloads \
+                     WHERE status IN ($1, $2, $3) \
+                       AND ({pred}) LIKE '%.zim' \
+                       AND file_path IS NOT NULL"
+                ),
+                |q| {
+                    q.bind(crate::torrent::DownloadStatus::Queued.as_str())
+                        .bind(crate::torrent::DownloadStatus::Downloading.as_str())
+                        .bind(crate::torrent::DownloadStatus::Error.as_str())
+                },
+            )
+            .await?;
             rows.into_iter().collect()
         };
         if let Ok(rd) = std::fs::read_dir(&self.zims.zim_dir) {
@@ -88,27 +84,17 @@ impl DownloadPoller {
             .collect();
 
         // 1) Rows: rebind hashes, recover finished torrents, flag orphans.
-        let rows: Vec<TorrentRow> = {
-            let db = crate::db::sea_orm_db(&self.db);
-            Entity::find()
-                .select_only()
-                .column(Column::Id)
-                .column(Column::Name)
-                .column(Column::Url)
-                .column(Column::Hash)
-                .column(Column::Status)
-                .column(Column::FilePath)
-                .column(Column::UpdatedAt)
-                .filter(Column::Status.is_in([
-                    crate::torrent::DownloadStatus::Downloading.as_str(),
-                    crate::torrent::DownloadStatus::Complete.as_str(),
-                    crate::torrent::DownloadStatus::Seeding.as_str(),
-                ]))
-                .into_tuple()
-                .all(&db)
-                .await
-                .map_err(Error::from)?
-        };
+        let rows: Vec<TorrentRow> = crate::db::raw::fetch_all(
+            &self.db,
+            "SELECT id, name, url, hash, status, file_path, updated_at FROM downloads \
+             WHERE status IN ($1, $2, $3)",
+            |q| {
+                q.bind(crate::torrent::DownloadStatus::Downloading.as_str())
+                    .bind(crate::torrent::DownloadStatus::Complete.as_str())
+                    .bind(crate::torrent::DownloadStatus::Seeding.as_str())
+            },
+        )
+        .await?;
 
         let mut known_hashes = HashSet::new();
         for (id, name, url, hash, status, file_path, updated_at) in &rows {

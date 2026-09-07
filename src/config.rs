@@ -36,6 +36,12 @@ pub struct Config {
     pub torrent_url: Option<String>,
     pub torrent_user: String,
     pub torrent_pass: String,
+
+    // Single-instance opt-outs (read by `cmd_serve` / `cmd_mcp`, not by the
+    // runtime settings table): m-7 partial opt-out (`ZIMSERVICE_ALLOW_MULTI_DB`
+    // = exact "1") and the stdio MCP auth password (DEC-2, `MCP_AUTH_PASSWORD`).
+    pub allow_multi_db: bool,
+    pub mcp_auth_password: Option<String>,
 }
 
 impl Default for Config {
@@ -50,6 +56,8 @@ impl Default for Config {
             torrent_url: None,
             torrent_user: String::new(),
             torrent_pass: String::new(),
+            allow_multi_db: false,
+            mcp_auth_password: None,
         }
     }
 }
@@ -137,6 +145,17 @@ impl Config {
         if let Some(v) = get("QBITTORRENT_PASS") {
             self.torrent_pass = v;
         }
+
+        // m-7: the per-DB advisory lock is best-effort only when the env var
+        // is exactly "1" (any other value — incl. "0"/"true"/"" — leaves the
+        // full guard enforced). Mirrors the `matches!` the guard site used
+        // before this was routed through `Config`.
+        self.allow_multi_db = matches!(get("ZIMSERVICE_ALLOW_MULTI_DB"), Some(v) if v == "1");
+        // DEC-2: stdio MCP session password, verified against the configured
+        // admin password in `cmd_mcp` (fail-closed in password mode).
+        if let Some(v) = get("MCP_AUTH_PASSWORD") {
+            self.mcp_auth_password = Some(v);
+        }
         Ok(())
     }
 
@@ -144,10 +163,10 @@ impl Config {
     ///
     /// `get` is the env getter (injected for testability — L14); a variable
     /// set to a non-empty value locks the key. A set-but-empty var is
-    /// treated as unset — consistent with [`env_settings_snapshot`], which
+    /// treated as unset — consistent with [`Config::env_settings_snapshot`], which
     /// also skips empty values: the snapshot never re-applies an empty var,
     /// so locking the UI key for it would be misleading. The rule applies
-    /// uniformly to every key in [`ENV_SETTING_KEYS`]. Derived from that
+    /// uniformly to every key in `ENV_SETTING_KEYS`. Derived from that
     /// table (L5).
     pub fn locked_env_settings(
         &self,
@@ -278,6 +297,41 @@ mod tests {
         // PORT is not a snapshot key; EMBEDDING_DIM is (raw string).
         assert_eq!(snap.get(KEY_EMBEDDING_DIMENSION), Some(&"768".to_string()));
         assert_eq!(snap.len(), 1);
+    }
+
+    #[test]
+    fn allow_multi_db_env_parses_only_literal_one() {
+        // Absent → false; the exact value "1" → true; any other value →
+        // false (mirrors the `matches!` semantics `cmd_serve` used to have).
+        let mut c = Config::default();
+        c.apply_env(&env_from(&[]))
+            .expect("apply_env should succeed");
+        assert!(!c.allow_multi_db, "absent env must default to false");
+        let mut c1 = Config::default();
+        c1.apply_env(&env_from(&[("ZIMSERVICE_ALLOW_MULTI_DB", "1")]))
+            .expect("apply_env should succeed");
+        assert!(c1.allow_multi_db, "exact \"1\" must enable allow_multi_db");
+        for v in ["0", "true", "yes", "", "2"] {
+            let mut c2 = Config::default();
+            c2.apply_env(&env_from(&[("ZIMSERVICE_ALLOW_MULTI_DB", v)]))
+                .expect("apply_env should succeed");
+            assert!(
+                !c2.allow_multi_db,
+                "value {v:?} must not enable allow_multi_db"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_auth_password_env_present_and_absent() {
+        let mut c = Config::default();
+        c.apply_env(&env_from(&[("MCP_AUTH_PASSWORD", "s3cret")]))
+            .expect("apply_env should succeed");
+        assert_eq!(c.mcp_auth_password.as_deref(), Some("s3cret"));
+        let mut c2 = Config::default();
+        c2.apply_env(&env_from(&[]))
+            .expect("apply_env should succeed");
+        assert!(c2.mcp_auth_password.is_none(), "absent env must stay None");
     }
 
     #[test]

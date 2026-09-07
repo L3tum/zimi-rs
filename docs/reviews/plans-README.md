@@ -1,5 +1,10 @@
 # Plans
 
+> **Note (2026-09):** the `plans/` directory was retired — its contents moved
+> to `docs/reviews/` (this file: `docs/reviews/plans-README.md`). The rest of
+> this document is the historical record of the old `plans/` directory and is
+> kept as-is.
+
 Scratch directory for the themed review/fix pipeline. Each run produces two
 artifacts, kept at the top level:
 

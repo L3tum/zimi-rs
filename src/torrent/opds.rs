@@ -11,12 +11,10 @@
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use crate::db::entities::downloads::{ActiveModel, Column, Entity};
 use crate::db::Pool;
 use crate::error::{Error, Result};
 use crate::netguard::{resolve_download_host, validate_download_url};
 use crate::zim::ZimManager;
-use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, QueryFilter};
 
 use super::poller::{build_download_client, ClientProfile, DownloadPoller};
 use super::*;
@@ -364,49 +362,45 @@ async fn queue_opds_updates(db: &Pool, updates: &[opds::OpdsUpdate]) -> Result<(
     if updates.is_empty() {
         return Ok(());
     }
-    let db = crate::db::sea_orm_db(db);
     for u in updates {
         // Second line of defense (B10): `find_updates` already dedups to
         // one (newest) update per local ZIM; this per-URL guard prevents
         // re-queueing while an older version of the same catalog is still
         // queued/downloading, so the update lands cleanly on completion.
-        let pending: Option<crate::db::entities::downloads::Model> = Entity::find()
-            .filter(Column::Url.eq(u.download_url.clone()))
-            .filter(Column::Status.is_in([
-                crate::torrent::DownloadStatus::Queued.as_str(),
-                crate::torrent::DownloadStatus::Downloading.as_str(),
-                crate::torrent::DownloadStatus::Complete.as_str(),
-                crate::torrent::DownloadStatus::Seeding.as_str(),
-            ]))
-            .one(&db)
-            .await
-            .map_err(Error::from)?;
+        let pending: Option<i32> = crate::db::raw::fetch_scalar_optional(
+            db,
+            "SELECT id FROM downloads WHERE url = $1 \
+             AND status IN ($2, $3, $4, $5) LIMIT 1",
+            |q| {
+                q.bind(&u.download_url)
+                    .bind(crate::torrent::DownloadStatus::Queued.as_str())
+                    .bind(crate::torrent::DownloadStatus::Downloading.as_str())
+                    .bind(crate::torrent::DownloadStatus::Complete.as_str())
+                    .bind(crate::torrent::DownloadStatus::Seeding.as_str())
+            },
+        )
+        .await?;
         if pending.is_some() {
             continue;
         }
-        let result = Entity::insert(ActiveModel {
-            name: ActiveValue::Set(u.catalog_name.clone()),
-            url: ActiveValue::Set(u.download_url.clone()),
-            status: ActiveValue::Set(crate::torrent::DownloadStatus::Queued.as_str().to_owned()),
-            ..Default::default()
-        })
-        .exec(&db)
-        .await;
-        match result {
+        match crate::db::raw::execute(
+            db,
+            "INSERT INTO downloads (name, url, status) VALUES ($1, $2, $3)",
+            |q| {
+                q.bind(&u.catalog_name)
+                    .bind(&u.download_url)
+                    .bind(crate::torrent::DownloadStatus::Queued.as_str())
+            },
+        )
+        .await
+        {
             Ok(_) => {}
             // 23505 unique_violation (concurrent insert, e.g. manual POST
             // /downloads) — safe to skip.
-            Err(e)
-                if matches!(
-                    &e,
-                    sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(
-                        sqlx::Error::Database(d)
-                    )) if d.code().as_deref() == Some("23505")
-                ) =>
-            {
+            Err(Error::Database(e)) if crate::db::collections::is_unique_violation(&e) => {
                 continue;
             }
-            Err(e) => return Err(Error::SeaOrm(e)),
+            Err(e) => return Err(e),
         }
         tracing::info!(
             "OPDS: queued auto-update for {} → {} ({})",

@@ -20,13 +20,6 @@ pub enum Error {
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 
-    /// SeaORM driver error (entity / query-builder API). SeaORM runs on the
-    /// same sqlx Postgres driver, so when the underlying sqlx error can be
-    /// extracted it gets the exact same SQLSTATE mapping as
-    /// [`Error::Database`]; anything else is a 503 with details logged only.
-    #[error("database error: {0}")]
-    SeaOrm(#[from] sea_orm::DbErr),
-
     #[error("ZIM error: {0}")]
     Zim(String),
 
@@ -174,11 +167,6 @@ impl Error {
             // failures (IO/TLS/protocol) are a 503 closed connection.
             // 23505 keeps its constraint-derived field message (no raw DB text).
             Error::Database(e) => sqlx_error_status_message(e),
-            // SeaORM runs on the same sqlx driver: unwrap to the sqlx error
-            // when possible and apply the identical SQLSTATE mapping; pool
-            // acquisition and SeaORM-internal failures are unclassified DB
-            // faults (503, raw detail stays in the log).
-            Error::SeaOrm(e) => sea_orm_status_message(e),
             // Decision 2026-08-27 (B6.9): keep 502 — upstream qBittorrent /
             // download failures dominate; client-data validation via torrent
             // is the rare case, so 502 is the more honest status.
@@ -203,12 +191,11 @@ impl Error {
     }
 }
 
-/// HTTP status + client-safe message for a raw sqlx error. Shared by
-/// [`Error::Database`] and (when unwrappable) [`Error::SeaOrm`]: a pool
-/// checkout timeout is a down pool (503, "database unavailable"); a
-/// server-returned SQLSTATE maps to an honest client status (ARCH m2) with
-/// 23505 keeping its constraint-derived field message (no raw DB text);
-/// connection-level failures (IO/TLS/protocol) are a 503 closed connection.
+/// HTTP status + client-safe message for a raw sqlx error. A pool checkout
+/// timeout is a down pool (503, "database unavailable"); a server-returned
+/// SQLSTATE maps to an honest client status (ARCH m2) with 23505 keeping its
+/// constraint-derived field message (no raw DB text); connection-level
+/// failures (IO/TLS/protocol) are a 503 closed connection.
 fn sqlx_error_status_message(e: &sqlx::Error) -> (axum::http::StatusCode, String) {
     use axum::http::StatusCode;
 
@@ -242,49 +229,6 @@ fn sqlx_error_status_message(e: &sqlx::Error) -> (axum::http::StatusCode, String
             StatusCode::SERVICE_UNAVAILABLE,
             "database connection closed".into(),
         )
-    }
-}
-
-/// HTTP status + client-safe message for a SeaORM error.
-///
-/// SeaORM runs on the same sqlx driver: a pool-acquisition failure is a down
-/// pool (503, "database unavailable"), and when a `Conn`/`Exec`/`Query` error
-/// wraps a sqlx driver error the identical SQLSTATE mapping as
-/// [`Error::Database`] applies. Anything else is an unclassified DB fault
-/// (503, raw detail stays in the log).
-fn sea_orm_status_message(e: &sea_orm::DbErr) -> (axum::http::StatusCode, String) {
-    use axum::http::StatusCode;
-
-    match e {
-        sea_orm::DbErr::ConnectionAcquire(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "database unavailable".into(),
-        ),
-        _ => match sqlx_error_from_db_err(e) {
-            Some(sqlx_err) => sqlx_error_status_message(sqlx_err),
-            None => {
-                tracing::error!("database error: {e}");
-                (StatusCode::SERVICE_UNAVAILABLE, "database error".into())
-            }
-        },
-    }
-}
-
-/// Borrow the sqlx driver error SeaORM carries: `DbErr::Conn` / `Exec` /
-/// `Query` hold a [`sea_orm::RuntimeErr`], and a driver failure is
-/// `RuntimeErr::SqlxError`. Returns `None` for pool-acquisition failures
-/// and SeaORM-internal errors, which the caller treats as unclassified DB
-/// faults.
-fn sqlx_error_from_db_err(e: &sea_orm::DbErr) -> Option<&sqlx::Error> {
-    use sea_orm::RuntimeErr;
-
-    match e {
-        sea_orm::DbErr::Conn(rt) | sea_orm::DbErr::Exec(rt) | sea_orm::DbErr::Query(rt) => match rt
-        {
-            RuntimeErr::SqlxError(e) => Some(e),
-            RuntimeErr::Internal(_) => None,
-        },
-        _ => None,
     }
 }
 
@@ -409,34 +353,5 @@ mod tests {
         assert_eq!(msg, "database unavailable");
         assert!(!msg.contains("postgres://"));
         assert!(!msg.contains("://"));
-    }
-
-    #[test]
-    fn sea_orm_error_maps_like_sqlx_and_does_not_leak() {
-        // A SeaORM query error wrapping a pool timeout behaves exactly like
-        // the raw sqlx error (SQLSTATE/status mapping is shared).
-        let err = Error::SeaOrm(sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(
-            sqlx::Error::PoolTimedOut,
-        )));
-        let (status, msg) = err.status_and_message();
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(msg, "database unavailable");
-
-        // A SeaORM-internal error (no sqlx driver error to unwrap) is a 503
-        // and its raw detail never reaches the client.
-        let err = Error::SeaOrm(sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
-            "secret detail".into(),
-        )));
-        let (status, msg) = err.status_and_message();
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(msg, "database error");
-        assert!(!msg.contains("secret detail"));
-
-        // RecordNotFound-style SeaORM errors are unclassified DB faults, not
-        // client input errors.
-        let err = Error::SeaOrm(sea_orm::DbErr::RecordNotFound("id".into()));
-        let (status, msg) = err.status_and_message();
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(!msg.contains("id"));
     }
 }

@@ -525,7 +525,7 @@ async fn tool_article_languages(state: &AppState, args: &Value) -> Result<Value,
 
 async fn tool_list_collections(state: &AppState) -> Value {
     let rows = match sqlx::query_as::<
-        // RAW-OK: collections listing needs `ARRAY_AGG` + a `LEFT JOIN` aggregate query — set-valued SQL the SeaORM builder cannot express (stdio MCP, outside the db layer); the lint regex doesn't match turbofish calls, so this marker documents the exemption
+        // RAW-OK: collections listing needs `ARRAY_AGG` + a `LEFT JOIN` aggregate query — set-valued SQL the `db::raw` helpers cannot express (stdio MCP, outside the db layer); the lint regex doesn't match turbofish calls, so this marker documents the exemption
         _,
         (
             String,

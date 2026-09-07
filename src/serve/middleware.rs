@@ -19,7 +19,7 @@ use crate::AppState;
 /// Per-source-IP auth-failure lockout (SEC-M1). In-memory, capped, per
 /// process. After [`Self::MAX_FAILURES`] failures within [`Self::WINDOW`], the
 /// IP is locked out for the remainder of the window. A successful auth clears
-/// the IP. The map is bounded to [`Self::MAX_TRACKED`] distinct IPs; when the
+/// the IP. The map is bounded to `MAX_TRACKED` distinct IPs; when the
 /// cap is hit the entry with the oldest `first_failure` is evicted.
 #[derive(Default)]
 pub struct LockoutTracker {
@@ -43,7 +43,7 @@ impl LockoutTracker {
     /// Remaining lockout time for `ip`, if any.
     ///
     /// PERF: no O(n) prune on this path — it runs on **every** auth-gated
-    /// request, and a full `retain` over up to [`Self::MAX_TRACKED`] entries
+    /// request, and a full `retain` over up to `MAX_TRACKED` entries
     /// under the process-wide mutex would serialize all concurrent requests
     /// (worst case: a scanner from many IPs). Expired entries are harmless
     /// here: the per-entry `first.elapsed()` filter below returns `None` for
@@ -532,11 +532,11 @@ pub(crate) async fn settings_authed(
 /// One-time, per-request auth verdict for handlers (ARCH-H2).
 ///
 /// Previously each auth-aware handler hand-assembled the
-/// `Authorization`/query-token plumbing and re-invoked [`settings_authed`] —
+/// `Authorization`/query-token plumbing and re-invoked `settings_authed` —
 /// a drift trap: a new handler that redacts or gates on auth had to replicate
 /// the exact call, or it would silently leak topology / weaken a gate. With
 /// the extractor, "this handler is auth-aware" is a type-level property and
-/// the verdict logic stays centralized in [`settings_authed`].
+/// the verdict logic stays centralized in `settings_authed`.
 ///
 /// The extractor only runs when a handler asks for it (axum extractors are
 /// per-handler), and in open mode it returns `authenticated = false` without

@@ -7,16 +7,11 @@
 //! `zim_ids` (`i32`); id↔name resolution is a presentation concern (it reads
 //! the ZIM registry, not the DB), so it stays in the handler.
 //!
-//! Query layer: the SeaORM query builder (entity `find` / active-model
-//! `insert` / `update_many` / `delete_by_id`) over the shared pool via
-//! [`crate::db::sea_orm_db`]. `updated_at = now()` stays a *server-side*
-//! timestamp via `Expr::cust("now()")`, so the SQL semantics match the old
-//! raw statements exactly.
-use crate::db::entities::collections::{ActiveModel, Column, Entity};
-use crate::db::{pool::Pool, sea_orm_db};
+//! Query layer: raw SQL via [`crate::db::raw`]. `updated_at = now()` stays
+//! a *server-side* timestamp (the SQL `now()`, never a Rust-side clock), so
+//! the SQL semantics match the old raw statements exactly.
+use crate::db::{pool::Pool, raw};
 use crate::error::{Error, Result};
-use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveModelTrait, ActiveValue, EntityTrait, QueryFilter, QueryOrder};
 
 /// One `collections` row — raw, with `zim_ids` still unresolved. The handler
 /// maps this to the wire `Collection` DTO (resolving `zim_ids` → names).
@@ -30,25 +25,40 @@ pub struct CollectionRow {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Decode tuple for [`list_collections`] — one field per [`CollectionRow`]
+/// column, in SELECT order.
+type CollectionRowCols = (
+    i32,
+    String,
+    String,
+    Vec<i32>,
+    bool,
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+);
+
 /// All collections, ordered by name.
 pub async fn list_collections(pool: &Pool) -> Result<Vec<CollectionRow>> {
-    let db = sea_orm_db(pool);
-    let models = Entity::find()
-        .order_by_asc(Column::Name)
-        .all(&db)
-        .await
-        .map_err(Error::from)?;
-    Ok(models
+    let rows: Vec<CollectionRowCols> = raw::fetch_all(
+        pool,
+        "SELECT id, name, label, zim_ids, is_favorite, created_at, updated_at \
+         FROM collections ORDER BY name",
+        |q| q,
+    )
+    .await?;
+    Ok(rows
         .into_iter()
-        .map(|m| CollectionRow {
-            id: m.id,
-            name: m.name,
-            label: m.label,
-            zim_ids: m.zim_ids,
-            is_favorite: m.is_favorite,
-            created_at: m.created_at,
-            updated_at: m.updated_at,
-        })
+        .map(
+            |(id, name, label, zim_ids, is_favorite, created_at, updated_at)| CollectionRow {
+                id,
+                name,
+                label,
+                zim_ids,
+                is_favorite,
+                created_at,
+                updated_at,
+            },
+        )
         .collect())
 }
 
@@ -71,22 +81,26 @@ pub async fn insert_collection(
     zim_ids: &[i32],
     is_favorite: bool,
 ) -> Result<InsertOutcome> {
-    let db = sea_orm_db(pool);
     // Only the four caller-provided columns are set; `created_at` /
-    // `updated_at` stay `NotSet` and keep the table's `now()` defaults
-    // (same column list as the old raw INSERT).
-    let model = ActiveModel {
-        name: ActiveValue::Set(name.to_owned()),
-        label: ActiveValue::Set(label.to_owned()),
-        zim_ids: ActiveValue::Set(zim_ids.to_vec()),
-        is_favorite: ActiveValue::Set(is_favorite),
-        ..Default::default()
+    // `updated_at` keep the table's `now()` defaults (same column list as
+    // the old raw INSERT).
+    let id: Option<i32> = match raw::fetch_scalar_optional(
+        pool,
+        "INSERT INTO collections (name, label, zim_ids, is_favorite) \
+         VALUES ($1, $2, $3, $4) RETURNING id",
+        |q| q.bind(name).bind(label).bind(zim_ids).bind(is_favorite),
+    )
+    .await
+    {
+        Ok(id) => id,
+        // BUG-9: a concurrent INSERT hitting the name UNIQUE index (23505) is
+        // a duplicate, not a DB fault.
+        Err(Error::Database(e)) if is_unique_violation(&e) => return Ok(InsertOutcome::Duplicate),
+        Err(e) => return Err(e),
     };
-    match model.insert(&db).await {
-        Ok(m) => Ok(InsertOutcome::Inserted(m.id)),
-        Err(e) if orm_is_unique_violation(&e) => Ok(InsertOutcome::Duplicate),
-        Err(e) => Err(Error::from(e)),
-    }
+    Ok(InsertOutcome::Inserted(
+        id.expect("INSERT … RETURNING id always yields a row"),
+    ))
 }
 
 /// Fields to set on [`update_collection`]; a `None` field keeps its current
@@ -115,43 +129,107 @@ pub async fn update_collection(
     id: i32,
     fields: &UpdateFields,
 ) -> Result<UpdateOutcome> {
-    // Dynamic `UPDATE`: a `NotSet` active value is omitted from the SET list,
-    // so only the provided fields are written. `updated_at` stays server-side
-    // (`now()`) — it is added separately, not via the active model.
-    let mut model = ActiveModel {
-        ..Default::default()
+    // Dynamic `UPDATE`: only the provided fields are written. `updated_at`
+    // stays server-side (`now()`) — always appended. Binds: `id` is `$1`;
+    // the provided fields follow in a fixed column order (name, label,
+    // zim_ids, is_favorite). The raw bind chain is positional and the four
+    // field types differ, so the dispatch is one arm per provided-set
+    // combination.
+    let updated = match (&fields.name, &fields.label, &fields.zim_ids, &fields.is_favorite) {
+        // Unreachable in practice (the handler 400s on an all-`None` body);
+        // a benign fallback so we never build a malformed `UPDATE`.
+        (None, None, None, None) => return Ok(UpdateOutcome::NotFound),
+        (Some(name), None, None, None) => raw::execute(
+            pool,
+            "UPDATE collections SET name = $2, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(name),
+        )
+        .await?,
+        (None, Some(label), None, None) => raw::execute(
+            pool,
+            "UPDATE collections SET label = $2, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(label),
+        )
+        .await?,
+        (None, None, Some(zim_ids), None) => raw::execute(
+            pool,
+            "UPDATE collections SET zim_ids = $2, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(zim_ids),
+        )
+        .await?,
+        (None, None, None, Some(is_favorite)) => raw::execute(
+            pool,
+            "UPDATE collections SET is_favorite = $2, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(is_favorite),
+        )
+        .await?,
+        (Some(name), Some(label), None, None) => raw::execute(
+            pool,
+            "UPDATE collections SET name = $2, label = $3, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(name).bind(label),
+        )
+        .await?,
+        (Some(name), None, Some(zim_ids), None) => raw::execute(
+            pool,
+            "UPDATE collections SET name = $2, zim_ids = $3, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(name).bind(zim_ids),
+        )
+        .await?,
+        (Some(name), None, None, Some(is_favorite)) => raw::execute(
+            pool,
+            "UPDATE collections SET name = $2, is_favorite = $3, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(name).bind(is_favorite),
+        )
+        .await?,
+        (None, Some(label), Some(zim_ids), None) => raw::execute(
+            pool,
+            "UPDATE collections SET label = $2, zim_ids = $3, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(label).bind(zim_ids),
+        )
+        .await?,
+        (None, Some(label), None, Some(is_favorite)) => raw::execute(
+            pool,
+            "UPDATE collections SET label = $2, is_favorite = $3, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(label).bind(is_favorite),
+        )
+        .await?,
+        (None, None, Some(zim_ids), Some(is_favorite)) => raw::execute(
+            pool,
+            "UPDATE collections SET zim_ids = $2, is_favorite = $3, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(zim_ids).bind(is_favorite),
+        )
+        .await?,
+        (Some(name), Some(label), Some(zim_ids), None) => raw::execute(
+            pool,
+            "UPDATE collections SET name = $2, label = $3, zim_ids = $4, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(name).bind(label).bind(zim_ids),
+        )
+        .await?,
+        (Some(name), Some(label), None, Some(is_favorite)) => raw::execute(
+            pool,
+            "UPDATE collections SET name = $2, label = $3, is_favorite = $4, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(name).bind(label).bind(is_favorite),
+        )
+        .await?,
+        (Some(name), None, Some(zim_ids), Some(is_favorite)) => raw::execute(
+            pool,
+            "UPDATE collections SET name = $2, zim_ids = $3, is_favorite = $4, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(name).bind(zim_ids).bind(is_favorite),
+        )
+        .await?,
+        (None, Some(label), Some(zim_ids), Some(is_favorite)) => raw::execute(
+            pool,
+            "UPDATE collections SET label = $2, zim_ids = $3, is_favorite = $4, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(label).bind(zim_ids).bind(is_favorite),
+        )
+        .await?,
+        (Some(name), Some(label), Some(zim_ids), Some(is_favorite)) => raw::execute(
+            pool,
+            "UPDATE collections SET name = $2, label = $3, zim_ids = $4, is_favorite = $5, updated_at = now() WHERE id = $1",
+            |q| q.bind(id).bind(name).bind(label).bind(zim_ids).bind(is_favorite),
+        )
+        .await?,
     };
-    if let Some(nm) = &fields.name {
-        model.name = ActiveValue::Set(nm.clone());
-    }
-    if let Some(l) = &fields.label {
-        model.label = ActiveValue::Set(l.clone());
-    }
-    if let Some(z) = &fields.zim_ids {
-        model.zim_ids = ActiveValue::Set(z.clone());
-    }
-    if let Some(f) = &fields.is_favorite {
-        model.is_favorite = ActiveValue::Set(*f);
-    }
-    // Unreachable in practice (the handler 400s on an all-`None` body); a
-    // benign fallback so we never build a malformed `UPDATE`.
-    if !model.name.is_set()
-        && !model.label.is_set()
-        && !model.zim_ids.is_set()
-        && !model.is_favorite.is_set()
-    {
-        return Ok(UpdateOutcome::NotFound);
-    }
-    let db = sea_orm_db(pool);
-    let stmt = Entity::update_many()
-        .set(model)
-        .col_expr(Column::UpdatedAt, Expr::cust("now()"));
-    let updated = stmt
-        .filter(Expr::col(Column::Id).eq(Expr::val(id)))
-        .exec(&db)
-        .await
-        .map_err(Error::from)?
-        .rows_affected;
     Ok(if updated > 0 {
         UpdateOutcome::Updated
     } else {
@@ -170,12 +248,10 @@ pub enum DeleteOutcome {
 
 /// Delete a collection by id.
 pub async fn delete_collection(pool: &Pool, id: i32) -> Result<DeleteOutcome> {
-    let db = sea_orm_db(pool);
-    let deleted = Entity::delete_by_id(id)
-        .exec(&db)
-        .await
-        .map_err(Error::from)?
-        .rows_affected;
+    let deleted = raw::execute(pool, "DELETE FROM collections WHERE id = $1", |q| {
+        q.bind(id)
+    })
+    .await?;
     Ok(if deleted > 0 {
         DeleteOutcome::Deleted
     } else {
@@ -188,20 +264,6 @@ pub async fn delete_collection(pool: &Pool, id: i32) -> Result<DeleteOutcome> {
 pub(crate) fn is_unique_violation(e: &sqlx::Error) -> bool {
     e.as_database_error()
         .is_some_and(|db| db.code().as_deref() == Some("23505"))
-}
-
-/// BUG-9 (SeaORM flavor): true when a SeaORM error wraps a sqlx
-/// unique-constraint violation (SQLSTATE 23505). SeaORM runs on the same
-/// sqlx driver, so the violation surfaces as
-/// `DbErr::{Exec, Query}(RuntimeErr::SqlxError(…))`.
-pub(crate) fn orm_is_unique_violation(e: &sea_orm::DbErr) -> bool {
-    match e {
-        sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(sqlx_err))
-        | sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(sqlx_err)) => {
-            is_unique_violation(sqlx_err)
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]

@@ -12,8 +12,8 @@
 //! - private ranges (RFC1918, ULA `fc00::/7`) are blocked unless the
 //!   caller passes `allow_private = true` (from
 //!   `downloads.allow_private_networks`);
-//! - every redirect hop is re-validated (see [`redirect_policy`]), and named
-//!   hosts are resolved up front and pinned (see [`resolve_download_host`])
+//! - every redirect hop is re-validated (see `redirect_policy`), and named
+//!   hosts are resolved up front and pinned (see `resolve_download_host`)
 //!   to close the DNS-rebinding window.
 
 use std::net::{IpAddr, ToSocketAddrs};

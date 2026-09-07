@@ -20,11 +20,6 @@ config.toml
 .DS_Store
 Thumbs.db
 
-# Build artifacts
-*.db
-*.db-shm
-*.db-wal
-
 # Testing
 test-data/
 

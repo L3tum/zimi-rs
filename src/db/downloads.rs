@@ -7,19 +7,12 @@
 //! URL/name; not-found vs not-cancellable) are expressed as outcomes, not as
 //! `Error` variants, so the presentation layer owns the 404/409/200 mapping.
 //!
-//! Query layer: the SeaORM query builder (entity `find` / active-model
-//! `insert` / `update_many`) over the shared pool via
-//! [`crate::db::sea_orm_db`]. `updated_at = now()` stays a *server-side*
-//! timestamp via `Expr::cust("now()")`, so the SQL semantics match the old
-//! raw statements exactly.
-use crate::db::entities::downloads::{ActiveModel, Column, Entity};
+//! Query layer: raw SQL via [`crate::db::raw`]. `updated_at = now()` stays
+//! a *server-side* timestamp (the SQL `now()`, never a Rust-side clock), so
+//! the SQL semantics match the old raw statements exactly.
 use crate::db::pool::Pool;
-use crate::db::sea_orm_db;
+use crate::db::raw;
 use crate::error::{Error, Result};
-use sea_orm::sea_query::Expr;
-use sea_orm::{
-    ActiveModelTrait, ActiveValue, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-};
 
 /// Normalised form of a download `url` for ZIM detection: the path with any
 /// `?query` / `#fragment` stripped, lowercased and trimmed. Reused by the
@@ -49,31 +42,167 @@ pub struct DownloadRow {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One full `downloads` row — every column, with the schema types (`i32` id;
+/// `Option<String>` hash/file_path/error; `f32` progress; `i64`
+/// speed_bps/eta_secs/up_speed_bps/num_seeds; `Option<f32>` ratio;
+/// `DateTime<Utc>` created_at/updated_at). Used by the poller's in-flight
+/// select, which needs every column; the partial [`DownloadRow`] above is
+/// the handler-facing shape.
+pub struct DownloadRecord {
+    pub id: i32,
+    pub name: String,
+    pub url: String,
+    pub hash: Option<String>,
+    pub status: String,
+    pub progress: f32,
+    pub speed_bps: Option<i64>,
+    pub eta_secs: Option<i64>,
+    pub file_path: Option<String>,
+    pub error: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub ratio: Option<f32>,
+    pub up_speed_bps: Option<i64>,
+    pub num_seeds: Option<i64>,
+}
+
+/// Decode tuple for [`fetch_downloads_by_statuses`] — one field per
+/// [`DownloadRecord`] column, in SELECT order.
+type DownloadRecordCols = (
+    i32,
+    String,
+    String,
+    Option<String>,
+    String,
+    f32,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+    Option<f32>,
+    Option<i64>,
+    Option<i64>,
+);
+
+/// Fetch `downloads` rows in the two given statuses (explicit column list,
+/// decoded as [`DownloadRecord`]).
+pub async fn fetch_downloads_by_statuses(
+    pool: &Pool,
+    status1: &str,
+    status2: &str,
+) -> Result<Vec<DownloadRecord>> {
+    let rows: Vec<DownloadRecordCols> = raw::fetch_all(
+        pool,
+        "SELECT id, name, url, hash, status, progress, speed_bps, eta_secs, file_path, error, \
+         created_at, updated_at, ratio, up_speed_bps, num_seeds \
+         FROM downloads WHERE status IN ($1, $2)",
+        |q| q.bind(status1).bind(status2),
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                name,
+                url,
+                hash,
+                status,
+                progress,
+                speed_bps,
+                eta_secs,
+                file_path,
+                error,
+                created_at,
+                updated_at,
+                ratio,
+                up_speed_bps,
+                num_seeds,
+            )| {
+                DownloadRecord {
+                    id,
+                    name,
+                    url,
+                    hash,
+                    status,
+                    progress,
+                    speed_bps,
+                    eta_secs,
+                    file_path,
+                    error,
+                    created_at,
+                    updated_at,
+                    ratio,
+                    up_speed_bps,
+                    num_seeds,
+                }
+            },
+        )
+        .collect())
+}
+
+/// Decode tuple for [`list_downloads`] — one field per [`DownloadRow`]
+/// column, in SELECT order.
+type DownloadRowCols = (
+    i32,
+    String,
+    String,
+    String,
+    f32,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    chrono::DateTime<chrono::Utc>,
+    Option<f32>,
+    Option<i64>,
+    Option<i64>,
+);
+
 /// Most recent downloads (newest first), capped at 500.
 pub async fn list_downloads(pool: &Pool) -> Result<Vec<DownloadRow>> {
-    let db = sea_orm_db(pool);
-    let models = Entity::find()
-        .order_by_desc(Column::CreatedAt)
-        .limit(500)
-        .all(&db)
-        .await
-        .map_err(Error::from)?;
-    Ok(models
+    let rows: Vec<DownloadRowCols> = raw::fetch_all(
+        pool,
+        "SELECT id, name, url, status, progress, speed_bps, eta_secs, error, created_at, \
+         ratio, up_speed_bps, num_seeds \
+         FROM downloads ORDER BY created_at DESC LIMIT 500",
+        |q| q,
+    )
+    .await?;
+    Ok(rows
         .into_iter()
-        .map(|m| DownloadRow {
-            id: m.id,
-            name: m.name,
-            url: m.url,
-            status: m.status,
-            progress: m.progress,
-            speed_bps: m.speed_bps,
-            eta_secs: m.eta_secs,
-            error: m.error,
-            created_at: m.created_at,
-            ratio: m.ratio,
-            up_speed_bps: m.up_speed_bps,
-            num_seeds: m.num_seeds,
-        })
+        .map(
+            |(
+                id,
+                name,
+                url,
+                status,
+                progress,
+                speed_bps,
+                eta_secs,
+                error,
+                created_at,
+                ratio,
+                up_speed_bps,
+                num_seeds,
+            )| {
+                DownloadRow {
+                    id,
+                    name,
+                    url,
+                    status,
+                    progress,
+                    speed_bps,
+                    eta_secs,
+                    error,
+                    created_at,
+                    ratio,
+                    up_speed_bps,
+                    num_seeds,
+                }
+            },
+        )
         .collect())
 }
 
@@ -94,45 +223,49 @@ pub enum InsertOutcome {
 /// partial unique indexes are the authority, and the `23505` (unique
 /// violation) path below closes the concurrent-POST race.
 pub async fn insert_download(pool: &Pool, name: &str, url: &str) -> Result<InsertOutcome> {
-    let db = sea_orm_db(pool);
-    // The `(url = $2 OR name = $1)` pre-check is only fast feedback — the
+    // The `(url = $1 OR name = $2)` pre-check is only fast feedback — the
     // 003/011 partial unique indexes are the authority, and the `23505`
     // (unique violation) path below closes the concurrent-POST race.
-    let dup = Entity::find()
-        .filter(
-            Expr::col(Column::Url)
-                .eq(Expr::val(url))
-                .or(Expr::col(Column::Name).eq(Expr::val(name))),
-        )
-        .filter(Column::Status.is_in([
-            crate::torrent::DownloadStatus::Queued.as_str(),
-            crate::torrent::DownloadStatus::Downloading.as_str(),
-        ]))
-        .limit(1)
-        .one(&db)
-        .await
-        .map_err(Error::from)?;
+    let dup: Option<i32> = raw::fetch_scalar_optional(
+        pool,
+        "SELECT id FROM downloads \
+         WHERE (url = $1 OR name = $2) AND status IN ($3, $4) LIMIT 1",
+        |q| {
+            q.bind(url)
+                .bind(name)
+                .bind(crate::torrent::DownloadStatus::Queued.as_str())
+                .bind(crate::torrent::DownloadStatus::Downloading.as_str())
+        },
+    )
+    .await?;
     if dup.is_some() {
         return Ok(InsertOutcome::Duplicate);
     }
     // Only the three caller-provided columns are set; `created_at` /
-    // `updated_at` stay `NotSet` and keep the table's `now()` defaults
-    // (same column list as the old raw INSERT).
-    let model = ActiveModel {
-        name: ActiveValue::Set(name.to_owned()),
-        url: ActiveValue::Set(url.to_owned()),
-        status: ActiveValue::Set(crate::torrent::DownloadStatus::Queued.as_str().to_owned()),
-        ..Default::default()
-    };
-    match model.insert(&db).await {
-        Ok(m) => Ok(InsertOutcome::Inserted(m.id)),
+    // `updated_at` keep the table's `now()` defaults (same column list as
+    // the old raw INSERT).
+    let id: Option<i32> = match raw::fetch_scalar_optional(
+        pool,
+        "INSERT INTO downloads (name, url, status) VALUES ($1, $2, $3) RETURNING id",
+        |q| {
+            q.bind(name)
+                .bind(url)
+                .bind(crate::torrent::DownloadStatus::Queued.as_str())
+        },
+    )
+    .await
+    {
+        Ok(id) => id,
         // BUG-9: a concurrent POST hitting the partial unique index (23505)
         // is a duplicate, not a DB fault — same mapping as `collections`.
-        Err(e) if crate::db::collections::orm_is_unique_violation(&e) => {
-            Ok(InsertOutcome::Duplicate)
+        Err(Error::Database(e)) if crate::db::collections::is_unique_violation(&e) => {
+            return Ok(InsertOutcome::Duplicate)
         }
-        Err(e) => Err(Error::from(e)),
-    }
+        Err(e) => return Err(e),
+    };
+    Ok(InsertOutcome::Inserted(
+        id.expect("INSERT … RETURNING id always yields a row"),
+    ))
 }
 
 /// Outcome of [`cancel_download`].
@@ -152,34 +285,27 @@ pub enum CancelOutcome {
 /// handler can map to 404 vs 409. Only `queued`/`downloading` rows are
 /// cancellable; anything else (complete/cancelled/…) is left alone.
 pub async fn cancel_download(pool: &Pool, id: i32) -> Result<CancelOutcome> {
-    let db = sea_orm_db(pool);
-    let updated = Entity::update_many()
-        .col_expr(
-            Column::Status,
-            Expr::val(crate::torrent::DownloadStatus::Cancelled.as_str()).into(),
-        )
-        .col_expr(Column::UpdatedAt, Expr::cust("now()"))
-        .filter(Column::Id.eq(id))
-        .filter(Column::Status.is_in([
-            crate::torrent::DownloadStatus::Queued.as_str(),
-            crate::torrent::DownloadStatus::Downloading.as_str(),
-        ]))
-        .exec(&db)
-        .await
-        .map_err(Error::from)?
-        .rows_affected;
+    let updated = raw::execute(
+        pool,
+        "UPDATE downloads SET status = $1, updated_at = now() \
+         WHERE id = $2 AND status IN ($3, $4)",
+        |q| {
+            q.bind(crate::torrent::DownloadStatus::Cancelled.as_str())
+                .bind(id)
+                .bind(crate::torrent::DownloadStatus::Queued.as_str())
+                .bind(crate::torrent::DownloadStatus::Downloading.as_str())
+        },
+    )
+    .await?;
     if updated > 0 {
         return Ok(CancelOutcome::Cancelled(id));
     }
     // Distinguish not-found from not-cancellable (BUG-16c).
-    let status: Option<String> = Entity::find_by_id(id)
-        .select_only()
-        .column(Column::Status)
-        .into_tuple()
-        .one(&db)
-        .await
-        .map_err(Error::from)?
-        .map(|(status,)| status);
+    let status: Option<String> =
+        raw::fetch_scalar_optional(pool, "SELECT status FROM downloads WHERE id = $1", |q| {
+            q.bind(id)
+        })
+        .await?;
     Ok(match status {
         Some(status) => CancelOutcome::NotCancellable { status },
         None => CancelOutcome::NotFound,

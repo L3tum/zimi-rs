@@ -551,9 +551,9 @@ pub async fn get_snippet(
     State(state): State<AppState>,
     Query(params): Query<SnippetQuery>,
 ) -> Result<Json<SnippetResponse>, crate::error::Error> {
-    // Raw escape hatch (db::raw): cross-table join — the entities define no
-    // SeaORM relations (every entity's `Relation` is empty), so cross-table
-    // reads stay raw (same convention as `crate::db`); tuple shape unchanged.
+    // Raw SQL (db::raw): cross-table JOIN — no `db::raw` named helper exists
+    // for it, so the read is kept inline (same convention as `crate::db`);
+    // tuple shape unchanged.
     let row = crate::db::raw::fetch_optional::<(String, String, Option<String>), _, _>(
         &state.db,
         "SELECT a.snippet, a.title, a.content_preview FROM articles a

@@ -1,12 +1,11 @@
 #!/bin/sh
 # M2: raw-SQL boundary lint.
 #
-# The sanctioned escape hatch for SQL the SeaORM query builder cannot express
-# lives in `src/db/` (the `db::raw` module in `src/db/mod.rs`); every other
-# direct `sqlx::query` / `sqlx::query_as` / `sqlx::query_scalar` call site is
-# a boundary violation and must carry a `// RAW-OK: <reason>` marker ON THE
+# The `db::raw` helpers in `src/db/` are the data-access layer; every other
+# direct `sqlx::query` / `sqlx::query_as` / `sqlx::query_scalar` call site
+# is a boundary crossing and must carry a `// RAW-OK: <reason>` marker ON THE
 # CALL LINE (a one-line justification future readers — and this lint — can
-# audit). `src/db/` is exempt because it owns the escape hatch.
+# audit). `src/db/` is exempt because it owns the raw helpers.
 #
 # Queries routed through the `db::raw` helpers (`raw::fetch_*`,
 # `raw::execute`, ...) are the intended path and are not flagged.

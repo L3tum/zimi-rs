@@ -50,7 +50,7 @@ fn is_browser_html(content_type: &str) -> bool {
 }
 
 /// Sandbox headers for `/w` responses: applied to every MIME type browsers
-/// render as an HTML document (see [`is_browser_html`]); empty for all other
+/// render as an HTML document (see `is_browser_html`); empty for all other
 /// content types.
 pub fn raw_content_security_headers(content_type: &str) -> Vec<(header::HeaderName, String)> {
     if is_browser_html(content_type) {

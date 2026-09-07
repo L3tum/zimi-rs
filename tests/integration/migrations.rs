@@ -122,8 +122,12 @@ async fn smoke_migration_drift_detection() {
     .await
     .expect("count applied migrations")
     .expect("schema_migrations row");
-    // Keep in lockstep with `MIGRATIONS` in src/db/migrate.rs.
-    assert_eq!(applied, 12, "all migrations must be recorded");
+    // Derives from `MIGRATIONS` in src/db/migrate.rs — no manual lockstep.
+    assert_eq!(
+        applied,
+        zimservice::db::migrate::MIGRATION_COUNT as i64,
+        "all migrations must be recorded"
+    );
     // Spot-check artifacts from the first and the latest migrations so a
     // silent early failure (e.g. only 001-004 applied) can't pass.
     for regclass in [
@@ -156,7 +160,11 @@ async fn smoke_migration_drift_detection() {
     .await
     .expect("count after re-run")
     .expect("schema_migrations row");
-    assert_eq!(still, 12, "re-run must not duplicate or drop rows");
+    assert_eq!(
+        still,
+        zimservice::db::migrate::MIGRATION_COUNT as i64,
+        "re-run must not duplicate or drop rows"
+    );
 
     // (3) Drift: tamper a recorded hash → the next run must refuse.
     zimservice::db::raw::execute(

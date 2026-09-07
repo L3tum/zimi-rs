@@ -8,14 +8,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned toolchain (1.96.0): keeps the rustdoc/clippy gates deterministic —
+      # a moving `stable` once made the docs gate flaky. Bump deliberately; the
+      # MSRV job below still guards 1.91.
+      - uses: dtolnay/rust-toolchain@1.96.0
         with: { components: rustfmt, clippy }
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       # M2: raw-SQL boundary lint — flags sqlx::query* call sites outside
       # src/db/ (the sanctioned db::raw escape hatch) that lack a
-      # `// RAW-OK: <reason>` marker, so the SeaORM-vs-raw boundary stops
-      # being doc-comment-only. POSIX sh, no dependencies.
+      # `// RAW-OK: <reason>` marker. Post-SeaORM the rule is: raw SQL outside
+      # `src/db/` must carry a `// RAW-OK` marker. POSIX sh, no dependencies.
       - run: make raw-sql-lint
       # JS syntax check for the embedded web UI (dependency-free, ~seconds).
       # Strict because `make web-check` skips silently without node; CI always
@@ -59,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with: { components: rustdoc }
       - run: cargo doc --no-deps --all-features
         env:
@@ -68,7 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
       # Unit half runs with the default parallel --test-threads: it holds no
       # shared process state (per-test tempdirs, ephemeral-port MockServers,
       # read-only tests/fixtures) and its DB-gated tests skip — this job has
@@ -91,7 +94,7 @@ jobs:
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with: { components: llvm-tools-preview }
       - uses: taiki-e/install-action@cargo-llvm-cov
       # DB-backed coverage floor (ratchet), same selection as `test-db`:
@@ -122,7 +125,7 @@ jobs:
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
       # `--bins` here (not just in the DB-less `test` job): the binary's
       # DB-gated startup smoke tests (single-instance refusal + the mutating
       # guard's refuse/acquire/release, `src/startup.rs`) run against a real
@@ -153,6 +156,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
       - run: cargo build --all-features
       - run: cargo test --lib --bins --test wiremock

@@ -3,7 +3,7 @@
 use crate::torrent::TorrentInfo;
 
 use super::*;
-use crate::db::entities::downloads::Model as DownloadRow;
+use crate::db::downloads::DownloadRecord;
 
 impl DownloadPoller {
     /// LINT-2 extraction (verbatim `tick()` step-3 block 2): the in-flight
@@ -18,7 +18,7 @@ impl DownloadPoller {
         qbit: Option<Arc<QbitClient>>,
         qb_available: bool,
         p: &crate::settings::PollerParams,
-        rows: Vec<DownloadRow>,
+        rows: Vec<DownloadRecord>,
     ) -> Result<Vec<StatsRow>> {
         // In-progress rows whose stats changed enough to write this tick;
         // flushed after the loop as per-row UPDATEs (M-poller-n1).
