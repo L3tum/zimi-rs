@@ -132,6 +132,12 @@ fn connect_options(dsn: &str, tls_mode: TlsMode) -> Result<PgConnectOptions> {
 /// `max_connections` deliberately.
 const POOL_SIZE_CEILING: u32 = 100;
 
+/// Clamp a configured pool size into the safe range `[1, POOL_SIZE_CEILING]`.
+///
+/// Floor 1: a misconfigured `db_pool_size = 0` must never create an
+/// unbounded pool. Ceiling 100: without it, `DB_POOL_SIZE=999999` would open
+/// that many connections and exhaust Postgres's `max_connections` (default
+/// 100) — raise both together if you raise `max_connections` deliberately.
 pub fn effective_pool_size(raw: u32) -> u32 {
     raw.clamp(1, POOL_SIZE_CEILING)
 }
@@ -154,6 +160,15 @@ pub fn driver_dsn(raw: &str) -> String {
 // (folded into `connect_options` — the options are built once and shared
 // between `create_pool` and `connect_dedicated`)
 
+/// Build the sqlx Postgres pool from [`Config`]: derives the TLS mode from
+/// the DSN scheme/`sslmode`, clamps the size via [`effective_pool_size`],
+/// and sets the lifetime/recycling options (10 s acquire timeout for fast
+/// 503s under exhaustion, 30 min max lifetime so NAT-dropped idle sockets
+/// are recycled).
+///
+/// Warns (not errors) when `sslmode` asks for more than can be enforced: the
+/// chain is validated against the native root store, but the hostname is
+/// never verified (sqlx-rustls limitation).
 pub async fn create_pool(config: &Config) -> Result<Pool> {
     let tls_mode = tls_mode_from_dsn(&config.database_url)?;
 

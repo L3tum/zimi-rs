@@ -6,9 +6,9 @@
 //! reviewable, *enumerable* artifact: every place a row's status, hash, error,
 //! or seed stats changes lives in this module, and every status value is
 //! rendered from the `DownloadStatus` enum (never a raw literal). The intended
-//! graph is [`DownloadStatus::can_transition_to`]; the per-statement `WHERE
+//! graph is `DownloadStatus::can_transition_to`; the per-statement `WHERE
 //! status …` guards are the enforcement, and the read-side `IN (…)` filters
-//! render their sets through [`in_list`].
+//! render their sets through `in_list`.
 //!
 //! **Scope note:** read-only row fetches (in-flight / queued / reconcile
 //! selects, the skip-tick count, the orphan-`.part` path set) and the per-tick
@@ -38,11 +38,18 @@ use sqlx::postgres::PgConnection;
 /// `transition_table_matches_production_guards`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DownloadStatus {
+    /// Waiting to start (nothing in progress yet).
     Queued,
+    /// In progress: a torrent or direct file the poller is tracking.
     Downloading,
+    /// Downloaded, verified, and installed into the ZIM directory.
     Complete,
+    /// Installed and still sharing with the swarm (`torrent.keep_completed`
+    /// on, seed ratio capped); settles back to `Complete` when seeding ends.
     Seeding,
+    /// Failed; the row's `error` column carries the last message.
     Error,
+    /// Cancelled by the user (the row is kept for history).
     Cancelled,
 }
 

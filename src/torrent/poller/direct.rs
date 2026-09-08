@@ -95,16 +95,74 @@ pub(crate) fn window_speed(window_bytes: u64, elapsed: std::time::Duration) -> i
     (window_bytes as f64 / secs).round() as i64
 }
 
+/// Parse `Content-Range: bytes S-T/FULL` (or `bytes */FULL`) into
+/// `(S, FULL)`; `S` is `None` for the `*` form (the reply does not say
+/// where its range starts). `None` when the unit is not `bytes` (e.g.
+/// `items 0-9/100` — a non-byte range set must not be mistaken for one)
+/// or the header is malformed.
+fn content_range_parts(val: &str) -> Option<(Option<u64>, u64)> {
+    let (range, full) = val.split_once('/')?;
+    let full = full.trim().parse().ok()?;
+    let (unit, spec) = range.split_once(' ')?;
+    if unit != "bytes" {
+        return None;
+    }
+    let start = if spec == "*" {
+        None
+    } else {
+        let (s, t) = spec.split_once('-')?;
+        let s: u64 = s.parse().ok()?;
+        let _t: u64 = t.parse().ok()?;
+        Some(s)
+    };
+    Some((start, full))
+}
+
 /// Parse the `FULL` part of `Content-Range: bytes S-T/FULL` (or
-/// `bytes */FULL`); `None` when absent/unparseable.
+/// `bytes */FULL`); `None` when the header is absent, is not a `bytes`
+/// range, or the total is unparseable.
 fn content_range_total(headers: &axum::http::HeaderMap) -> Option<u64> {
     let val = headers
         .get(axum::http::header::CONTENT_RANGE)?
         .to_str()
         .ok()?;
-    // Expect "bytes S-T/FULL" or "bytes */FULL"
-    let slash = val.rfind('/')?;
-    val[slash + 1..].trim().parse().ok()
+    content_range_parts(val).map(|(_, full)| full)
+}
+
+/// Parse the `S` (first byte) part of `Content-Range: bytes S-T/FULL`;
+/// `None` when the header is absent, is not a `bytes` range, S is `*` (the
+/// reply does not say where its range starts), or the header is malformed.
+fn content_range_start(headers: &axum::http::HeaderMap) -> Option<u64> {
+    let val = headers
+        .get(axum::http::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?;
+    content_range_parts(val)?.0
+}
+
+/// How to handle a `206 Partial Content` reply to a resume Range request
+/// whose `.part` holds `from` bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resume206Decision {
+    /// The reply's `Content-Range` starts exactly at the resumed offset
+    /// (S == `from`): append to the existing `.part`.
+    Append,
+    /// S != `from`, or S is unknowable (`bytes */FULL`, missing/malformed
+    /// header): a redirected mirror serving a *different* revision also
+    /// answers `bytes=from-` with a 206 on its own file, and appending
+    /// would splice the old prefix onto the new suffix. Take the 416
+    /// route: discard the stale partial, reissue fresh.
+    FallbackFresh,
+}
+
+/// The 206 dispatch decision (factored out so the check is unit-testable
+/// without a server): append only when the server confirms the range
+/// starts exactly where the `.part` ends.
+fn resume_206_decision(headers: &axum::http::HeaderMap, from: u64) -> Resume206Decision {
+    match content_range_start(headers) {
+        Some(s) if s == from => Resume206Decision::Append,
+        _ => Resume206Decision::FallbackFresh,
+    }
 }
 
 /// The in-loop cancel observation (the ~5 s check), factored out so the
@@ -113,8 +171,8 @@ fn content_range_total(headers: &axum::http::HeaderMap) -> Option<u64> {
 /// open on a DB blip like [`status_if_changed`]). Once it has left
 /// `downloading`, a CANCEL removes the staged `.part` right here — a
 /// CANCEL always removes the staged file, at every cancel-observation
-/// site — because a plain `break` would leave it on disk: [`PartGuard`] keeps
-/// the file on drop (PERF-11 resume), and the post-loop truncation guard
+/// site — because a plain `break` would leave it on disk: the partial file
+/// is intentionally kept on drop for resume (PERF-11), and the post-loop truncation guard
 /// would return `Err` (typical mid-stream cancel: `received < total`) before
 /// the `finalize_direct_download` cancel sites — which DO remove the file —
 /// are ever reached, so a multi-GB `.part` would linger until the next
@@ -127,6 +185,62 @@ async fn observe_cancel(db: &Pool, id: i32, part: &Path) -> Option<String> {
     Some(status)
 }
 
+/// File stream + bookkeeping for [`stream_part`]'s body loop.
+enum FileStream {
+    /// 206 append: file opened in append mode, `from` = resumed offset.
+    Append(tokio::fs::File, u64, Option<u64>, reqwest::Response),
+    /// Fresh/416-fallback: file opened in create/truncate mode.
+    Fresh(tokio::fs::File, Option<u64>, reqwest::Response),
+}
+
+/// Reissue a fresh GET (no Range) to the pinned final `url` and stream its
+/// body into a re-created `part`. Reached on a 416 (source changed, or the
+/// `.part` was already complete) and on a 206 whose `Content-Range` start
+/// does not match the resumed offset (a mirror serving a different
+/// revision answered our Range — see [`resume_206_decision`]).
+///
+/// The stale `.part` is removed only **after** the reissue is confirmed a
+/// success status within the byte cap: a transient `send()` failure must
+/// not throw away resume progress (PERF-11). If the reissue answers
+/// non-success, the `.part` is removed and the row error-marked (the
+/// fallback has already proven the resume unusable).
+#[allow(clippy::too_many_arguments)]
+async fn fresh_fallback(
+    url: &str,
+    client: &reqwest::Client,
+    part: &Path,
+    max_bytes: u64,
+    db: &Pool,
+    id: i32,
+) -> Result<FileStream> {
+    let resp2 = client.get(url).send().await?;
+    if !resp2.status().is_success() {
+        let _ = std::fs::remove_file(part);
+        let msg = format!("HTTP {}", resp2.status());
+        mark_error(db, id, &msg).await;
+        return Err(Error::Torrent {
+            kind: TorrentKind::Other,
+            msg,
+        });
+    }
+    // Same up-front cap check as the 200 branch: reject before touching the
+    // file (a declared size over the cap must not stream to the cap).
+    if let Some(t) = resp2.content_length() {
+        if t > max_bytes {
+            let msg = format!("file is {t} bytes, exceeds the {max_bytes}-byte limit");
+            mark_error(db, id, &msg).await;
+            return Err(Error::Torrent {
+                kind: TorrentKind::Other,
+                msg,
+            });
+        }
+    }
+    // Confirmed success — only now discard the stale partial.
+    let _ = std::fs::remove_file(part);
+    let f = tokio::fs::File::create(part).await?;
+    Ok(FileStream::Fresh(f, resp2.content_length(), resp2))
+}
+
 /// Stream an in-flight HTTP body into `part`, with Range resume support
 /// (PERF-11). `resp` is the terminal (non-redirect) response of the manual
 /// redirect chain and `url`/`client` the pinned final hop that produced it
@@ -134,11 +248,16 @@ async fn observe_cancel(db: &Pool, id: i32, part: &Path) -> Option<String> {
 /// fallback re-issues to the FINAL redirected URL with the pinned client.
 ///
 /// Response-shape dispatch:
-/// - **206 + Range sent** → append to the existing `.part`; `total` from
-///   `Content-Range` (or `from + Content-Length` fallback).
-/// - **416 + Range sent** → source changed (or the `.part` was already
-///   complete): discard the stale partial, reissue once, fresh, without
-///   Range.
+/// - **206 + Range sent** → append to the existing `.part`, but only when
+///   `Content-Range` confirms the range starts exactly at the resumed
+///   offset (S == `from`); a mismatch or an unknowable S takes the 416
+///   route instead. `total` from `Content-Range` (or
+///   `from + Content-Length` fallback).
+/// - **416 + Range sent** (and the 206 mismatch above) → source changed
+///   (or the `.part` was already complete): reissue once, fresh, without
+///   Range. The stale partial is removed only after the reissue is
+///   confirmed (a transient `send()` failure keeps it for resume), and the
+///   reissue gets the same up-front `max_bytes` check as a 200.
 /// - **200** → fresh download (also covers servers that ignore Range);
 ///   truncates any existing partial.
 /// - Anything else → `mark_error` + `Err`.
@@ -167,48 +286,40 @@ async fn stream_part(
 
     // Determine the file open mode, the starting `received` offset, the
     // declared `total`, and the bytes stream to consume.
-    enum FileStream {
-        /// 206 append: file opened in append mode, `from` = resumed offset.
-        Append(tokio::fs::File, u64, Option<u64>, reqwest::Response),
-        /// Fresh/416-fallback: file opened in create/truncate mode.
-        Fresh(tokio::fs::File, Option<u64>, reqwest::Response),
-    }
     let fs = match (resp.status(), resume_from) {
         (s, Some(from)) if s == axum::http::StatusCode::PARTIAL_CONTENT => {
-            let total = content_range_total(resp.headers())
-                .or_else(|| resp.content_length().map(|l| from.saturating_add(l)));
-            if let Some(t) = total {
-                if t > max_bytes {
-                    let msg = format!("file is {t} bytes, exceeds the {max_bytes}-byte limit");
-                    mark_error(db, id, &msg).await;
-                    return Err(Error::Torrent {
-                        kind: TorrentKind::Other,
-                        msg,
-                    });
+            if resume_206_decision(resp.headers(), from) != Resume206Decision::Append {
+                // S != from (or S unknowable): a mirror serving a different
+                // revision answered our `bytes=from-` — appending would
+                // splice the old prefix onto the new suffix. Same route as
+                // a 416: discard the stale partial, reissue fresh.
+                fresh_fallback(url, client, part, max_bytes, db, id).await?
+            } else {
+                let total = content_range_total(resp.headers())
+                    .or_else(|| resp.content_length().map(|l| from.saturating_add(l)));
+                if let Some(t) = total {
+                    if t > max_bytes {
+                        let msg = format!("file is {t} bytes, exceeds the {max_bytes}-byte limit");
+                        mark_error(db, id, &msg).await;
+                        return Err(Error::Torrent {
+                            kind: TorrentKind::Other,
+                            msg,
+                        });
+                    }
                 }
+                let f = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(part)
+                    .await?;
+                FileStream::Append(f, from, total, resp)
             }
-            let f = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(part)
-                .await?;
-            FileStream::Append(f, from, total, resp)
         }
         (s, Some(_)) if s.as_u16() == 416 => {
             // 416: source changed (or the .part was already complete) —
-            // discard the stale partial and reissue once, fresh, without a Range.
-            let _ = std::fs::remove_file(part);
-            let resp2 = client.get(url).send().await?;
-            if !resp2.status().is_success() {
-                let msg = format!("HTTP {}", resp2.status());
-                mark_error(db, id, &msg).await;
-                return Err(Error::Torrent {
-                    kind: TorrentKind::Other,
-                    msg,
-                });
-            }
-            let f = tokio::fs::File::create(part).await?;
-            FileStream::Fresh(f, resp2.content_length(), resp2)
+            // discard the stale partial (once the reissue is confirmed) and
+            // reissue once, fresh, without a Range.
+            fresh_fallback(url, client, part, max_bytes, db, id).await?
         }
         (s, _) if s.is_success() => {
             // 200: fresh download — also covers servers that ignore Range.
@@ -388,10 +499,9 @@ pub(super) async fn direct_download(
     )
     .await?;
 
-    // Keep the .part file on failure for resume (PERF-11). Disabled once
-    // the file is safely renamed into place or explicitly removed (inside
-    // [`finalize_direct_download`]).
-    let mut part_guard = PartGuard::new(part);
+    // On a transient failure the `.part` file is intentionally left in place
+    // for resume (PERF-11); it is removed only on the explicit cancel/finalize
+    // paths (see [`finalize_direct_download`]).
     let max_bytes = dp.max_bytes;
     let outcome = stream_part(
         &final_url,
@@ -408,12 +518,11 @@ pub(super) async fn direct_download(
         // Mid-stream cancel: the staged `.part` was already removed by the
         // in-loop cancel observation ([`observe_cancel`]). Same route as the
         // [`finalize_direct_download`] cancel sites: leave the `cancelled`
-        // row alone (no error mark, no verify/rename/index) and release the
-        // guard (the file is gone — nothing left to keep for resume).
+        // row alone (no error mark, no verify/rename/index) — the file is
+        // gone, so nothing is left to keep for resume.
         tracing::info!(
             "direct download {id} cancelled during transfer — staged part removed, leaving row cancelled"
         );
-        part_guard.disable();
         return Ok(());
     }
     tracing::debug!(
@@ -424,7 +533,7 @@ pub(super) async fn direct_download(
 
     // Post-stream finalize (TEST-5 seam): cancel re-checks, verify, rename,
     // resync, guarded row update, auto-index.
-    finalize_direct_download(db, zims, id, part, part_guard).await
+    finalize_direct_download(db, zims, id, part).await
 }
 
 /// Post-stream finalize for a direct download (TEST-5 seam, extracted from
@@ -442,7 +551,6 @@ async fn finalize_direct_download(
     zims: &Arc<ZimManager>,
     id: i32,
     part: &Path,
-    mut part_guard: PartGuard,
 ) -> Result<()> {
     // Cancel re-check BEFORE the expensive verify: a cancelled partial file
     // must never be fed to verify_zim (a multi-GB central-dir parse of a
@@ -457,7 +565,6 @@ async fn finalize_direct_download(
                 part.display()
             );
             let _ = std::fs::remove_file(part);
-            part_guard.disable();
             return Ok(());
         }
     }
@@ -482,7 +589,6 @@ async fn finalize_direct_download(
                 part.display()
             );
             let _ = std::fs::remove_file(part);
-            part_guard.disable();
             return Ok(());
         }
     }
@@ -493,7 +599,6 @@ async fn finalize_direct_download(
             Error::InvalidInput(format!("bad part file name: {}", part.display()))
         })?);
     std::fs::rename(part, &dst)?;
-    part_guard.disable(); // renamed into place — no cleanup needed.
 
     zims.resync().await?;
 
@@ -538,8 +643,9 @@ mod tests {
 
     // ── B5.4: download-client SSRF / redirect / pinning (wiremock) ───────────
     // In-module so the private `build_download_client` / `ClientProfile` are
-    // reachable; the builder-failure path is covered by the `client_or_err`
-    // unit test (propagation instead of the old silent `unwrap_or_default()`).
+    // reachable; the builder-failure path is covered by the
+    // `client_from_option` unit test (propagation instead of the old silent
+    // `unwrap_or_default()`).
 
     /// Drive the SEC-1 manual chain (netguard::follow_pinned_get) with a
     /// Transfer-profile pinned client. `testhost` is mapped onto the local
@@ -854,15 +960,9 @@ mod tests {
         let part = tmp.path().join("utiny.part");
         std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage utiny.zim as .part");
 
-        super::finalize_direct_download(
-            &pool,
-            &zims,
-            id,
-            &part,
-            super::super::PartGuard::new(&part),
-        )
-        .await
-        .expect("finalize must succeed");
+        super::finalize_direct_download(&pool, &zims, id, &part)
+            .await
+            .expect("finalize must succeed");
 
         let dst = zims.zim_dir.join("utiny.zim");
         assert!(dst.exists(), "part renamed into zim_dir");
@@ -955,15 +1055,9 @@ mod tests {
         .await
         .unwrap();
 
-        super::finalize_direct_download(
-            &pool,
-            &zims,
-            id,
-            &part,
-            super::super::PartGuard::new(&part),
-        )
-        .await
-        .expect("cancelled finalize still returns Ok");
+        super::finalize_direct_download(&pool, &zims, id, &part)
+            .await
+            .expect("cancelled finalize still returns Ok");
 
         assert!(!part.exists(), "cancelled part must be removed");
         assert!(
@@ -1037,6 +1131,85 @@ mod tests {
         let mut h3 = HeaderMap::new();
         h3.insert("Content-Range", HeaderValue::from_static("bytes 6-11/x"));
         assert_eq!(super::content_range_total(&h3), None);
+
+        // A non-`bytes` range unit is not a byte range → None.
+        let mut h4 = HeaderMap::new();
+        h4.insert("Content-Range", HeaderValue::from_static("items 0-9/100"));
+        assert_eq!(super::content_range_total(&h4), None);
+    }
+
+    #[test]
+    fn content_range_start_unit() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let with_header = |val: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("Content-Range", HeaderValue::from_str(val).unwrap());
+            h
+        };
+
+        assert_eq!(
+            super::content_range_start(&with_header("bytes 100-199/1000")),
+            Some(100)
+        );
+        assert_eq!(
+            super::content_range_start(&with_header("bytes 6-11/12")),
+            Some(6)
+        );
+        // `*` form: S is unknowable → None.
+        assert_eq!(super::content_range_start(&with_header("bytes */12")), None);
+        // Absent → None.
+        assert_eq!(super::content_range_start(&HeaderMap::new()), None);
+        // Non-`bytes` unit → None (not a byte range).
+        assert_eq!(
+            super::content_range_start(&with_header("items 0-9/100")),
+            None
+        );
+        // Malformed → None.
+        assert_eq!(
+            super::content_range_start(&with_header("bytes 6-11/x")),
+            None
+        );
+        assert_eq!(super::content_range_start(&with_header("bytes 6/12")), None);
+    }
+
+    #[test]
+    fn resume_206_decision_unit() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let with_header = |val: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("Content-Range", HeaderValue::from_str(val).unwrap());
+            h
+        };
+
+        // S == from → append.
+        assert_eq!(
+            super::resume_206_decision(&with_header("bytes 6-11/12"), 6),
+            super::Resume206Decision::Append
+        );
+        // S != from (a mirror serving a different revision) → fresh fallback.
+        assert_eq!(
+            super::resume_206_decision(&with_header("bytes 0-11/12"), 6),
+            super::Resume206Decision::FallbackFresh
+        );
+        assert_eq!(
+            super::resume_206_decision(&with_header("bytes 7-11/12"), 6),
+            super::Resume206Decision::FallbackFresh
+        );
+        // `*` → S unknowable → treat as mismatch.
+        assert_eq!(
+            super::resume_206_decision(&with_header("bytes */12"), 6),
+            super::Resume206Decision::FallbackFresh
+        );
+        // Absent header → S unknowable → treat as mismatch.
+        assert_eq!(
+            super::resume_206_decision(&HeaderMap::new(), 6),
+            super::Resume206Decision::FallbackFresh
+        );
+        // Non-`bytes` unit → not a byte range → mismatch.
+        assert_eq!(
+            super::resume_206_decision(&with_header("items 6-11/12"), 6),
+            super::Resume206Decision::FallbackFresh
+        );
     }
 
     #[tokio::test]
@@ -1242,6 +1415,230 @@ mod tests {
         assert_eq!(outcome.total, Some(12));
         let on_disk = std::fs::read(&part).unwrap();
         assert_eq!(on_disk, body, "file must be fresh after 416 fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 206 whose `Content-Range` does NOT start at the resumed offset
+    /// (a mirror serving a different revision answered `bytes=6-` with the
+    /// start of ITS file) must take the 416 route: discard the stale
+    /// partial, reissue fresh without a Range — never append (which would
+    /// splice the old prefix onto the new suffix).
+    #[tokio::test]
+    async fn stream_part_206_start_mismatch_falls_back_fresh() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let body: &[u8] = b"hello world!"; // 12 bytes
+        let server = MockServer::start().await;
+        // Range request → 206 with S=0 (a different revision answered our
+        // `bytes=6-` with the start of its own file).
+        Mock::given(method("GET"))
+            .and(path("/x.zim"))
+            .and(header("range", "bytes=6-"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .set_body_bytes(body.to_vec())
+                    .append_header("Content-Range", "bytes 0-11/12"),
+            )
+            .mount(&server)
+            .await;
+        // Plain GET (no range) → 200 full body.
+        Mock::given(method("GET"))
+            .and(path("/x.zim"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.to_vec())
+                    .append_header("Content-Length", "12"),
+            )
+            .mount(&server)
+            .await;
+        let pins = [("testhost".to_string(), *server.address())];
+        // Hop 0 goes out with the Range header; the mock answers 206 with a
+        // mismatched start offset (the terminal response of the chain).
+        let pr = pinned_chain(
+            &format!("http://testhost:{}/x.zim", server.address().port()),
+            &pins,
+            false,
+            |c, u| c.get(u).header("Range", "bytes=6-"),
+        )
+        .await;
+        assert_eq!(pr.response.status(), 206);
+
+        let dir = std::env::temp_dir().join(format!("zimi-sp-206mm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("x.zim.part");
+        // Pre-write 6 stale bytes.
+        std::fs::write(&part, b"stale!").unwrap();
+        let pool = dead_pool();
+        let outcome = super::stream_part(
+            &pr.url,
+            &pr.client,
+            pr.response,
+            &part,
+            Some(6),
+            1024,
+            &pool,
+            999_999,
+        )
+        .await
+        .expect("stream_part ok");
+        assert_eq!(outcome.size, 12);
+        assert_eq!(
+            std::fs::read(&part).unwrap(),
+            body,
+            "file must be rewritten fresh, not appended onto the stale prefix"
+        );
+        // The fallback reissue went out WITHOUT a Range header.
+        let got = server.received_requests().await.unwrap_or_default();
+        assert_eq!(got.len(), 2, "initial ranged GET + one fresh reissue");
+        assert!(
+            got[0].headers.contains_key("range"),
+            "hop 0 carries the Range header"
+        );
+        assert!(
+            !got[1].headers.contains_key("range"),
+            "the reissue must be fresh (no Range)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The 416 fallback must run the same up-front `max_bytes` check as the
+    /// 200 branch: a declared size over the cap is rejected immediately —
+    /// not streamed to the cap — and the stale `.part` is kept (rejection
+    /// happens before the partial is discarded).
+    #[tokio::test]
+    async fn stream_part_416_fallback_respects_max_bytes() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // Range request → 416.
+        Mock::given(method("GET"))
+            .and(path("/x.zim"))
+            .and(header("range", "bytes=6-"))
+            .respond_with(ResponseTemplate::new(416).append_header("Content-Range", "bytes */4096"))
+            .mount(&server)
+            .await;
+        // Plain GET (no range) → 200 with a 4096-byte body (over the 1024
+        // cap); the declared Content-Length triggers the up-front check.
+        Mock::given(method("GET"))
+            .and(path("/x.zim"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 4096]))
+            .mount(&server)
+            .await;
+        let pins = [("testhost".to_string(), *server.address())];
+        let pr = pinned_chain(
+            &format!("http://testhost:{}/x.zim", server.address().port()),
+            &pins,
+            false,
+            |c, u| c.get(u).header("Range", "bytes=6-"),
+        )
+        .await;
+        assert_eq!(pr.response.status(), 416);
+
+        let dir = std::env::temp_dir().join(format!("zimi-sp-416cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("x.zim.part");
+        std::fs::write(&part, b"stale!").unwrap();
+        let pool = dead_pool();
+        let err = super::stream_part(
+            &pr.url,
+            &pr.client,
+            pr.response,
+            &part,
+            Some(6),
+            1024,
+            &pool,
+            999_999,
+        )
+        .await
+        .err()
+        .expect("an over-cap fallback must be rejected up front");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "expected the cap message, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&part).unwrap(),
+            b"stale!",
+            "a cap rejection must not discard the partial"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A transient `send()` failure of the 416 fallback reissue must NOT
+    /// discard the resumable `.part` — the deletion is deferred until the
+    /// reissue is confirmed a success. (Raw-TCP server: conn 1 answers the
+    /// ranged GET with 416; conn 2 — the reissue — is closed before any
+    /// response, i.e. a connection-level failure.)
+    #[tokio::test]
+    async fn stream_part_416_fallback_send_failure_keeps_part() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Conn 1 (the ranged GET): read the head, answer 416, close.
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).await.expect("read head");
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 416 Range Not Satisfiable\r\n\
+                      Content-Range: bytes */12\r\n\
+                      Content-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                )
+                .await;
+            let _ = sock.shutdown().await;
+            // Conn 2 (the fallback reissue): close before responding.
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = sock.shutdown().await;
+        });
+
+        let url = format!("http://127.0.0.1:{}/x.zim", addr.port());
+        let client = super::build_download_client(super::ClientProfile::Transfer, None)
+            .expect("client builds");
+        // Hop 0 (ranged) → 416, the terminal response we feed to stream_part.
+        let resp = client
+            .get(&url)
+            .header("Range", "bytes=6-")
+            .send()
+            .await
+            .expect("initial 416 response");
+        assert_eq!(resp.status(), 416);
+
+        let dir = std::env::temp_dir().join(format!("zimi-sp-416fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("x.zim.part");
+        std::fs::write(&part, b"stale!").unwrap();
+        let pool = dead_pool();
+        let _ = super::stream_part(&url, &client, resp, &part, Some(6), 1024, &pool, 999_999)
+            .await
+            .err()
+            .expect("a failed reissue must error");
+        assert!(
+            part.exists(),
+            "a transient fallback failure must keep the .part for resume"
+        );
+        assert_eq!(
+            std::fs::read(&part).unwrap(),
+            b"stale!",
+            "the partial must be byte-identical (untouched)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

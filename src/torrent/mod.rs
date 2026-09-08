@@ -60,28 +60,42 @@ pub struct QbitClient {
     http: reqwest::Client,
 }
 
+/// Torrent info as reported by the qBittorrent Web API (`/api/v2/torrents/info`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentInfo {
+    /// Torrent hash (its qBittorrent identifier).
     pub hash: String,
+    /// Torrent name.
     pub name: String,
+    /// Download progress in `0.0..=1.0`.
     #[serde(default)]
     pub progress: f64,
+    /// qBittorrent state string (e.g. `downloading`, `error`).
     #[serde(default)]
     pub state: String,
+    /// Current download speed in bytes/sec.
     #[serde(default)]
     pub dlspeed: i64,
+    /// Current upload speed in bytes/sec.
     #[serde(default)]
     pub upspeed: i64,
+    /// Upload/download share ratio.
     #[serde(default)]
     pub ratio: f64,
+    /// qBittorrent category assigned to this torrent (when set).
     pub category: Option<String>,
+    /// Save path configured for this torrent (when set).
     pub save_path: Option<String>,
+    /// Path where the torrent's content is stored (when reported).
     #[serde(default)]
     pub content_path: Option<String>,
+    /// Total torrent size in bytes.
     #[serde(default)]
     pub size: i64,
+    /// Bytes downloaded so far.
     #[serde(default)]
     pub downloaded: i64,
+    /// Number of connected seeds.
     #[serde(default)]
     pub num_seeds: i64,
     /// Human-readable error message when state == "error".
@@ -416,6 +430,7 @@ pub struct QbitClientCache {
 }
 
 impl QbitClientCache {
+    /// Create an empty cache (no client connected yet).
     pub fn new() -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::Mutex::new(None)),

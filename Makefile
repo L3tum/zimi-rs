@@ -37,7 +37,7 @@ endef
 
 # Quick pre-commit checks
 check:
-	$(CARGO) check --all-targets --all-features
+	$(CARGO) check --all-targets
 
 fmt: web-fmt
 	$(CARGO) fmt --all
@@ -46,7 +46,7 @@ fmt-check:
 	$(CARGO) fmt --all -- --check
 
 clippy:
-	$(CARGO) clippy --all-targets --all-features -- -D warnings
+	$(CARGO) clippy --all-targets -- -D warnings
 
 # M2: raw-SQL boundary lint — flags sqlx::query*/query_as/query_scalar call
 # sites outside src/db/ (the module owning the sanctioned db::raw escape
@@ -89,19 +89,14 @@ test-integration:
 test-strict:
 	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration)
 
-# Local mirror of the CI PR gate (P13): the CI `coverage` job in
-# .github/workflows/ci.yml is this target's CI twin — strict integration, now
-# run under `cargo llvm-cov` as a superset of this selection (it adds
-# --all-features and the wiremock suite). Keep the two in sync: any change to
-# the selection of lib vs integration halves (flags) needs to land in both
-# this target and the CI job. Both halves
-# run with the default parallel --test-threads: the lib's DB-gated tests and
-# the integration suite share one dev DB, but every DB-gated test is
-# serialized by DbExclusiveGuard (cross-process lockfile + in-process slot),
-# and the migration drift check
-# now runs in a dedicated temp DB it drops.
+# Local mirror of the CI `test` job (.github/workflows/ci.yml): strict DB
+# (ZIMSERVICE_REQUIRE_DB=1), lib + bins + wiremock, then the integration
+# suite. Both halves run with the default parallel --test-threads: every
+# DB-gated test is serialized by DbExclusiveGuard (cross-process lockfile +
+# in-process slot), and the migration drift check runs in a dedicated temp
+# DB it drops.
 test-strict-ci:
-	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --lib --bins && \
+	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --lib --bins --test wiremock && \
 	    DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration)
 
 # JS syntax check for the embedded web UI (web/*.js — the pages carry no
@@ -179,7 +174,7 @@ help:
 	@echo "  make test-fast    Run unit tests only (lib + bins; no integration/doctests)"
 	@echo "  make test-integration  Boot compose Postgres, run DB integration tests"
 	@echo "  make test-strict      Strict mode: DB required (missing DB is a hard failure)"
-	@echo "  make test-strict-ci    Mirrors the CI PR gate: strict integration (DB required)"
+	@echo "  make test-strict-ci    Mirrors the CI test job: strict DB, lib+bins+wiremock+integration"
 	@echo "  make web-check    JS syntax check of the embedded web UI (web/*.js; needs node; skips if absent)"
 	@echo "  make web-test     Behavioral unit tests for web/common.js helpers (node --test; skips if absent)"
 	@echo "  make web-fmt      eslint --fix for the web UI (JS half of make fmt; needs npm install; skips if absent)"

@@ -25,8 +25,8 @@ use crate::settings::{
 /// vector-index build on completion (H2). Kept at 1 to preserve the original
 /// "build after embedding" behavior; the 10k early-build in `auto_embed_loop`
 /// covers big libraries so `run_pipeline` doesn't wait on a full run.
-/// Both build paths share the 10-minute [`BUILD_BACKOFF_SECS`] gate
-/// ([`build_probe_within_backoff`]), so the recurring pipeline-end probe is
+/// Both build paths share the 10-minute `BUILD_BACKOFF_SECS` gate
+/// (`build_probe_within_backoff`), so the recurring pipeline-end probe is
 /// no hotter than one attempt per 10 minutes.
 pub const VECTOR_INDEX_MIN_ROWS: i64 = 1;
 
@@ -117,16 +117,28 @@ fn reset_last_build_probe() {
 /// Configuration for the embedding client.
 #[derive(Debug, Clone)]
 pub struct EmbedConfig {
+    /// Base URL of the OpenAI-compatible `/v1/embeddings` endpoint.
     pub endpoint: String,
+    /// API key, sent as `Authorization: Bearer` when non-empty.
     pub api_key: String,
+    /// Model name to request in each embeddings call.
     pub model: String,
+    /// Expected vector dimension; must match the pgvector column.
     pub dimension: u32,
+    /// Number of texts per request batch.
     pub batch_size: usize,
+    /// Max batches in flight at once (HTTP + write, held under a semaphore).
     pub max_concurrency: usize,
+    /// Per-request HTTP timeout, in seconds.
     pub timeout_secs: u64,
 }
 
 impl EmbedConfig {
+    /// Build the config from the runtime settings table.
+    ///
+    /// Returns `None` only when `embedding.endpoint` is unset/empty — the
+    /// other fields fall back to the canonical defaults (see
+    /// `EMBED_DEFAULT_*`). Values are floored at 1 for the numeric fields.
     pub fn from_settings(settings: &SettingsCache) -> Option<Self> {
         let endpoint = settings.get_typed::<String>(KEY_EMBEDDING_ENDPOINT)?;
         if endpoint.is_empty() {
@@ -635,6 +647,15 @@ fn reset_embed_fails() {
         .clear();
 }
 
+/// Run the full embedding pipeline for one ZIM: configure the client from
+/// the settings table, reconcile the vector column dimension, then claim
+/// un-embedded article rows in batches (atomic `embed_at` stamp), embed them
+/// at bounded concurrency, and bulk-write the vectors.
+///
+/// Finishes by probing the vector-index build (gated by the shared
+/// 10-minute backoff). Fails fast — leaving rows un-claimed, so a fix
+/// recovers them — when embedding is unconfigured or when stored vectors'
+/// dimension mismatches the configured model.
 pub async fn run_pipeline(pool: Pool, settings: SettingsCache, zim_name: &str) -> Result<()> {
     let Some(config) = EmbedConfig::from_settings(&settings) else {
         return Err(Error::Embedding("embedding not configured".into()));
@@ -939,10 +960,10 @@ async fn index_build_worth_probing(pool: &Pool) -> bool {
 ///
 /// Both build paths (the [`auto_embed_loop`] early-build and the
 /// [`run_pipeline`] post-run build) funnel through this one CAS claim — the
-/// only place that stamps [`LAST_BUILD_PROBE`] — so the recurring 60 s
+/// only place that stamps `LAST_BUILD_PROBE` — so the recurring 60 s
 /// pipeline-end probe is no hotter than one attempt per 10 minutes, and a
 /// loop-spawned build and a pipeline-end build can't double-claim the slot.
-/// (The loop's pre-filter uses the read-only [`build_probe_claimed_recently`],
+/// (The loop's pre-filter uses the read-only `build_probe_claimed_recently`,
 /// which never claims, so it cannot starve this claim.)
 pub async fn maybe_build_vector_index(
     pool: &Pool,

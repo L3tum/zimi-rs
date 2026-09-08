@@ -22,16 +22,22 @@ use super::strip_query_fragment;
 /// One `<entry>` in the OPDS feed.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct OpdsEntry {
+    /// The entry's unique ID (e.g. `zim:wikipedia_en_all_maxi_2024-06`).
     pub id: Option<String>,
+    /// Human-readable title of the entry.
     pub title: Option<String>,
     /// RFC 3339 timestamp from the feed, if present.
     pub updated: Option<String>,
+    /// All `<link>` elements in the entry (acquisition, thumbnail, etc.).
     pub links: Vec<OpdsLink>,
 }
 
+/// A single `<link>` element from an OPDS Atom feed entry.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct OpdsLink {
+    /// The `rel` attribute (e.g. `http://opds-spec.org/acquisition/open-access`).
     pub rel: Option<String>,
+    /// The `href` attribute (the URL the link points to).
     pub href: Option<String>,
     /// The `type` attribute (e.g. `application/x-zim`).
     pub media_type: Option<String>,
@@ -60,9 +66,13 @@ impl OpdsEntry {
 /// An available update for a locally-installed ZIM.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct OpdsUpdate {
+    /// The local ZIM file name (without `.zim` extension).
     pub local_name: String,
+    /// The catalog ZIM file name (without `.zim` extension).
     pub catalog_name: String,
+    /// The catalog entry's title, if present in the feed.
     pub title: Option<String>,
+    /// The direct download URL for the new ZIM file.
     pub download_url: String,
 }
 
@@ -166,7 +176,7 @@ pub fn parse_catalog(xml: &str) -> Vec<OpdsEntry> {
 /// Fetch and parse the OPDS catalog at `url`.
 ///
 /// SEC-1: the catalog URL is user-influenced (like direct download URLs), so
-/// redirects are followed **manually** by [`follow_pinned_get`]: every hop
+/// redirects are followed **manually** by `follow_pinned_get`: every hop
 /// — including hop 0 — is validated, re-resolved, and pinned to the exact
 /// address(es) that passed the check. The initial-URL gate
 /// (`validate_download_url`) is applied by the caller (`opds_check`) before

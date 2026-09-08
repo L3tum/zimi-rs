@@ -16,9 +16,12 @@ const MAX_QUERY_CHARS: usize = 500;
 
 // ─── Search + random + interlanguage: response DTOs (OpenAPI schemas) ────────
 
+/// `GET /search` response: the merged multi-engine result page.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct SearchResponse {
+    /// The query string as received.
     pub query: String,
+    /// Matches on this page.
     pub results: Vec<SearchResult>,
     /// Number of results in this page (after offset/limit). Hybrid search
     /// merges capped per-branch results, so this is the page size — not a
@@ -29,8 +32,10 @@ pub struct SearchResponse {
     pub degraded: Vec<String>,
 }
 
+/// `GET /suggest` response: title suggestions for a query prefix.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct SuggestResponse {
+    /// The prefix string as received.
     pub query: String,
     /// Suggested titles.
     pub suggestions: Vec<String>,
@@ -38,24 +43,36 @@ pub struct SuggestResponse {
     pub results: Vec<SearchResult>,
 }
 
+/// `GET /random` response: one randomly chosen article.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct RandomArticleResponse {
+    /// Row id of the matched `articles` record.
     pub id: i64,
+    /// DB id of the ZIM the article belongs to.
     pub zim_id: i32,
+    /// Article path within the ZIM.
     pub path: String,
+    /// Article title.
     pub title: String,
+    /// Stored FTS snippet.
     pub snippet: String,
     /// ZIM name.
     pub zim: String,
 }
 
+/// One cross-language link to the same article in another ZIM.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct InterlanguageLink {
+    /// Name of the ZIM containing the linked article.
     pub zim: String,
+    /// Path of the linked article within that ZIM.
     pub path: String,
+    /// Title of the linked article, when known.
     pub title: Option<String>,
 }
 
+/// Response for `GET /article/{path}/interlanguage` — the Wikidata Q-ID and
+/// cross-language links for the article.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct InterlanguageResponse {
     /// Wikidata Q-ID (null when the article has no Q-ID).
@@ -69,11 +86,17 @@ pub struct InterlanguageResponse {
 /// Query parameters for `GET /search`.
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
+    /// Search query (required unless `query` is given).
     pub q: Option<String>,
+    /// Deprecated alias of `q`.
     pub query: Option<String>,
+    /// Restrict to one ZIM by name.
     pub zim: Option<String>,
+    /// Restrict to one language code.
     pub language: Option<String>,
+    /// Max results (default from settings).
     pub limit: Option<usize>,
+    /// Result offset for pagination.
     pub offset: Option<usize>,
     /// Engine(s) to use: "fts", "trgm" (a.k.a. "fuzzy"/"prefix"), or "hybrid" (default).
     pub mode: Option<String>,
@@ -81,6 +104,8 @@ pub struct SearchQuery {
     pub highlight: Option<bool>,
 }
 
+/// `GET /search` — multi-engine article search (FTS / trigram / vector) with
+/// score merge; `mode` selects the engine(s) and pagination via limit/offset.
 #[utoipa::path(
     get,
     path = "/search",
@@ -165,12 +190,17 @@ pub async fn search(
 /// Query parameters for `GET /suggest`.
 #[derive(Debug, Deserialize)]
 pub struct SuggestQuery {
+    /// Title prefix (required unless `query` is given).
     pub q: Option<String>,
+    /// Deprecated alias of `q`.
     pub query: Option<String>,
+    /// Restrict to one ZIM by name.
     pub zim: Option<String>,
+    /// Max suggestions (default 10, max 20).
     pub limit: Option<usize>,
 }
 
+/// `GET /suggest` — title suggestions for a query prefix.
 #[utoipa::path(
     get,
     path = "/suggest",
@@ -232,9 +262,11 @@ pub async fn suggest(
 /// Query parameters for `GET /random` (a random article).
 #[derive(Debug, Deserialize)]
 pub struct RandomQuery {
+    /// Restrict to one ZIM by name.
     pub zim: Option<String>,
 }
 
+/// `GET /random` — a random article, optionally restricted to one ZIM.
 #[utoipa::path(
     get,
     path = "/random",
@@ -269,10 +301,14 @@ pub async fn random_article(
 /// Query parameters for `GET /interlanguage` (cross-language links via Q-ID).
 #[derive(Debug, Deserialize)]
 pub struct InterlangQuery {
+    /// Name of the ZIM containing the article.
     pub zim: String,
+    /// Article path within the ZIM.
     pub path: String,
 }
 
+/// `GET /interlanguage` — cross-language links for an article via its
+/// Wikidata Q-ID (empty when the article has no Q-ID).
 #[utoipa::path(
     get,
     path = "/interlanguage",

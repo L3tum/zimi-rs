@@ -14,6 +14,7 @@ use super::{CreatedIdResponse, OkResponse};
 
 // ─── Settings: response DTOs (OpenAPI schemas) ───────────────────────────────
 
+/// `PUT /settings` response: the applied count and any per-key errors.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct SettingsUpdateResponse {
     /// Number of settings updated. Invariant: equals the applied count since
@@ -25,6 +26,7 @@ pub struct SettingsUpdateResponse {
     pub settings: serde_json::Value,
 }
 
+/// `PUT /settings/zim/{name}` response.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct PutZimSettingsResponse {
     /// Always true.
@@ -42,18 +44,26 @@ pub struct ListCollectionsResponse {
     pub collections: Vec<Collection>,
 }
 
+/// One user-defined collection (member ZIM ids resolved to names).
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct Collection {
+    /// Collection id.
     pub id: i32,
+    /// URL-safe unique slug.
     pub name: String,
+    /// Human-readable display name.
     pub label: String,
     /// Names of the member ZIM archives.
     pub zim_names: Vec<String>,
+    /// Whether the collection is marked as a favorite.
     pub is_favorite: bool,
+    /// RFC3339 creation timestamp.
     pub created_at: String,
+    /// RFC3339 last-update timestamp.
     pub updated_at: String,
 }
 
+/// `POST /collections` request body.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateCollectionBody {
     /// URL-safe unique slug (e.g. `science-en`).
@@ -64,21 +74,27 @@ pub struct CreateCollectionBody {
     #[serde(default)]
     pub zim_names: Vec<String>,
     #[serde(default)]
+    /// Mark as a favorite (default `false`).
     pub is_favorite: bool,
 }
 
+/// `PUT /collections/{id}` request body; omitted fields keep their current values.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateCollectionBody {
     /// New slug; omitted to keep the current one.
     pub name: Option<String>,
+    /// New display name; omitted to keep the current one.
     pub label: Option<String>,
     /// Replace the member set; omitted to keep the current one.
     pub zim_names: Option<Vec<String>>,
+    /// Replace the favorite flag; omitted to keep the current one.
     pub is_favorite: Option<bool>,
 }
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
 
+/// `GET /settings` — all settings grouped by category; topology values are
+/// redacted for unauthenticated callers (S6).
 #[utoipa::path(
     get,
     path = "/settings",
@@ -110,6 +126,8 @@ pub async fn get_settings(
     Json(state.settings.all_grouped_for(authenticated))
 }
 
+/// `PUT /settings` — bulk-update settings by key; unauthenticated writes to
+/// security-sensitive keys are rejected with 403 before any DB round-trip.
 #[utoipa::path(
     put,
     path = "/settings",
@@ -177,6 +195,7 @@ pub async fn put_settings(
     }))
 }
 
+/// `GET /settings/zim/{name}` — per-ZIM settings (404 if the ZIM is unknown).
 #[utoipa::path(
     get,
     path = "/settings/zim/{name}",
@@ -201,6 +220,7 @@ pub async fn get_zim_settings(
     }
 }
 
+/// `PUT /settings/zim/{name}` — update per-ZIM settings (404 if the ZIM is unknown).
 #[utoipa::path(
     put,
     path = "/settings/zim/{name}",
@@ -223,6 +243,14 @@ pub async fn put_zim_settings(
     AxumPath(name): AxumPath<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<PutZimSettingsResponse>, crate::error::Error> {
+    // A non-object body (array/scalar/null) is not a settings update —
+    // `update_zim_settings` would skip validation and return a fake
+    // `ok:true` no-op, so 400 it up front (same style as `put_settings`).
+    if body.as_object().is_none() {
+        return Err(crate::error::Error::InvalidInput(
+            "expected a JSON object".into(),
+        ));
+    }
     state.settings.update_zim_settings(&name, &body).await?;
     Ok(Json(PutZimSettingsResponse { ok: true, name }))
 }
@@ -279,6 +307,7 @@ fn collection_from_row(
     }
 }
 
+/// `GET /collections` — user collections with ZIM ids resolved to names.
 #[utoipa::path(
     get,
     path = "/collections",
@@ -300,6 +329,7 @@ pub async fn list_collections(
     Ok(Json(ListCollectionsResponse { collections }))
 }
 
+/// `POST /collections` — create a collection (409 if the slug already exists).
 #[utoipa::path(
     post,
     path = "/collections",
@@ -346,6 +376,7 @@ pub async fn create_collection(
     }
 }
 
+/// `PUT /collections/{id}` — partial update of a collection (404 if it does not exist).
 #[utoipa::path(
     put,
     path = "/collections/{id}",
@@ -410,6 +441,7 @@ pub async fn update_collection(
     }
 }
 
+/// `DELETE /collections/{id}` — delete a collection (404 if it does not exist).
 #[utoipa::path(
     delete,
     path = "/collections/{id}",

@@ -17,7 +17,7 @@
 //!   host):
 //!   - *user-influenced URLs* (direct `.zim` downloads, the OPDS catalog)
 //!     are fetched with **manual, bounded redirect following**
-//!     ([`follow_pinned_get`]): every hop — including the first — is
+//!     (`follow_pinned_get`): every hop — including the first — is
 //!     validated, re-resolved, and pinned to the exact address(es) that
 //!     passed the check, and the request goes out through a client pinned
 //!     to that resolution (`Policy::none` clients never follow redirects
@@ -27,8 +27,8 @@
 //!     policy's check.
 //!   - *operator-configured endpoints* (qBittorrent, embedding) use
 //!     reqwest's built-in following with the initial host pinned
-//!     ([`resolve_download_host`]) and every hop re-validated
-//!     ([`redirect_hop_ok`]). The residual sub-second rebinding window on
+//!     (`resolve_download_host`) and every hop re-validated
+//!     (`redirect_hop_ok`). The residual sub-second rebinding window on
 //!     a redirect to a *different* host is accepted there: the operator
 //!     picked the endpoint, and the per-hop re-validation bounds the
 //!     damage.
@@ -63,17 +63,30 @@ pub(crate) fn is_blocked_ip(ip: IpAddr, allow_private: bool, allow_loopback: boo
             !allow_private && (v4.is_private() || is_cgnat)
         }
         IpAddr::V6(v6) => {
-            // IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254) — recurse on
-            // the embedded IPv4 address so the V4 rules apply.
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_blocked_ip(IpAddr::V4(v4), allow_private, allow_loopback);
-            }
-            // fe80::/10 link-local — the IPv6 metadata / AMT surface.
-            if (v6.segments()[0] & 0xffc0) == 0xfe80 || v6.is_unspecified() {
+            // Loopback and unspecified are decided **before** the
+            // IPv4-embedded recursion below: `::1` and `::` also fall in the
+            // legacy ::/96 block, but must keep their plain V6 loopback /
+            // unspecified semantics (respecting `allow_loopback`).
+            if v6.is_unspecified() {
                 return true;
             }
             if v6.is_loopback() {
                 return !allow_loopback;
+            }
+            // IPv4-embedded IPv6 — recurse on the embedded IPv4 address so
+            // the V4 rules apply. Covers both the IPv4-*mapped* form
+            // (::ffff:0:0/96, e.g. ::ffff:169.254.169.254) and the legacy
+            // IPv4-*compatible* form (::/96, first six segments zero, e.g.
+            // ::a9fe:a9fe == 169.254.169.254 cloud metadata) — the latter
+            // matched no V6 check and otherwise passed as a public address
+            // (SSRF bypass). (`to_ipv4` accepts exactly these two blocks; the
+            // `::1`/`::` members of ::/96 are handled above.)
+            if let Some(v4) = v6.to_ipv4() {
+                return is_blocked_ip(IpAddr::V4(v4), allow_private, allow_loopback);
+            }
+            // fe80::/10 link-local — the IPv6 metadata / AMT surface.
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return true;
             }
             // Special-purpose ranges that never host a real mirror: the NAT64
             // well-known prefix 64:ff9b::/96 and IPv6 documentation
@@ -799,5 +812,48 @@ mod tests {
         assert!(!is_blocked_ip(not_cgnat_1, false, false));
         let not_cgnat_2 = IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1));
         assert!(!is_blocked_ip(not_cgnat_2, false, false));
+    }
+
+    #[test]
+    fn is_blocked_ip_v4_compatible_ipv6() {
+        // Legacy IPv4-*compatible* IPv6 (::/96, first five segments zero)
+        // must recurse into the V4 rules exactly like the ::ffff:0:0/96
+        // mapped form. Previously only the mapped form was checked, so
+        // `::a9fe:a9fe` (== 169.254.169.254 cloud metadata) slipped past
+        // every V6 check and passed as a public address (SSRF bypass).
+        // ::a9fe:a9fe == 169.254.169.254 — link-local/metadata, always
+        // blocked regardless of the flags.
+        let compat_meta = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0xa9fe, 0xa9fe));
+        assert!(is_blocked_ip(compat_meta, false, true));
+        assert!(is_blocked_ip(compat_meta, true, true));
+        // ::7f00:1 == 127.0.0.1 — loopback gated by allow_loopback.
+        let compat_lo = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x7f00, 0x0001));
+        assert!(is_blocked_ip(compat_lo, false, false));
+        assert!(!is_blocked_ip(compat_lo, false, true));
+        // ::a:0:1 == 10.0.0.1 — private, gated by allow_private.
+        let compat_priv = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0a00, 0x0001));
+        assert!(is_blocked_ip(compat_priv, false, false));
+        assert!(!is_blocked_ip(compat_priv, true, false));
+        // The ::ffff:0:0/96 *mapped* form still recurses (no regression):
+        // ::ffff:a9fe:a9fe == 169.254.169.254.
+        let mapped_meta = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xa9fe, 0xa9fe));
+        assert!(is_blocked_ip(mapped_meta, true, true));
+        // ::1 technically falls in the legacy ::/96 block, but its plain
+        // V6 loopback semantics take precedence (checked before the
+        // recursion) — behavior unchanged, respects allow_loopback.
+        let lo6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert!(is_blocked_ip(lo6, false, false));
+        assert!(!is_blocked_ip(lo6, false, true));
+        // Genuinely public IPv6 (2001:4860::8888) is still allowed — note
+        // 2001:db8::/32 is IETF documentation and is always blocked.
+        let pub6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888));
+        assert!(!is_blocked_ip(pub6, false, false));
+
+        // URL level: a compatible-form metadata IP literal is rejected by
+        // the download guard (this is the bypass `validate_download_url`
+        // must now close; `resolve_download_host` re-checks resolved
+        // addresses through the same `is_blocked_ip`).
+        assert!(validate_download_url("http://[::a9fe:a9fe]/latest/meta-data", true).is_err());
+        assert!(validate_download_url("http://[::ffff:a9fe:a9fe]/latest/meta-data", true).is_err());
     }
 }

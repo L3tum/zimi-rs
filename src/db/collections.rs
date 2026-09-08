@@ -16,12 +16,19 @@ use crate::error::{Error, Result};
 /// One `collections` row — raw, with `zim_ids` still unresolved. The handler
 /// maps this to the wire `Collection` DTO (resolving `zim_ids` → names).
 pub struct CollectionRow {
+    /// Primary key.
     pub id: i32,
+    /// Unique collection name (the wire identifier).
     pub name: String,
+    /// Display label.
     pub label: String,
+    /// Member ZIM rows' ids (unresolved — the handler maps them to names).
     pub zim_ids: Vec<i32>,
+    /// Favorite flag for this collection.
     pub is_favorite: bool,
+    /// Server-side (`now()`) timestamp of row creation.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Server-side timestamp of the most recent write.
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -107,9 +114,13 @@ pub async fn insert_collection(
 /// value (the repo builds a dynamic `UPDATE` so only the provided fields are
 /// written).
 pub struct UpdateFields {
+    /// New unique name; `None` keeps the current one.
     pub name: Option<String>,
+    /// New display label; `None` keeps the current one.
     pub label: Option<String>,
+    /// New member ZIM ids; `None` keeps the current set.
     pub zim_ids: Option<Vec<i32>>,
+    /// New favorite flag; `None` keeps the current one.
     pub is_favorite: Option<bool>,
 }
 

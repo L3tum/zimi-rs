@@ -138,22 +138,39 @@ fn evict_lru_if_full(handles: &mut HashMap<String, CachedZim>) {
 /// Metadata for a single ZIM archive.
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct ZimMeta {
+    /// DB row id (`None` for a stub not yet persisted).
     pub id: Option<i32>,
+    /// ZIM name (catalog/filename name).
     pub name: String,
+    /// Human-readable title shown in the UI.
     pub display_title: String,
+    /// Archive description (from ZIM metadata, when present).
     pub description: Option<String>,
+    /// Language code of the archive content.
     pub language: String,
+    /// Creator from ZIM metadata (when present).
     pub creator: Option<String>,
+    /// Publisher from ZIM metadata (when present).
     pub publisher: Option<String>,
+    /// Date from ZIM metadata (when present).
     pub date: Option<String>,
+    /// Total number of entries in the archive.
     pub entry_count: u64,
+    /// Number of articles in the archive.
     pub article_count: u64,
+    /// On-disk path of the `.zim` file.
     pub file_path: String,
+    /// File size in bytes.
     pub file_size: u64,
+    /// Catalog category (when set).
     pub category: Option<String>,
+    /// Full-text index status (e.g. `pending` for a fresh stub).
     pub index_status: String,
+    /// Full-text index progress in `0.0..=1.0`.
     pub index_progress: f64,
+    /// Entries indexed so far (counts toward the aggregate index progress).
     pub indexed_entries: u64,
+    /// Whether the embedding index is enabled for this ZIM.
     pub embed_enabled: bool,
 }
 

@@ -37,11 +37,17 @@ const SEEK_SQL_OPT: &str = "SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z
 
 /// A single article row returned by `fetch_random_article`.
 pub struct RandomArticle {
+    /// Global `articles.id` (unique across ZIMs).
     pub id: i64,
+    /// `zims.id` of the owning archive (join key).
     pub zim_id: i32,
+    /// ZIM entry path of the article.
     pub path: String,
+    /// Article title.
     pub title: String,
+    /// Short extract from the article body.
     pub snippet: String,
+    /// Name of the owning ZIM archive (resolved in SQL).
     pub zim: String,
 }
 

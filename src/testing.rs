@@ -16,7 +16,7 @@
 //!
 //! A live holder keeps the staleness check honest: while the guard is held,
 //! a background heartbeat refreshes the lockfile's mtime every
-//! [`HEARTBEAT_INTERVAL`]. This is required, not optional — the steal
+//! `HEARTBEAT_INTERVAL`. This is required, not optional — the steal
 //! threshold *doubles* as the waiter deadline, so without refreshing, a test
 //! that holds the slot for longer than the timeout (e.g. a slow migration)
 //! would look stale and have its slot stolen mid-run. With the heartbeat, an

@@ -46,18 +46,31 @@ pub(crate) fn floor_trgm_threshold(v: f64) -> f64 {
 /// callers can detect change without per-key re-reads.
 #[derive(Clone, Debug, Default)]
 pub struct SearchParamsSnapshot {
+    /// Cache generation the values were read under.
     pub generation: u64,
+    /// `search.default_limit` (seed default when unset).
     pub default_limit: usize,
+    /// `search.max_limit`.
     pub max_limit: usize,
+    /// Clamped `search.fts_weight`.
     pub fts_weight: f64,
+    /// Clamped `search.trgm_weight`.
     pub trgm_weight: f64,
+    /// Clamped `search.vector_weight`.
     pub vector_weight: f64,
+    /// Clamped `search.trgm_threshold` (floored at 0.3).
     pub trgm_threshold: f64,
+    /// Whether the vector branch is active (`embedding.enabled`).
     pub embedding_enabled: bool,
+    /// `embedding.endpoint` (normalised on write).
     pub embed_endpoint: String,
+    /// `embedding.api_key` (empty when unset).
     pub embed_api_key: String,
+    /// `embedding.model`.
     pub embed_model: String,
+    /// `embedding.dimension`.
     pub embed_dimension: u32,
+    /// `embedding.batch_size`.
     pub embed_batch_size: usize,
 }
 
@@ -148,7 +161,7 @@ pub struct PollerParams {
 
 impl SettingsCache {
     #[cfg(test)]
-    pub fn search_trgm_threshold(&self) -> f64 {
+    fn search_trgm_threshold(&self) -> f64 {
         // See [`floor_trgm_threshold`] for why the floor exists.
         let v = self
             .get_typed(KEY_SEARCH_TRGM_THRESHOLD)

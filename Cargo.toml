@@ -91,6 +91,10 @@ strip = true
 
 [lints.rust]
 unsafe_code = "deny"
+# WARN (not deny): the crate is 0.x with an explicitly unstable public API
+# (see the API-stability note in lib.rs), so CI must not block on stragglers
+# while the public surface is still being documented.
+missing_docs = "warn"
 
 [lints.clippy]
 correctness = "warn"

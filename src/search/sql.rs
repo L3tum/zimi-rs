@@ -17,9 +17,27 @@
 //!   helpers cannot emit).
 use super::trgm_arms_enabled;
 
-/// Hard ceiling on `limit` regardless of `search.max_limit`, applied before the
-/// `limit * 2` casts to keep the i32 fetch budget bounded.
+/// Hard ceiling on `limit` regardless of `search.max_limit` (keeps the i32
+/// fetch budget bounded).
 pub(super) const SEARCH_HARD_LIMIT: usize = 500;
+
+/// Hard ceiling on `offset`: deeper pages are clamped here.
+pub(super) const SEARCH_HARD_OFFSET: usize = 5000;
+
+/// Per-branch SQL fetch cap: max offset + max limit (5500).
+///
+/// Every search branch fetches up to this many rows so the post-dedup merged
+/// pool can cover any legal page (`offset + limit` ≤ this cap). Without it
+/// each branch fetched a flat `limit * 2` (~6×limit pooled max), so pages
+/// beyond ~3 pages were unsatisfiable even with thousands of matches.
+pub(super) const SEARCH_FETCH_HARD_CAP: usize = SEARCH_HARD_OFFSET + SEARCH_HARD_LIMIT;
+
+/// Per-branch fetch count for a request: `min(limit + offset,
+/// SEARCH_FETCH_HARD_CAP)` (offset-aware — see the cap's doc for why the old
+/// flat `limit * 2` under-fetched deep pages).
+pub(super) fn branch_fetch_limit(limit: usize, offset: usize) -> i32 {
+    limit.saturating_add(offset).min(SEARCH_FETCH_HARD_CAP) as i32
+}
 
 /// Escape LIKE wildcards so a user-supplied query matches literally (pair with
 /// `ESCAPE '\'` in the SQL).
@@ -59,7 +77,9 @@ pub(super) fn build_trgm_arms(
 /// contract (broken query → empty, no error) against a live pool.
 #[derive(Debug, Clone, Default)]
 pub struct SqlQuery {
+    /// The SQL text, with `$N` placeholders in Postgres positional style.
     pub sql: String,
+    /// Parameter values, one per `$N` placeholder (1-based).
     pub params: Vec<String>,
 }
 
@@ -106,11 +126,14 @@ impl SqlQuery {
 /// Shared SQL tail for the search builders: the ZIM/language filter block,
 /// then `ORDER BY` + `LIMIT`.
 ///
-/// `order_by` is `"ORDER BY score DESC"` for the FTS/trgm builders. `vector_sql`
-/// must pass the ANN ordering ("ORDER BY a.embedding <=> $1::vector") instead:
-/// the score expression is not index-usable (hnsw/ivfflat), so a uniform
-/// `ORDER BY score` tail would silently degrade the vector query to a full
-/// scan + sort.
+/// `order_by` is `"ORDER BY score DESC, a.id"` for the FTS/trgm builders
+/// (the `a.id` tiebreaker makes equal-score page boundaries deterministic).
+/// `vector_sql` must pass the ANN ordering (`ORDER BY a.embedding <=>
+/// $1::vector`) instead: the score expression is not index-usable (hnsw/
+/// ivfflat), so a uniform `ORDER BY score` tail — or ANY secondary ORDER BY
+/// key, which would also defeat the index's order guarantee — would silently
+/// degrade the vector query to a full scan + sort. Vector determinism is
+/// restored by the outer re-sort `vector_sql` wraps around this tail.
 fn push_filters(
     sq: &mut SqlQuery,
     zim: Option<&str>,
@@ -133,14 +156,18 @@ fn push_filters(
         .push_str(&format!(" {order_by} LIMIT ${}::int8", sq.params.len()));
 }
 
-const ORDER_BY_SCORE_DESC: &str = "ORDER BY score DESC";
+// The `, a.id` tiebreaker (`articles.id`, BIGINT identity PK) is mandatory
+// for page-boundary determinism: without it, equal-score rows have no stable
+// DB order and can reorder between requests, skipping/duplicating rows at
+// `offset` boundaries. (`a` is the articles alias in every branch.)
+const ORDER_BY_SCORE_DESC: &str = "ORDER BY score DESC, a.id";
 const ORDER_BY_ANN: &str = "ORDER BY a.embedding <=> $1::vector";
 
 /// Shared SELECT column list for the five search builders (S2: one constant
 /// instead of five verbatim copies). `left(a.content_preview, 600)`: the
 /// preview is only needed for merged-winner rows (the embed claim uses 500
 /// chars), and pulling the full ~2000-char preview into 4–5 branches ×
-/// limit*2 rows is the ~10MB worst-case over-fetch — clamped at fetch.
+/// limit*fetch rows is the ~10MB worst-case over-fetch — clamped at fetch.
 const SELECT_ARTICLE_COLS: &str = "a.id, a.zim_id, a.path, a.title";
 const SELECT_ARTICLE_TAIL: &str =
     ", left(a.content_preview, 600) as content_preview, a.language, z.name as zim_name";
@@ -322,10 +349,15 @@ pub(super) fn vector_sql(
     limit: i32,
     weight: f64,
 ) -> SqlQuery {
-    // ANN ordering (NOT `ORDER_BY_SCORE_DESC`): the score expression is not
-    // index-usable, so `push_filters` must keep `ORDER BY a.embedding <=>
-    // $1::vector` or the query degrades to a full scan + sort.
-    score_query(
+    // Inner query: ANN ordering ONLY (NOT `ORDER_BY_SCORE_DESC`). The score
+    // expression is not index-usable, so the inner tail must stay
+    // `ORDER BY a.embedding <=> $1::vector LIMIT k` or the query degrades to
+    // a full scan + sort. A secondary key (like the score branches' `a.id`
+    // tiebreaker) cannot be added INSIDE the inner query either: the ANN
+    // index only guarantees distance order, so `ORDER BY dist, id` would
+    // force a Sort node over the entire (filtered) table instead of a
+    // top-k index seek.
+    let mut inner = score_query(
         "GREATEST(1.0 - (a.embedding <=> $1::vector), 0.0)",
         "a.embedding IS NOT NULL",
         vec![vec_str.to_string()],
@@ -333,13 +365,41 @@ pub(super) fn vector_sql(
         (zim, lang),
         limit,
         weight,
-    )
+    );
+    // Outer deterministic re-sort over the fetched top-k rows: exact
+    // float-distance ties (hence equal scores) are possible between
+    // distinct articles, and without the `s.id` tiebreaker those rows could
+    // reorder between requests, skipping/duplicating rows at page
+    // boundaries. Sorting ≤ k already-fetched rows is negligible next to
+    // the ANN seek.
+    let inner_sql = inner.sql;
+    let limit_idx = inner.params.len() + 1;
+    inner.params.push(limit.to_string());
+    inner.sql = format!(
+        "SELECT * FROM ({inner_sql}) s ORDER BY s.score DESC, s.id LIMIT ${limit_idx}::int8"
+    );
+    inner
 }
 
-/// ANN fetch limit: over-fetch 2× more when a post-filter is active.
-/// ANN top-k is not filter-aware — with `zim_filter`/`lang_filter` active a
-/// plain `limit*2` fetch can return fewer than `limit` rows after the WHERE.
-/// `merge_results` still applies offset/limit, so this is correctness-neutral.
-pub(super) fn vector_fetch_limit(limit: usize, filtered: bool) -> i32 {
-    (limit * (if filtered { 4 } else { 2 })) as i32
+/// Vector (ANN) fetch limit for the branch: the offset-aware `fetch`
+/// (`min(limit + offset, SEARCH_FETCH_HARD_CAP)`, see
+/// [`branch_fetch_limit`]) over-fetched 2× (4× when a post-filter is
+/// active — ANN top-k is not filter-aware, so a plain fetch can return
+/// fewer rows than requested after the WHERE), then clamped back to
+/// [`SEARCH_FETCH_HARD_CAP`].
+///
+/// The clamp bounds the worst-case ANN top-k at 5500 instead of
+/// 5500×4 = 22000 for a filtered deepest-page request. It never drops
+/// below the plain fetch (multiplier ≥ 2, cap ≥ fetch), so an unfiltered
+/// vector-only search can still satisfy every legal page; a FILTERED
+/// vector-ONLY search on extreme pages may under-return if the ANN scan
+/// discards enough post-filter rows — accepted: 22000-row ANN top-k is
+/// not a sane cost to avoid that corner, and hybrid-mode requests have the
+/// FTS/trgm branches (each capped at 5500) to fill the pool.
+/// `merge_results` still applies offset/limit, so this is
+/// correctness-neutral either way.
+pub(super) fn vector_fetch_limit(fetch: usize, filtered: bool) -> i32 {
+    fetch
+        .saturating_mul(if filtered { 4 } else { 2 })
+        .min(SEARCH_FETCH_HARD_CAP) as i32
 }

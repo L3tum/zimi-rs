@@ -10,19 +10,25 @@ use thiserror::Error;
 /// client; `Other` is any other qBittorrent / upload / download failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TorrentKind {
+    /// Stale qBittorrent session (401/403) — the poller clears the cached client.
     SessionExpired,
+    /// Any other qBittorrent / upload / download failure.
     Other,
 }
 
 /// Top-level application error type.
 #[derive(Error, Debug)]
 pub enum Error {
+    /// Postgres/SQLx failure. Pool-checkout timeout and connection-level
+    /// faults map to 503; a server-returned SQLSTATE maps to an honest 4xx/503.
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 
+    /// ZIM archive handling error with a human-readable detail (500, redacted).
     #[error("ZIM error: {0}")]
     Zim(String),
 
+    /// Configuration error with a human-readable detail (500, redacted).
     #[error("config error: {0}")]
     Config(String),
 
@@ -32,9 +38,11 @@ pub enum Error {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// Filesystem/IO failure (500, redacted).
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// JSON (de)serialization failure (500, redacted).
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
@@ -42,23 +50,35 @@ pub enum Error {
     /// Maps to HTTP 502 Bad Gateway since it represents a failure of the
     /// upstream torrent-management service.
     #[error("torrent error: {msg}")]
-    Torrent { kind: TorrentKind, msg: String },
+    Torrent {
+        /// Whether the failure is a session expiry (401/403) or any other error.
+        kind: TorrentKind,
+        /// The upstream error message (logged, not returned to clients).
+        msg: String,
+    },
 
+    /// Embedding pipeline failure (OpenAI-compatible endpoint) with a detail (500, redacted).
     #[error("embedding error: {0}")]
     Embedding(String),
 
+    /// MCP (Model Context Protocol) server failure with a detail (500, redacted).
     #[error("MCP error: {0}")]
     Mcp(String),
 
+    /// Resource not found; the message is returned to the client (404).
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// Caller not authorized for the action; the message is returned to the client (403).
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// State conflict, e.g. a unique-constraint duplicate; the message is
+    /// returned to the client (409).
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// Invalid request input; the message is returned to the client (400).
     #[error("invalid input: {0}")]
     InvalidInput(String),
 

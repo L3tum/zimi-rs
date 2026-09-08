@@ -399,11 +399,10 @@ make web-test    # behavioral unit tests for web/common.js helpers (node --test;
 make run         # build + run `zimservice serve`
 ```
 
-The `docs/reviews/` directory holds review / research / deep-plan process
-artifacts — the process record of design decisions and their rationale
-(previous home: `plans/`, retired 2026-09). It is not shipped in
-the binary: the build only embeds migrations via `include_str!` and the static
-`web/` UI.
+The build only embeds migrations via `include_str!` and the static `web/`
+UI — nothing else is shipped in the binary. (Point-in-time review / research /
+deep-plan process artifacts that used to live in `docs/reviews/` — previously
+`plans/` — are preserved in git history.)
 
 **Formatting.** The 100-char line limit is enforced by `cargo fmt` (rustfmt,
 `max_width = 100` in `rustfmt.toml`) on Rust code only. `web/` (JS) and the

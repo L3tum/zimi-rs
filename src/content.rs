@@ -13,11 +13,16 @@ use crate::AppState;
 
 // ─── Read + chunks: response DTOs (OpenAPI schemas) ──────────────────────────
 
+/// Response DTO for an article read: extracted text plus provenance.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct ReadResponse {
+    /// Article title.
     pub title: String,
+    /// Name of the ZIM the article was read from.
     pub zim: String,
+    /// ZIM entry path of the article.
     pub path: String,
+    /// Extracted article text (see `truncated` / `full_length` for caps).
     pub content: String,
     /// True when `content` is not the whole article: either it was cut at
     /// `max_length`, or (with `source == "db"`) the stored preview itself was
@@ -35,19 +40,29 @@ pub struct ReadResponse {
     pub source: String,
 }
 
+/// One RAG chunk of an article's extracted text.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct TextChunk {
+    /// 0-based position in the returned `chunks` list.
     pub index: usize,
+    /// Byte offset (char boundary) of this window's start in the full text.
     pub start: usize,
+    /// Exclusive byte offset (char boundary) of this window's end.
     pub end: usize,
+    /// Trimmed text of the window; adjacent chunks overlap.
     pub text: String,
 }
 
+/// Response DTO for the chunking endpoint: all chunks of one article.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct ChunksResponse {
+    /// Name of the ZIM the article belongs to.
     pub zim: String,
+    /// ZIM entry path of the article.
     pub path: String,
+    /// Number of chunks in `chunks`.
     pub chunk_count: usize,
+    /// Chunks in `start` order; adjacent chunks overlap.
     pub chunks: Vec<TextChunk>,
 }
 

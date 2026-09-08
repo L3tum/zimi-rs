@@ -139,6 +139,133 @@ fn sweep_stale_guard_entries(guard: &mut HashMap<i32, GuardEntry>, pass: u64) ->
     }
     stale.len()
 }
+
+/// Outcome of one stale `error` row passing through the BUG-6 requeue guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequeueDecision {
+    /// Re-queue the row (it goes into the `id = ANY(…)` requeue batch).
+    Requeue,
+    /// Give up: leave the row in `error` for manual intervention (not re-queued).
+    GiveUp,
+}
+
+/// BUG-6 requeue guard, one row at a time (pure — no DB, no lock, so the
+/// give-up contract is unit-testable without Postgres).
+///
+/// Decides whether the row is re-queued this pass and updates `guard` in
+/// place:
+///
+/// - **Give up** (`should_give_up`): the row is *not* re-queued and its guard
+///   entry is **retained** — *not* removed — with its `last_seen` refreshed to
+///   `pass`. Retention is the whole point (FIX-B): a give-up row stays `error`
+///   with the same message, so the *next* pass must still see the give-up state
+///   (count already at the cap) instead of treating it as a fresh failure
+///   (`prev = None` → count resets to 1) and re-queueing it — that one-shot
+///   removal was the bug that made "bounded retry" unbounded. Once the row
+///   leaves `error` by other means (cancel / complete) it stops being observed
+///   as an error row, its `last_seen` freezes, and the lazy
+///   [`sweep_stale_guard_entries`] reclaims the entry after
+///   `GUARD_STALE_AFTER_PASSES` unobserved passes.
+/// - **Re-queue**: record/refresh the row's entry, incrementing the
+///   consecutive-identical-message count, and re-queue it. A brand-new entry is
+///   admitted only while under `MAX_LAST_ERROR_TRACKED` (sweeping stale entries
+///   first; failing open — re-queue without a guard entry — if nothing was
+///   stale).
+fn requeue_guard_step(
+    guard: &mut HashMap<i32, GuardEntry>,
+    id: i32,
+    msg: &str,
+    pass: u64,
+) -> RequeueDecision {
+    let is_auth = is_auth_error(msg);
+    let prev = guard.get(&id).map(|e| (e.prev_msg.as_str(), e.count));
+    if should_give_up(prev, msg, is_auth) {
+        tracing::warn!(
+            download_id = id,
+            "requeue guard: same error {msg:?} {REQUEUE_GIVE_UP_AFTER}x in a row — leaving row in error state"
+        );
+        // FIX-B: retain the entry (never remove) so the give-up state survives
+        // to the next pass; refresh `last_seen` so the lazy sweep reclaims it
+        // once the row leaves `error` by other means. On give-up the entry is
+        // always present (`should_give_up` needs a prior count ≥ 2).
+        if let Some(existing) = guard.get_mut(&id) {
+            existing.last_seen = pass;
+        }
+        return RequeueDecision::GiveUp;
+    }
+    let count = prev.filter(|(m, _)| *m == msg).map_or(1, |(_, n)| n + 1);
+    let entry = GuardEntry {
+        prev_msg: msg.to_string(),
+        count,
+        last_seen: pass,
+    };
+    if let Some(existing) = guard.get_mut(&id) {
+        *existing = entry;
+    } else if guard.len() >= MAX_LAST_ERROR_TRACKED {
+        // Cap reached: sweep entries whose rows stopped appearing as error
+        // rows (left `error` by other means) more than
+        // `GUARD_STALE_AFTER_PASSES` passes ago, then admit the new entry if
+        // the sweep freed a slot. If nothing was stale, fail open: the row
+        // retries without a guard entry (and without give-up protection).
+        sweep_stale_guard_entries(guard, pass);
+        if guard.len() < MAX_LAST_ERROR_TRACKED {
+            guard.insert(id, entry);
+        }
+    } else {
+        guard.insert(id, entry);
+    }
+    if count >= 2 {
+        tracing::warn!(
+            download_id = id,
+            attempt = count,
+            "requeue guard: same error {count}x, will stop after {REQUEUE_GIVE_UP_AFTER}"
+        );
+    }
+    RequeueDecision::Requeue
+}
+
+/// FIX-A (requeue 23505), pure: drop stale `error` rows that would trip the
+/// partial unique `uq_downloads_active_name` if re-queued in this batch —
+/// either because their `name` is already held by an ACTIVE row, or because
+/// another stale `error` row in the same batch shares it.
+///
+/// The partial unique `uq_downloads_active_name` (name UNIQUE where status IN
+/// queued/downloading) covers active-vs-active only — an `error` row may share
+/// a `name` with an active one. Re-queueing such a row (`status='error'` →
+/// `queued`) would trip 23505, which the guarded UPDATE surfaces as an error
+/// the tick treats as fatal — aborting the whole tick (and, with `updated_at`
+/// never advancing, re-picking the same row every tick until the active row
+/// goes terminal). Skipping the colliding rows here (they stay in `error` and
+/// retry on a later pass once the colliding active row leaves the active
+/// states) keeps the requeue UPDATE from ever seeing a collision. Returns the
+/// `(id, name, error)` rows that may be safely re-queued.
+fn filter_requeue_name_collisions(
+    stale: &[(i32, String, String)],
+    active_names: &HashSet<String>,
+) -> Vec<(i32, String, String)> {
+    // Two stale `error` rows sharing a name (re-adding a previously-failed
+    // name is legal — only active-vs-active is constrained) would both flip
+    // to `queued` in one batched UPDATE and still trip the partial unique.
+    // Keep only the newest (highest-id) candidate per name; the older
+    // duplicates stay in `error` and can be retried later.
+    let mut best_id: HashMap<String, i32> = HashMap::new();
+    for (id, name, _) in stale {
+        if active_names.contains(name) {
+            continue;
+        }
+        match best_id.get_mut(name) {
+            Some(prev) => *prev = (*prev).max(*id),
+            None => {
+                best_id.insert(name.clone(), *id);
+            }
+        }
+    }
+    stale
+        .iter()
+        .filter(|(id, name, _)| best_id.get(name) == Some(id))
+        .cloned()
+        .collect()
+}
 use crate::zim::{index, ZimManager};
 
 /// The shared transfer client, or a clear error when the startup build failed.
@@ -163,6 +290,8 @@ const MAX_QUEUED_PER_TICK: i32 = 50;
 /// table, not the poller). See `crate::db::downloads::ZIM_URL_PREDICATE`.
 pub use crate::db::downloads::ZIM_URL_PREDICATE;
 
+/// Background poller that reconciles the `downloads` table with qBittorrent
+/// state, direct-download progress, and the ZIM library on each tick.
 pub struct DownloadPoller {
     pub(crate) db: Pool,
     pub(crate) settings: SettingsCache,
@@ -194,6 +323,7 @@ pub struct DownloadPoller {
 }
 
 impl DownloadPoller {
+    /// Create a new poller wired to the given DB pool, settings, and ZIM manager.
     pub fn new(
         db: Pool,
         settings: SettingsCache,
@@ -289,11 +419,6 @@ impl DownloadPoller {
             &self.torrent_password,
         )
         .is_some()
-    }
-
-    /// The shared transfer client, or a clear error if the startup build failed.
-    fn client_or_err(&self) -> Result<&reqwest::Client> {
-        client_from_option(self.http.as_ref())
     }
 
     /// BUG-5: atomically check whether this row is still `downloading`; if the
@@ -483,12 +608,19 @@ impl DownloadPoller {
         Ok(n == 0)
     }
 
-    /// LINT-2 extraction (verbatim `tick()` requeue block): re-queue error
-    /// rows that hit a connection-level failure more than 10 minutes ago,
-    /// bounded by `REQUEUE_GIVE_UP_AFTER` (BUG-6) so a persistently-failing
-    /// row eventually stays `error` for manual intervention instead of
-    /// cycling forever. A 401/403 session expiry is always exempt — the next
-    /// re-login is the fix, not a human.
+    /// LINT-2 extraction (`tick()` requeue block): re-queue error rows that
+    /// hit a connection-level failure more than 10 minutes ago, bounded by
+    /// `REQUEUE_GIVE_UP_AFTER` (BUG-6) so a persistently-failing row
+    /// eventually stays `error` for manual intervention instead of cycling
+    /// forever — and give-up is *sticky* (FIX-B): the guard entry is retained
+    /// on give-up, so the row is not re-queued again on the next pass. A
+    /// 401/403 session expiry is always exempt — the next re-login is the fix,
+    /// not a human.
+    ///
+    /// FIX-A (requeue 23505): the per-row guard decision is the pure
+    /// [`requeue_guard_step`] and the collision pre-filter is the pure
+    /// [`filter_requeue_name_collisions`], so both bugs are unit-testable
+    /// without Postgres.
     async fn requeue_stale_errors(&self) -> Result<()> {
         // Lazy-eviction clock: count every pass (also the timestamp stamped
         // on entries observed below), so "not seen for N passes" is measured
@@ -496,11 +628,12 @@ impl DownloadPoller {
         let pass = self.requeue_passes.fetch_add(1, Ordering::SeqCst) + 1;
         // Raw SQL (db::raw): the case-insensitive regex match `error ~* $1`
         // has no `db::raw` helper shape (the guarded UPDATE lives in
-        // `downloads_lifecycle::requeue_stale_errors`).
-        let stale: Vec<(i32, String)> = crate::db::raw::fetch_all(
+        // `downloads_lifecycle::requeue_stale_errors`). `name` is fetched too
+        // so the FIX-A collision filter below can match it against active rows.
+        let stale: Vec<(i32, String, String)> = crate::db::raw::fetch_all(
             &self.db,
             &format!(
-                "SELECT id, error FROM downloads \
+                "SELECT id, name, error FROM downloads \
                  WHERE status = {err} \
                    AND updated_at < now() - interval '10 minutes' \
                    AND error ~* $1",
@@ -512,53 +645,42 @@ impl DownloadPoller {
         if stale.is_empty() {
             return Ok(());
         }
+        // FIX-A (requeue 23505): the partial unique `uq_downloads_active_name`
+        // (name UNIQUE where status IN queued/downloading) covers active-vs-
+        // active only, so an `error` row may share a `name` with an active one.
+        // Re-queueing that row would trip 23505 — an error the guarded UPDATE
+        // propagates and the tick treats as fatal — aborting the whole tick
+        // (and, with `updated_at` never advancing, re-picking the same row
+        // every tick). Fetch the active names once and skip the colliding
+        // stale rows; they stay in `error` and retry once the active row goes
+        // terminal.
+        let active_names: HashSet<String> = crate::db::raw::fetch_scalar_all(
+            &self.db,
+            &format!(
+                "SELECT name FROM downloads WHERE status IN {active}",
+                active = crate::torrent::in_list([
+                    crate::torrent::DownloadStatus::Queued,
+                    crate::torrent::DownloadStatus::Downloading,
+                ])
+            ),
+            |q| q,
+        )
+        .await?
+        .into_iter()
+        .collect();
+        let candidates = filter_requeue_name_collisions(&stale, &active_names);
+        if candidates.is_empty() {
+            return Ok(());
+        }
         // The guard's scope ends here (before the DB write) so the
         // `MutexGuard` is never held across an await.
         let requeue: Vec<i32> = {
             let mut requeue = Vec::new();
             let mut guard = self.last_error.lock().expect("last_error lock");
-            for (id, msg) in &stale {
-                let is_auth = is_auth_error(msg);
-                let prev = guard.get(id).map(|e| (e.prev_msg.as_str(), e.count));
-                if should_give_up(prev, msg, is_auth) {
-                    tracing::warn!(
-                        download_id = id,
-                        "requeue guard: same error {msg:?} {REQUEUE_GIVE_UP_AFTER}x in a row — leaving row in error state"
-                    );
-                    guard.remove(id);
-                    continue;
+            for (id, _name, msg) in &candidates {
+                if requeue_guard_step(&mut guard, *id, msg, pass) == RequeueDecision::Requeue {
+                    requeue.push(*id);
                 }
-                let count = prev.filter(|(m, _)| *m == *msg).map_or(1, |(_, n)| n + 1);
-                let entry = GuardEntry {
-                    prev_msg: msg.clone(),
-                    count,
-                    last_seen: pass,
-                };
-                if let Some(existing) = guard.get_mut(id) {
-                    *existing = entry;
-                } else if guard.len() >= MAX_LAST_ERROR_TRACKED {
-                    // Cap reached: sweep entries whose rows stopped
-                    // appearing as error rows (left `error` by other means,
-                    // e.g. a manual re-queue) more than
-                    // `GUARD_STALE_AFTER_PASSES` passes ago, then admit the
-                    // new entry if the sweep freed a slot. If nothing was
-                    // stale, fail open as before: the row retries without a
-                    // guard entry (and without give-up protection).
-                    sweep_stale_guard_entries(&mut guard, pass);
-                    if guard.len() < MAX_LAST_ERROR_TRACKED {
-                        guard.insert(*id, entry);
-                    }
-                } else {
-                    guard.insert(*id, entry);
-                }
-                if count >= 2 {
-                    tracing::warn!(
-                        download_id = id,
-                        attempt = count,
-                        "requeue guard: same error {count}x, will stop after {REQUEUE_GIVE_UP_AFTER}"
-                    );
-                }
-                requeue.push(*id);
             }
             requeue
         };
@@ -923,39 +1045,6 @@ impl DownloadPoller {
     }
 }
 
-/// RAII marker for a `.part` file. Since PERF-11 a dropped guard does NOT
-/// delete the partial file: failed/interrupted downloads keep their bytes
-/// so a later attempt (restart/reclaim) can resume via `Range: bytes=S-`.
-/// Removal is explicit — success renames the file into place and calls
-/// `disable()`; cancel paths remove the file then call `disable()`;
-/// leftovers of terminal-state rows are reclaimed by the reconcile sweep.
-/// The `Drop` impl keeps the file (unless `disable()` was called) and logs
-/// at debug level to make the keep-for-resume intent visible in traces.
-struct PartGuard {
-    path: Option<std::path::PathBuf>,
-}
-
-impl PartGuard {
-    fn new(path: &Path) -> Self {
-        Self {
-            path: Some(path.to_path_buf()),
-        }
-    }
-
-    /// Stop tracking (the file was renamed into place or explicitly removed).
-    fn disable(&mut self) {
-        self.path = None;
-    }
-}
-
-impl Drop for PartGuard {
-    fn drop(&mut self) {
-        if let Some(p) = self.path.take() {
-            tracing::debug!("keeping partial file for resume: {}", p.display());
-        }
-    }
-}
-
 /// Decision for a seeding row based on the live qBittorrent state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SeedingAction {
@@ -1249,34 +1338,131 @@ mod tests {
             assert!(!super::super::is_auth_error("download failed"));
         }
 
+        /// BUG-6 give-up is STICKY, not one-shot (FIX-B): the moment a row
+        /// gives up, its guard entry is retained (not removed), so the very
+        /// next pass — the row still `error` with the same message — keeps
+        /// giving up instead of treating it as a fresh failure (count resets
+        /// to 1) and re-queueing it forever. While the row stays in `error` it
+        /// keeps being observed, so `last_seen` is refreshed each pass and it
+        /// is never swept. Once the row leaves `error` by other means
+        /// (cancel/complete) it stops being observed, `last_seen` freezes, and
+        /// the lazy stale sweep reclaims the entry after
+        /// `GUARD_STALE_AFTER_PASSES` unobserved passes.
         #[test]
-        fn part_guard_retains_part_on_drop() {
-            let dir = std::env::temp_dir().join(format!("zimi-part-{}-p1", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            // A guard that is never disabled retains the file on drop (PERF-11).
-            {
-                let p = dir.join("a.part");
-                std::fs::write(&p, b"x").unwrap();
-                let _g = super::super::PartGuard::new(&p);
-                assert!(p.exists());
-            }
-            assert!(
-                dir.join("a.part").exists(),
-                "PERF-11: guard must retain partial on drop"
+        fn requeue_guard_give_up_is_sticky_not_one_shot() {
+            use super::super::{
+                requeue_guard_step, sweep_stale_guard_entries, GuardEntry, RequeueDecision,
+            };
+            let mut guard: std::collections::HashMap<i32, GuardEntry> =
+                std::collections::HashMap::new();
+            const ID: i32 = 42;
+            const MSG: &str = "connection refused";
+            // First two identical errors → keep retrying (count climbs 1→2).
+            assert_eq!(
+                requeue_guard_step(&mut guard, ID, MSG, 1),
+                RequeueDecision::Requeue
             );
+            assert_eq!(
+                requeue_guard_step(&mut guard, ID, MSG, 2),
+                RequeueDecision::Requeue
+            );
+            // Third identical error → give up, and the entry must be RETAINED.
+            assert_eq!(
+                requeue_guard_step(&mut guard, ID, MSG, 3),
+                RequeueDecision::GiveUp
+            );
+            assert!(
+                guard.contains_key(&ID),
+                "give-up must retain the guard entry (the one-shot-removal bug)"
+            );
+            assert_eq!(guard[&ID].last_seen, 3);
+            // The next pass (row still error, same message) must still give up
+            // rather than reset the count to 1 and re-queue it, and keep the
+            // entry fresh while the row stays in `error`.
+            assert_eq!(
+                requeue_guard_step(&mut guard, ID, MSG, 4),
+                RequeueDecision::GiveUp
+            );
+            assert_eq!(guard[&ID].last_seen, 4);
+            assert_eq!(
+                requeue_guard_step(&mut guard, ID, MSG, 50),
+                RequeueDecision::GiveUp
+            );
+            assert_eq!(guard[&ID].last_seen, 50);
 
-            // A disabled guard also leaves the file in place.
-            {
-                let p = dir.join("b.part");
-                std::fs::write(&p, b"x").unwrap();
-                let mut g = super::super::PartGuard::new(&p);
-                g.disable();
-            }
+            // The row leaves `error` (cancel/complete) at pass 50: it stops
+            // being observed, `last_seen` freezes at 50, and the lazy sweep
+            // reclaims the entry once it is > `GUARD_STALE_AFTER_PASSES` (100)
+            // passes old.
+            let horizon = 50 + super::super::GUARD_STALE_AFTER_PASSES;
             assert!(
-                dir.join("b.part").exists(),
-                "disabled guard must not remove"
+                sweep_stale_guard_entries(&mut guard, horizon) == 0,
+                "at the sweep horizon the entry is still kept"
             );
-            let _ = std::fs::remove_dir_all(&dir);
+            assert!(guard.contains_key(&ID));
+            assert!(
+                sweep_stale_guard_entries(&mut guard, horizon + 1) == 1,
+                "just past the horizon the entry is swept"
+            );
+            assert!(
+                !guard.contains_key(&ID),
+                "stale give-up entry must be reclaimed"
+            );
+        }
+
+        /// FIX-A (requeue 23505): a stale `error` row whose `name` is already
+        /// held by an ACTIVE (`queued`/`downloading`) row must be skipped, and
+        /// two stale `error` rows sharing a name must collapse to the newest —
+        /// re-queueing both would trip the partial unique `uq_downloads_active_name`
+        /// and abort the whole tick — while a non-colliding `error` row is
+        /// still re-queued. The filter is pure (no DB), so it is testable
+        /// without Postgres: seed an in-memory active name set and stale error
+        /// rows, and check the colliding ids are dropped and the rest kept.
+        #[test]
+        fn requeue_skips_error_rows_whose_name_is_held_by_an_active_row() {
+            use super::super::filter_requeue_name_collisions;
+            // Seed: one active row `dupe`, plus two stale error rows — one
+            // sharing that name (collides), one not.
+            let active: std::collections::HashSet<String> =
+                ["dupe".to_string()].into_iter().collect();
+            let stale = vec![
+                (1, "dupe".to_string(), "connection refused".to_string()),
+                (
+                    2,
+                    "other".to_string(),
+                    "timeout while connecting".to_string(),
+                ),
+            ];
+            let kept = filter_requeue_name_collisions(&stale, &active);
+            assert_eq!(
+                kept.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                vec![2],
+                "only the non-colliding error row is requeued"
+            );
+            // No active rows → nothing collides, everything is requeued.
+            let none: std::collections::HashSet<String> = Default::default();
+            assert_eq!(
+                filter_requeue_name_collisions(&stale, &none)
+                    .iter()
+                    .map(|(id, _, _)| *id)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            // Two stale error rows sharing a name (re-adding a previously-
+            // failed name) → only the newest (highest id) is requeued; the
+            // older duplicate stays in `error` for a later pass.
+            let stale_dupes = vec![
+                (5, "dupe".to_string(), "older failure".to_string()),
+                (9, "dupe".to_string(), "newer failure".to_string()),
+            ];
+            assert_eq!(
+                filter_requeue_name_collisions(&stale_dupes, &none)
+                    .iter()
+                    .map(|(id, _, _)| *id)
+                    .collect::<Vec<_>>(),
+                vec![9],
+                "only the newest same-name error row is requeued"
+            );
         }
 
         /// T2: drive one real `tick()` end-to-end against a live Postgres and a
@@ -2897,7 +3083,16 @@ mod tests {
                 .expect("last_error lock")
                 .get(&guarded)
                 .is_some();
-            assert!(!still_tracked, "given-up row must leave the guard map");
+            // FIX-B: the give-up row must STAY in the guard map (its entry is
+            // retained, not removed), so the next pass still sees the give-up
+            // state and does not reset the count to 1 and re-queue it. The
+            // entry is reclaimed later by the lazy stale sweep once the row
+            // leaves `error` — pinned DB-free in
+            // `requeue_guard_give_up_is_sticky_not_one_shot`.
+            assert!(
+                still_tracked,
+                "given-up row must stay tracked so the next pass doesn't re-queue it"
+            );
             // The fresh and the 401 rows were requeued and enqueued to qB in the
             // same tick (add mock `.expect(2)` is verified on drop).
             for id in [fresh, auth] {

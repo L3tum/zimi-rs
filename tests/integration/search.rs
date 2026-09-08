@@ -145,6 +145,127 @@ async fn search_handler_shape() {
         .unwrap();
 }
 
+/// Deep-paging + determinism regression (DB-gated — skipped without Postgres):
+/// the branch fetch must be offset-aware, so a page past 5×limit still
+/// returns real rows when the fixture has enough matches (the old flat
+/// `limit*2` fetch capped the merged pool at ~6×limit → empty pages). Also
+/// pins page-boundary determinism: two identical consecutive requests return
+/// the same `id` sequence, and consecutive pages don't overlap.
+#[tokio::test]
+async fn search_deep_paging_serves_rows_and_is_deterministic() {
+    let (pool, _db_gate) = match pool_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    run_migrations(&pool).await.expect("migrations");
+    const ZIM: &str = "__itest_deep__";
+    zimservice::db::raw::execute(
+        &pool,
+        "DELETE FROM articles WHERE zim_id IN (SELECT id FROM zims WHERE name=$1)",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+        .await
+        .unwrap();
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 130, 130)",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap();
+    // 130 articles, all matching `deep` — enough that offset 120 (6× limit 20)
+    // is a satisfiable page. One multi-row INSERT keeps it to one round-trip.
+    let mut values = String::new();
+    for i in 1..=130 {
+        let sep = if i == 1 { String::new() } else { ",\n".into() };
+        values.push_str(&format!(
+            "{sep}((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Deep_{i}', 'Deep Paging Probe {i}',
+             'deep paging probe text {i}', to_tsvector('simple','deep paging probe {i}'))"
+        ));
+    }
+    zimservice::db::raw::execute(
+        &pool,
+        &format!(
+            "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES {values}"
+        ),
+        |q| q,
+    )
+    .await
+    .unwrap();
+
+    let engine = zimservice::search::SearchEngine::new(
+        pool.clone(),
+        zimservice::settings::SettingsCache::load(
+            pool.clone(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .expect("settings"),
+        zimservice::health::DegradationTracker::default(),
+    );
+    // FTS-only keeps the assertion exact (one branch, deterministic pool).
+    let params = |offset: Option<usize>| SearchParams {
+        zim: Some(ZIM),
+        language: None,
+        mode: Some("fts"),
+        limit: Some(20),
+        offset,
+        highlight: false,
+    };
+
+    // Page 1: limit 20 → a full page.
+    let p1 = engine
+        .search("deep", &params(Some(0)))
+        .await
+        .expect("page 1");
+    assert_eq!(p1.len(), 20, "page 1 must be full (130 matches)");
+
+    // Deep page: offset 120 > 5×limit — empty before the offset-aware fetch.
+    let p_deep = engine
+        .search("deep", &params(Some(120)))
+        .await
+        .expect("deep page");
+    assert_eq!(p_deep.len(), 10, "130 matches - 120 offset = 10 rows");
+    // Consecutive pages never overlap (no skips/dupes at the boundary).
+    let page1_ids: std::collections::HashSet<i64> = p1.iter().map(|r| r.id).collect();
+    assert!(
+        p_deep.iter().all(|r| !page1_ids.contains(&r.id)),
+        "deep page must not overlap page 1"
+    );
+
+    // Determinism: an identical consecutive request returns the same id
+    // sequence (the `a.id` ORDER BY tiebreaker — without it, equal
+    // ts_rank_cd scores could reorder rows between requests).
+    let p_deep_again = engine
+        .search("deep", &params(Some(120)))
+        .await
+        .expect("deep page again");
+    let ids1: Vec<i64> = p_deep.iter().map(|r| r.id).collect();
+    let ids2: Vec<i64> = p_deep_again.iter().map(|r| r.id).collect();
+    assert_eq!(
+        ids1, ids2,
+        "identical requests must return identical id sequences"
+    );
+
+    // Cleanup.
+    zimservice::db::raw::execute(
+        &pool,
+        "DELETE FROM articles WHERE zim_id IN (SELECT id FROM zims WHERE name=$1)",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+        .await
+        .unwrap();
+}
+
 /// P3 (H3) — per-branch soft-fail on a SHARED connection: a broken branch
 /// query returns empty (warn-and-degrade) and does NOT poison the same
 /// client for the other branches — this is the guarantee that lets one

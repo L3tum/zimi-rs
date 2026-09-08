@@ -16,16 +16,22 @@ const MAX_DOWNLOAD_URL_BYTES: usize = 2048;
 
 // ─── Downloads: response/request DTOs (OpenAPI schemas) ──────────────────────
 
+/// A single entry in the download queue (one `downloads` table row).
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct Download {
+    /// Download id.
     pub id: i32,
+    /// Display name (also the `.part` file basename).
     pub name: String,
+    /// Download URL (redacted for unauthenticated callers — SEC-L1).
     pub url: String,
     /// One of: queued, downloading, complete, seeding, error, cancelled.
     pub status: String,
     /// 0.0–1.0 (fraction of the download complete).
     pub progress: f64,
+    /// Download speed in bytes/sec, when known.
     pub speed_bps: Option<i64>,
+    /// Estimated time remaining in seconds, when known.
     pub eta_secs: Option<i64>,
     /// Current share ratio (torrents; null for direct downloads).
     pub ratio: Option<f64>,
@@ -33,16 +39,20 @@ pub struct Download {
     pub up_speed_bps: Option<i64>,
     /// Number of seeding peers (torrents).
     pub num_seeds: Option<i64>,
+    /// Failure message for `error`-status rows (redacted for unauthenticated callers).
     pub error: Option<String>,
     /// RFC3339 timestamp.
     pub created_at: String,
 }
 
+/// `GET /downloads` response: the download queue.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct ListDownloadsResponse {
+    /// Queue entries (latest 500, newest first).
     pub downloads: Vec<Download>,
 }
 
+/// `POST /downloads` response: the newly queued download.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct DownloadQueuedResponse {
     /// New download id.
@@ -53,6 +63,8 @@ pub struct DownloadQueuedResponse {
 
 // ─── Downloads ────────────────────────────────────────────────────────────────
 
+/// `GET /downloads` — list the download queue; URLs, names, and error text
+/// are redacted for unauthenticated callers (SEC-L1/SEC-L1b).
 #[utoipa::path(
     get,
     path = "/downloads",
@@ -113,6 +125,7 @@ pub async fn list_downloads(
     Ok(Json(ListDownloadsResponse { downloads }))
 }
 
+/// `POST /downloads` request body.
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct AddDownloadBody {
     /// Direct `.zim` URL or torrent URL (torrents require qBittorrent).
@@ -121,6 +134,9 @@ pub struct AddDownloadBody {
     pub name: Option<String>,
 }
 
+/// `POST /downloads` — enqueue a direct `.zim` URL or a torrent (torrents
+/// require qBittorrent). Runs the SSRF guard and rejects duplicate
+/// URL/name pairs already in the queue.
 #[utoipa::path(
     post,
     path = "/downloads",
@@ -201,6 +217,8 @@ pub(crate) fn default_download_name(url: &str) -> String {
     crate::torrent::strip_query_fragment(seg).to_string()
 }
 
+/// `DELETE /downloads/{id}` — cancel a download (409 if it exists but is not
+/// cancellable in its current state, 404 if it does not exist).
 #[utoipa::path(
     delete,
     path = "/downloads/{id}",

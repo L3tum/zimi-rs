@@ -17,11 +17,16 @@ use crate::AppState;
 
 // ─── Snippet: response DTO (OpenAPI schema) ──────────────────────────────────
 
+/// Response DTO for `GET /snippet`: the indexed snippet of one article.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct SnippetResponse {
+    /// Name of the ZIM the article belongs to.
     pub zim: String,
+    /// Article path within the ZIM.
     pub path: String,
+    /// Article title.
     pub title: String,
+    /// Indexed snippet text.
     pub snippet: String,
     /// Content preview (may be null).
     pub preview: Option<String>,
@@ -32,8 +37,11 @@ pub struct SnippetResponse {
 /// Query parameters for `GET /read` (full article text).
 #[derive(Debug, Deserialize)]
 pub struct ReadQuery {
+    /// Name of the ZIM to read from.
     pub zim: String,
+    /// Article path within the ZIM.
     pub path: String,
+    /// Truncate text at N chars (default 8000).
     pub max_length: Option<usize>,
 }
 
@@ -54,6 +62,8 @@ fn content_type_for(mt: &zim::MimeType) -> String {
     }
 }
 
+/// `GET /read` — full article text, truncated at `max_length` (default 8000
+/// chars; the underlying raw read is bounded at 256 KB regardless).
 #[utoipa::path(
     get,
     path = "/read",
@@ -301,6 +311,9 @@ fn read_raw_entry_blocking(
     })
 }
 
+/// `GET /w/{zim}/{path}` — raw ZIM entry bytes with their MIME type. Supports
+/// single-byte Range requests and ETag/304 revalidation; entries above
+/// `MAX_RAW_BYTES` are refused.
 #[utoipa::path(
     get,
     path = "/w/{zim}/{path}",
@@ -483,12 +496,17 @@ fn insert_etag(resp: &mut Response, etag: &Option<String>) {
 /// Query parameters for `GET /chunks` (overlapping text chunks for RAG).
 #[derive(Debug, Deserialize)]
 pub struct ChunksQuery {
+    /// Name of the ZIM to read from.
     pub zim: String,
+    /// Article path within the ZIM.
     pub path: String,
+    /// Chunk size in chars (default 1000).
     pub size: Option<usize>,
+    /// Overlap between chunks in chars (default 200).
     pub overlap: Option<usize>,
 }
 
+/// `GET /chunks` — overlapping text chunks of an article, for RAG ingestion.
 #[utoipa::path(
     get,
     path = "/chunks",
@@ -530,10 +548,14 @@ pub async fn get_chunks(
 /// Query parameters for `GET /snippet` (the indexed snippet of an article).
 #[derive(Debug, Deserialize)]
 pub struct SnippetQuery {
+    /// Name of the ZIM the article belongs to.
     pub zim: String,
+    /// Article path within the ZIM.
     pub path: String,
 }
 
+/// `GET /snippet` — the indexed snippet and title of an article (404 if the
+/// article has no `articles` row).
 #[utoipa::path(
     get,
     path = "/snippet",

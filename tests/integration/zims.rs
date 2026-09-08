@@ -910,3 +910,192 @@ async fn collections_crud() {
         "deleted collection should be absent"
     );
 }
+
+/// Per-ZIM settings writes: an unknown ZIM 404s (NotFound), a live ZIM
+/// round-trips both fields, and an explicit `null` resets the category
+/// override. DB-gated — `update_zim_settings` writes to the `zims` table
+/// (the 0-row concurrent-delete guard is pinned DB-free in
+/// `settings::cache::tests::check_zim_update_affected_zero_rows_is_not_found`).
+#[tokio::test]
+async fn update_zim_settings_roundtrip_and_not_found() {
+    let (pool, _db_gate) = match pool_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    run_migrations(&pool).await.expect("migrations");
+    const NAME: &str = "__itest_zimset__";
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(NAME))
+        .await
+        .unwrap();
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
+        |q| q.bind(NAME),
+    )
+    .await
+    .unwrap();
+
+    let settings = SettingsCache::load(pool.clone(), HashMap::new(), HashMap::new())
+        .await
+        .expect("settings load");
+
+    // Unknown ZIM → NotFound (the handler maps this to 404).
+    let err = settings
+        .update_zim_settings(
+            "no-such-zim-xyz",
+            &serde_json::json!({ "embed_enabled": true }),
+        )
+        .await
+        .expect_err("unknown ZIM must not succeed");
+    assert!(
+        matches!(
+            err,
+            zimservice::error::Error::NotFound(ref m) if m.contains("no-such-zim-xyz")
+        ),
+        "expected NotFound, got: {err:?}"
+    );
+
+    // Happy path: both fields update in one transaction.
+    settings
+        .update_zim_settings(
+            NAME,
+            &serde_json::json!({ "embed_enabled": false, "category": "itest" }),
+        )
+        .await
+        .expect("update_zim_settings");
+    let (embed_enabled, category): (bool, Option<String>) = zimservice::db::raw::fetch_optional(
+        &pool,
+        "SELECT embed_enabled, category FROM zims WHERE name = $1",
+        |q| q.bind(NAME),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
+    assert!(!embed_enabled, "embed_enabled must be persisted");
+    assert_eq!(
+        category.as_deref(),
+        Some("itest"),
+        "category must be persisted"
+    );
+    // Read accessor round-trip.
+    let got = settings
+        .get_zim_settings(NAME)
+        .await
+        .unwrap()
+        .expect("row present");
+    assert_eq!(got["embed_enabled"], false);
+    assert_eq!(got["category"], "itest");
+
+    // Explicit null resets the override to NULL.
+    settings
+        .update_zim_settings(NAME, &serde_json::json!({ "category": null }))
+        .await
+        .expect("category reset");
+    let category: Option<String> = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT category FROM zims WHERE name = $1",
+        |q| q.bind(NAME),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(category.is_none(), "null must reset the category override");
+
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(NAME))
+        .await
+        .unwrap();
+}
+
+/// Regression (write-time SSRF): a single batch that enables
+/// `torrent.allow_private_networks` **and** sets a private-IP `torrent.url`
+/// must persist both rows — the URL's SSRF check must see the pending batch
+/// value, not the stale cached flag (the pre-fix code rejected the URL
+/// against the pre-batch cache, so a LAN qB endpoint needed two saves).
+#[tokio::test]
+async fn update_torrent_url_batch_enables_flag_in_same_save() {
+    let (pool, _db_gate) = match pool_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    run_migrations(&pool).await.expect("migrations");
+
+    const FLAG: &str = "torrent.allow_private_networks";
+    const URL: &str = "torrent.url";
+    // Snapshot both keys (usually absent or seeded defaults) for restore.
+    let mut original: Vec<(&str, Option<String>)> = Vec::new();
+    for k in [FLAG, URL] {
+        let v = zimservice::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT value::text FROM settings WHERE key = $1",
+            |q| q.bind(k),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        original.push((k, v));
+    }
+    // Hermetic start: the cached flag is false.
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO settings (key, value) VALUES ($1, $2)\n             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        |q| q.bind(FLAG).bind(serde_json::json!(false).to_string()),
+    )
+    .await
+    .unwrap();
+
+    let settings = SettingsCache::load(pool.clone(), HashMap::new(), HashMap::new())
+        .await
+        .expect("settings load");
+
+    // One save: enable the opt-in and set the private-IP endpoint together.
+    let mut updates = HashMap::new();
+    updates.insert(FLAG.to_string(), serde_json::json!(true));
+    updates.insert(URL.to_string(), serde_json::json!("http://10.0.0.5:8080"));
+    let errors = settings.update(&updates, true).await.expect("update");
+    assert!(errors.is_empty(), "no errors expected: {errors:?}");
+
+    // Both rows persisted in one commit.
+    let flag: bool = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT value::boolean FROM settings WHERE key = $1",
+        |q| q.bind(FLAG),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(flag, "the opt-in flag must be persisted");
+    let url: String = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT value::text FROM settings WHERE key = $1",
+        |q| q.bind(URL),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        url, "\"http://10.0.0.5:8080\"",
+        "the private endpoint must be persisted in the same save"
+    );
+
+    // Restore both keys to their prior state.
+    for (key, v) in original {
+        match v {
+            Some(v) => {
+                zimservice::db::raw::execute(
+                    &pool,
+                    "UPDATE settings SET value = $1 WHERE key = $2",
+                    |q| q.bind(v).bind(key),
+                )
+                .await
+                .unwrap();
+            }
+            None => {
+                zimservice::db::raw::execute(&pool, "DELETE FROM settings WHERE key = $1", |q| {
+                    q.bind(key)
+                })
+                .await
+                .unwrap();
+            }
+        }
+    }
+}

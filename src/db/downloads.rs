@@ -28,17 +28,29 @@ pub const ZIM_URL_PREDICATE: &str = "lower(trim(split_part(split_part(url, '?', 
 /// pre-redaction. The handler maps this to the wire `Download` DTO and applies
 /// the SEC-L1 topology redaction (a presentation concern).
 pub struct DownloadRow {
+    /// Primary key.
     pub id: i32,
+    /// Display name for the download.
     pub name: String,
+    /// Source URL (ZIM archive or direct file).
     pub url: String,
+    /// Lifecycle status value (`queued` / `downloading` / …; see [`crate::db::downloads_lifecycle::DownloadStatus`]).
     pub status: String,
+    /// Download progress in `0.0..=1.0` (qBittorrent convention).
     pub progress: f32,
+    /// Current download speed in bytes/s, when reported.
     pub speed_bps: Option<i64>,
+    /// Estimated seconds to completion, when reported.
     pub eta_secs: Option<i64>,
+    /// Downloaded/uploaded byte ratio, when reported.
     pub ratio: Option<f32>,
+    /// Current upload speed in bytes/s, when reported.
     pub up_speed_bps: Option<i64>,
+    /// Seed count, when reported.
     pub num_seeds: Option<i64>,
+    /// Last error message, when the row is in the error state.
     pub error: Option<String>,
+    /// Server-side (`now()`) timestamp of row creation.
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -49,20 +61,35 @@ pub struct DownloadRow {
 /// select, which needs every column; the partial [`DownloadRow`] above is
 /// the handler-facing shape.
 pub struct DownloadRecord {
+    /// Primary key.
     pub id: i32,
+    /// Display name for the download.
     pub name: String,
+    /// Source URL (ZIM archive or direct file).
     pub url: String,
+    /// Torrent hash, once known to the qBittorrent backend.
     pub hash: Option<String>,
+    /// Lifecycle status value (`queued` / `downloading` / …; see [`crate::db::downloads_lifecycle::DownloadStatus`]).
     pub status: String,
+    /// Download progress in `0.0..=1.0` (qBittorrent convention).
     pub progress: f32,
+    /// Current download speed in bytes/s, when reported.
     pub speed_bps: Option<i64>,
+    /// Estimated seconds to completion, when reported.
     pub eta_secs: Option<i64>,
+    /// Local destination path of the downloaded file (direct downloads).
     pub file_path: Option<String>,
+    /// Last error message, when the row is in the error state.
     pub error: Option<String>,
+    /// Server-side (`now()`) timestamp of row creation.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Server-side timestamp of the most recent write.
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// Downloaded/uploaded byte ratio, when reported.
     pub ratio: Option<f32>,
+    /// Current upload speed in bytes/s, when reported.
     pub up_speed_bps: Option<i64>,
+    /// Seed count, when reported.
     pub num_seeds: Option<i64>,
 }
 
@@ -304,7 +331,10 @@ pub enum CancelOutcome {
     /// No such row.
     NotFound,
     /// The row exists but is not cancellable in its current state.
-    NotCancellable { status: String },
+    NotCancellable {
+        /// The row's current status (why it can't be cancelled).
+        status: String,
+    },
 }
 
 /// Cancel a `queued`/`downloading` download.

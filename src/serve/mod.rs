@@ -3,11 +3,15 @@
 //! `build_router(state)` assembles the route tree (auth middleware, rate
 //! limiting, JSON/HTML handlers, and the OpenAPI spec) from a shared
 //! `AppState`.
+/// HTTP route handlers: ZIMs, search, content, settings, downloads, and the embedded Web UI.
 pub mod handlers;
 #[cfg(test)]
 mod handlers_test;
+/// HTTP middleware: shared-password auth and access-token sanitisation.
 pub mod middleware;
+/// OpenAPI 3.1 document, generated at compile time by utoipa from the handler attributes.
 pub mod openapi;
+/// Global token-bucket rate limiting for the HTTP API.
 pub mod ratelimit;
 
 use axum::Router;

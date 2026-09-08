@@ -101,30 +101,37 @@ fn web_js_response(body: &'static str) -> Response {
     resp
 }
 
+/// Serve the embedded web UI index page (`web/index.html`).
 pub async fn web_index() -> Response {
     web_html_response(include_str!("../../../web/index.html"))
 }
 
+/// Serve the embedded web UI search page (`web/search.html`).
 pub async fn web_search() -> Response {
     web_html_response(include_str!("../../../web/search.html"))
 }
 
+/// Serve the embedded web UI settings page (`web/settings.html`).
 pub async fn web_settings() -> Response {
     web_html_response(include_str!("../../../web/settings.html"))
 }
 
+/// Serve the embedded shared UI script (`web/common.js`).
 pub async fn web_common_js() -> Response {
     web_js_response(include_str!("../../../web/common.js"))
 }
 
+/// Serve the embedded index-page script (`web/index.js`).
 pub async fn web_index_js() -> Response {
     web_js_response(include_str!("../../../web/index.js"))
 }
 
+/// Serve the embedded search-page script (`web/search.js`).
 pub async fn web_search_js() -> Response {
     web_js_response(include_str!("../../../web/search.js"))
 }
 
+/// Serve the embedded settings-page script (`web/settings.js`).
 pub async fn web_settings_js() -> Response {
     web_js_response(include_str!("../../../web/settings.js"))
 }

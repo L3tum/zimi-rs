@@ -173,6 +173,12 @@ pub async fn drop_invalid_indexes(pool: &Pool) -> Result<()> {
     Ok(())
 }
 
+/// The core migration loop, run on a single caller-held connection.
+///
+/// [`run_migrations`] invokes this with `client` under the session-level
+/// advisory lock — the lock is tied to the session, so the caller must keep
+/// that exact connection open until the migrations are done (and release the
+/// lock explicitly on every path).
 pub async fn run_migrations_on(client: &mut PgConnection) -> Result<()> {
     // Normalise the tracking table to the (name, hash) shape. A fresh database
     // gets the table created; an existing database built by the legacy

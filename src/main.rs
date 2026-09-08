@@ -1,3 +1,5 @@
+//! zimservice — CLI entry point (see `zimservice::lib` for the library docs).
+
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -180,22 +182,24 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
         }
     }
 
-    // M-3: refuse to start when the trusted-proxy CIDR list is all-zero
-    // (`0.0.0.0/0` / `::/0`): it would trust every X-Forwarded-For value,
-    // so a distributed attacker could rotate the header and get a fresh
-    // lockout bucket per attempt, defeating the per-IP auth-failure
-    // lockout. Same fail-closed precedent as the open-mode non-loopback
-    // refusal above; the narrower over-broad class (≥ /8 IPv4 / ≥ /56
-    // IPv6) still only warns below.
+    // M-3: refuse to start when the trusted-proxy CIDR list contains any
+    // prefix-0 CIDR (any `x.x.x.x/0` / `X:X::/0`, including `0.0.0.0/0` and
+    // `::/0`): the network address is irrelevant — a /0 entry matches every
+    // address, so the list would trust every X-Forwarded-For value and a
+    // distributed attacker could rotate the header to get a fresh lockout
+    // bucket per attempt, defeating the per-IP auth-failure lockout. Same
+    // fail-closed precedent as the open-mode non-loopback refusal above;
+    // the narrower over-broad class (≥ /8 IPv4 / ≥ /56 IPv6) still only
+    // warns below.
     let cidrs_raw = state
         .settings
         .get_typed::<String>(KEY_GENERAL_TRUSTED_PROXY_CIDRS)
         .unwrap_or_default();
-    if serve::middleware::has_all_zero_cidr(&cidrs_raw) {
+    if serve::middleware::has_zero_prefix_cidr(&cidrs_raw) {
         anyhow::bail!(
-            "general.trusted_proxy_cidrs contains an all-zero CIDR (0.0.0.0/0 or ::/0): \
-             it would trust every X-Forwarded-For value and defeat the per-IP \
-             auth-failure lockout. Restrict the list to your actual proxy IPs."
+            "general.trusted_proxy_cidrs contains a /0 CIDR (prefix length 0, e.g. 0.0.0.0/0 or ::/0): \
+             a /0 entry matches every address, so it would trust every X-Forwarded-For value \
+             and defeat the per-IP auth-failure lockout. Restrict the list to your actual proxy IPs."
         );
     }
     if serve::middleware::has_over_broad_cidr(&cidrs_raw) {

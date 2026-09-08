@@ -530,6 +530,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_zim_settings_non_object_body_returns_400() {
+        // A non-object body (array/scalar/null) is not a settings update —
+        // 400 before any DB touch (the old `if let Some(obj)` skipped
+        // validation entirely and returned a fake `ok:true` no-op).
+        let app = build_router(test_state());
+        for body in [
+            serde_json::json!([1, 2]),
+            serde_json::json!("some-zim"),
+            serde_json::json!(null),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/settings/zim/some-zim")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_string(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "body {body} must 400"
+            );
+            let text = body_text(resp).await;
+            assert!(text.contains("expected a JSON object"), "body: {text}");
+        }
+    }
+
+    #[tokio::test]
     async fn put_collection_empty_label_returns_400() {
         // BUG-16a: a whitespace-only label 400s before any DB touch.
         let app = build_router(test_state());

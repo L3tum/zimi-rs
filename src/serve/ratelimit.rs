@@ -62,6 +62,8 @@ fn now_ns() -> u64 {
 }
 
 impl RateLimiter {
+    /// Create a limiter starting at full capacity (`burst` tokens, refilling
+    /// at `rps`). Both values are clamped to sane ceilings before scaling.
     pub fn new(rps: u64, burst: u64) -> Self {
         let (capacity, refill_per_sec) = scaled_limits(rps, burst);
         Self {
@@ -181,11 +183,15 @@ fn scaled_limits(rps: u64, burst: u64) -> (u64, u64) {
 /// paired with the limits it was built for and the limiter itself.
 type LimiterSlot = (u64, (u64, u64), Arc<RateLimiter>);
 
+/// Handle to the process-wide limiter: lazily builds it on first use and
+/// rebuilds it when the `access.rate_limit_*` settings change at runtime.
 pub struct RateLimiterHandle {
     inner: std::sync::Mutex<Option<LimiterSlot>>,
 }
 
 impl RateLimiterHandle {
+    /// Create an empty handle; the underlying limiter is built on the first
+    /// `limiter()` call.
     pub fn new() -> Self {
         Self {
             inner: std::sync::Mutex::new(None),

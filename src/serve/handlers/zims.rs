@@ -14,12 +14,17 @@ use crate::AppState;
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct HealthResponse {
-    /// Always `"ok"`.
+    /// Always `"ok"` (or `"degraded"` when the DB probe fails).
     pub status: String,
+    /// Version of the running crate.
     pub version: String,
+    /// Number of ZIM archives known to this instance.
     pub zims_count: usize,
+    /// Total indexed articles across all ZIMs.
     pub articles_count: i64,
+    /// Postgres liveness probe result (memoized, 2 s TTL).
     pub db_connected: bool,
+    /// qBittorrent liveness probe result (memoized, 2 s TTL).
     pub qbit_connected: bool,
     /// True when this process started with `ZIMSERVICE_ALLOW_MULTI_INSTANCE=1`
     /// (M1): its in-memory caches (settings, rate limiter, ZIM metadata) have
@@ -32,6 +37,7 @@ pub struct HealthResponse {
     pub degraded: Vec<String>,
 }
 
+/// `GET /list` response: all ZIM archives with metadata.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct ListZimsResponse {
     /// ZIM archives with metadata.
@@ -40,6 +46,8 @@ pub struct ListZimsResponse {
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 
+/// `GET /health` — liveness probe: 503 while the Postgres probe fails (the
+/// body always reports the real probe results).
 #[utoipa::path(
     get,
     path = "/health",
@@ -86,6 +94,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
 
 // ─── ZIM List ─────────────────────────────────────────────────────────────────
 
+/// `GET /list` — all ZIM archives; `file_path` is redacted for unauthenticated callers (WP3.7).
 #[utoipa::path(
     get,
     path = "/list",

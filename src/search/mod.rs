@@ -18,8 +18,8 @@ use crate::settings::{SearchParamsSnapshot, SettingsCache};
 
 pub use self::sql::SqlQuery;
 use self::sql::{
-    build_trgm_arms, fts_sql, trgm_contains_sql, trgm_prefix_sql, trgm_similarity_sql,
-    vector_fetch_limit, vector_sql, SEARCH_HARD_LIMIT,
+    branch_fetch_limit, build_trgm_arms, fts_sql, trgm_contains_sql, trgm_prefix_sql,
+    trgm_similarity_sql, vector_fetch_limit, vector_sql, SEARCH_HARD_LIMIT, SEARCH_HARD_OFFSET,
 };
 
 /// PERF-2: the trigram *contains*/*similarity* arms need at least 3 chars to
@@ -94,31 +94,52 @@ pub struct SearchEngine {
     degradation: crate::health::DegradationTracker,
 }
 
+/// One article match from the merged multi-engine result set (FTS/trigram/vector).
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct SearchResult {
+    /// Row id of the matched `articles` record.
     pub id: i64,
+    /// Id of the ZIM the article belongs to.
     pub zim_id: i32,
+    /// Name of the ZIM the article belongs to.
     pub zim_name: String,
+    /// Article path inside the ZIM.
     pub path: String,
+    /// Article title.
     pub title: String,
+    /// Stored FTS snippet; when highlighting is on, a `ts_headline`
+    /// fragment with `<b>`-marked query terms instead.
     pub snippet: String,
+    /// First ~600 chars of the article content (headline source); `None`
+    /// when the branch has no stored content (e.g. vector-only results).
     pub content_preview: Option<String>,
+    /// Weighted match score (branch weight × raw score).
     pub score: f64,
+    /// Article language code.
     pub language: String,
 }
 
 /// Optional filters and pagination for [`SearchEngine::search`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SearchParams<'a> {
+    /// Restrict to one ZIM name.
     pub zim: Option<&'a str>,
+    /// Restrict to one language code.
     pub language: Option<&'a str>,
+    /// Which engine(s) run: `fts`, `vector`, `semantic`; `None`/other = hybrid.
     pub mode: Option<&'a str>,
+    /// Max results (clamped to the configured max).
     pub limit: Option<usize>,
+    /// Skip the first N results (pagination).
     pub offset: Option<usize>,
+    /// Return `ts_headline` snippets with `<b>`-marked query terms.
     pub highlight: bool,
 }
 
 impl SearchEngine {
+    /// Create the engine. The embed client and trgm-ready cache start
+    /// empty — both are resolved lazily on first use (and the embed
+    /// client is rebuilt at runtime when its settings change).
     pub fn new(
         pool: Pool,
         settings: SettingsCache,
@@ -332,7 +353,7 @@ impl SearchEngine {
             .unwrap_or(snap.default_limit)
             .min(snap.max_limit)
             .min(SEARCH_HARD_LIMIT);
-        let offset = offset.unwrap_or(0).min(SEARCH_HARD_LIMIT * 10);
+        let offset = offset.unwrap_or(0).min(SEARCH_HARD_OFFSET);
 
         let run_fts = !matches!(
             mode,
@@ -353,7 +374,13 @@ impl SearchEngine {
         let fts_weight = snap.fts_weight;
         let trgm_weight = snap.trgm_weight;
         let vector_weight = snap.vector_weight;
-        let limit_i32 = (limit * 2) as i32;
+        // Offset-aware per-branch fetch: each branch's LIMIT must reach
+        // `offset + limit` rows so the post-dedup merged pool can cover the
+        // requested page. The old flat `limit * 2` capped the pooled max at
+        // ~6×limit, so any offset beyond ~3 pages always came back empty
+        // even with thousands of matches. Capped at SEARCH_FETCH_HARD_CAP
+        // (= max offset + max limit = 5500).
+        let fetch_i32 = branch_fetch_limit(limit, offset);
 
         // ── Build all branch SQL up front (pure, index-friendly shapes) ──
         let fts_sq: Option<SqlQuery> = if run_fts {
@@ -362,7 +389,7 @@ impl SearchEngine {
                 highlight,
                 zim_filter,
                 lang_filter,
-                limit_i32,
+                fetch_i32,
                 fts_weight,
             ))
         } else {
@@ -377,7 +404,7 @@ impl SearchEngine {
             &query_lower,
             zim_filter,
             lang_filter,
-            limit_i32,
+            fetch_i32,
             trgm_weight,
             trgm_threshold,
         );
@@ -508,7 +535,10 @@ impl SearchEngine {
                 &vec_str,
                 zim_filter,
                 lang_filter,
-                vector_fetch_limit(limit, filtered),
+                // Multiplier + cap interaction is documented on
+                // `vector_fetch_limit` (capped ANN top-k, see there for the
+                // filtered vector-only corner).
+                vector_fetch_limit(fetch_i32 as usize, filtered),
                 vector_weight,
             );
             debug_assert!(sq.placeholder_count() == sq.params.len());
@@ -843,7 +873,7 @@ fn merge_results(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::sql::escape_like;
+    use super::sql::{escape_like, SEARCH_FETCH_HARD_CAP};
     use super::*;
 
     use crate::settings::KEY_SEARCH_DEFAULT_LIMIT;
@@ -1300,7 +1330,7 @@ mod tests {
 
     #[test]
     fn vector_fetch_limit_scales_with_filters() {
-        // Unfiltered: the classic limit*2 over-fetch.
+        // Unfiltered: the classic fetch*2 over-fetch.
         assert_eq!(vector_fetch_limit(10, false), 20);
         assert_eq!(vector_fetch_limit(0, false), 0);
         // Filtered: ANN top-k is not filter-aware, so over-fetch 2× more.
@@ -1309,6 +1339,151 @@ mod tests {
         // Bounded by the caller: search clamps limit to SEARCH_HARD_LIMIT
         // before this, so no i32 overflow here.
         assert_eq!(vector_fetch_limit(SEARCH_HARD_LIMIT, true), 2000);
+        // Deepest legal page: the multiplier no longer escapes the cap
+        // (5500×4 = 22000 → 5500), keeping the ANN top-k bounded.
+        assert_eq!(
+            vector_fetch_limit(SEARCH_FETCH_HARD_CAP, true),
+            SEARCH_FETCH_HARD_CAP as i32
+        );
+        assert_eq!(
+            vector_fetch_limit(SEARCH_FETCH_HARD_CAP, false),
+            SEARCH_FETCH_HARD_CAP as i32
+        );
+    }
+
+    // ── Deep-paging fetch budget (regression: offset > ~3 pages → always []) ─
+
+    #[test]
+    fn fetch_hard_cap_is_max_offset_plus_max_limit() {
+        // The cap must cover the deepest legal page exactly: the request
+        // clamps (limit ≤ SEARCH_HARD_LIMIT, offset ≤ SEARCH_HARD_OFFSET),
+        // and `merge_results` stops at `limit + offset` rows.
+        assert_eq!(
+            SEARCH_FETCH_HARD_CAP,
+            SEARCH_HARD_OFFSET + SEARCH_HARD_LIMIT
+        );
+        assert_eq!(SEARCH_FETCH_HARD_CAP, 5500);
+    }
+
+    #[test]
+    fn branch_fetch_limit_is_offset_aware_and_capped() {
+        // Shallow page: fetch == limit + offset (supersedes the old flat
+        // limit*2 — for offset=0 it is `limit`, and the post-dedup pool is
+        // still the union of every branch's top-`limit` rows).
+        assert_eq!(branch_fetch_limit(20, 0), 20);
+        assert_eq!(branch_fetch_limit(20, 100), 120);
+        // Deep page: the bug-hunt case — limit=20, offset=120 (> 5×limit)
+        // must fetch 140 rows per branch, not 40.
+        assert_eq!(branch_fetch_limit(20, 120), 140);
+        // Deepest legal page hits the cap, and offsets past the clamp still
+        // cannot push a branch past it.
+        assert_eq!(branch_fetch_limit(500, 5000), 5500);
+        assert_eq!(branch_fetch_limit(500, 999_999), 5500);
+        assert_eq!(branch_fetch_limit(0, 0), 0);
+    }
+
+    /// Built-SQL pin (DB-free): each branch's LIMIT param is the caller-
+    /// supplied fetch count verbatim — deep paging works iff `search()`
+    /// passes the offset-aware fetch, which `branch_fetch_limit` pins and the
+    /// live `search_deep_paging_*` integration test exercises end-to-end.
+    #[test]
+    fn branch_sql_limit_is_the_fetch_count_verbatim() {
+        for sq in [
+            fts_sql("deep", false, None, None, 140, 1.0),
+            trgm_prefix_sql("deep", None, None, 140, 1.0),
+            trgm_contains_sql("deep", None, None, 140, 1.0),
+            trgm_similarity_sql("deep", 0.3, None, None, 140, 1.0),
+        ] {
+            assert!(
+                sq.sql
+                    .ends_with(&format!("LIMIT ${}::int8", sq.params.len())),
+                "LIMIT must be the final (param) placeholder: {}",
+                sq.sql
+            );
+            assert_eq!(sq.params.last().unwrap(), "140");
+            sq.assert_placeholders_match();
+        }
+    }
+
+    /// Determinism pin (DB-free): every score branch orders by
+    /// `(score DESC, a.id)` so equal-score rows keep a stable order across
+    /// requests and page boundaries can't skip/duplicate rows.
+    #[test]
+    fn score_branches_order_by_score_then_id() {
+        let branch_sqls = [
+            fts_sql("deep", false, None, None, 40, 1.0),
+            trgm_prefix_sql("deep", None, None, 40, 1.0),
+            trgm_contains_sql("deep", None, None, 40, 1.0),
+            trgm_similarity_sql("deep", 0.3, None, None, 40, 1.0),
+        ];
+        for sq in branch_sqls {
+            assert!(
+                sq.sql.contains("ORDER BY score DESC, a.id"),
+                "missing a.id tiebreaker: {}",
+                sq.sql
+            );
+            sq.assert_placeholders_match();
+        }
+    }
+
+    /// Determinism pin (DB-free) for the vector branch: the INNER query keeps
+    /// the pure ANN ordering (a secondary key there would defeat the top-k
+    /// index seek), and the OUTER wrapper adds the `(score DESC, id)`
+    /// tiebreaker over the fetched rows only.
+    #[test]
+    fn vector_sql_ann_inner_order_with_deterministic_outer_sort() {
+        for (zim, lang) in [(None, None), (Some("zim"), Some("en"))] {
+            let sq = vector_sql("[0.1,0.2]", zim, lang, 140, 1.0);
+            // Inner ANN ordering intact (index-usable, top-k seek preserved).
+            assert!(
+                sq.sql.contains("ORDER BY a.embedding <=> $1::vector LIMIT"),
+                "inner ANN order must remain a pure top-k: {}",
+                sq.sql
+            );
+            // Outer deterministic re-sort over the fetched rows, with its own
+            // LIMIT param (so `params` grew by one vs the inner shape).
+            assert!(
+                sq.sql.contains("ORDER BY s.score DESC, s.id LIMIT"),
+                "outer id tiebreaker missing: {}",
+                sq.sql
+            );
+            assert!(
+                sq.sql.starts_with("SELECT * FROM ("),
+                "must wrap the ANN query: {}",
+                sq.sql
+            );
+            assert_eq!(
+                sq.params.last().unwrap(),
+                "140",
+                "outer LIMIT = same fetch count"
+            );
+            sq.assert_placeholders_match();
+        }
+    }
+
+    /// Deep paging through `merge_results`: with a pool as deep as
+    /// `limit + offset` (what the offset-aware branch fetch now provides),
+    /// a page past 5×limit still serves real rows (DB-free half of the
+    /// regression; the DB-gated half is
+    /// `search_deep_paging_...` in tests/integration/search.rs).
+    #[test]
+    fn merge_results_serves_deep_page_from_full_pool() {
+        let pool: Vec<SearchResult> = (1..=130)
+            .map(|i| mk(i as i64, 1, &format!("A/probe_{i}"), i as f64))
+            .collect();
+        // offset 120 > 5×limit (100): the old limit*2 pool (≤ 40 rows for
+        // limit=20) returned [] here; the full pool must return the tail.
+        let out = merge_results(pool.clone(), vec![], vec![], 20, 120);
+        assert_eq!(out.len(), 10, "page 7 of 130 rows (limit 20) → 10 rows");
+        // Highest scores win the score-desc merge, so the deep page is the
+        // lowest-scored tail: ids 10..=1 (score-descending order).
+        let ids: Vec<i64> = out.iter().map(|r| r.id).collect();
+        assert_eq!(ids, (1..=10).rev().collect::<Vec<_>>());
+        // Deepest legal page: offset 5000, limit 500, pool of exactly
+        // limit+offset rows → 500 rows back.
+        let big: Vec<SearchResult> = (1..=5501).map(|i| mk(i as i64, 1, "x", 0.0)).collect();
+        let out = merge_results(big, vec![], vec![], 500, 5000);
+        assert_eq!(out.len(), 500, "deepest legal page is satisfiable");
     }
 
     #[test]

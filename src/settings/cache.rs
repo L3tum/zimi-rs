@@ -16,7 +16,8 @@ use super::defs::{
     normalize_embedding_endpoint, redact, sync_config_values, type_mismatch,
     KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_MODE, KEY_ACCESS_REQUIRE_AUTH_FOR_READS,
     KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS, KEY_EMBEDDING_ENABLED, KEY_EMBEDDING_ENDPOINT,
-    KEY_TORRENT_ENABLED, KEY_TORRENT_MAX_ACTIVE, KEY_TORRENT_OPDS_URL, KEY_TORRENT_URL,
+    KEY_TORRENT_ALLOW_PRIVATE_NETWORKS, KEY_TORRENT_ENABLED, KEY_TORRENT_MAX_ACTIVE,
+    KEY_TORRENT_OPDS_URL, KEY_TORRENT_URL,
 };
 
 /// SEC (KDF DoS): a 19.5 MiB argon2id verify is expensive in both memory and
@@ -48,6 +49,7 @@ static KDF_SEM: std::sync::LazyLock<tokio::sync::Semaphore> =
 /// the accessor is total.
 macro_rules! typed_getter {
     ($name:ident, $key:expr, $ty:ty) => {
+        /// Typed read accessor for this setting (total — the key is always seeded by `reload()`).
         pub fn $name(&self) -> $ty {
             // Every key is seeded by `reload()`, so `get_typed` is total; the
             // panic is the unreachable last-resort if a key ever lacks a seed.
@@ -119,6 +121,33 @@ enum TokenVerifyFast {
     Verdict(bool),
     /// No fresh cache entry — run the KDF against this stored password.
     RunKdf(String),
+}
+
+/// Effective private-network flag for the write-time SSRF check: a bool
+/// pending in the **same** update batch wins over the cache, so an operator
+/// can enable the opt-in and set the LAN endpoint in one save. Fails closed
+/// on a mistyped pending value (treated as `false` — the `type_mismatch`
+/// pass reports the type error separately); an absent pending value falls
+/// back to the current cache value.
+fn effective_private_flag(pending: Option<&serde_json::Value>, cached: bool) -> bool {
+    match pending {
+        Some(v) => v.as_bool().unwrap_or(false),
+        None => cached,
+    }
+}
+
+/// Concurrent-delete guard for [`SettingsCache::update_zim_settings`]: the
+/// existence pre-check and the UPDATEs are separate statements, so a
+/// concurrent ZIM delete can land between them. A 0-row result means the row
+/// is gone (both UPDATEs target the same row in one transaction, so it
+/// cannot be a partial update) — return the same `NotFound` the fast path
+/// returns, so the handler 404s instead of reporting a fake success. An
+/// empty slice (no fields in the body) is trivially ok.
+fn check_zim_update_affected(affected: &[u64], zim_name: &str) -> Result<()> {
+    if affected.iter().any(|&n| n == 0) {
+        return Err(Error::NotFound(format!("ZIM '{zim_name}' not found")));
+    }
+    Ok(())
 }
 
 impl SettingsCache {
@@ -523,15 +552,44 @@ impl SettingsCache {
                     ));
                     continue;
                 }
-                // SSRF guard: validate URL-typed settings at write time.
+                // SSRF guard: validate URL-typed settings at write time,
+                // honoring the same per-integration private-network opt-in
+                // the runtime gates read at connect/fetch time. Fail-closed:
+                // an absent or mistyped flag keeps private networks off.
                 if matches!(
                     key.as_str(),
                     KEY_EMBEDDING_ENDPOINT | KEY_TORRENT_URL | KEY_TORRENT_OPDS_URL
                 ) {
                     if let Some(url_str) = value.as_str() {
                         if !url_str.is_empty() {
+                            // Effective flag = the value pending in this
+                            // batch (if the paired flag key is also being
+                            // saved) else the current cache value — a PUT
+                            // can enable the opt-in and set the LAN endpoint
+                            // in one save.
+                            let allow_private = match key.as_str() {
+                                // `connect_qbit` (SEC M-1) gates the qB
+                                // endpoint on `torrent.allow_private_networks`.
+                                KEY_TORRENT_URL => effective_private_flag(
+                                    updates.get(KEY_TORRENT_ALLOW_PRIVATE_NETWORKS),
+                                    self.get_typed(KEY_TORRENT_ALLOW_PRIVATE_NETWORKS)
+                                        .unwrap_or(false),
+                                ),
+                                // `validate_download_url` gates the catalog on
+                                // `downloads.allow_private_networks`.
+                                KEY_TORRENT_OPDS_URL => effective_private_flag(
+                                    updates.get(KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS),
+                                    self.get_typed(KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS)
+                                        .unwrap_or(false),
+                                ),
+                                // The embed client pins allow_private=false
+                                // at runtime (src/embed/mod.rs), so write time
+                                // must agree.
+                                _ => false,
+                            };
                             if let Err(e) = crate::netguard::assert_host_not_blocked(
-                                url_str, /* allow_private */ false,
+                                url_str,
+                                allow_private,
                                 /* allow_loopback */ true,
                             ) {
                                 errors.push(format!("{key}: {e}"));
@@ -690,33 +748,49 @@ impl SettingsCache {
         // ZIM row in an inconsistent state.
         let mut tx = self.inner.pool.begin().await.map_err(Error::Database)?;
 
+        // Track the rows-affected of every UPDATE: a concurrent ZIM delete
+        // between the COUNT pre-check above and the UPDATEs would otherwise
+        // leave 0 rows touched while the handler still reported success.
+        let mut affected: Vec<u64> = Vec::new();
+
         if let Some(embed_enabled) = updates.get("embed_enabled").and_then(|v| v.as_bool()) {
-            raw::execute(
-                &mut *tx,
-                "UPDATE zims SET embed_enabled = $2, updated_at = now() WHERE name = $1",
-                |q| q.bind(zim_name).bind(embed_enabled),
-            )
-            .await?;
+            affected.push(
+                raw::execute(
+                    &mut *tx,
+                    "UPDATE zims SET embed_enabled = $2, updated_at = now() WHERE name = $1",
+                    |q| q.bind(zim_name).bind(embed_enabled),
+                )
+                .await?,
+            );
         }
 
         if let Some(category) = updates.get("category") {
             if let Some(c) = category.as_str() {
-                raw::execute(
-                    &mut *tx,
-                    "UPDATE zims SET category = $2, updated_at = now() WHERE name = $1",
-                    |q| q.bind(zim_name).bind(c),
-                )
-                .await?;
+                affected.push(
+                    raw::execute(
+                        &mut *tx,
+                        "UPDATE zims SET category = $2, updated_at = now() WHERE name = $1",
+                        |q| q.bind(zim_name).bind(c),
+                    )
+                    .await?,
+                );
             } else if category.is_null() {
                 // Explicit null resets the override to the default (NULL).
-                raw::execute(
-                    &mut *tx,
-                    "UPDATE zims SET category = NULL, updated_at = now() WHERE name = $1",
-                    |q| q.bind(zim_name),
-                )
-                .await?;
+                affected.push(
+                    raw::execute(
+                        &mut *tx,
+                        "UPDATE zims SET category = NULL, updated_at = now() WHERE name = $1",
+                        |q| q.bind(zim_name),
+                    )
+                    .await?,
+                );
             }
         }
+
+        // Concurrent-delete guard: 0-row UPDATEs mean the ZIM vanished after
+        // the existence pre-check — NotFound (→ 404), not a fake success.
+        // The transaction rolls back when the error drops it.
+        check_zim_update_affected(&affected, zim_name)?;
 
         tx.commit().await.map_err(Error::Database)?;
 
@@ -1045,6 +1119,10 @@ mod tests {
             KEY_EMBEDDING_ENDPOINT.into(),
             serde_json::json!("http://10.0.0.6:8000/embed"),
         );
+        values.insert(
+            KEY_GENERAL_ZIM_DIR.into(),
+            serde_json::json!("/srv/private/zims"),
+        );
         let cache = SettingsCache::new_with_map(dead_pool(), values, HashMap::new());
 
         // Unauthenticated: topology values are replaced, everything else kept.
@@ -1052,10 +1130,12 @@ mod tests {
         assert_eq!(g["torrent"]["url"]["value"], "[redacted]");
         assert_eq!(g["torrent"]["username"]["value"], "[redacted]");
         assert_eq!(g["embedding"]["endpoint"]["value"], "[redacted]");
+        assert_eq!(g["general"]["zim_dir"]["value"], "[redacted]");
         let dumped = g.to_string();
         assert!(!dumped.contains("10.0.0.5"));
         assert!(!dumped.contains("10.0.0.6"));
         assert!(!dumped.contains("qbit-admin"));
+        assert!(!dumped.contains("/srv/private/zims"));
 
         // Authenticated: full values.
         let g2 = cache.all_grouped_for(true);
@@ -1065,6 +1145,7 @@ mod tests {
             g2["embedding"]["endpoint"]["value"],
             "http://10.0.0.6:8000/embed"
         );
+        assert_eq!(g2["general"]["zim_dir"]["value"], "/srv/private/zims");
     }
 
     #[test]
@@ -1285,6 +1366,285 @@ mod tests {
             Err(Error::Database(e))
                 if matches!(e, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
         ));
+    }
+
+    // ── M1: write-time SSRF honors the live per-integration flags ────────
+
+    /// `default_settings()` with the two private-network opt-ins set, so the
+    /// write-path SSRF check sees the live flags. Dead pool: an accepted
+    /// write surfaces as `Err(Error::Database)`, a rejected one as errors.
+    fn cache_with_private_flags(qbit: bool, downloads: bool) -> SettingsCache {
+        let mut values = default_settings();
+        values.insert(
+            KEY_TORRENT_ALLOW_PRIVATE_NETWORKS.into(),
+            serde_json::json!(qbit),
+        );
+        values.insert(
+            KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS.into(),
+            serde_json::json!(downloads),
+        );
+        SettingsCache::new_with_map(dead_pool(), values, HashMap::new())
+    }
+
+    #[tokio::test]
+    async fn update_torrent_url_honors_qbit_private_flag() {
+        let mut updates = HashMap::new();
+        updates.insert(
+            KEY_TORRENT_URL.into(),
+            serde_json::json!("http://10.0.0.5:8080"),
+        );
+        // Flag off (the default): private-IP qB endpoint rejected.
+        let cache = cache_with_private_flags(false, false);
+        let errors = cache.update(&updates, true).await.unwrap();
+        assert_eq!(
+            errors.len(),
+            1,
+            "private qB endpoint rejected by default: {errors:?}"
+        );
+        assert!(errors[0].starts_with("torrent.url:"));
+        // Flag on: passes validation → the write reaches the (dead) pool.
+        let cache = cache_with_private_flags(true, false);
+        assert!(matches!(
+            cache.update(&updates, true).await,
+            Err(Error::Database(e))
+                if matches!(e, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
+        ));
+        // Cross-check: the downloads flag must not gate the qB endpoint.
+        let cache = cache_with_private_flags(false, true);
+        let errors = cache.update(&updates, true).await.unwrap();
+        assert_eq!(
+            errors.len(),
+            1,
+            "downloads flag must not open the qB endpoint: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_torrent_url_batch_pending_flag_opens_private_endpoint() {
+        // Regression: the flag must be read *pending-in-batch*, not from the
+        // stale pre-batch cache — an operator saving both in one PUT can set
+        // up a LAN endpoint without a second save.
+        //
+        // The paired flag key is env-locked so its write is rejected: on the
+        // dead pool that makes the URL key's fate observable — an accepted
+        // URL is the only to_update entry and reaches the pool
+        // (`Err(Database)`); a stale-cache regression would reject the URL
+        // too, leaving nothing to write (`Ok(errors)`).
+        let mut locked = HashMap::new();
+        locked.insert(
+            KEY_TORRENT_ALLOW_PRIVATE_NETWORKS.to_string(),
+            "QBITTORRENT_ALLOW_PRIVATE_NETWORKS".to_string(),
+        );
+        let cache = cache_with_locks(default_settings(), locked);
+        let mut updates = HashMap::new();
+        updates.insert(
+            KEY_TORRENT_ALLOW_PRIVATE_NETWORKS.into(),
+            serde_json::json!(true),
+        );
+        updates.insert(
+            KEY_TORRENT_URL.into(),
+            serde_json::json!("http://10.0.0.5:8080"),
+        );
+        assert!(
+            matches!(
+                cache.update(&updates, true).await,
+                Err(Error::Database(e))
+                    if matches!(e, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
+            ),
+            "pending flag=true must open the private qB endpoint"
+        );
+
+        // Same for the catalog pair.
+        let mut locked = HashMap::new();
+        locked.insert(
+            KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS.to_string(),
+            "DOWNLOADS_ALLOW_PRIVATE_NETWORKS".to_string(),
+        );
+        let cache = cache_with_locks(default_settings(), locked);
+        let mut updates = HashMap::new();
+        updates.insert(
+            KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS.into(),
+            serde_json::json!(true),
+        );
+        updates.insert(
+            KEY_TORRENT_OPDS_URL.into(),
+            serde_json::json!("http://10.0.0.5:8080/opds"),
+        );
+        assert!(
+            matches!(
+                cache.update(&updates, true).await,
+                Err(Error::Database(e))
+                    if matches!(e, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
+            ),
+            "pending flag=true must open the private catalog endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_torrent_url_batch_flag_off_rejects_despite_cached_true() {
+        // The pending value wins in both directions: batch {flag: false,
+        // url: private-IP} with the flag currently true in the cache must be
+        // rejected against the effective flag (false). The flag key is
+        // env-locked, so exactly two errors (flag locked + URL SSRF) and an
+        // empty to_update prove the URL was rejected — a stale-cache
+        // regression would accept the URL and surface `Err(Database)` from
+        // the (dead) pool instead of `Ok(errors)`.
+        let mut values = default_settings();
+        values.insert(
+            KEY_TORRENT_ALLOW_PRIVATE_NETWORKS.into(),
+            serde_json::json!(true),
+        );
+        let mut locked = HashMap::new();
+        locked.insert(
+            KEY_TORRENT_ALLOW_PRIVATE_NETWORKS.to_string(),
+            "QBITTORRENT_ALLOW_PRIVATE_NETWORKS".to_string(),
+        );
+        let cache = cache_with_locks(values, locked);
+        let mut updates = HashMap::new();
+        updates.insert(
+            KEY_TORRENT_ALLOW_PRIVATE_NETWORKS.into(),
+            serde_json::json!(false),
+        );
+        updates.insert(
+            KEY_TORRENT_URL.into(),
+            serde_json::json!("http://10.0.0.5:8080"),
+        );
+        let errors = cache.update(&updates, true).await.unwrap();
+        assert_eq!(
+            errors.len(),
+            2,
+            "flag locked + url rejected, nothing written: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.starts_with("torrent.allow_private_networks:")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.starts_with("torrent.url:")),
+            "{errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_torrent_url_batch_mistyped_flag_fails_closed() {
+        // A non-bool pending flag is treated as false for the SSRF check
+        // (fail-closed); the `type_mismatch` pass reports the type error for
+        // the flag key separately — one error per key, both named.
+        let cache = cache_with_private_flags(true, false);
+        let mut updates = HashMap::new();
+        updates.insert(
+            KEY_TORRENT_ALLOW_PRIVATE_NETWORKS.into(),
+            serde_json::json!("yes"),
+        );
+        updates.insert(
+            KEY_TORRENT_URL.into(),
+            serde_json::json!("http://10.0.0.5:8080"),
+        );
+        let errors = cache.update(&updates, true).await.unwrap();
+        assert_eq!(errors.len(), 2, "both keys get their own error: {errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.starts_with("torrent.allow_private_networks:")),
+            "flag key gets the type error: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.starts_with("torrent.url:")),
+            "url rejected against the fail-closed flag: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn effective_private_flag_batch_value_wins() {
+        // A bool pending in the same batch wins over the cache, in both
+        // directions; a non-bool pending value fails closed regardless of
+        // the cache; an absent pending value uses the cached value.
+        assert!(effective_private_flag(
+            Some(&serde_json::json!(true)),
+            false
+        ));
+        assert!(!effective_private_flag(
+            Some(&serde_json::json!(false)),
+            true
+        ));
+        assert!(!effective_private_flag(
+            Some(&serde_json::json!("yes")),
+            true
+        ));
+        assert!(!effective_private_flag(Some(&serde_json::json!(1)), true));
+        assert!(effective_private_flag(None, true));
+        assert!(!effective_private_flag(None, false));
+    }
+
+    #[test]
+    fn check_zim_update_affected_zero_rows_is_not_found() {
+        // A 0-row UPDATE (ZIM deleted between the existence pre-check and
+        // the UPDATE) yields the same NotFound the COUNT fast path returns.
+        let err = check_zim_update_affected(&[0], "gone").unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(ref m) if m == "ZIM 'gone' not found"),
+            "got: {err:?}"
+        );
+        // A present row is reported as 1 affected row even when the new
+        // value equals the old one, so any non-zero count passes.
+        assert!(check_zim_update_affected(&[1], "x").is_ok());
+        assert!(check_zim_update_affected(&[1, 1], "x").is_ok());
+        // An empty body runs no UPDATEs — nothing to check.
+        assert!(check_zim_update_affected(&[], "x").is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_torrent_opds_url_honors_downloads_private_flag() {
+        let mut updates = HashMap::new();
+        updates.insert(
+            KEY_TORRENT_OPDS_URL.into(),
+            serde_json::json!("http://10.0.0.5:8080/opds"),
+        );
+        // Flag off (the default): private-IP catalog rejected.
+        let cache = cache_with_private_flags(false, false);
+        let errors = cache.update(&updates, true).await.unwrap();
+        assert_eq!(
+            errors.len(),
+            1,
+            "private catalog rejected by default: {errors:?}"
+        );
+        assert!(errors[0].starts_with("torrent.opds_url:"));
+        // Flag on: passes validation → the write reaches the (dead) pool.
+        let cache = cache_with_private_flags(false, true);
+        assert!(matches!(
+            cache.update(&updates, true).await,
+            Err(Error::Database(e))
+                if matches!(e, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
+        ));
+        // Cross-check: the qB flag must not gate the catalog.
+        let cache = cache_with_private_flags(true, false);
+        let errors = cache.update(&updates, true).await.unwrap();
+        assert_eq!(
+            errors.len(),
+            1,
+            "qbit flag must not open the catalog: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_embedding_endpoint_private_rejected_even_with_flags() {
+        // The embed client pins allow_private=false at runtime, so a private
+        // endpoint is rejected even with both opt-ins on.
+        let cache = cache_with_private_flags(true, true);
+        let mut updates = HashMap::new();
+        updates.insert(
+            KEY_EMBEDDING_ENDPOINT.into(),
+            serde_json::json!("http://10.0.0.5:8000"),
+        );
+        let errors = cache.update(&updates, true).await.unwrap();
+        assert_eq!(
+            errors.len(),
+            1,
+            "private endpoint rejected regardless of flags: {errors:?}"
+        );
+        assert!(errors[0].starts_with("embedding.endpoint:"));
     }
 
     #[test]

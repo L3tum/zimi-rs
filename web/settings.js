@@ -73,7 +73,10 @@ function inputFor(fullKey, info) {
     return `<select data-key="${esc(fullKey)}" ${locked ? 'disabled' : ''}>${opts}</select>`;
   }
   if (type === 'password') {
-    return `<input type="password" data-key="${esc(fullKey)}" value="${esc(val)}" ${locked ? 'disabled' : ''} autocomplete="new-password">
+    // A locked secret is set elsewhere (env); never echo its value into the DOM.
+    const shown = locked ? '' : val;
+    const ph = locked ? ' placeholder="locked (set via env)"' : '';
+    return `<input type="password" data-key="${esc(fullKey)}" value="${esc(shown)}"${ph} ${locked ? 'disabled' : ''} autocomplete="new-password">
             <button class="show-pass" ${locked ? 'disabled' : ''}>show</button>`;
   }
   const itype = type === 'int' || type === 'float' ? 'number' : 'text';

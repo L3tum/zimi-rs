@@ -176,7 +176,7 @@ impl DownloadPoller {
 
     pub(super) fn spawn_direct(&self, id: i32, url: &str, part: &Path) {
         let db = self.db.clone();
-        let http = match self.client_or_err() {
+        let http = match client_from_option(self.http.as_ref()) {
             Ok(c) => c.clone(),
             Err(e) => {
                 // The row was already claimed `downloading` — mark the error

@@ -29,14 +29,19 @@ pub const DEFAULT_MAX_BYTES: u64 = 1 << 60; // 1 EiB
 
 /// Canonical `access.mode` values — compare against these, not string literals.
 pub const ACCESS_MODE_OPEN: &str = "open";
+/// `password` — requests are gated by the admin password (which must be set).
 pub const ACCESS_MODE_PASSWORD: &str = "password";
 
 /// The JSON type a setting value must have (write-time type-checking).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum JsonType {
+    /// The stored value must be a JSON string.
     Str,
+    /// The stored value must be a JSON integer (`i64` or `u64`).
     Int,
+    /// The stored value must be a JSON number (integers accepted too).
     Num,
+    /// The stored value must be a JSON boolean.
     Bool,
 }
 
@@ -70,9 +75,13 @@ pub struct SettingPolicy {
 /// One row of [`SETTING_DEFS`]: key, seed default, expected JSON type, policy.
 #[derive(Clone, Debug)]
 pub struct SettingDef {
+    /// The settings key string (one of the `KEY_` constants).
     pub key: &'static str,
+    /// Seed default value (kept in sync with `default_settings()` by test).
     pub default: serde_json::Value,
+    /// Expected JSON type for the stored value (write-time type-checking).
     pub json_type: JsonType,
+    /// Policy flags for this setting.
     pub policy: SettingPolicy,
 }
 
@@ -86,58 +95,101 @@ pub struct SettingDef {
 // Naming: `KEY_` + the key uppercased with `.` → `_`.
 
 // general.* — process/topology config (host, port, storage, logging, CORS).
+/// `general.zim_dir` — directory scanned for ZIM archives.
 pub const KEY_GENERAL_ZIM_DIR: &str = "general.zim_dir";
+/// `general.host` — HTTP server bind host.
 pub const KEY_GENERAL_HOST: &str = "general.host";
+/// `general.port` — HTTP server bind port.
 pub const KEY_GENERAL_PORT: &str = "general.port";
+/// `general.log_level` — log verbosity.
 pub const KEY_GENERAL_LOG_LEVEL: &str = "general.log_level";
+/// `general.cors_origins` — allowed CORS origins.
 pub const KEY_GENERAL_CORS_ORIGINS: &str = "general.cors_origins";
+/// `general.trusted_proxy_cidrs` — CIDRs of trusted reverse proxies for client-IP resolution.
 pub const KEY_GENERAL_TRUSTED_PROXY_CIDRS: &str = "general.trusted_proxy_cidrs";
 
 // search.* — FTS / trigram / vector weighting, threshold, and result limits.
+/// `search.fts_weight` — FTS component weight in the hybrid score.
 pub const KEY_SEARCH_FTS_WEIGHT: &str = "search.fts_weight";
+/// `search.trgm_weight` — trigram-similarity component weight in the hybrid score.
 pub const KEY_SEARCH_TRGM_WEIGHT: &str = "search.trgm_weight";
+/// `search.vector_weight` — vector-similarity component weight in the hybrid score.
 pub const KEY_SEARCH_VECTOR_WEIGHT: &str = "search.vector_weight";
+/// `search.trgm_threshold` — minimum trigram similarity for a match (floored at 0.3).
 pub const KEY_SEARCH_TRGM_THRESHOLD: &str = "search.trgm_threshold";
+/// `search.default_limit` — default number of results per query.
 pub const KEY_SEARCH_DEFAULT_LIMIT: &str = "search.default_limit";
+/// `search.max_limit` — maximum number of results per query.
 pub const KEY_SEARCH_MAX_LIMIT: &str = "search.max_limit";
 
 // downloads.* — direct-download size cap and private-network policy.
+/// `downloads.max_bytes` — direct-download size cap in bytes.
 pub const KEY_DOWNLOADS_MAX_BYTES: &str = "downloads.max_bytes";
+/// `downloads.allow_private_networks` — allow direct downloads from private-network addresses.
 pub const KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS: &str = "downloads.allow_private_networks";
 
 // torrent.* — qBittorrent client + OPDS auto-update integration.
+/// `torrent.enabled` — master switch for torrent-based ZIM acquisition.
 pub const KEY_TORRENT_ENABLED: &str = "torrent.enabled";
+/// `torrent.url` — qBittorrent Web API base URL.
 pub const KEY_TORRENT_URL: &str = "torrent.url";
+/// `torrent.username` — qBittorrent Web API username.
 pub const KEY_TORRENT_USERNAME: &str = "torrent.username";
+/// `torrent.password` — qBittorrent Web API password (secret, redacted in responses).
 pub const KEY_TORRENT_PASSWORD: &str = "torrent.password";
+/// `torrent.allow_private_networks` — opt in to a qBittorrent Web API on a private address.
 pub const KEY_TORRENT_ALLOW_PRIVATE_NETWORKS: &str = "torrent.allow_private_networks";
+/// `torrent.save_path` — qBittorrent download save path.
 pub const KEY_TORRENT_SAVE_PATH: &str = "torrent.save_path";
+/// `torrent.category` — qBittorrent category for ZIM downloads.
 pub const KEY_TORRENT_CATEGORY: &str = "torrent.category";
+/// `torrent.max_active` — max concurrent ZIM torrents.
 pub const KEY_TORRENT_MAX_ACTIVE: &str = "torrent.max_active";
+/// `torrent.poll_secs` — poller loop interval in seconds.
 pub const KEY_TORRENT_POLL_SECS: &str = "torrent.poll_secs";
+/// `torrent.file_strategy` — how completed files are moved into the ZIM dir (e.g. hardlink).
 pub const KEY_TORRENT_FILE_STRATEGY: &str = "torrent.file_strategy";
+/// `torrent.seed_ratio` — share ratio reached before a completed torrent stops seeding.
 pub const KEY_TORRENT_SEED_RATIO: &str = "torrent.seed_ratio";
+/// `torrent.keep_completed` — keep completed torrents in qBittorrent.
 pub const KEY_TORRENT_KEEP_COMPLETED: &str = "torrent.keep_completed";
+/// `torrent.opds_url` — OPDS catalog URL for new-ZIM discovery.
 pub const KEY_TORRENT_OPDS_URL: &str = "torrent.opds_url";
+/// `torrent.auto_update` — auto-download new ZIMs from the OPDS catalog.
 pub const KEY_TORRENT_AUTO_UPDATE: &str = "torrent.auto_update";
 
 // embedding.* — vector-embedding client + index strategy.
+/// `embedding.enabled` — master switch for vector-embedding search.
 pub const KEY_EMBEDDING_ENABLED: &str = "embedding.enabled";
+/// `embedding.endpoint` — embedding API base URL (`/embeddings` suffix normalised away).
 pub const KEY_EMBEDDING_ENDPOINT: &str = "embedding.endpoint";
+/// `embedding.api_key` — API key for the embedding endpoint (secret, redacted in responses).
 pub const KEY_EMBEDDING_API_KEY: &str = "embedding.api_key";
+/// `embedding.model` — embedding model name.
 pub const KEY_EMBEDDING_MODEL: &str = "embedding.model";
+/// `embedding.dimension` — embedding vector dimensionality.
 pub const KEY_EMBEDDING_DIMENSION: &str = "embedding.dimension";
+/// `embedding.batch_size` — texts per embedding request.
 pub const KEY_EMBEDDING_BATCH_SIZE: &str = "embedding.batch_size";
+/// `embedding.max_concurrency` — max concurrent embedding requests.
 pub const KEY_EMBEDDING_MAX_CONCURRENCY: &str = "embedding.max_concurrency";
+/// `embedding.timeout_secs` — per-request embedding timeout in seconds.
 pub const KEY_EMBEDDING_TIMEOUT_SECS: &str = "embedding.timeout_secs";
+/// `embedding.hnsw_threshold` — article count at/below which an HNSW index is used.
 pub const KEY_EMBEDDING_HNSW_THRESHOLD: &str = "embedding.hnsw_threshold";
+/// `embedding.ivfflat_threshold` — article count at/above which IVFFlat is preferred over HNSW.
 pub const KEY_EMBEDDING_IVFFLAT_THRESHOLD: &str = "embedding.ivfflat_threshold";
 
 // access.* — auth mode, rate limits, admin password, and read-gating.
+/// `access.mode` — auth mode (`open` or `password`; see `ACCESS_MODE_*`).
 pub const KEY_ACCESS_MODE: &str = "access.mode";
+/// `access.rate_limit_rps` — sustained request rate limit (requests/second).
 pub const KEY_ACCESS_RATE_LIMIT_RPS: &str = "access.rate_limit_rps";
+/// `access.rate_limit_burst` — burst allowance for the request rate limiter.
 pub const KEY_ACCESS_RATE_LIMIT_BURST: &str = "access.rate_limit_burst";
+/// `access.admin_password` — admin password (secret, redacted in responses).
 pub const KEY_ACCESS_ADMIN_PASSWORD: &str = "access.admin_password";
+/// `access.require_auth_for_reads` — require auth for read endpoints too.
 pub const KEY_ACCESS_REQUIRE_AUTH_FOR_READS: &str = "access.require_auth_for_reads";
 
 /// The single source of truth for settings policy: every known setting, its
@@ -156,6 +208,10 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             json_type: JsonType::Str,
             policy: SettingPolicy {
                 env_locked: true,
+                // S6: an absolute server path — leak topology to
+                // unauthenticated `GET /settings` callers no more than the
+                // internal URLs.
+                topology: true,
                 config_only: true,
                 ..Default::default()
             },

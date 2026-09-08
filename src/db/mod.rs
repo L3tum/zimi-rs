@@ -1,18 +1,24 @@
 //! Database layer: migrations, connection pooling, and query helpers.
 //!
-//! The pool is a [`sqlx::PgPool`](sqlx::postgres::PgPool) (see
-//! [`pool`]), and [`raw`] is the data-access layer: every application
+//! The pool is a [`sqlx::PgPool`](sqlx::postgres::PgPool) (see `pool`), and `raw` is the data-access layer: every application
 //! query goes through the `raw` helpers (or through a module in `src/db/`
 //! that owns the raw helpers and is therefore exempt from the
 //! `scripts/check-raw-sql.sh` lint; everything else marks its
 //! `sqlx::query*` call sites `// RAW-OK`).
 
+/// User-collection data access (ARCH M1 repository extraction).
 pub mod collections;
+/// Download-queue data access (ARCH M1 repository extraction).
 pub mod downloads;
+/// Download lifecycle state machine: status/hash/error/seed-stats transitions on the `downloads` table.
 pub mod downloads_lifecycle;
+/// SQL migrations: a numbered, hash-tracked list applied in order at startup.
 pub mod migrate;
+/// Postgres connection pool configuration and TLS handling.
 pub mod pool;
+/// Wikidata Q-ID lookup for cross-language article discovery.
 pub mod qid;
+/// O(1) random article selection via index seek.
 pub mod random_article;
 
 pub use pool::Pool;

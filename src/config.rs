@@ -24,23 +24,36 @@ use crate::settings::{
 /// they are runtime-editable and seed from env where applicable.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Directory scanned for `.zim` archives (`ZIM_DIR`, default `/zims`).
     pub zim_dir: PathBuf,
+    /// Postgres connection string (`DATABASE_URL`).
     pub database_url: String,
+    /// Postgres connection pool size (`DB_POOL_SIZE`, default 20).
     pub db_pool_size: u32,
+    /// HTTP bind address (`HOST`, default `127.0.0.1`).
     pub host: String,
+    /// HTTP port (`PORT`, default 8899).
     pub port: u16,
+    /// Tracing log level (`LOG_LEVEL`, default `info`).
     pub log_level: String,
 
     // Torrent (qBittorrent Web API endpoint only — category / save path /
     // max-active are settings-table keys, not process config).
+    /// qBittorrent Web API endpoint (`QBITTORRENT_URL`); its presence enables
+    /// torrent support — the `torrent.enabled` setting gates the poller.
     pub torrent_url: Option<String>,
+    /// qBittorrent Web API username (`QBITTORRENT_USER`, default empty).
     pub torrent_user: String,
+    /// qBittorrent Web API password (`QBITTORRENT_PASS`, default empty).
     pub torrent_pass: String,
 
     // Single-instance opt-outs (read by `cmd_serve` / `cmd_mcp`, not by the
     // runtime settings table): m-7 partial opt-out (`ZIMSERVICE_ALLOW_MULTI_DB`
     // = exact "1") and the stdio MCP auth password (DEC-2, `MCP_AUTH_PASSWORD`).
+    /// Set only when `ZIMSERVICE_ALLOW_MULTI_DB` is exactly `"1"` — any other
+    /// value keeps the full single-instance guard enforced.
     pub allow_multi_db: bool,
+    /// stdio MCP session password (`MCP_AUTH_PASSWORD`); `None` when unset.
     pub mcp_auth_password: Option<String>,
 }
 

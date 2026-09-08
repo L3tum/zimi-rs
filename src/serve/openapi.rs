@@ -9,8 +9,10 @@ use utoipa::OpenApi;
 use crate::search::SearchResult;
 use crate::zim::ZimMeta;
 
+/// Standard error body returned by every failing endpoint.
 #[derive(utoipa::ToSchema)]
 pub struct ErrorResponse {
+    /// Human-readable, client-safe error message.
     pub error: String,
 }
 
@@ -103,6 +105,8 @@ impl utoipa::Modify for AddSecuritySchemes {
     )),
     modifiers(&AddSecuritySchemes),
 )]
+/// utoipa `OpenApi` root: the compile-time-generated OpenAPI 3.1 spec
+/// (served at `GET /openapi.json`).
 pub struct ApiDoc;
 
 /// `GET /openapi.json` — the generated spec.
