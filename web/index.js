@@ -1,6 +1,16 @@
 'use strict';
 
 // ── Library ─────────────────────────────────────────────────────────────
+// Per-page parts of the shared zimControls() markup (see web/common.js).
+const ZIM_CARD_CONTROLS = {
+  toggleTitle: 'Enable semantic (embedding) search for this ZIM',
+  embedAttr: 'embed',
+  labelHtml: '<span title="Embedding">embed</span>',
+  catAttr: 'cat',
+  msgClass: 'cat-saved',
+  msgAttr: 'catmsg',
+  msgText: '✓',
+};
 let zimsData = [];
 
 async function loadLibrary() {
@@ -47,13 +57,7 @@ function renderZims() {
         </div>
       </div>
       <div class="zim-settings">
-        <label class="toggle" title="Enable semantic (embedding) search for this ZIM">
-          <input type="checkbox" data-embed="${esc(z.name)}" ${z.embed_enabled ? 'checked' : ''}>
-          <span class="slider"></span>
-        </label>
-        <span title="Embedding">embed</span>
-        <input type="text" data-cat="${esc(z.name)}" value="${esc(z.category || '')}" placeholder="category (default)">
-        <span class="cat-saved" data-catmsg="${esc(z.name)}">✓</span>
+        ${zimControls(z, ZIM_CARD_CONTROLS)}
       </div>
       <div style="margin-top:12px;display:flex;gap:8px">
         <a class="btn" href="/search.html?q=&zim=${encodeURIComponent(z.name)}">Search</a>

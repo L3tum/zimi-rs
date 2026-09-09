@@ -1,4 +1,4 @@
-/* exported apiFetch, apiJson, esc, fmtBytes, fmtEta, fmtNum, snippetHtml, toast */
+/* exported apiFetch, apiJson, esc, fmtBytes, fmtEta, fmtNum, snippetHtml, toast, zimControls */
 'use strict';
 
 // ── HTML escape ──────────────────────────────────────────────────────────
@@ -23,17 +23,19 @@ function _promptToken() {
   return !!t;
 }
 async function apiFetch(url, opts) {
-  opts = opts || {};
-  const headers = Object.assign({}, opts.headers);
+  // Build a fresh request object so the caller's opts is never mutated:
+  // headers are added here, and the retry flag is internal to this call.
+  const merged = { ...opts };
+  const headers = { ...(opts?.headers || {}) };
   const token = _getToken();
   if (token) headers['Authorization'] = 'Bearer ' + token;
-  opts.headers = headers;
-  let r = await fetch(url, opts);
-  if (r.status === 401 && !opts._retried) {
+  merged.headers = headers;
+  let r = await fetch(url, merged);
+  if (r.status === 401 && !merged._retried) {
     if (_promptToken()) {
-      opts._retried = true;
-      opts.headers['Authorization'] = 'Bearer ' + _getToken();
-      r = await fetch(url, opts);
+      merged._retried = true;
+      merged.headers['Authorization'] = 'Bearer ' + _getToken();
+      r = await fetch(url, merged);
     }
   }
   return r;
@@ -103,4 +105,20 @@ function snippetHtml(raw) {
   }
   out += esc(raw.slice(i));
   return out;
+}
+
+// ── Per-ZIM controls (embed toggle + category input + saved marker) ─────
+// Shared by the library page (zim-card) and the settings page (zim-row),
+// which render the same controls with page-local classes and data-* attribute
+// names (data-embed vs data-zembed, …). The per-page parts are passed in via
+// `p`: { toggleTitle, embedAttr, catAttr, msgClass, msgAttr, msgText, labelHtml }
+function zimControls(z, p) {
+  return `
+      <label class="toggle" title="${p.toggleTitle}">
+        <input type="checkbox" data-${p.embedAttr}="${esc(z.name)}" ${z.embed_enabled ? 'checked' : ''}>
+        <span class="slider"></span>
+      </label>
+      ${p.labelHtml || ''}
+      <input type="text" data-${p.catAttr}="${esc(z.name)}" value="${esc(z.category || '')}" placeholder="category (default)">
+      <span class="${p.msgClass}" data-${p.msgAttr}="${esc(z.name)}">${p.msgText}</span>`;
 }

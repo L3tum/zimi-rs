@@ -144,7 +144,7 @@ fn effective_private_flag(pending: Option<&serde_json::Value>, cached: bool) -> 
 /// returns, so the handler 404s instead of reporting a fake success. An
 /// empty slice (no fields in the body) is trivially ok.
 fn check_zim_update_affected(affected: &[u64], zim_name: &str) -> Result<()> {
-    if affected.iter().any(|&n| n == 0) {
+    if affected.contains(&0) {
         return Err(Error::NotFound(format!("ZIM '{zim_name}' not found")));
     }
     Ok(())

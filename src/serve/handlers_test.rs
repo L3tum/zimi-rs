@@ -80,35 +80,10 @@ mod tests {
     /// tightened to `rps=1, burst=1` so the second request of the same burst
     /// is throttled. A fresh `RateLimiterHandle` starts with `burst` tokens.
     fn rate_limited_state() -> AppState {
-        let pool = crate::testing::dead_pool();
         let mut values = crate::settings::default_settings();
         values.insert(KEY_ACCESS_RATE_LIMIT_RPS.into(), serde_json::json!(1));
         values.insert(KEY_ACCESS_RATE_LIMIT_BURST.into(), serde_json::json!(1));
-        let settings = crate::settings::SettingsCache::new_with_map(
-            pool.clone(),
-            values,
-            std::collections::HashMap::new(),
-        );
-        let zims = crate::zim::ZimManager::new(
-            std::path::PathBuf::from("/nonexistent-zims"),
-            pool.clone(),
-        );
-        let search = crate::search::SearchEngine::new(
-            pool.clone(),
-            settings.clone(),
-            crate::health::DegradationTracker::default(),
-        );
-        AppState {
-            db: pool,
-            settings,
-            zims,
-            search,
-            torrent: crate::torrent::QbitClientCache::new(),
-            rate_limiter: std::sync::Arc::new(crate::serve::ratelimit::RateLimiterHandle::new()),
-            probes: crate::HealthProbes::default(),
-            auth_lockout: std::sync::Arc::new(Default::default()),
-            degradation: crate::health::DegradationTracker::default(),
-        }
+        crate::testing::test_state_with_settings(values)
     }
 
     #[tokio::test]
@@ -360,12 +335,7 @@ mod tests {
     async fn list_state_with_zim(
         settings_map: std::collections::HashMap<String, serde_json::Value>,
     ) -> AppState {
-        let mut state = test_state();
-        state.settings = crate::settings::SettingsCache::new_with_map(
-            state.db.clone(),
-            settings_map,
-            std::collections::HashMap::new(),
-        );
+        let mut state = crate::testing::test_state_with_settings(settings_map);
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("demo.zim"), b"ZIM\x00").unwrap();
         let zims = crate::zim::ZimManager::new(dir.path().to_path_buf(), state.db.clone());
@@ -587,35 +557,7 @@ mod tests {
     async fn auth_middleware_fail_closed_body() {
         // BUG-16d: password mode + empty `admin_password` → fail-closed 503 on
         // a non-health route, with the misconfiguration message in the body.
-        let pool = crate::testing::dead_pool();
-        let mut values = crate::settings::default_settings();
-        values.insert(KEY_ACCESS_MODE.into(), serde_json::json!("password"));
-        values.insert(KEY_ACCESS_ADMIN_PASSWORD.into(), serde_json::json!(""));
-        let settings = crate::settings::SettingsCache::new_with_map(
-            pool.clone(),
-            values,
-            std::collections::HashMap::new(),
-        );
-        let zims = crate::zim::ZimManager::new(
-            std::path::PathBuf::from("/nonexistent-zims"),
-            pool.clone(),
-        );
-        let search = crate::search::SearchEngine::new(
-            pool.clone(),
-            settings.clone(),
-            crate::health::DegradationTracker::default(),
-        );
-        let state = AppState {
-            db: pool,
-            settings,
-            zims,
-            search,
-            torrent: crate::torrent::QbitClientCache::new(),
-            rate_limiter: std::sync::Arc::new(crate::serve::ratelimit::RateLimiterHandle::new()),
-            probes: crate::HealthProbes::default(),
-            auth_lockout: std::sync::Arc::new(Default::default()),
-            degradation: crate::health::DegradationTracker::default(),
-        };
+        let state = fail_closed_state();
         let app = build_router(state);
         let resp = app
             .oneshot(
@@ -958,8 +900,13 @@ mod tests {
             text.contains("Library — zimservice"),
             "index page title missing: {text}"
         );
+        // The served page is cache-busted: the common.js tag carries the
+        // crate-version stamp (see `stamp_assets` in handlers/web.rs).
         assert!(
-            text.contains("<script src=\"/common.js\">"),
+            text.contains(&format!(
+                "<script src=\"/common.js?v={}\">",
+                env!("CARGO_PKG_VERSION")
+            )),
             "index page must load common.js"
         );
     }
@@ -990,7 +937,10 @@ mod tests {
             "search page title missing: {text}"
         );
         assert!(
-            text.contains("<script src=\"/common.js\">"),
+            text.contains(&format!(
+                "<script src=\"/common.js?v={}\">",
+                env!("CARGO_PKG_VERSION")
+            )),
             "search page must load common.js"
         );
     }
@@ -1021,7 +971,10 @@ mod tests {
             "settings page title missing: {text}"
         );
         assert!(
-            text.contains("<script src=\"/common.js\">"),
+            text.contains(&format!(
+                "<script src=\"/common.js?v={}\">",
+                env!("CARGO_PKG_VERSION")
+            )),
             "settings page must load common.js"
         );
     }
@@ -1099,7 +1052,6 @@ mod tests {
     /// the M1 read-gating flag. (Plaintext password → fast verify, no 100k
     /// hash in tests.)
     fn password_state(require_reads: bool) -> AppState {
-        let pool = crate::testing::dead_pool();
         let mut values = crate::settings::default_settings();
         values.insert(KEY_ACCESS_MODE.into(), serde_json::json!("password"));
         values.insert(KEY_ACCESS_ADMIN_PASSWORD.into(), serde_json::json!("pw"));
@@ -1107,65 +1059,16 @@ mod tests {
             KEY_ACCESS_REQUIRE_AUTH_FOR_READS.into(),
             serde_json::json!(require_reads),
         );
-        let settings = crate::settings::SettingsCache::new_with_map(
-            pool.clone(),
-            values,
-            std::collections::HashMap::new(),
-        );
-        let zims = crate::zim::ZimManager::new(
-            std::path::PathBuf::from("/nonexistent-zims"),
-            pool.clone(),
-        );
-        let search = crate::search::SearchEngine::new(
-            pool.clone(),
-            settings.clone(),
-            crate::health::DegradationTracker::default(),
-        );
-        AppState {
-            db: pool,
-            settings,
-            zims,
-            search,
-            torrent: crate::torrent::QbitClientCache::new(),
-            rate_limiter: std::sync::Arc::new(crate::serve::ratelimit::RateLimiterHandle::new()),
-            probes: crate::HealthProbes::default(),
-            auth_lockout: std::sync::Arc::new(Default::default()),
-            degradation: crate::health::DegradationTracker::default(),
-        }
+        crate::testing::test_state_with_settings(values)
     }
 
     /// AppState like `password_state` but with an empty
     /// `access.admin_password` — the fail-closed 503 configuration (BUG-2).
     fn fail_closed_state() -> AppState {
-        let pool = crate::testing::dead_pool();
         let mut values = crate::settings::default_settings();
         values.insert(KEY_ACCESS_MODE.into(), serde_json::json!("password"));
         values.insert(KEY_ACCESS_ADMIN_PASSWORD.into(), serde_json::json!(""));
-        let settings = crate::settings::SettingsCache::new_with_map(
-            pool.clone(),
-            values,
-            std::collections::HashMap::new(),
-        );
-        let zims = crate::zim::ZimManager::new(
-            std::path::PathBuf::from("/nonexistent-zims"),
-            pool.clone(),
-        );
-        let search = crate::search::SearchEngine::new(
-            pool.clone(),
-            settings.clone(),
-            crate::health::DegradationTracker::default(),
-        );
-        AppState {
-            db: pool,
-            settings,
-            zims,
-            search,
-            torrent: crate::torrent::QbitClientCache::new(),
-            rate_limiter: std::sync::Arc::new(crate::serve::ratelimit::RateLimiterHandle::new()),
-            probes: crate::HealthProbes::default(),
-            auth_lockout: std::sync::Arc::new(Default::default()),
-            degradation: crate::health::DegradationTracker::default(),
-        }
+        crate::testing::test_state_with_settings(values)
     }
 
     // ── BUG-2: /health exempt from the fail-closed 503 ───────────────────

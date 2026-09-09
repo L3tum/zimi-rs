@@ -256,3 +256,51 @@ pub async fn cancel_download(
         )),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::default_download_name;
+
+    /// `strip_query_fragment` keeps the piece before the **first** `?` or `#`
+    /// (single `split(['?', '#'])` pass), so whichever delimiter appears first
+    /// wins — a fragment before a query still strips at the `#`.
+    #[test]
+    fn plain_url_takes_last_path_segment() {
+        assert_eq!(default_download_name("http://x.com/foo/bar.zim"), "bar.zim");
+    }
+
+    #[test]
+    fn strips_query_and_fragment_from_last_segment() {
+        assert_eq!(
+            default_download_name("http://x.com/a/b.zim?sig=1#f"),
+            "b.zim"
+        );
+        assert_eq!(default_download_name("http://x.com/a/b.zim?sig=1"), "b.zim");
+        assert_eq!(default_download_name("http://x.com/a/b.zim#f"), "b.zim");
+        // Fragment before query: still stripped at the first delimiter.
+        assert_eq!(default_download_name("http://x.com/a/b.zim#f?q=1"), "b.zim");
+    }
+
+    #[test]
+    fn empty_string_yields_empty_name_not_unknown() {
+        // `"".rsplit('/')` yields one empty segment, so the
+        // `unwrap_or("unknown")` fallback is unreachable for every input —
+        // pinning the real behavior: empty input maps to `""`.
+        assert_eq!(default_download_name(""), "");
+    }
+
+    #[test]
+    fn trailing_slash_yields_empty_name() {
+        // Regression pin: `rsplit('/')` on a trailing-slash URL yields an
+        // empty last segment, so the name is `""` (empty names are rejected
+        // later by `validate_download_name` in `queue_download`).
+        assert_eq!(default_download_name("http://x.com/a/"), "");
+    }
+
+    #[test]
+    fn url_without_slash_uses_whole_input_stripped() {
+        assert_eq!(default_download_name("bare.zim"), "bare.zim");
+        assert_eq!(default_download_name("bare.zim?sig=1"), "bare.zim");
+    }
+}

@@ -131,82 +131,25 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
     )
     .await?;
 
-    // Security: refuse to start in open mode on a non-loopback bind.
-    // Open mode means no authentication at all; binding to 0.0.0.0 would
-    // expose the entire API to any network peer.
-    if state.settings.access_mode() == zimservice::settings::ACCESS_MODE_OPEN
-        && !matches!(config.host.as_str(), "127.0.0.1" | "localhost" | "::1")
-    {
-        anyhow::bail!(
-            "access.mode=open requires a loopback bind (host=127.0.0.1 or ::1); \
-             set access.mode=password (with AUTH_PASSWORD) for network-facing deployments"
-        );
-    }
-
-    // Security warning: password mode on a non-loopback bind is legitimate
-    // (reverse proxy / VPN) but should use TLS termination to protect
-    // credentials in transit. Warn once so the operator is aware.
-    if state.settings.access_mode() == zimservice::settings::ACCESS_MODE_PASSWORD
-        && !matches!(config.host.as_str(), "127.0.0.1" | "localhost" | "::1")
-    {
-        tracing::warn!(
-            "access.mode=password with non-loopback bind ({host}): ensure TLS \
-             termination (reverse proxy) to protect AUTH_PASSWORD in transit. \
-             See the README 'Security' section.",
-            host = config.host,
-        );
-
-        // M-1: state the effective read-gating decision for network-facing
-        // password-mode binds. `access.require_auth_for_reads` defaults to
-        // true on non-loopback binds (an open network-facing read exposes
-        // full article content plus unauthenticated expensive work); the
-        // operator can override it via REQUIRE_AUTH_FOR_READS (persistent)
-        // or the settings API (runtime, reverts to the bind-based default
-        // on restart).
-        if state.settings.require_auth_for_reads() {
-            tracing::warn!(
-                "access.require_auth_for_reads is effective-true on non-loopback bind \
-                 ({host}): GET/HEAD/OPTIONS require the admin password (M-1 \
-                 default). Set REQUIRE_AUTH_FOR_READS=false to restore open \
-                 reads — see the README 'Security' section.",
-                host = config.host,
-            );
-        } else {
-            tracing::info!(
-                "access.require_auth_for_reads is false on non-loopback bind ({host}): \
-                 reads (GET/HEAD/OPTIONS) stay open — full article content is \
-                 exposed to any network peer. Set REQUIRE_AUTH_FOR_READS=true \
-                 to gate reads.",
-                host = config.host,
-            );
-        }
-    }
-
-    // M-3: refuse to start when the trusted-proxy CIDR list contains any
-    // prefix-0 CIDR (any `x.x.x.x/0` / `X:X::/0`, including `0.0.0.0/0` and
-    // `::/0`): the network address is irrelevant — a /0 entry matches every
-    // address, so the list would trust every X-Forwarded-For value and a
-    // distributed attacker could rotate the header to get a fresh lockout
-    // bucket per attempt, defeating the per-IP auth-failure lockout. Same
-    // fail-closed precedent as the open-mode non-loopback refusal above;
-    // the narrower over-broad class (≥ /8 IPv4 / ≥ /56 IPv6) still only
-    // warns below.
+    // Security policy checks (open-mode refusal, TLS warnings, CIDR policy).
     let cidrs_raw = state
         .settings
         .get_typed::<String>(KEY_GENERAL_TRUSTED_PROXY_CIDRS)
         .unwrap_or_default();
-    if serve::middleware::has_zero_prefix_cidr(&cidrs_raw) {
-        anyhow::bail!(
-            "general.trusted_proxy_cidrs contains a /0 CIDR (prefix length 0, e.g. 0.0.0.0/0 or ::/0): \
-             a /0 entry matches every address, so it would trust every X-Forwarded-For value \
-             and defeat the per-IP auth-failure lockout. Restrict the list to your actual proxy IPs."
-        );
-    }
-    if serve::middleware::has_over_broad_cidr(&cidrs_raw) {
-        tracing::warn!(
-            "general.trusted_proxy_cidrs contains an over-broad CIDR (≥ /8 IPv4 or ≥ /56 IPv6): \
-             this allows X-Forwarded-For lockout bypass. Restrict to your actual proxy IPs."
-        );
+    let warnings = match startup::serve_policy_checks(
+        &config.host,
+        &state.settings.access_mode(),
+        state.settings.require_auth_for_reads(),
+        &cidrs_raw,
+    ) {
+        Ok(w) => w,
+        Err(msg) => anyhow::bail!("{msg}"),
+    };
+    for w in &warnings {
+        match w.level {
+            startup::WarnLevel::Warn => tracing::warn!("{}", w.message),
+            startup::WarnLevel::Info => tracing::info!("{}", w.message),
+        }
     }
 
     // Clean up invalid concurrent indexes from prior crashed index builds.
@@ -524,7 +467,13 @@ async fn cmd_embed(config: Config, zim: Option<String>) -> anyhow::Result<()> {
 
     for name in &targets {
         println!("Embedding '{name}' …");
-        zimservice::embed::run_pipeline(state.db.clone(), state.settings.clone(), name).await?;
+        zimservice::embed::run_pipeline(
+            state.db.clone(),
+            state.settings.clone(),
+            name,
+            &state.build_probe,
+        )
+        .await?;
         println!("Done: {name}");
     }
 

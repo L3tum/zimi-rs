@@ -3,6 +3,7 @@
 //! Hand-rolled JSON-RPC 2.0 with newline-delimited JSON messages.
 //! No external MCP crate needed — the protocol is simple.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -591,39 +592,27 @@ async fn tool_article_languages(state: &AppState, args: &Value) -> Result<Value,
 }
 
 async fn tool_list_collections(state: &AppState) -> Value {
-    let rows = match sqlx::query_as::<
-        // RAW-OK: collections listing needs `ARRAY_AGG` + a `LEFT JOIN` aggregate query — set-valued SQL the `db::raw` helpers cannot express (stdio MCP, outside the db layer); the lint regex doesn't match turbofish calls, so this marker documents the exemption
-        _,
-        (
-            String,
-            String,
-            bool,
-            chrono::DateTime<chrono::Utc>,
-            Vec<String>,
-        ),
-    >(
-        "SELECT c.name, c.label, c.is_favorite, c.created_at,
-                COALESCE(ARRAY_AGG(z.name) FILTER (WHERE z.id IS NOT NULL), '{}')
-         FROM collections c
-         LEFT JOIN zims z ON z.id = ANY(c.zim_ids)
-         GROUP BY c.id
-         ORDER BY c.name",
-    )
-    .fetch_all(&state.db)
-    .await
-    {
+    let rows = match crate::db::collections::list_collections(&state.db).await {
         Ok(r) => r,
         Err(e) => return tool_error(e.to_string()),
     };
+    // Resolve ZIM ids → names via the in-memory registry (same pattern as
+    // the HTTP handler `zim_id_to_name_map` in serve/handlers/settings.rs).
+    let id_to_name: HashMap<i32, String> = state
+        .zims
+        .list()
+        .iter()
+        .filter_map(|z| z.id.map(|id| (id, z.name.clone())))
+        .collect();
     let collections: Vec<Value> = rows
         .iter()
-        .map(|(name, label, is_favorite, created_at, zims)| {
+        .map(|r| {
             json!({
-                "name": name,
-                "label": label,
-                "is_favorite": is_favorite,
-                "zims": zims,
-                "created_at": created_at.to_rfc3339(),
+                "name": r.name,
+                "label": r.label,
+                "is_favorite": r.is_favorite,
+                "zims": r.zim_ids.iter().filter_map(|id| id_to_name.get(id).cloned()).collect::<Vec<_>>(),
+                "created_at": r.created_at.to_rfc3339(),
             })
         })
         .collect();

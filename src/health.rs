@@ -1,5 +1,6 @@
 //! Memoized liveness probes for `/health` (ARCH-7: moved out of `lib.rs`;
-//! PONY-N3: the db probe is de-memoized, only the qbit slot keeps the TTL).
+//! PONY-N3: the db probe is de-memoized — a free function — only the qbit
+//! slot keeps the TTL).
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -7,7 +8,7 @@ use crate::{db, torrent};
 
 /// Liveness probes for `/health`. The qbit probe is cached for a short TTL so
 /// a burst of health checks does not ping qBittorrent unthrottled (the db
-/// probe is deliberately not memoized — see [`HealthProbes::probe_db`]). The
+/// probe is deliberately not memoized — see [`probe_db`]). The
 /// cache is checked and updated without holding the lock across an `.await`
 /// (two short lock phases), so the handler future stays `Send`.
 #[derive(Clone)]
@@ -18,6 +19,19 @@ pub struct HealthProbes {
 #[derive(Default)]
 struct ProbeState {
     qbit: Option<(bool, Instant)>,
+}
+
+/// Real Postgres liveness probe (`SELECT 1`). Deliberately **not**
+/// memoized (PONY-N3): the qbit probe stays 2 s TTL because
+/// `app/version` is a network round-trip; `SELECT 1` is the cheapest
+/// possible probe and `/health` is rate-limit-exempt (ratelimit.rs:190).
+/// Free function (not on [`HealthProbes`]): it holds no per-probe state —
+/// the pool is passed in and nothing of `self` is read.
+pub async fn probe_db(db: &db::Pool) -> bool {
+    match db.acquire().await {
+        Ok(mut pg) => sqlx::query("SELECT 1").execute(&mut *pg).await.is_ok(), // RAW-OK: `SELECT 1` liveness probe — the cheapest possible statement, run on a raw pooled connection (db::raw helpers are for query builders, not a one-word probe)
+        Err(_) => false,
+    }
 }
 
 impl HealthProbes {
@@ -33,17 +47,6 @@ impl HealthProbes {
                     .is_some_and(|age| age < Self::TTL)
             })
             .map(|(v, _)| *v)
-    }
-
-    /// Real Postgres liveness probe (`SELECT 1`). Deliberately **not**
-    /// memoized (PONY-N3): the qbit probe stays 2 s TTL because
-    /// `app/version` is a network round-trip; `SELECT 1` is the cheapest
-    /// possible probe and `/health` is rate-limit-exempt (ratelimit.rs:190).
-    pub async fn probe_db(&self, db: &db::Pool) -> bool {
-        match db.acquire().await {
-            Ok(mut pg) => sqlx::query("SELECT 1").execute(&mut *pg).await.is_ok(), // RAW-OK: `SELECT 1` liveness probe — the cheapest possible statement, run on a raw pooled connection (db::raw helpers are for query builders, not a one-word probe)
-            Err(_) => false,
-        }
     }
 
     /// Real qBittorrent liveness probe (one lightweight `app/version` call),

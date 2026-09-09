@@ -411,8 +411,9 @@ async fn embed_pipeline_embeds_then_guard_skips() {
     run_migrations(&pool).await.expect("migrations");
     const ZIM: &str = "__itest_embed__";
     const DIM: u32 = 1536; // == baseline articles.embedding dimension → no ALTER
-                           // Build a `{data:[{index,embedding:[…]}]}` body with one vector per
-                           // requested index (values distinct per index so the mapping is real).
+    let probe = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Build a `{data:[{index,embedding:[…]}]}` body with one vector per
+    // requested index (values distinct per index so the mapping is real).
     let embed_body = |indices: &[usize]| -> String {
         let data: Vec<String> = indices
             .iter()
@@ -476,7 +477,7 @@ async fn embed_pipeline_embeds_then_guard_skips() {
         .respond_with(ResponseTemplate::new(200).set_body_string(embed_body(&[2, 0, 1])))
         .mount(&server)
         .await;
-    zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM)
+    zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM, &probe)
         .await
         .expect("pipeline run 1");
     let n1: i64 = zimservice::db::raw::fetch_scalar_optional(
@@ -503,7 +504,7 @@ async fn embed_pipeline_embeds_then_guard_skips() {
     );
 
     // Run 2: nothing unembedded → claims 0, sends no HTTP, stays a no-op.
-    zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM)
+    zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM, &probe)
         .await
         .expect("pipeline run 2 (no-op)");
     let n2: i64 = zimservice::db::raw::fetch_scalar_optional(
@@ -536,7 +537,7 @@ async fn embed_pipeline_embeds_then_guard_skips() {
         .respond_with(ResponseTemplate::new(200).set_body_string(embed_body(&[0, 1])))
         .mount(&server)
         .await;
-    zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM)
+    zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM, &probe)
         .await
         .expect("pipeline run 3 (guard skip)");
     let n3: i64 = zimservice::db::raw::fetch_scalar_optional(
@@ -576,6 +577,7 @@ async fn embed_poisoned_rows_not_resent_within_run() {
     run_migrations(&pool).await.expect("migrations");
     const ZIM: &str = "__itest_embed_poison__";
     const DIM: u32 = 1536;
+    let probe = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let zim_id: i32 = {
         zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
@@ -631,7 +633,7 @@ async fn embed_poisoned_rows_not_resent_within_run() {
     for _ in 0..3 {
         claimable_reset(&pool, zim_id).await;
         assert!(
-            zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM)
+            zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM, &probe)
                 .await
                 .is_err(),
             "a 500ing endpoint must surface an error (row stays NULL)"
@@ -646,7 +648,7 @@ async fn embed_poisoned_rows_not_resent_within_run() {
     // Run 4: the row is now poison (count 3). Even though it is re-claimable
     // (embed_at reset), the poison filter drops it → no embed HTTP call, Ok.
     claimable_reset(&pool, zim_id).await;
-    zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM)
+    zimservice::embed::run_pipeline(pool.clone(), settings.clone(), ZIM, &probe)
         .await
         .expect("run 4 (poison, no HTTP) returns Ok");
     assert_eq!(

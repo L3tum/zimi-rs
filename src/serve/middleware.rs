@@ -400,7 +400,7 @@ pub(crate) fn client_ip_from_xff(
         .rev()
         .find(|c| !cidrs_contains(cidrs, c))
         .copied()
-        .unwrap_or_else(|| *entries.first().unwrap())
+        .unwrap_or_else(|| *entries.first().expect("entries non-empty (checked above)"))
 }
 
 fn ip4_in_cidr(net: std::net::Ipv4Addr, target: std::net::Ipv4Addr, prefix: u32) -> bool {

@@ -416,7 +416,7 @@ async fn index_body(
 
     // Check for checkpoint (resume support)
     let checkpoint_path = checkpoint_file_path(&meta.name);
-    let checkpoint = load_checkpoint(&checkpoint_path);
+    let checkpoint = load_checkpoint(&checkpoint_path).await;
 
     let start_idx: u64 = if let Some(cp) = &checkpoint {
         if cp.file_mtime == file_mtime_u64(&file_path_for_mtime)
@@ -584,7 +584,8 @@ async fn index_body(
                 started_at: std::time::SystemTime::now(),
                 index_started_at: index_started_at.clone(),
             },
-        );
+        )
+        .await;
 
         tracing::info!(
             "ZIM '{}': {}/{} ({:.1}%) — {}s elapsed",
@@ -1163,15 +1164,28 @@ fn checkpoint_file_path(zim_name: &str) -> PathBuf {
     dir.join(format!("{zim_name}.index-checkpoint.json"))
 }
 
-fn load_checkpoint(path: &Path) -> Option<Checkpoint> {
-    let contents = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+async fn load_checkpoint(path: &Path) -> Option<Checkpoint> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let contents = fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&contents).ok()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
-fn save_checkpoint(path: &Path, cp: &Checkpoint) {
-    if let Ok(json) = serde_json::to_string(cp) {
-        let _ = fs::write(path, json);
-    }
+async fn save_checkpoint(path: &Path, cp: &Checkpoint) {
+    let path = path.to_path_buf();
+    let json = match serde_json::to_string(cp) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    tokio::task::spawn_blocking(move || {
+        let _ = fs::write(&path, json);
+    })
+    .await
+    .ok();
 }
 
 fn file_mtime_u64(path: &Path) -> u64 {

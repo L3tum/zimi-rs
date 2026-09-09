@@ -134,18 +134,13 @@ fn test_pool_skip(url: &str, why: &str) -> Option<(crate::db::Pool, DbExclusiveG
     None
 }
 
-/// A fully in-memory [`crate::AppState`] for unit tests that need a complete
-/// state but never touch the database: the pool is a [`dead_pool`] (unreachable),
-/// settings are [`crate::settings::default_settings`], the ZIM dir does not
-/// exist, and the qBittorrent / rate-limit / probe / lockout / degradation
-/// fields all use their defaults.
-pub fn test_state() -> crate::AppState {
-    let pool = dead_pool();
-    let settings = crate::settings::SettingsCache::new_with_map(
-        pool.clone(),
-        crate::settings::default_settings(),
-        std::collections::HashMap::new(),
-    );
+/// Core test-state factory: the single place an `AppState` is built for
+/// tests. `pool`/`settings` are the live test dependencies; everything else
+/// uses production defaults. A new `AppState` field is added here once.
+pub fn state_from_parts(
+    pool: crate::db::Pool,
+    settings: crate::settings::SettingsCache,
+) -> crate::AppState {
     let zims =
         crate::zim::ZimManager::new(std::path::PathBuf::from("/nonexistent-zims"), pool.clone());
     let search = crate::search::SearchEngine::new(
@@ -163,7 +158,32 @@ pub fn test_state() -> crate::AppState {
         probes: crate::HealthProbes::default(),
         auth_lockout: std::sync::Arc::new(Default::default()),
         degradation: crate::health::DegradationTracker::default(),
+        build_probe: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }
+}
+
+/// [`test_state`] with a custom seed settings map (e.g. default settings plus
+/// a few test-specific overrides) instead of the plain defaults.
+pub fn test_state_with_settings(
+    values: std::collections::HashMap<String, serde_json::Value>,
+) -> crate::AppState {
+    let pool = dead_pool();
+    let settings = crate::settings::SettingsCache::new_with_map(
+        pool.clone(),
+        values,
+        std::collections::HashMap::new(),
+    );
+    state_from_parts(pool, settings)
+}
+
+/// A fully in-memory [`crate::AppState`] for unit tests that need a complete
+/// state but never touch the database: the pool is a [`dead_pool`] (unreachable),
+/// settings are [`crate::settings::default_settings`], the ZIM dir does not
+/// exist, and the qBittorrent / rate-limit / probe / lockout / degradation
+/// fields all use their defaults (the state is built by
+/// [`state_from_parts`]).
+pub fn test_state() -> crate::AppState {
+    test_state_with_settings(crate::settings::default_settings())
 }
 
 static DB_LOCK: Mutex<bool> = Mutex::new(false);

@@ -203,6 +203,7 @@ pub fn assemble_state(
         probes: HealthProbes::default(),
         auth_lockout: Arc::new(Default::default()),
         degradation: zimservice::health::DegradationTracker::default(),
+        build_probe: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }
 }
 

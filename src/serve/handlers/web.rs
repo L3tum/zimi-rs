@@ -63,10 +63,35 @@ pub fn raw_content_security_headers(content_type: &str) -> Vec<(header::HeaderNa
     }
 }
 
+/// Version stamp appended to the embedded asset URLs in the served pages
+/// (`?v=<crate version>`). The JS files are served from their own routes
+/// with `Cache-Control: public, max-age=300`, so stamping them with the
+/// crate version busts stale browser caches across deploys: a new version
+/// is a new URL.
+const ASSET_STAMP: &str = concat!("?v=", env!("CARGO_PKG_VERSION"));
+
+/// Rewrite the known embedded asset URLs in a page to carry [`ASSET_STAMP`]
+/// (see cache-busting above). Only the four `src="…"` references are
+/// touched; everything else passes through untouched. The raw `web/*.html`
+/// files stay unstamped — the stamping happens only at serve time.
+fn stamp_assets(page: &str) -> String {
+    const ASSETS: [&str; 4] = ["/common.js", "/index.js", "/search.js", "/settings.js"];
+    let mut out = page.to_string();
+    for asset in ASSETS {
+        out = out.replace(
+            &format!("src=\"{asset}\""),
+            &format!("src=\"{asset}{ASSET_STAMP}\""),
+        );
+    }
+    out
+}
+
 /// Build a `text/html` response for an embedded page carrying the SEC L3
-/// security headers.
+/// security headers, with the embedded asset URLs version-stamped
+/// (see [`stamp_assets`]).
 fn web_html_response(body: &'static str) -> Response {
-    let mut resp = Response::new(axum::body::Body::from(body));
+    let stamped = stamp_assets(body);
+    let mut resp = Response::new(axum::body::Body::from(stamped));
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
         "text/html; charset=utf-8"
@@ -296,6 +321,39 @@ mod tests {
                     <script data-src=\"/x.js\">three</script>\
                     <script defer>four</script>";
         assert_eq!(inline_scripts(html), vec!["one", "two", "four"]);
+    }
+
+    #[tokio::test]
+    async fn web_pages_stamp_asset_urls_with_version() {
+        // Cache-busting: every embedded script URL in the served pages must
+        // carry the crate-version stamp (and no unstamped `src="…js"` may
+        // remain). Reads the response body, not the raw file, so it proves
+        // what actually ships to the browser.
+        for (resp, page_js) in [
+            (web_index().await, "/index.js"),
+            (web_search().await, "/search.js"),
+            (web_settings().await, "/settings.js"),
+        ] {
+            let (_, body) = resp.into_parts();
+            let bytes = http_body_util::BodyExt::collect(body)
+                .await
+                .unwrap()
+                .to_bytes();
+            let html = String::from_utf8(bytes.to_vec()).unwrap();
+            let v = env!("CARGO_PKG_VERSION");
+            assert!(
+                html.contains(&format!("<script src=\"/common.js?v={v}\"></script>")),
+                "common.js tag lost its version stamp"
+            );
+            assert!(
+                html.contains(&format!("<script src=\"{page_js}?v={v}\"></script>")),
+                "{page_js} tag lost its version stamp"
+            );
+            assert!(
+                !html.contains("src=\"/common.js\">"),
+                "unstamped common.js reference remains"
+            );
+        }
     }
 
     #[test]

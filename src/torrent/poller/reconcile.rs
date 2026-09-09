@@ -49,17 +49,23 @@ impl DownloadPoller {
         // `.part` would force a full multi-GB re-download (B1). Only truly
         // orphaned `.part`s (no live row, or a terminal `cancelled`/`complete`
         // row) are reclaimed.
-        if let Ok(rd) = std::fs::read_dir(&self.zims.zim_dir) {
-            for entry in rd.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|s| s.to_str()) == Some("part")
-                    && !active_paths.contains(&p.display().to_string())
-                {
-                    tracing::debug!("reconcile: removing orphan .part file {}", p.display());
-                    let _ = std::fs::remove_file(&p);
+        let sweep_dir = self.zims.zim_dir.clone();
+        let sweep_active = active_paths.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(rd) = std::fs::read_dir(&sweep_dir) {
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("part")
+                        && !sweep_active.contains(&p.display().to_string())
+                    {
+                        tracing::debug!("reconcile: removing orphan .part file {}", p.display());
+                        let _ = std::fs::remove_file(&p);
+                    }
                 }
             }
-        }
+        })
+        .await
+        .ok();
 
         let Some(q) = qbit.as_ref() else {
             return Ok(());

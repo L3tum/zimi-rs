@@ -33,6 +33,27 @@ $(WAIT_PG)
 $1; st=$$?; docker compose stop postgres; exit $$st
 endef
 
+# Shared boilerplate for every web-UI dev target (a make macro, invoked as
+# $(call WEB_WRAP,<target>,<eslint>,<skip-label>,<commands>)): guard node
+# presence, and — when <eslint> is non-empty (only the targets that read
+# node_modules) — guard eslint presence. Either guard fails hard under
+# ZIMSERVICE_WEB_CHECK_STRICT=1, else skips with a warning. <skip-label> is
+# the human phrase after "skipping" in the warning. As with DB_WRAP, the
+# guard lines precede <commands> as separate recipe lines (same skip/exit
+# semantics as the pre-macro recipes). Use only inside recipe lines.
+define WEB_WRAP
+@command -v node >/dev/null 2>&1 || { \
+  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
+    echo "$1: node not found (strict mode)" >&2; exit 1; \
+  fi; echo "$1: node not found — skipping $3"; exit 0; }
+$(if $2,\
+@[ -x node_modules/.bin/eslint ] || { \
+  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
+    echo "$1: eslint not installed (run: npm install; strict mode)" >&2; exit 1; \
+  fi; echo "$1: eslint not installed (npm install) — skipping $3"; exit 0; },)
+$4
+endef
+
 .PHONY: all help check fmt fmt-check clippy raw-sql-lint test test-fast test-integration test-strict test-strict-ci build release install uninstall doc run clean web-check web-fmt web-test web-lint
 
 # Quick pre-commit checks
@@ -104,11 +125,8 @@ test-strict-ci:
 # guards that). Requires node; skips with a warning when node is absent.
 # Set ZIMSERVICE_WEB_CHECK_STRICT=1 to fail without node.
 web-check:
-	@command -v node >/dev/null 2>&1 || { \
-	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
-	    echo "web-check: node not found (strict mode)" >&2; exit 1; \
-	  fi; echo "web-check: node not found — skipping JS syntax checks"; exit 0; }
-	@node --check web/common.js web/index.js web/search.js web/settings.js
+	$(call WEB_WRAP,web-check,,JS syntax checks,\
+	@node --check web/common.js web/index.js web/search.js web/settings.js)
 	@echo "web-check: OK"
 
 # Behavioral unit tests for the pure helpers in web/common.js (node --test,
@@ -116,26 +134,16 @@ web-check:
 # absent, same policy as web-check. Set ZIMSERVICE_WEB_CHECK_STRICT=1 to fail
 # without node.
 web-test:
-	@command -v node >/dev/null 2>&1 || { \
-	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
-	    echo "web-test: node not found (strict mode)" >&2; exit 1; \
-	  fi; echo "web-test: node not found — skipping web UI unit tests"; exit 0; }
-	node --test tests/web/*.test.mjs
+	$(call WEB_WRAP,web-test,,web UI unit tests,\
+	node --test tests/web/*.test.mjs)
 
 # Real lint (eslint) of the embedded web UI: web/common.js + the per-page
 # scripts (web/index.js, web/search.js, web/settings.js). Requires
 # `npm install` first (populates node_modules). Skips with a warning when
 # eslint isn't installed; strict mode (CI) fails instead.
 web-lint:
-	@command -v node >/dev/null 2>&1 || { \
-	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
-	    echo "web-lint: node not found (strict mode)" >&2; exit 1; \
-	  fi; echo "web-lint: node not found — skipping JS lint"; exit 0; }
-	@[ -x node_modules/.bin/eslint ] || { \
-	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
-	    echo "web-lint: eslint not installed (run: npm install; strict mode)" >&2; exit 1; \
-	  fi; echo "web-lint: eslint not installed (npm install) — skipping JS lint"; exit 0; }
-	./node_modules/.bin/eslint web/common.js web/index.js web/search.js web/settings.js
+	$(call WEB_WRAP,web-lint,yes,JS lint,\
+	./node_modules/.bin/eslint web/common.js web/index.js web/search.js web/settings.js)
 	@echo "web-lint: OK"
 
 # eslint --fix for the embedded web UI (the JS half of `make fmt`): auto-fixes
@@ -145,15 +153,8 @@ web-lint:
 # isn't installed. Set ZIMSERVICE_WEB_CHECK_STRICT=1 to fail without
 # node/eslint.
 web-fmt:
-	@command -v node >/dev/null 2>&1 || { \
-	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
-	    echo "web-fmt: node not found (strict mode)" >&2; exit 1; \
-	  fi; echo "web-fmt: node not found — skipping JS auto-fix"; exit 0; }
-	@[ -x node_modules/.bin/eslint ] || { \
-	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
-	    echo "web-fmt: eslint not installed (run: npm install; strict mode)" >&2; exit 1; \
-	  fi; echo "web-fmt: eslint not installed (npm install) — skipping JS auto-fix"; exit 0; }
-	./node_modules/.bin/eslint --fix web/common.js web/index.js web/search.js web/settings.js
+	$(call WEB_WRAP,web-fmt,yes,JS auto-fix,\
+	./node_modules/.bin/eslint --fix web/common.js web/index.js web/search.js web/settings.js)
 	@echo "web-fmt: OK"
 
 # Full pre-merge check suite: type-check, format check, lint, full test run,

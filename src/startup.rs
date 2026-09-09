@@ -304,6 +304,7 @@ pub async fn build_state(
         probes: crate::HealthProbes::default(),
         auth_lockout: Arc::new(Default::default()),
         degradation,
+        build_probe: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
 }
 
@@ -794,6 +795,110 @@ pub(crate) fn legacy_password_startup_warn(mode: &str, password: &str) -> bool {
     mode == crate::settings::ACCESS_MODE_PASSWORD
         && !password.is_empty()
         && crate::settings::is_legacy_password(password)
+}
+
+/// Log level for a [`StartupWarning`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarnLevel {
+    /// Logged via `tracing::warn!`.
+    Warn,
+    /// Logged via `tracing::info!`.
+    Info,
+}
+
+/// A warning message from the startup security-policy checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupWarning {
+    /// The human-readable warning text to log.
+    pub message: String,
+    /// Whether this is logged at `warn` or `info` level.
+    pub level: WarnLevel,
+}
+
+/// Run the startup security-policy checks for a `serve` invocation.
+///
+/// Returns `Ok(warnings)` with any non-fatal warnings the operator should
+/// see, or `Err(message)` for fatal policy violations that must refuse
+/// startup (open-mode non-loopback bind, `/0` CIDR in trusted proxies).
+///
+/// This is a pure function (no I/O, no DB) so it can be unit-tested without
+/// a running server or database.
+pub fn serve_policy_checks(
+    host: &str,
+    access_mode: &str,
+    require_auth_for_reads: bool,
+    trusted_proxy_cidrs: &str,
+) -> Result<Vec<StartupWarning>, String> {
+    use crate::serve::middleware;
+    use crate::settings;
+
+    let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "::1");
+
+    // 1. Open mode on non-loopback: refuse.
+    if access_mode == settings::ACCESS_MODE_OPEN && !is_loopback {
+        return Err(
+            "access.mode=open requires a loopback bind (host=127.0.0.1 or ::1); \
+             set access.mode=password (with AUTH_PASSWORD) for network-facing deployments"
+                .to_string(),
+        );
+    }
+
+    let mut warnings: Vec<StartupWarning> = Vec::new();
+
+    // 2 + 3. Password mode on non-loopback: TLS + read-gating warnings.
+    if access_mode == settings::ACCESS_MODE_PASSWORD && !is_loopback {
+        warnings.push(StartupWarning {
+            message: format!(
+                "access.mode=password with non-loopback bind ({host}): ensure TLS \
+                 termination (reverse proxy) to protect AUTH_PASSWORD in transit. \
+                 See the README 'Security' section."
+            ),
+            level: WarnLevel::Warn,
+        });
+        if require_auth_for_reads {
+            warnings.push(StartupWarning {
+                message: format!(
+                    "access.require_auth_for_reads is effective-true on non-loopback bind \
+                     ({host}): GET/HEAD/OPTIONS require the admin password (M-1 \
+                     default). Set REQUIRE_AUTH_FOR_READS=false to restore open \
+                     reads — see the README 'Security' section."
+                ),
+                level: WarnLevel::Warn,
+            });
+        } else {
+            warnings.push(StartupWarning {
+                message: format!(
+                    "access.require_auth_for_reads is false on non-loopback bind ({host}): \
+                     reads (GET/HEAD/OPTIONS) stay open — full article content is \
+                     exposed to any network peer. Set REQUIRE_AUTH_FOR_READS=true \
+                     to gate reads."
+                ),
+                level: WarnLevel::Info,
+            });
+        }
+    }
+
+    // 4. /0 CIDR: refuse.
+    if middleware::has_zero_prefix_cidr(trusted_proxy_cidrs) {
+        return Err(
+            "general.trusted_proxy_cidrs contains a /0 CIDR (prefix length 0, e.g. 0.0.0.0/0 or ::/0): \
+             a /0 entry matches every address, so it would trust every X-Forwarded-For value \
+             and defeat the per-IP auth-failure lockout. Restrict the list to your actual proxy IPs."
+                .to_string(),
+        );
+    }
+
+    // 5. Over-broad CIDR: warn.
+    if middleware::has_over_broad_cidr(trusted_proxy_cidrs) {
+        warnings.push(StartupWarning {
+            message: "general.trusted_proxy_cidrs contains an over-broad CIDR (≥ /8 IPv4 or ≥ /56 IPv6): \
+             this allows X-Forwarded-For lockout bypass. Restrict to your actual proxy IPs."
+                .to_string(),
+            level: WarnLevel::Warn,
+        });
+    }
+
+    Ok(warnings)
 }
 
 #[cfg(test)]
@@ -1652,5 +1757,107 @@ mod serve_shutdown_tests {
             result.is_ok(),
             "a dead supervisor with no other failure is a clean exit: {result:?}"
         );
+    }
+}
+
+// ── serve_policy_checks unit tests ───────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod serve_policy_checks_tests {
+    use super::*;
+
+    #[test]
+    fn open_mode_loopback_ok() {
+        let result = serve_policy_checks("127.0.0.1", crate::settings::ACCESS_MODE_OPEN, false, "");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn open_mode_non_loopback_refused() {
+        let result = serve_policy_checks("0.0.0.0", crate::settings::ACCESS_MODE_OPEN, false, "");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("access.mode=open"));
+    }
+
+    #[test]
+    fn password_mode_loopback_ok() {
+        let result =
+            serve_policy_checks("127.0.0.1", crate::settings::ACCESS_MODE_PASSWORD, true, "");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn password_mode_non_loopback_warns_tls() {
+        let result =
+            serve_policy_checks("0.0.0.0", crate::settings::ACCESS_MODE_PASSWORD, true, "")
+                .unwrap();
+        assert!(!result.is_empty());
+        assert!(result[0].message.contains("TLS"));
+    }
+
+    #[test]
+    fn zero_prefix_cidr_refused() {
+        let result = serve_policy_checks(
+            "127.0.0.1",
+            crate::settings::ACCESS_MODE_OPEN,
+            false,
+            "0.0.0.0/0",
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("/0 CIDR"));
+    }
+
+    #[test]
+    fn over_broad_cidr_warns() {
+        let result = serve_policy_checks(
+            "127.0.0.1",
+            crate::settings::ACCESS_MODE_OPEN,
+            false,
+            "10.0.0.0/8",
+        )
+        .unwrap();
+        assert!(result.iter().any(|w| w.message.contains("over-broad")));
+    }
+
+    #[test]
+    fn require_auth_for_reads_false_warns_open_reads() {
+        let result =
+            serve_policy_checks("0.0.0.0", crate::settings::ACCESS_MODE_PASSWORD, false, "")
+                .unwrap();
+        // Should have the TLS warning AND the open-reads warning.
+        assert!(result
+            .iter()
+            .any(|w| w.message.contains("reads (GET/HEAD/OPTIONS) stay open")));
+    }
+
+    #[test]
+    fn require_auth_for_reads_true_warns_gated_reads() {
+        let result =
+            serve_policy_checks("0.0.0.0", crate::settings::ACCESS_MODE_PASSWORD, true, "")
+                .unwrap();
+        assert!(result.iter().any(|w| w.message.contains("effective-true")));
+    }
+
+    #[test]
+    fn localhost_is_loopback() {
+        let result = serve_policy_checks("localhost", crate::settings::ACCESS_MODE_OPEN, false, "");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn info_level_for_open_reads() {
+        let result =
+            serve_policy_checks("0.0.0.0", crate::settings::ACCESS_MODE_PASSWORD, false, "")
+                .unwrap();
+        // The "reads stay open" warning should be at Info level.
+        let open_reads = result
+            .iter()
+            .find(|w| w.message.contains("reads (GET/HEAD/OPTIONS) stay open"))
+            .expect("open-reads warning present");
+        assert_eq!(open_reads.level, WarnLevel::Info);
     }
 }

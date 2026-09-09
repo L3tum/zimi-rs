@@ -20,6 +20,7 @@ const commonJsGlobals = {
   fmtNum: 'readonly',
   snippetHtml: 'readonly',
   toast: 'readonly',
+  zimControls: 'readonly',
 };
 
 export default [

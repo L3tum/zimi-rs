@@ -295,6 +295,89 @@ mod tests {
     /// rule), so the committed corpus must contain no `E'…'` literals —
     /// this guard is the net that keeps the plain-string rule sound for
     /// every migration. Cheap regression net (no DB needed).
+    /// The 005 void invariant (see the `MIGRATIONS` doc comment): `005` was
+    /// removed/superseded and is RESERVED/VOID — a `005_*.sql` added later
+    /// would silently apply *before* `006` on databases that already ran
+    /// `006`, re-running its superseded DDL. This test pins the numbering of
+    /// the compile-time `MIGRATIONS` list so the invariant is machine-checked:
+    /// - no filename starts with `005`;
+    /// - every filename is `NNN_slug.sql` (exactly 3-digit numeric prefix,
+    ///   non-empty slug) and all filenames are unique;
+    /// - numeric prefixes strictly increase in the const's order;
+    /// - the set of numbers equals exactly {1,2,3,4,6,7,8,9,10,11,12,13} —
+    ///   pinning the current set and proving 5 is the ONLY missing number in
+    ///   1..=13, with the set size cross-checked against `MIGRATION_COUNT`.
+    #[test]
+    fn migration_numbering_keeps_the_005_void_gap() {
+        use std::collections::{BTreeSet, HashSet};
+
+        let mut numbers = Vec::with_capacity(MIGRATION_COUNT);
+        let mut seen_names = HashSet::new();
+
+        for (name, _) in MIGRATIONS {
+            // NNN_slug.sql: exactly 3 ASCII digits, then '_', then a
+            // non-empty slug, then ".sql".
+            let prefix = name
+                .get(..3)
+                .unwrap_or_else(|| panic!("migration {name}: shorter than 3 chars"));
+            assert!(
+                prefix.chars().all(|c| c.is_ascii_digit()),
+                "migration {name}: first 3 chars {prefix:?} are not all digits (expected NNN_slug.sql)"
+            );
+            assert!(
+                name.as_bytes().get(3) == Some(&b'_'),
+                "migration {name}: 4th char is not '_' (expected NNN_slug.sql)"
+            );
+            let suffix = &name[4..];
+            assert!(
+                suffix.len() > 4 && suffix.ends_with(".sql"),
+                "migration {name}: missing non-empty slug between the prefix and .sql"
+            );
+
+            let num: usize = prefix
+                .parse()
+                .expect("3 ASCII digits always parse as a number");
+            assert!(
+                seen_names.insert(name.to_string()),
+                "migration filename {name} appears more than once in MIGRATIONS"
+            );
+            numbers.push(num);
+        }
+
+        // No 005 — the permanent gap.
+        assert!(
+            !numbers.contains(&5),
+            "a `005_*.sql` migration exists — 005 is a permanent void gap; it would \
+             silently apply before 006 on databases that already ran 006"
+        );
+
+        // Strictly increasing in the const's order.
+        for (prev, next) in numbers.iter().zip(numbers.iter().skip(1)) {
+            assert!(
+                next > prev,
+                "MIGRATIONS not strictly increasing by number: {prev} followed by {next}"
+            );
+        }
+
+        // The full set is exactly 1..=13 minus 5: pins the current migration
+        // set and proves the ONLY missing number in 1..=13 is the reserved 5.
+        let expected: BTreeSet<usize> = (1..=13).filter(|n| *n != 5).collect();
+        let actual: BTreeSet<usize> = numbers.iter().copied().collect();
+        assert_eq!(
+            actual.len(),
+            MIGRATION_COUNT,
+            "MIGRATION_COUNT ({MIGRATION_COUNT}) does not match the number of \
+             distinct migration prefixes ({}); duplicate prefixes or a stale \
+             count",
+            numbers.len()
+        );
+        assert_eq!(
+            actual, expected,
+            "MIGRATIONS number set differs from the pinned set — 005 must stay \
+             absent and no other number may be added or removed"
+        );
+    }
+
     #[test]
     fn committed_migrations_contain_no_e_string_literals() {
         for (name, sql) in MIGRATIONS {

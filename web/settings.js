@@ -184,6 +184,15 @@ async function saveAll() {
 }
 
 // ── Per-ZIM section ────────────────────────────────────────────────────
+// Per-page parts of the shared zimControls() markup (see web/common.js).
+const ZIM_ROW_CONTROLS = {
+  toggleTitle: 'Embedding for this ZIM',
+  embedAttr: 'zembed',
+  catAttr: 'zcat',
+  msgClass: 'zmsg',
+  msgAttr: 'zmsg',
+  msgText: 'saved ✓',
+};
 let zimsData = [];
 let zimTimers = {};
 
@@ -195,21 +204,19 @@ async function loadZimRows() {
   } catch (e) { wrap.innerHTML = `<div class="sub">Could not load ZIM list: ${esc(e.message)}</div>`; return; }
   if (!zimsData.length) { wrap.innerHTML = '<div class="sub">No ZIMs in the library.</div>'; return; }
   wrap.innerHTML = zimsData.map(z => `
-    <div class="zim-row" id="zim-${esc(z.name)}">
+    <div class="zim-row" id="zim-${encodeURIComponent(z.name)}">
       <span class="zname" title="${esc(z.name)}">${esc(z.display_title)}</span>
-      <label class="toggle" title="Embedding for this ZIM">
-        <input type="checkbox" data-zembed="${esc(z.name)}" ${z.embed_enabled ? 'checked' : ''}>
-        <span class="slider"></span>
-      </label>
-      <input type="text" data-zcat="${esc(z.name)}" value="${esc(z.category || '')}" placeholder="category (default)">
-      <span class="zmsg" data-zmsg="${esc(z.name)}">saved ✓</span>
+      ${zimControls(z, ZIM_ROW_CONTROLS)}
     </div>
   `).join('');
   handleAnchor();
 }
 
 function flashZim(name) {
-  const row = document.getElementById('zim-' + name);
+  // Row ids are built from encodeURIComponent(z.name) at render time (the
+  // index page's Settings links use #zim-${encodeURIComponent(...)}, decoded
+  // by handleAnchor), so the lookup must use the same construction.
+  const row = document.getElementById('zim-' + encodeURIComponent(name));
   if (!row) return;
   row.classList.add('flash');
   row.scrollIntoView({ behavior: 'smooth', block: 'center' });

@@ -2,11 +2,11 @@
 //! crate root so `zimservice::AppState` / `crate::AppState` stay stable).
 //!
 //! The fields are intentionally broad for handler convenience — each handler
-//! uses only 1–3 of the 9 fields.
+//! uses only 1–3 of the 10 fields.
 //!
 //! M-5 threshold revisit (2026-09-04, at 26 handlers — past the original ~20
 //! trigger): regrouping the fields into sub-states (e.g. `core` / `downloads`
-//! / `settings`) was evaluated and rejected — the 9 fields belong to 7
+//! / `settings`) was evaluated and rejected — the 10 fields belong to 7
 //! distinct top-level modules (`db`, `settings`, `zim`, `search`, `torrent`,
 //! `serve` ×2, `health` ×2) and every handler group would still span more
 //! than one sub-state, so sub-states would add indirection without narrowing
@@ -17,7 +17,7 @@
 //! **Active trigger (not a passive revisit):** re-run this M-5 evaluation
 //! **every time a field is added to or removed from `AppState`** — do not
 //! wait for a size threshold. Checklist: (1) update the field counts stated
-//! in this doc (there are 9 today), (2) re-decide whether the fields should
+//! in this doc (there are 10 today), (2) re-decide whether the fields should
 //! be regrouped into sub-states or narrowed via per-handler extractors, (3)
 //! update the handler count above. A handler that ever needs ≥4 fields is a
 //! sign it is doing two jobs — split it.
@@ -54,4 +54,8 @@ pub struct AppState {
     /// Per-branch degradation tracker: surfaces which search capabilities
     /// are silently failing (WI-5).
     pub degradation: DegradationTracker,
+    /// Shared vector-index build-probe backoff timestamp (moved from
+    /// `embed::LAST_BUILD_PROBE` process-global static to `AppState` for
+    /// testability — the old `#[cfg(test)]` reset raced parallel test threads).
+    pub build_probe: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }

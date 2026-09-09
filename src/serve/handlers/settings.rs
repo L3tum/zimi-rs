@@ -467,3 +467,76 @@ pub async fn delete_collection(
         )),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::db::collections::CollectionRow;
+
+    /// A row with fixed passthrough fields so each test pins one aspect.
+    fn row(zim_ids: Vec<i32>) -> CollectionRow {
+        CollectionRow {
+            id: 7,
+            name: "science".into(),
+            label: "Science".into(),
+            zim_ids,
+            is_favorite: true,
+            created_at: chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            updated_at: chrono::DateTime::parse_from_rfc3339("2024-06-07T08:09:10Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
+    #[test]
+    fn collection_from_row_resolves_ids_in_row_order_and_passes_fields_through() {
+        let map: HashMap<i32, String> = [(10, "a".into()), (20, "b".into()), (30, "c".into())]
+            .into_iter()
+            .collect();
+        // Ids are resolved in the row's `zim_ids` order, not sorted by id.
+        let c = collection_from_row(&map, &row(vec![30, 10, 20]));
+        assert_eq!(
+            c.zim_names,
+            vec!["c".to_string(), "a".to_string(), "b".to_string()]
+        );
+        assert_eq!(c.id, 7);
+        assert_eq!(c.name, "science");
+        assert_eq!(c.label, "Science");
+        assert!(c.is_favorite);
+        // RFC3339 rendering of the Utc timestamps (zero sub-seconds → no
+        // fractional part).
+        assert_eq!(c.created_at, "2024-01-02T03:04:05+00:00");
+        assert_eq!(c.updated_at, "2024-06-07T08:09:10+00:00");
+    }
+
+    #[test]
+    fn collection_from_row_drops_unknown_ids_silently() {
+        // Documented behavior: ids missing from the map are dropped (no error,
+        // no placeholder) — a collection row can outlive deleted ZIMs.
+        let map: HashMap<i32, String> = [(10, "a".into())].into_iter().collect();
+        let c = collection_from_row(&map, &row(vec![10, 99, 20]));
+        assert_eq!(c.zim_names, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn collection_from_row_empty_zim_ids_gives_empty_names() {
+        let map: HashMap<i32, String> = [(10, "a".into())].into_iter().collect();
+        let c = collection_from_row(&map, &row(Vec::new()));
+        assert!(c.zim_names.is_empty());
+    }
+
+    #[test]
+    fn zim_id_to_name_map_is_empty_when_registry_is_empty() {
+        // `test_state_with_settings` builds the in-memory state with a
+        // non-existent ZIM dir, so `state.zims.list()` is empty → empty map.
+        let state = crate::testing::test_state_with_settings(crate::settings::default_settings());
+        assert!(zim_id_to_name_map(&state).is_empty());
+        // The populated case is not testable without a live DB: `ZimMeta.id`
+        // is only assigned by `persist_to_db` (src/zim/mod.rs) after a
+        // successful upsert, so a DB-less `scan()` leaves every ZIM with
+        // `id: None`, which `zim_id_to_name_map` filters out.
+    }
+}
