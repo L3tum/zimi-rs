@@ -20,12 +20,11 @@ pub type Pool = PgPool;
 
 /// Determines the TLS mode to use for the database connection based on the DSN.
 ///
-/// All `require`/`verify-ca`/`verify-full` (and the `+tls` schemes) map to the
-/// single `Tls` variant, which enforces chain validation against the native
-/// root store (sqlx's `SslMode::VerifyCa`) — the same effective level as the
-/// old tokio-postgres-rustls integration (certificate chain verified, hostname
-/// NOT verified). `verify-full` is accepted for compatibility but does not
-/// enable hostname verification.
+/// All `require`/`verify-ca` (and the `+tls` schemes) map to the `Tls` variant,
+/// which enforces chain validation against the native root store
+/// (sqlx's `SslMode::VerifyCa`). `verify-full` also maps to `Tls` but is
+/// promoted to `SslMode::VerifyFull` in [`connect_options`], which additionally
+/// validates the server certificate's hostname.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsMode {
     /// No TLS (plain connection)
@@ -44,8 +43,7 @@ pub enum TlsMode {
 /// - Any other `sslmode` value → `Err`
 ///
 /// The `+tls` schemes are rewritten to their plain form for the driver in
-/// `create_pool` (see `driver_dsn`) — tokio-postgres only accepts
-/// `postgres://` / `postgresql://`.
+/// [`driver_dsn`] — sqlx only accepts `postgres://` / `postgresql://`.
 pub fn tls_mode_from_dsn(dsn: &str) -> Result<TlsMode> {
     // Check for explicit TLS scheme
     if dsn.starts_with("postgres+tls://") || dsn.starts_with("postgresql+tls://") {
@@ -98,26 +96,56 @@ fn normalize_sslmode(dsn: &str) -> String {
     format!("{head}?{rebuilt}")
 }
 
+/// Whether the DSN explicitly requests full certificate + hostname
+/// verification (`sslmode=verify-full`, case-insensitive). Uses the same
+/// first-`?` query rule as [`tls_mode_from_dsn`] so an accidental second `?`
+/// does not drop a later `sslmode` (see the B2 tests).
+fn dsn_has_verify_full(dsn: &str) -> bool {
+    let query = dsn.split_once('?').map(|(_, q)| q).unwrap_or("");
+    for pair in query.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            if key == "sslmode" {
+                return value.eq_ignore_ascii_case("verify-full");
+            }
+        }
+    }
+    false
+}
+
+/// The `PgSslMode` to pin for a validated [`TlsMode`], given the original DSN.
+///
+/// `verify-full` is the one mode promoted to hostname verification; every
+/// other TLS case stops at chain validation. Kept as a pure function so the
+/// security-relevant mapping is unit-testable without opening a socket.
+fn ssl_mode_for(tls_mode: TlsMode, dsn: &str) -> PgSslMode {
+    match tls_mode {
+        TlsMode::None => PgSslMode::Disable,
+        TlsMode::Tls => {
+            if dsn_has_verify_full(dsn) {
+                PgSslMode::VerifyFull
+            } else {
+                PgSslMode::VerifyCa
+            }
+        }
+    }
+}
+
 /// Build a `PgConnectOptions` for the DSN with the validated TLS mode applied.
 ///
 /// `from_str` already parses the URL's `sslmode` (after [`normalize_sslmode`]);
-/// we then pin the mode explicitly because sqlx's URL default is `prefer` and
-/// this codebase's no-`sslmode` behavior is a *plain* connection, not a TLS
-/// negotiation.
+/// we then pin the mode explicitly (see [`ssl_mode_for`]) because sqlx's URL
+/// default is `prefer` and this codebase's no-`sslmode` behavior is a *plain*
+/// connection, not a TLS negotiation.
 ///
-/// Native root certificates: with sqlx's `tls-rustls-ring-native-roots`
-/// feature, `SslMode::VerifyCa` loads the OS trust store via
-/// rustls-native-certs (pre-deadpool parity) and validates the server chain
-/// against it (no hostname check — same effective level as before the
-/// driver swap).
+/// With sqlx's `tls-rustls-ring-native-roots` feature, `SslMode::VerifyCa`
+/// loads the OS trust store via rustls-native-certs and validates the server
+/// chain against it. `SslMode::VerifyFull` (used when the DSN specifies
+/// `sslmode=verify-full`) additionally validates the server certificate's
+/// hostname.
 fn connect_options(dsn: &str, tls_mode: TlsMode) -> Result<PgConnectOptions> {
-    let mut opts = PgConnectOptions::from_str(&normalize_sslmode(&driver_dsn(dsn)))
+    let opts = PgConnectOptions::from_str(&normalize_sslmode(&driver_dsn(dsn)))
         .map_err(|e| Error::Internal(anyhow::anyhow!("db connect options: {e}")))?;
-    match tls_mode {
-        TlsMode::None => opts = opts.ssl_mode(PgSslMode::Disable),
-        TlsMode::Tls => opts = opts.ssl_mode(PgSslMode::VerifyCa),
-    }
-    Ok(opts)
+    Ok(opts.ssl_mode(ssl_mode_for(tls_mode, dsn)))
 }
 
 /// Create a Postgres connection pool from config, with automatic TLS
@@ -166,36 +194,11 @@ pub fn driver_dsn(raw: &str) -> String {
 /// 503s under exhaustion, 30 min max lifetime so NAT-dropped idle sockets
 /// are recycled).
 ///
-/// Warns (not errors) when `sslmode` asks for more than can be enforced: the
-/// chain is validated against the native root store, but the hostname is
-/// never verified (sqlx-rustls limitation).
+/// TLS enforcement: `verify-full` enforces both chain and hostname validation;
+/// `require`/`verify-ca`/`+tls` enforce chain validation against the native
+/// root store.
 pub async fn create_pool(config: &Config) -> Result<Pool> {
     let tls_mode = tls_mode_from_dsn(&config.database_url)?;
-
-    // WI-6: warn when the operator asked for verification we can't fully
-    // enforce: hostname verification (verify-full) is never performed, and
-    // `require` now additionally gets chain validation (verify-ca level).
-    if matches!(tls_mode, TlsMode::Tls) {
-        let query = config
-            .database_url
-            .split_once('?')
-            .map(|(_, q)| q)
-            .unwrap_or("");
-        for pair in query.split('&') {
-            if let Some((key, value)) = pair.split_once('=') {
-                if key == "sslmode"
-                    && matches!(value.to_lowercase().as_str(), "verify-ca" | "verify-full")
-                {
-                    tracing::warn!(
-                        "DATABASE_URL specifies sslmode={value} but only verify-ca is enforced — \
-                         the certificate chain is validated against the native root store, \
-                         but the hostname is NOT verified. This is a limitation of the \
-                         sqlx-rustls integration."
-                    );
-                }
-            }
-        }
-    }
 
     let opts = connect_options(&config.database_url, tls_mode)?;
 
@@ -445,5 +448,77 @@ mod tests {
     #[test]
     fn empty_dsn() {
         assert_eq!(tls_mode_from_dsn("").unwrap(), TlsMode::None);
+    }
+
+    // --- verify-full promotion (hostname verification) ---
+    //
+    // `PgSslMode` does not derive `PartialEq`, so these assert with `matches!`.
+
+    #[test]
+    fn dsn_has_verify_full_only_for_verify_full() {
+        assert!(dsn_has_verify_full(
+            "postgres://u:p@h/db?sslmode=verify-full"
+        ));
+        assert!(dsn_has_verify_full(
+            "postgres://u:p@h/db?sslmode=VERIFY-FULL"
+        ));
+        // Other modes must not be mistaken for verify-full.
+        assert!(!dsn_has_verify_full("postgres://u:p@h/db?sslmode=require"));
+        assert!(!dsn_has_verify_full(
+            "postgres://u:p@h/db?sslmode=verify-ca"
+        ));
+        assert!(!dsn_has_verify_full("postgres://u:p@h/db?sslmode=disable"));
+        assert!(!dsn_has_verify_full("postgres://u:p@h/db"));
+    }
+
+    #[test]
+    fn dsn_has_verify_full_after_second_question_mark() {
+        // Mirrors the B2 rule: a `?` inside the query must not drop a later
+        // sslmode — otherwise a `verify-full` request would silently fall
+        // back to chain-only verification.
+        assert!(dsn_has_verify_full(
+            "postgres://u:p@h/db?a=1?b=2&sslmode=verify-full"
+        ));
+    }
+
+    #[test]
+    fn ssl_mode_full_when_verify_full() {
+        assert!(matches!(
+            ssl_mode_for(TlsMode::Tls, "postgres://u:p@h/db?sslmode=verify-full"),
+            PgSslMode::VerifyFull
+        ));
+    }
+
+    #[test]
+    fn ssl_mode_ca_for_require_and_verify_ca() {
+        assert!(matches!(
+            ssl_mode_for(TlsMode::Tls, "postgres://u:p@h/db?sslmode=require"),
+            PgSslMode::VerifyCa
+        ));
+        assert!(matches!(
+            ssl_mode_for(TlsMode::Tls, "postgres://u:p@h/db?sslmode=verify-ca"),
+            PgSslMode::VerifyCa
+        ));
+    }
+
+    #[test]
+    fn ssl_mode_ca_for_plus_tls_scheme() {
+        // The `+tls` scheme carries no sslmode, so it stays at chain level.
+        assert!(matches!(
+            ssl_mode_for(TlsMode::Tls, "postgres+tls://u:p@h/db"),
+            PgSslMode::VerifyCa
+        ));
+    }
+
+    #[test]
+    fn ssl_mode_disable_when_no_tls() {
+        assert!(matches!(
+            ssl_mode_for(TlsMode::None, "postgres://u:p@h/db"),
+            PgSslMode::Disable
+        ));
+        assert!(matches!(
+            ssl_mode_for(TlsMode::None, "postgres://u:p@h/db?sslmode=disable"),
+            PgSslMode::Disable
+        ));
     }
 }

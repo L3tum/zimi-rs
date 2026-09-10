@@ -3,48 +3,146 @@
 // Field metadata: label, description, input type. `int`/`float`/`password`/
 // `select` default to text. `restart` marks settings read only at startup.
 const FIELDS = {
-  'general.zim_dir':   { label: 'ZIM directory', desc: 'Directory scanned for .zim files (watched for changes)', restart: true },
-  'general.host':      { label: 'Bind host', restart: true },
-  'general.port':      { label: 'Port', type: 'int', restart: true },
-  'general.log_level': { label: 'Log level', type: 'select', options: ['trace','debug','info','warn','error'], restart: true },
+  'general.zim_dir': {
+    label: 'ZIM directory',
+    desc: 'Directory scanned for .zim files (watched for changes)',
+    restart: true,
+  },
+  'general.host': { label: 'Bind host', restart: true },
+  'general.port': { label: 'Port', type: 'int', restart: true },
+  'general.log_level': {
+    label: 'Log level',
+    type: 'select',
+    options: ['trace', 'debug', 'info', 'warn', 'error'],
+    restart: true,
+  },
 
-  'search.fts_weight':     { label: 'Full-text weight', desc: 'Hybrid: weight of FTS matches (0–1)', type: 'float' },
-  'search.trgm_weight':    { label: 'Trigram weight', desc: 'Hybrid: weight of fuzzy matches (0–1)', type: 'float' },
-  'search.vector_weight':  { label: 'Vector weight', desc: 'Hybrid: weight of semantic matches (0–1); requires embeddings', type: 'float' },
-  'search.trgm_threshold': { label: 'Trigram threshold', desc: 'Minimum similarity for fuzzy matches (0–1)', type: 'float' },
+  'search.fts_weight': {
+    label: 'Full-text weight',
+    desc: 'Hybrid: weight of FTS matches (0–1)',
+    type: 'float',
+  },
+  'search.trgm_weight': {
+    label: 'Trigram weight',
+    desc: 'Hybrid: weight of fuzzy matches (0–1)',
+    type: 'float',
+  },
+  'search.vector_weight': {
+    label: 'Vector weight',
+    desc: 'Hybrid: weight of semantic matches (0–1); requires embeddings',
+    type: 'float',
+  },
+  'search.trgm_threshold': {
+    label: 'Trigram threshold',
+    desc: 'Minimum similarity for fuzzy matches (0–1)',
+    type: 'float',
+  },
   'search.default_limit':  { label: 'Default result limit', type: 'int' },
   'search.max_limit':      { label: 'Max result limit', type: 'int' },
 
-  'torrent.enabled':        { label: 'Enable qBittorrent', desc: 'Manage ZIM downloads via the qBittorrent Web API' },
-  'torrent.url':            { label: 'qBittorrent URL', desc: 'Base URL of the Web UI, e.g. http://localhost:8080' },
+  'torrent.enabled': {
+    label: 'Enable qBittorrent',
+    desc: 'Manage ZIM downloads via the qBittorrent Web API',
+  },
+  'torrent.url': {
+    label: 'qBittorrent URL',
+    desc: 'Base URL of the Web UI, e.g. http://localhost:8080',
+  },
   'torrent.username':       { label: 'qBittorrent username' },
   'torrent.password':       { label: 'qBittorrent password', type: 'password' },
-  'torrent.save_path':      { label: 'Save path', desc: 'Directory inside qBittorrent where ZIM torrents are stored' },
+  'torrent.save_path': {
+    label: 'Save path',
+    desc: 'Directory inside qBittorrent where ZIM torrents are stored',
+  },
   'torrent.category':       { label: 'Torrent category' },
   'torrent.max_active':     { label: 'Max active downloads', type: 'int' },
   'torrent.poll_secs':      { label: 'Poll interval (seconds)', type: 'int' },
-  'torrent.file_strategy':  { label: 'File strategy', desc: 'hardlink = no extra disk space (same filesystem); copy = always duplicate', type: 'select', options: ['hardlink','copy'] },
-  'torrent.seed_ratio':     { label: 'Seed ratio cap', desc: 'Stop seeding after this upload/download ratio', type: 'float' },
-  'torrent.keep_completed': { label: 'Keep completed torrents', desc: 'Leave finished torrents in qBittorrent (recommended for seeding)' },
-  'torrent.opds_url':       { label: 'OPDS catalog URL', desc: 'Kiwix catalog polled for new ZIM versions' },
-  'torrent.auto_update':    { label: 'Auto-update ZIMs', desc: 'Queue newer catalog versions as downloads automatically' },
+  'torrent.file_strategy': {
+    label: 'File strategy',
+    desc: 'hardlink = no extra disk space (same filesystem); copy = always duplicate',
+    type: 'select',
+    options: ['hardlink', 'copy'],
+  },
+  'torrent.seed_ratio': {
+    label: 'Seed ratio cap',
+    desc: 'Stop seeding after this upload/download ratio',
+    type: 'float',
+  },
+  'torrent.keep_completed': {
+    label: 'Keep completed torrents',
+    desc: 'Leave finished torrents in qBittorrent (recommended for seeding)',
+  },
+  'torrent.opds_url': {
+    label: 'OPDS catalog URL',
+    desc: 'Kiwix catalog polled for new ZIM versions',
+  },
+  'torrent.auto_update': {
+    label: 'Auto-update ZIMs',
+    desc: 'Queue newer catalog versions as downloads automatically',
+  },
 
-  'embedding.enabled':          { label: 'Enable embeddings', desc: 'Semantic (vector) search over article text' },
-  'embedding.endpoint':         { label: 'Embeddings endpoint', desc: 'OpenAI-compatible base URL, e.g. http://localhost:11434/v1 (Ollama)' },
-  'embedding.api_key':          { label: 'API key', desc: 'Leave empty for local servers', type: 'password' },
+  'embedding.enabled': {
+    label: 'Enable embeddings',
+    desc: 'Semantic (vector) search over article text',
+  },
+  'embedding.endpoint': {
+    label: 'Embeddings endpoint',
+    desc: 'OpenAI-compatible base URL, e.g. http://localhost:11434/v1 (Ollama)',
+  },
+  'embedding.api_key': {
+    label: 'API key',
+    desc: 'Leave empty for local servers',
+    type: 'password',
+  },
   'embedding.model':            { label: 'Model' },
-  'embedding.dimension':        { label: 'Vector dimension', desc: 'Must match the model output size', type: 'int' },
+  'embedding.dimension': {
+    label: 'Vector dimension',
+    desc: 'Must match the model output size',
+    type: 'int',
+  },
   'embedding.batch_size':       { label: 'Batch size', type: 'int' },
-  'embedding.hnsw_threshold':   { label: 'HNSW below (rows)', desc: 'Use HNSW index when row count is below this', type: 'int' },
-  'embedding.ivfflat_threshold':{ label: 'IVFFlat above (rows)', desc: 'Use IVFFlat index above this (less RAM)', type: 'int' },
+  'embedding.hnsw_threshold': {
+    label: 'HNSW below (rows)',
+    desc: 'Use HNSW index when row count is below this',
+    type: 'int',
+  },
+  'embedding.ivfflat_threshold': {
+    label: 'IVFFlat above (rows)',
+    desc: 'Use IVFFlat index above this (less RAM)',
+    type: 'int',
+  },
 
-  'access.mode':            { label: 'Access mode', desc: 'open = no auth · password = shared token required for mutating API calls (POST/PUT/DELETE) via Bearer header or ?access_token=', type: 'select', options: ['open','password'] },
-  'access.admin_password':  { label: 'Admin password', desc: 'Required when mode = password', type: 'password' },
-  'access.rate_limit_rps':   { label: 'Rate limit (req/s)', desc: 'Sustained requests per second allowed (token bucket refill rate)', type: 'int' },
-  'access.rate_limit_burst': { label: 'Rate limit (burst)', desc: 'Max burst of requests before throttling to the rate above', type: 'int' },
+  'access.mode': {
+    label: 'Access mode',
+    desc: 'open = no auth · password = shared token required for mutating API '
+      + 'calls (POST/PUT/DELETE) via Bearer header or ?access_token=',
+    type: 'select',
+    options: ['open', 'password'],
+  },
+  'access.admin_password': {
+    label: 'Admin password',
+    desc: 'Required when mode = password',
+    type: 'password',
+  },
+  'access.rate_limit_rps': {
+    label: 'Rate limit (req/s)',
+    desc: 'Sustained requests per second allowed (token bucket refill rate)',
+    type: 'int',
+  },
+  'access.rate_limit_burst': {
+    label: 'Rate limit (burst)',
+    desc: 'Max burst of requests before throttling to the rate above',
+    type: 'int',
+  },
 };
 const CAT_ORDER = ['general', 'search', 'torrent', 'embedding', 'access'];
-const CAT_NAMES = { general: 'General', search: 'Search', torrent: 'Torrent (qBittorrent)', embedding: 'Embedding', access: 'Access' };
+const CAT_NAMES = {
+  general: 'General',
+  search: 'Search',
+  torrent: 'Torrent (qBittorrent)',
+  embedding: 'Embedding',
+  access: 'Access',
+};
 
 let settings = {};   // raw server response: {cat: {key: {value, locked?, locked_by?}}}
 let originals = {};  // full key -> original value (for change detection + typing)
@@ -63,36 +161,55 @@ function inputFor(fullKey, info) {
   const val = info.value;
   const locked = !!info.locked;
   const meta = FIELDS[fullKey] || {};
-  const type = meta.type || (typeof val === 'number' ? (Number.isInteger(val) ? 'int' : 'float') : 'text');
+  const type = meta.type
+    || (typeof val === 'number' ? (Number.isInteger(val) ? 'int' : 'float') : 'text');
 
   if (typeof val === 'boolean') {
-    return `<label class="toggle"><input type="checkbox" data-key="${esc(fullKey)}" ${val ? 'checked' : ''} ${locked ? 'disabled' : ''}><span class="slider"></span></label>`;
+    const checked = val ? 'checked' : '';
+    const disabled = locked ? 'disabled' : '';
+    return `<label class="toggle">`
+      + `<input type="checkbox" data-key="${esc(fullKey)}" ${checked} ${disabled}>`
+      + `<span class="slider"></span></label>`;
   }
   if (type === 'select') {
-    const opts = (meta.options || [String(val)]).map(o => `<option ${o === String(val) ? 'selected' : ''}>${esc(o)}</option>`).join('');
+    const opts = (meta.options || [String(val)])
+      .map(o => `<option ${o === String(val) ? 'selected' : ''}>${esc(o)}</option>`)
+      .join('');
     return `<select data-key="${esc(fullKey)}" ${locked ? 'disabled' : ''}>${opts}</select>`;
   }
   if (type === 'password') {
     // A locked secret is set elsewhere (env); never echo its value into the DOM.
     const shown = locked ? '' : val;
     const ph = locked ? ' placeholder="locked (set via env)"' : '';
-    return `<input type="password" data-key="${esc(fullKey)}" value="${esc(shown)}"${ph} ${locked ? 'disabled' : ''} autocomplete="new-password">
-            <button class="show-pass" ${locked ? 'disabled' : ''}>show</button>`;
+    const disabled = locked ? 'disabled' : '';
+    return `<input type="password" data-key="${esc(fullKey)}" value="${esc(shown)}"${ph}`
+      + ` ${disabled} autocomplete="new-password">`
+      + `\n            <button class="show-pass" ${disabled}>show</button>`;
   }
   const itype = type === 'int' || type === 'float' ? 'number' : 'text';
   const step = type === 'float' ? 'step="any"' : '';
-  return `<input type="${itype}" ${step} data-key="${esc(fullKey)}" value="${esc(val)}" ${locked ? 'disabled' : ''}>`;
+  return `<input type="${itype}" ${step} data-key="${esc(fullKey)}"`
+    + ` value="${esc(val)}" ${locked ? 'disabled' : ''}>`;
 }
 
 function render() {
-  const cats = [...CAT_ORDER.filter(c => settings[c]), ...Object.keys(settings).filter(c => !CAT_ORDER.includes(c))];
+  const cats = [
+    ...CAT_ORDER.filter(c => settings[c]),
+    ...Object.keys(settings).filter(c => !CAT_ORDER.includes(c)),
+  ];
   document.getElementById('sections').innerHTML = cats.map(cat => {
     const fields = Object.entries(settings[cat]).map(([key, info]) => {
       const fullKey = `${cat}.${key}`;
       const meta = FIELDS[fullKey] || {};
       const tags = [];
-      if (info.locked) tags.push(`<span class="tag lock" title="Set via ${esc(info.locked_by || 'environment variable')}">🔒 ${esc(info.locked_by || 'env')}</span>`);
-      if (meta.restart) tags.push(`<span class="tag restart" title="Read at startup — restart zimservice to apply">⚠ restart</span>`);
+      const lockedBy = info.locked_by || 'env';
+      if (info.locked) {
+        const title = `Set via ${esc(info.locked_by || 'environment variable')}`;
+        tags.push(`<span class="tag lock" title="${title}">🔒 ${esc(lockedBy)}</span>`);
+      }
+      const restartTag = '<span class="tag restart"'
+        + ' title="Read at startup — restart zimservice to apply">⚠ restart</span>';
+      if (meta.restart) tags.push(restartTag);
       return `<div class="field" data-field="${esc(fullKey)}">
         <div>
           <div class="flabel">${esc(meta.label || key)}</div>
@@ -129,7 +246,10 @@ function bindChanges() {
   document.querySelectorAll('[data-key]').forEach(el => {
     if (el.disabled) return;
     const evt = (el.tagName === 'SELECT' || el.type === 'checkbox') ? 'change' : 'input';
-    el.addEventListener(evt, () => { el.closest('.field').classList.add('changed'); updateSaveBtn(); });
+    el.addEventListener(evt, () => {
+      el.closest('.field').classList.add('changed');
+      updateSaveBtn();
+    });
   });
 }
 
@@ -162,7 +282,7 @@ async function saveAll() {
   btn.disabled = true;
   try {
     const body = await apiJson('/settings', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      method: 'PUT',
       body: JSON.stringify(updates),
     });
     if (body.errors && body.errors.length) {
@@ -201,8 +321,14 @@ async function loadZimRows() {
   try {
     const data = await apiJson('/list');
     zimsData = data.zims || [];
-  } catch (e) { wrap.innerHTML = `<div class="sub">Could not load ZIM list: ${esc(e.message)}</div>`; return; }
-  if (!zimsData.length) { wrap.innerHTML = '<div class="sub">No ZIMs in the library.</div>'; return; }
+  } catch (e) {
+    wrap.innerHTML = `<div class="sub">Could not load ZIM list: ${esc(e.message)}</div>`;
+    return;
+  }
+  if (!zimsData.length) {
+    wrap.innerHTML = '<div class="sub">No ZIMs in the library.</div>';
+    return;
+  }
   wrap.innerHTML = zimsData.map(z => `
     <div class="zim-row" id="zim-${encodeURIComponent(z.name)}">
       <span class="zname" title="${esc(z.name)}">${esc(z.display_title)}</span>
@@ -225,12 +351,14 @@ function flashZim(name) {
 function handleAnchor() {
   if (!location.hash) return;
   const name = location.hash.slice(1);
-  if (name.startsWith('zim-')) setTimeout(() => flashZim(decodeURIComponent(name.slice(4))), 60);
+  if (name.startsWith('zim-')) {
+    setTimeout(() => flashZim(decodeURIComponent(name.slice(4))), 60);
+  }
 }
 
 async function putZim(name, patch) {
   await apiJson(`/settings/zim/${encodeURIComponent(name)}`, {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    method: 'PUT',
     body: JSON.stringify(patch),
   });
   const msg = document.querySelector(`[data-zmsg="${CSS.escape(name)}"]`);
@@ -245,7 +373,10 @@ document.getElementById('zimRows').addEventListener('change', async (e) => {
     const z = zimsData.find(x => x.name === name);
     if (z) z.embed_enabled = e.target.checked;
     toast(`Embedding ${e.target.checked ? 'enabled' : 'disabled'} for ${name}`);
-  } catch (err) { toast('Save failed: ' + err.message, false); e.target.checked = !e.target.checked; }
+  } catch (err) {
+    toast('Save failed: ' + err.message, false);
+    e.target.checked = !e.target.checked;
+  }
 });
 
 document.getElementById('zimRows').addEventListener('input', (e) => {
@@ -272,6 +403,7 @@ document.getElementById('sections').addEventListener('click', (e) => {
 });
 
 load().catch(e => {
-  document.getElementById('sections').innerHTML = `<div class="sub">Failed to load settings: ${esc(e.message)}</div>`;
+  const msg = `<div class="sub">Failed to load settings: ${esc(e.message)}</div>`;
+  document.getElementById('sections').innerHTML = msg;
 });
 window.addEventListener('hashchange', handleAnchor);

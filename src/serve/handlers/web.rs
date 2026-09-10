@@ -370,6 +370,55 @@ mod tests {
         assert!(script_src.contains("'self'"));
     }
 
+    // ── :root token drift guard ───────────────────────────────────────────
+
+    /// Extract the `:root { … }` block from a page — from the `:root {` marker
+    /// up to and including its matching closing `}` (brace-counted, so nested
+    /// braces can't truncate it). Returns `None` when the page has no `:root`
+    /// rule.
+    fn root_block(html: &str) -> Option<&str> {
+        let start = html.find(":root {")?;
+        let rest = &html[start..];
+        let mut depth = 0;
+        for (i, ch) in rest.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&rest[..=i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    // Drift guard: the three pages' `:root` token blocks must stay
+    // byte-identical so a token added to one page (e.g. `--yellow`) is
+    // mirrored in all of them and no page renders `var(--…)` against an
+    // undefined token.
+    #[test]
+    fn root_blocks_identical_across_pages() {
+        let blocks: Vec<&str> = [
+            include_str!("../../../web/index.html"),
+            include_str!("../../../web/search.html"),
+            include_str!("../../../web/settings.html"),
+        ]
+        .iter()
+        .map(|page| root_block(page).expect("page lost its :root block"))
+        .collect();
+        assert_eq!(
+            blocks[0], blocks[1],
+            "index.html and search.html :root blocks diverged"
+        );
+        assert_eq!(
+            blocks[0], blocks[2],
+            "index.html and settings.html :root blocks diverged"
+        );
+    }
+
     // ── Raw-content sandbox headers (SEC-M2) ──────────────────────────────────
 
     #[test]

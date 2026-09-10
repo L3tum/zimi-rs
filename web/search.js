@@ -81,13 +81,17 @@ async function doSearch() {
 }
 
 function renderResults(results) {
-  document.getElementById('results').innerHTML = results.map(res => `
+  document.getElementById('results').innerHTML = results.map(res => {
+    const href = `/w/${encodeURIComponent(res.zim_name)}/${encodeURIComponent(res.path)}`;
+    const score = Number(res.score).toFixed(3);
+    return `
     <div class="result">
-      <h3><a href="/w/${encodeURIComponent(res.zim_name)}/${encodeURIComponent(res.path)}">${esc(res.title)}</a></h3>
+      <h3><a href="${href}">${esc(res.title)}</a></h3>
       <div class="snippet">${snippetHtml(res.snippet || res.content_preview || '')}</div>
-      <div class="meta">${esc(res.zim_name)} · ${esc(res.language)} · score ${Number(res.score).toFixed(3)}</div>
+      <div class="meta">${esc(res.zim_name)} · ${esc(res.language)} · score ${score}</div>
     </div>
-  `).join('');
+  `;
+  }).join('');
   showState(results.length ? 'results' : 'empty');
 }
 

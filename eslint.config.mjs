@@ -29,7 +29,10 @@ export default [
   {
     files: ['web/common.js'],
     languageOptions: { ecmaVersion: 2022, sourceType: 'script', globals: globals.browser },
-    rules: { 'no-unused-vars': ['error', { args: 'none' }] },
+    rules: {
+      'no-unused-vars': ['error', { args: 'none' }],
+      'max-len': ['error', { code: 100 }],
+    },
   },
   {
     files: ['web/index.js', 'web/search.js', 'web/settings.js'],
@@ -38,6 +41,9 @@ export default [
       sourceType: 'script',
       globals: { ...globals.browser, ...commonJsGlobals },
     },
-    rules: { 'no-unused-vars': ['error', { args: 'none' }] },
+    rules: {
+      'no-unused-vars': ['error', { args: 'none' }],
+      'max-len': ['error', { code: 100 }],
+    },
   },
 ];

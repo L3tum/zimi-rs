@@ -69,10 +69,12 @@ fmt-check:
 clippy:
 	$(CARGO) clippy --all-targets -- -D warnings
 
-# M2: raw-SQL boundary lint — flags sqlx::query*/query_as/query_scalar call
-# sites outside src/db/ (the module owning the sanctioned db::raw escape
-# hatch) that lack a `// RAW-OK: <reason>` marker on the call line. POSIX sh
-# + grep only so it runs on the dev box and in CI alike.
+# M2: raw-SQL boundary lint — two rules: (1) flags sqlx::query* call sites
+# outside src/db/ (the module owning the sanctioned db::raw escape hatch)
+# that lack a `// RAW-OK: <reason>` marker on the call line; (2) flags
+# db::raw::* call sites in the presentation layer (src/serve/handlers/) —
+# handlers must not own SQL (move it into a named src/db/ helper).
+# POSIX sh + grep only so it runs on the dev box and in CI alike.
 raw-sql-lint:
 	@sh scripts/check-raw-sql.sh
 
@@ -170,7 +172,7 @@ help:
 	@echo "  make fmt          Format Rust (cargo fmt) + JS (eslint --fix; see web-fmt)"
 	@echo "  make fmt-check    Check formatting (CI)"
 	@echo "  make clippy       Lint (warnings as errors)"
-	@echo "  make raw-sql-lint  Flag unmarked raw sqlx::query* sites outside src/db/ (M2)"
+	@echo "  make raw-sql-lint  Flag unmarked raw SQL: sqlx::query* outside src/db/, db::raw::* call sites in handlers (M2)"
 	@echo "  make test         Run full test suite"
 	@echo "  make test-fast    Run unit tests only (lib + bins; no integration/doctests)"
 	@echo "  make test-integration  Boot compose Postgres, run DB integration tests"

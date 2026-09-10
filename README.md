@@ -257,6 +257,13 @@ is reachable by any network peer. Open mode is rejected at startup on a
   control — prefer `Authorization: Bearer` wherever possible. The server
   speaks plain HTTP; terminate TLS at a reverse proxy before exposing it
   beyond loopback.
+- **Secrets in the `settings` table are unencrypted at rest** —
+  operator-config secrets, specifically `embedding.api_key` and
+  `torrent.password`, are redacted in API responses but stored UNENCRYPTED in
+  the Postgres `settings` table; anyone with database access (a dump, a DB
+  admin) can read them in full. This is a documented, accepted trade-off —
+  the settings table and its backups must be treated as sensitive in both
+  access modes (see Access control).
 
 ### MCP server authentication
 

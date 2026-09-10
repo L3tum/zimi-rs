@@ -1,2 +1,6 @@
 [toolchain]
-channel = "1.91"
+# Dev toolchain tracks the CI lint/docs toolchain (1.96.0) so local
+# clippy/rustfmt results match the gates that block merges. MSRV 1.91 is
+# still guarded by `rust-version` in Cargo.toml and the dedicated `msrv`
+# CI job.
+channel = "1.96.0"

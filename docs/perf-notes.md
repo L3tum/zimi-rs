@@ -16,33 +16,46 @@ in doubt.
 
 ### The predicate
 
-`SearchEngine::search` (trgm/fuzzy/prefix branch) issues, per query:
+`SearchEngine::search` (trgm/fuzzy/prefix branch) runs the three split arms
+concurrently (`build_trgm_arms`, `src/search/sql.rs`), each its own query with
+the shared tail `ORDER BY score DESC, a.id LIMIT $n::int8`:
 
 ```sql
+-- Q1 prefix (btree) — $2 = '<query_lower>%' (ESCAPE '\')
 SELECT …, {trgm_weight} * GREATEST(similarity(a.title_lower, $1), 0.0) AS score
 FROM articles a JOIN zims z ON z.id = a.zim_id
-WHERE a.title_lower LIKE $2 ESCAPE '\'      -- $2 = '<query_lower>%'
-   OR similarity(a.title_lower, $1) > $3    -- $3 = search.trgm_threshold (default 0.3)
-ORDER BY score DESC LIMIT <limit_i32>
+WHERE a.title_lower LIKE $2 ESCAPE '\'
+ORDER BY score DESC, a.id LIMIT $3::int8
+
+-- Q2 contains (GIN) — same shape, $2 = '%<query_lower>%' (ESCAPE '\')
+-- Q3 similarity (GiST) — same shape, $2 = search.trgm_threshold (default 0.3, floored at 0.3):
+--    WHERE a.title_lower % $1 AND similarity(a.title_lower, $1) > $2::float8
 ```
 
-### Relevant indexes (from `migrations/001_initial.sql`)
+The Q2/Q3 arms are gated off for queries shorter than 3 chars
+(`trgm_arms_enabled` — prefix-only below that), and each arm fetches up to
+`min(limit + offset, 5500)` rows for the post-dedup merge.
+
+### Relevant indexes (from `migrations/001_initial.sql` + `008`)
 
 | Index | Type | Serves |
 |---|---|---|
-| `idx_articles_title_prefix` / `idx_articles_title_lower` | btree on `title_lower` | the `LIKE '…%'` prefix scan |
-| `idx_articles_title_trgm` | GIN `gin_trgm_ops` on `title_lower` | the `LIKE '%…%'` contains scan |
-| `idx_articles_title_gist` | GiST `gist_trgm_ops` on `title_lower` | the `similarity() > $3` scan |
+| `idx_articles_title_prefix` (001) | btree on `title_lower` | the `LIKE '…%'` prefix scan |
+| `idx_articles_title_trgm` (001) | GIN `gin_trgm_ops` on `title_lower` | the `LIKE '%…%'` contains scan |
+| `idx_articles_title_gist` (008) | GiST `gist_trgm_ops` on `title_lower` | the `%`/`similarity()` scan |
+
+(008 also added a second btree, `idx_articles_title_lower`, which 009 dropped
+as an exact duplicate of `idx_articles_title_prefix`.)
 
 `title_lower` is `TEXT NOT NULL GENERATED ALWAYS AS (lower(title)) STORED`.
 
 ### Expected plan
 
-For a selective term at 100k rows, the planner should produce a
-`BitmapOr` (or a merge of the two index scans) over
-`idx_articles_title_prefix` (for the prefix) and `idx_articles_title_trgm`
-(for the similarity), feeding a top-N (`LIMIT`) sort. A **sequential scan**
-would indicate the OR predicate is not index-friendly at this scale.
+For a selective term at 100k rows, each of the three split predicates should
+hit its own index — `idx_articles_title_prefix` (Q1),
+`idx_articles_title_trgm` (Q2), `idx_articles_title_gist` (Q3) — feeding a
+top-N (`LIMIT`) sort. A **sequential scan** on any arm would indicate that
+arm's predicate is not index-friendly at this scale.
 
 ### How to capture the actual plan
 
@@ -55,21 +68,20 @@ EXPLAIN (ANALYZE, BUFFERS) SELECT a.id … WHERE a.title_lower LIKE 'art 42%' ES
 -- Q2 contains (GIN)
 EXPLAIN (ANALYZE, BUFFERS) SELECT a.id … WHERE a.title_lower LIKE '%art 42%' ESCAPE '\'
 -- Q3 similarity (GiST)
-EXPLAIN (ANALYZE, BUFFERS) SELECT a.id … WHERE similarity(a.title_lower, 'art 42') > 0.3
+EXPLAIN (ANALYZE, BUFFERS) SELECT a.id … WHERE a.title_lower % 'art 42' AND similarity(a.title_lower, 'art 42') > 0.3
 ```
 
 The regression-relevant result is that none of the three contains `Seq Scan
 on articles`. There is no automated harness — run the statements by hand
 (e.g. `psql`) and paste the plans below.
 
-### Result (fill in after a manual run)
+### Result (unmeasured)
 
-_Plane captured on: ______ (Postgres version, row count, `pg_trgm` similarity
-threshold)._
-
-```
-(paste the EXPLAIN (ANALYZE, BUFFERS) output for Q1/Q2/Q3 here)
-```
+**No plan has been captured.** There is no automated harness, and no manual
+run against the 100k-row fixture has been recorded — the capture metadata
+(Postgres version, row count, `pg_trgm` similarity threshold) and the
+`EXPLAIN (ANALYZE, BUFFERS)` output for Q1/Q2/Q3 are unmeasured, and remain
+to be filled in by whoever runs the recipe above.
 
 **Verdict:** the split is implemented (DEC-5); there is no automated harness —
 plan capture is pending a manual measurement.
@@ -80,7 +92,7 @@ plan capture is pending a manual measurement.
 
 **Question.** The Q1 prefix arm (`WHERE title_lower LIKE 'q%'`) can use the
 btree `idx_articles_title_prefix`, but `gin_trgm_ops` (the GIN trgm index) can
-serve `LIKE 'q%'` too. Is the btree redundant — can we drop it (migration 013)
+serve `LIKE 'q%'` too. Is the btree redundant — can we drop it (migration 014)
 and let the GIN index cover the prefix shape as well?
 
 **How it is measured (manual).** Seed the 100k-row `__itrge__` fixture in the
@@ -94,7 +106,7 @@ in the repo and its references were removed):
 | Q2 | `title_lower LIKE '%q%'` | GIN |
 | Q3 | `title_lower % $1 AND similarity(...) > $2` | GiST |
 | SUG | prefix arm (weight 1.0) | btree prefix *or* GIN |
-| Q5 | `ORDER BY title_lower ASC LIMIT 20` (no predicate) | btree (ordering) |
+| Q5 | `ORDER BY title_lower ASC LIMIT 20` (no predicate — hypothetical shape; no current endpoint issues it) | btree (ordering) |
 
 Q1/Q2/Q3/SUG are the regression-relevant shapes: none should fall back to a
 `Seq Scan on articles` at 100k rows. Q5 is recorded for the decision but is
@@ -103,9 +115,9 @@ planner choice that this decision weighs.
 
 **Decision rule (fixed, no judgment).**
 - **DROP** `idx_articles_title_prefix` (emit
-  `migrations/013_articles_title_prefix_drop.sql`:
+  `migrations/014_articles_title_prefix_drop.sql`:
   `DROP INDEX IF EXISTS idx_articles_title_prefix;` + a `MIGRATIONS` entry
-  after 012) **only if**, across *all* recorded EXPLAINs, the planner uses the
+  after 013) **only if**, across *all* recorded EXPLAINs, the planner uses the
   GIN trgm index or a seq scan for the Q1 `LIKE 'q%'` prefix shape **and**
   never uses `Index Scan using idx_articles_title_prefix` for any of the five
   shapes.
@@ -121,11 +133,11 @@ transaction migrate harness; `010:16` precedent).
 100k-row fixture + `EXPLAIN ANALYZE`). The keep/drop call is deferred to a
 manual measurement run — CI has no perf job (the former `test-db-perf` push
 job referenced a test that did not exist and was removed). **Default is KEEP**
-— migration 013 is created *only* in the drop branch,
+— migration 014 is created *only* in the drop branch,
 and that branch is not reached until the rule's drop condition is
 measured-confirmed. _To fill in after the measurement run:_ paste the five plan
 nodes
-here, tick the decision rule, and either create migration 013 (drop) or record
+here, tick the decision rule, and either create migration 014 (drop) or record
 KEEP with the reason.
 
 ---

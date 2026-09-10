@@ -573,17 +573,9 @@ pub async fn get_snippet(
     State(state): State<AppState>,
     Query(params): Query<SnippetQuery>,
 ) -> Result<Json<SnippetResponse>, crate::error::Error> {
-    // Raw SQL (db::raw): cross-table JOIN — no `db::raw` named helper exists
-    // for it, so the read is kept inline (same convention as `crate::db`);
-    // tuple shape unchanged.
-    let row = crate::db::raw::fetch_optional::<(String, String, Option<String>), _, _>(
-        &state.db,
-        "SELECT a.snippet, a.title, a.content_preview FROM articles a
-         JOIN zims z ON z.id = a.zim_id
-         WHERE z.name = $1 AND a.path = $2",
-        |q| q.bind(&params.zim).bind(&params.path),
-    )
-    .await?;
+    let row =
+        crate::db::random_article::fetch_article_snippet(&state.db, &params.zim, &params.path)
+            .await?;
 
     match row {
         Some((snippet, title, preview)) => Ok(Json(SnippetResponse {

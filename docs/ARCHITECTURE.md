@@ -27,7 +27,7 @@ hardlink-based file sharing, an OpenAI-compatible embedding pipeline, and an MCP
   startup resync (a DELETE/INSERT cycle on `zims`) can never interleave between
   two starting instances.
 
-- **`src/state.rs`** — `AppState`: the 9-field shared state passed to every
+- **`src/state.rs`** — `AppState`: the 10-field shared state passed to every
   axum handler (db pool, settings, ZIM manager, search engine, qBittorrent
   cache, rate limiter, probes, lockout, degradation); sub-state regrouping is
   re-evaluated on every field change (documented active trigger) and kept flat.
@@ -194,7 +194,12 @@ advisory lock best-effort (different-database deployments sharing a `zim_dir`);
 Postgres through a single shared `sqlx::PgPool` (`src/db/pool.rs`; default 20
 connections, 10 s acquire timeout, TLS mode derived from the DSN's `sslmode`
 or `+tls` scheme). All subsystems — HTTP API, poller, embedding, index COPY —
-share this one pool.
+share this one pool. The single pool is therefore a shared, contended resource:
+a large reindex (`COPY`) can hold connections long enough that search/HTTP
+requests time out acquiring a connection and surface as 503 (the 10 s acquire
+timeout is a fast 503 by design, mapped in `src/error.rs`). This is a
+deliberate, bounded trade-off — the 20-connection ceiling bounds the blast
+radius rather than isolating the indexer from serving traffic.
 
 **Pure sqlx.** Application-table queries go through the `db::raw` helpers
 (`src/db/mod.rs`) against the shared pool — no ORM, no extra connections, the
@@ -217,7 +222,8 @@ Postgres-specific operators — `websearch_to_tsquery`/tsvector, pg_trgm
 casts). The SQLSTATE/HTTP mapping in `Error` redacts DB details; 23505
 unique-violations are domain duplicates (409), not DB faults (503).
 
-**Migrations.** Numbered `.sql` files in `migrations/` (001–014) are embedded
+**Migrations.** Numbered `.sql` files in `migrations/` (001–013; 005 is a
+void/retired number, never reused) are embedded
 with `include_str!` and applied by `src/db/migrate.rs` at **every** startup,
 in every subcommand mode: tracked in `schema_migrations` by filename + content
 hash, idempotent, and serialized by a session-level advisory lock so

@@ -60,7 +60,6 @@ argon2 = "0.5"
 # salt generation for argon2id (OsRng) — feature unifies with argon2's dep
 password-hash = { version = "0.5", features = ["getrandom"] }
 futures = "0.3"
-bytes = "1"
 
 url = "2"
 

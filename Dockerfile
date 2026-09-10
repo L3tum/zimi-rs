@@ -1,8 +1,12 @@
 # Multi-stage build for zimservice
 FROM rust:1.91-slim AS builder
 WORKDIR /build
+# Dependency-layer caching: fetch the manifest-only layer first so the
+# Cargo.lock-driven download layer stays valid across source-only changes.
+COPY Cargo.toml Cargo.lock .
+RUN cargo fetch
 COPY . .
-RUN cargo build --release
+RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \

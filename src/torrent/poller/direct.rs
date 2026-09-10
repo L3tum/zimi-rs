@@ -346,10 +346,12 @@ async fn stream_part(
         }
     };
 
-    let (mut file, mut received, total, resp) = match fs {
+    let (file, mut received, total, resp) = match fs {
         FileStream::Append(f, from, total, resp) => (f, from, total, resp),
         FileStream::Fresh(f, total, resp) => (f, 0u64, total, resp),
     };
+    // Batch the per-chunk writes into syscalls; flushed on completion below.
+    let mut file = tokio::io::BufWriter::new(file);
 
     let mut stream = resp.bytes_stream();
     let mut window_bytes: u64 = 0;

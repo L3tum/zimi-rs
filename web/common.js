@@ -3,7 +3,8 @@
 
 // ── HTML escape ──────────────────────────────────────────────────────────
 function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const map = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'};
+  return String(s ?? '').replace(/[&<>"']/g, c => map[c]);
 }
 
 // ── Auth token (password mode) ─────────────────────────────────────────────
@@ -29,6 +30,12 @@ async function apiFetch(url, opts) {
   const headers = { ...(opts?.headers || {}) };
   const token = _getToken();
   if (token) headers['Authorization'] = 'Bearer ' + token;
+  // Default the Content-Type for requests carrying a body: every caller sends
+  // a JSON body (JSON.stringify at each site), so centralizing the header here
+  // keeps the per-page calls free of the repeated literal.
+  if (merged.body && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json';
+  }
   merged.headers = headers;
   let r = await fetch(url, merged);
   if (r.status === 401 && !merged._retried) {
@@ -115,10 +122,13 @@ function snippetHtml(raw) {
 function zimControls(z, p) {
   return `
       <label class="toggle" title="${p.toggleTitle}">
-        <input type="checkbox" data-${p.embedAttr}="${esc(z.name)}" ${z.embed_enabled ? 'checked' : ''}>
+        <input type="checkbox"
+          data-${p.embedAttr}="${esc(z.name)}" ${z.embed_enabled ? 'checked' : ''}>
         <span class="slider"></span>
       </label>
       ${p.labelHtml || ''}
-      <input type="text" data-${p.catAttr}="${esc(z.name)}" value="${esc(z.category || '')}" placeholder="category (default)">
+      <input type="text"
+        data-${p.catAttr}="${esc(z.name)}" value="${esc(z.category || '')}"
+        placeholder="category (default)">
       <span class="${p.msgClass}" data-${p.msgAttr}="${esc(z.name)}">${p.msgText}</span>`;
 }
