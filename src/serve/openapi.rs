@@ -53,6 +53,7 @@ impl utoipa::Modify for AddSecuritySchemes {
     ),
     paths(
         crate::serve::handlers::health,
+        crate::serve::handlers::diagnostic,
         crate::serve::handlers::list_zims,
         crate::serve::handlers::search,
         crate::serve::handlers::suggest,
@@ -83,6 +84,7 @@ impl utoipa::Modify for AddSecuritySchemes {
         crate::serve::handlers::CreateCollectionBody,
         crate::serve::handlers::UpdateCollectionBody,
         crate::serve::handlers::AddDownloadBody,
+        crate::serve::handlers::DiagnosticResponse,
         crate::serve::handlers::HealthResponse,
         crate::serve::handlers::ListZimsResponse,
         crate::serve::handlers::SearchResponse,
@@ -128,7 +130,7 @@ mod tests {
     #[test]
     fn openapi_paths_match_route_table() {
         // Two-sided pinning, side 1 (ARCH-4): the utoipa `paths(...)` macro
-        // (21 handler refs collapsing to 16 unique path keys) must stay in
+        // (22 handler refs collapsing to 17 unique path keys) must stay in
         // sync with the axum route table in `serve::build_router`. The 5
         // routes intentionally absent from `paths(...)` are the 4 web-UI
         // pages + `/openapi.json` itself.
@@ -137,6 +139,7 @@ mod tests {
         let actual: BTreeSet<String> = doc.paths.paths.keys().cloned().collect();
         let expected: BTreeSet<String> = [
             "/health",
+            "/diagnostic",
             "/list",
             "/search",
             "/suggest",
@@ -167,6 +170,7 @@ mod tests {
         let doc = ApiDoc::openapi();
         for path in [
             "/health",
+            "/diagnostic",
             "/list",
             "/search",
             "/read",

@@ -699,9 +699,12 @@ fn value_type_name(v: &serde_json::Value) -> &'static str {
 }
 
 /// Apply the startup env snapshot to a settings map (non-empty wins).
-/// `embedding.dimension` is stored as a raw string in the snapshot and parsed
-/// here; unparseable values are ignored (same as the pre-snapshot code). Pure
-/// and DB-free so the override semantics are unit-testable.
+/// Snapshot values are parsed per the setting's `json_type` ([`def`]):
+/// `Bool`/`Int`/`Num` keys get a typed `Value` (so `get_typed` and the
+/// `json_type` check both see a well-formed value), unparseable values are
+/// ignored (same as the pre-snapshot code), and `Str` keys — or keys with no
+/// table row — stay raw strings. Pure and DB-free so the override semantics
+/// are unit-testable.
 pub(crate) fn apply_env_snapshot(
     map: &mut HashMap<String, serde_json::Value>,
     snapshot: &HashMap<String, String>,
@@ -710,13 +713,36 @@ pub(crate) fn apply_env_snapshot(
         if raw.is_empty() {
             continue;
         }
-        if key == KEY_EMBEDDING_DIMENSION {
-            if let Ok(n) = raw.parse::<i64>() {
-                map.insert(key.clone(), serde_json::json!(n));
-            }
-        } else {
-            map.insert(key.clone(), serde_json::json!(raw.clone()));
+        if let Some(value) = parse_snapshot_value(key, raw) {
+            map.insert(key.clone(), value);
         }
+    }
+}
+
+/// Parse one raw env-snapshot string into the `Value` the setting's
+/// `json_type` expects (`Str` → string; `Bool` → `true`/`false`, case-
+/// insensitive; `Int` → `i64`; `Num` → `f64`). `None` = unparseable or no
+/// table row → the caller leaves the previous value in place. Dispatching on
+/// the def (rather than a per-key special case) means a future
+/// `Bool`/`Int`/`Num` key added to the snapshot parses correctly without a
+/// second code change — the class of bug this replaced: `access.
+/// require_auth_for_reads` was stored as the string `"true"`, which
+/// `get_typed::<bool>` cannot deserialize, so read-gating silently fell back
+/// to its seed default in every non-loopback deployment.
+fn parse_snapshot_value(key: &str, raw: &str) -> Option<serde_json::Value> {
+    match def(key)?.json_type {
+        JsonType::Str => Some(serde_json::Value::String(raw.to_string())),
+        JsonType::Bool => {
+            if raw.eq_ignore_ascii_case("true") {
+                Some(serde_json::json!(true))
+            } else if raw.eq_ignore_ascii_case("false") {
+                Some(serde_json::json!(false))
+            } else {
+                None
+            }
+        }
+        JsonType::Int => raw.parse::<i64>().ok().map(|n| serde_json::json!(n)),
+        JsonType::Num => raw.parse::<f64>().ok().map(|n| serde_json::json!(n)),
     }
 }
 
@@ -828,5 +854,211 @@ mod tests {
         for key in seeds.keys() {
             assert!(keys.contains(key.as_str()), "un-tabled seed key {key:?}");
         }
+    }
+
+    /// FIELDS drift guard (Ponytail SIMPLIFY #2 / ARCH #2): the web UI's
+    /// `web/settings.js` FIELDS map and `SETTING_DEFS` must agree in both
+    /// directions — a FIELDS key missing from the table would render an
+    /// orphan row, and a table key missing from FIELDS would render without
+    /// label/description (and a `config_only` key would silently lose its
+    /// "restart" tag). Each entry's `restart: true` flag is pinned against
+    /// `policy.config_only` so the restart warning can't drift either.
+    #[test]
+    fn web_settings_fields_match_setting_defs() {
+        let js = include_str!("../../web/settings.js");
+        let body = js
+            .get(
+                js.find("const FIELDS = {").expect("FIELDS map")
+                    ..js.find("const CAT_ORDER").expect("CAT_ORDER"),
+            )
+            .expect("FIELDS body");
+
+        // A 2-space-indented, single-quoted line starts a FIELDS entry; the
+        // entry's text runs to the next such line.
+        let mut entries: Vec<(String, String)> = Vec::new();
+        let mut cur: Option<(String, Vec<&str>)> = None;
+        for line in body.lines() {
+            if line.starts_with("  '") {
+                if let Some((k, lns)) = cur.take() {
+                    entries.push((k, lns.join("\n")));
+                }
+                let key = line
+                    .trim_start()
+                    .split('\'')
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                cur = Some((key, vec![line]));
+            } else if let Some((_, lns)) = cur.as_mut() {
+                lns.push(line);
+            }
+        }
+        if let Some((k, lns)) = cur.take() {
+            entries.push((k, lns.join("\n")));
+        }
+        assert!(
+            !entries.is_empty(),
+            "no FIELDS entries parsed — guard is vacuous"
+        );
+
+        let known = known_keys();
+        let js_keys: std::collections::HashSet<&str> =
+            entries.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            js_keys.len(),
+            entries.len(),
+            "duplicate FIELDS entries: {js_keys:?}"
+        );
+
+        // JS → Rust: every FIELDS key is a known setting, and its `restart`
+        // flag matches the row's `config_only` policy.
+        for (key, text) in &entries {
+            let d = def(key).unwrap_or_else(|| panic!("FIELDS key {key:?} is not a known setting"));
+            let restart = text.contains("restart: true");
+            assert_eq!(
+                restart, d.policy.config_only,
+                "restart flag for {key:?} is {restart} but policy.config_only is {}",
+                d.policy.config_only
+            );
+        }
+
+        // Rust → JS: every known setting has a FIELDS entry (a new setting
+        // added to the table must be added to the UI at the same time).
+        for key in known.iter() {
+            assert!(
+                js_keys.contains(key),
+                "known setting {key:?} is missing from web/settings.js FIELDS"
+            );
+        }
+    }
+
+    #[test]
+    fn web_settings_categories_match_setting_defs() {
+        // CAT_ORDER + CAT_NAMES wiring guard (TESTS F2): the settings page
+        // renders one section per category, keyed by each setting's category
+        // (the prefix before the first `.`). A category missing from
+        // CAT_ORDER falls back to "unknown category last" and one missing
+        // from CAT_NAMES renders its raw key as the heading. Both directions
+        // pinned, so a new category added to the table must be added to the
+        // UI at the same time (the new `downloads` category is this case).
+        let js = include_str!("../../web/settings.js");
+
+        let mut known_cats = std::collections::BTreeSet::new();
+        for key in known_keys().iter() {
+            known_cats.insert(key.split('.').next().unwrap_or("general").to_string());
+        }
+
+        // CAT_ORDER: a single-line single-quoted JS array.
+        let order_line = js
+            .lines()
+            .find(|l| l.starts_with("const CAT_ORDER ="))
+            .expect("CAT_ORDER line");
+        let inner = order_line
+            .split_once("[")
+            .expect("CAT_ORDER array")
+            .1
+            .trim_end_matches("];")
+            .trim();
+        let order: Vec<String> = inner
+            .split(',')
+            .filter_map(|s| {
+                s.trim()
+                    .strip_prefix("'")
+                    .and_then(|s| s.split_once("'").map(|(a, _)| a))
+            })
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            !order.is_empty(),
+            "no CAT_ORDER entries parsed — guard is vacuous"
+        );
+        let order_set: std::collections::BTreeSet<&str> =
+            order.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            order_set.len(),
+            order.len(),
+            "duplicate CAT_ORDER entries: {order:?}"
+        );
+
+        // CAT_NAMES: a 2-space-indented `key: 'Name',` block.
+        let names_start = js.find("const CAT_NAMES = {").expect("CAT_NAMES map");
+        let names_close = js[names_start..].find("};").expect("CAT_NAMES close") + names_start;
+        let names_block = js.get(names_start..names_close).expect("CAT_NAMES body");
+        let mut names = std::collections::BTreeSet::new();
+        for line in names_block.lines() {
+            let line = line.trim();
+            if line.starts_with("const") {
+                continue;
+            }
+            if let Some(key) = line.split(':').next() {
+                let key = key.trim();
+                if !key.is_empty() {
+                    names.insert(key.to_string());
+                }
+            }
+        }
+
+        // Rust -> JS: every in-use category is ordered and named.
+        for cat in &known_cats {
+            assert!(
+                order_set.contains(cat.as_str()),
+                "in-use category {cat:?} is missing from web/settings.js CAT_ORDER"
+            );
+            assert!(
+                names.contains(cat),
+                "in-use category {cat:?} is missing from web/settings.js CAT_NAMES"
+            );
+        }
+
+        // JS -> Rust: no dead categories (order/name with no setting behind it).
+        for cat in &order_set {
+            assert!(
+                known_cats.contains(*cat),
+                "CAT_ORDER category {cat:?} has no matching setting key"
+            );
+        }
+        for cat in &names {
+            assert!(
+                order_set.contains(cat.as_str()),
+                "CAT_NAMES category {cat:?} is not in CAT_ORDER"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_snapshot_value_dispatches_on_json_type() {
+        // Str → raw string; Bool → real boolean (case-insensitive),
+        // unparseable → None; Int → i64; Num → f64; unknown key → None
+        // (the caller leaves the previous value in place).
+        assert_eq!(
+            parse_snapshot_value(KEY_ACCESS_MODE, "password"),
+            Some(serde_json::json!("password"))
+        );
+        assert_eq!(
+            parse_snapshot_value(KEY_ACCESS_REQUIRE_AUTH_FOR_READS, "true"),
+            Some(serde_json::json!(true))
+        );
+        assert_eq!(
+            parse_snapshot_value(KEY_ACCESS_REQUIRE_AUTH_FOR_READS, "FALSE"),
+            Some(serde_json::json!(false))
+        );
+        assert_eq!(
+            parse_snapshot_value(KEY_ACCESS_REQUIRE_AUTH_FOR_READS, "maybe"),
+            None
+        );
+        assert_eq!(
+            parse_snapshot_value(KEY_TORRENT_MAX_ACTIVE, "5"),
+            Some(serde_json::json!(5))
+        );
+        assert_eq!(parse_snapshot_value(KEY_TORRENT_MAX_ACTIVE, "5.5"), None);
+        assert_eq!(
+            parse_snapshot_value(KEY_SEARCH_FTS_WEIGHT, "0.6"),
+            Some(serde_json::json!(0.6))
+        );
+        assert_eq!(
+            parse_snapshot_value("not.a.real.key", "x"),
+            None,
+            "unknown key must not be force-parsed"
+        );
     }
 }

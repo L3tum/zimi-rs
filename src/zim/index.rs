@@ -1463,42 +1463,14 @@ mod tests {
     /// H3: `mark_index_error` must mark only the failed ZIM's row
     /// (`index_status` → `error`, `updated_at` bumped) and leave every other
     /// ZIM row untouched — one corrupt archive must not dirty the rest of the
-    /// library. DB-gated exactly like the poller's `test_pool`/startup smoke
-    /// tests: skips cleanly when the DB is unreachable unless
-    /// `ZIMSERVICE_REQUIRE_DB` is set (then a skip is a hard failure).
+    /// library. DB-gated via `crate::testing::test_pool` (counted skip,
+    /// `ZIMSERVICE_REQUIRE_DB` hard-fail).
     #[tokio::test]
     async fn db_mark_index_error_only_touches_that_zim_row() {
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
-        });
-        let config = crate::config::Config {
-            database_url: url.clone(),
-            db_pool_size: 4,
-            ..Default::default()
+        // DB gate (src/testing.rs): counted skip, strict-mode hard-fail.
+        let Some((pool, _db_gate)) = crate::testing::test_pool().await else {
+            return;
         };
-        let pool = match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            crate::db::pool::create_pool(&config),
-        )
-        .await
-        {
-            Ok(Ok(pool)) => pool,
-            Ok(Err(e)) => {
-                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
-                    panic!("ZIMSERVICE_REQUIRE_DB is set but cannot reach {url}: {e}");
-                }
-                eprintln!("skipping db_mark_index_error_only_touches_that_zim_row: cannot reach {url} ({e})");
-                return;
-            }
-            Err(_) => {
-                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
-                    panic!("ZIMSERVICE_REQUIRE_DB is set but timed out reaching {url}");
-                }
-                eprintln!("skipping db_mark_index_error_only_touches_that_zim_row: timed out reaching {url}");
-                return;
-            }
-        };
-        let _db_gate = crate::testing::DbExclusiveGuard::acquire();
         crate::db::migrate::run_migrations(&pool)
             .await
             .expect("migrations");

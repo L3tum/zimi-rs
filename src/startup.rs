@@ -1068,27 +1068,11 @@ mod tests {
         let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
         });
-        let mut conn = match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            crate::db::pool::connect_dedicated(&url),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
-                    panic!("ZIMSERVICE_REQUIRE_DB set but cannot reach {url}: {e}");
-                }
-                eprintln!("skipping liveness_monitor_fires_on_closed_connection: cannot reach {url} ({e})");
-                return;
-            }
-            Err(_) => {
-                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
-                    panic!("ZIMSERVICE_REQUIRE_DB set but timed out reaching {url}");
-                }
-                eprintln!("skipping liveness_monitor_fires_on_closed_connection: timed out reaching {url}");
-                return;
-            }
+        // DB gate (src/testing.rs): counted skip, strict-mode hard-fail.
+        let Some(mut conn) =
+            crate::testing::test_conn("liveness_monitor_fires_on_closed_connection").await
+        else {
+            return;
         };
         let _db_gate = crate::testing::DbExclusiveGuard::acquire();
         // sqlx's `Connection::close` consumes the handle, so sever the socket
@@ -1129,34 +1113,11 @@ mod tests {
         // positive on a healthy connection). We abandon the (still-pending)
         // detector — its probe loop simply never completes in this window —
         // which also drops the connection.
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
-        });
-        let conn = match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            crate::db::pool::connect_dedicated(&url),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
-                    panic!("ZIMSERVICE_REQUIRE_DB set but cannot reach {url}: {e}");
-                }
-                eprintln!(
-                    "skipping liveness_monitor_stays_quiet_while_alive: cannot reach {url} ({e})"
-                );
-                return;
-            }
-            Err(_) => {
-                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
-                    panic!("ZIMSERVICE_REQUIRE_DB set but timed out reaching {url}");
-                }
-                eprintln!(
-                    "skipping liveness_monitor_stays_quiet_while_alive: timed out reaching {url}"
-                );
-                return;
-            }
+        // DB gate (src/testing.rs): counted skip, strict-mode hard-fail.
+        let Some(conn) =
+            crate::testing::test_conn("liveness_monitor_stays_quiet_while_alive").await
+        else {
+            return;
         };
         let _db_gate = crate::testing::DbExclusiveGuard::acquire();
         let fired = Arc::new(AtomicBool::new(false));
@@ -1174,39 +1135,18 @@ mod tests {
 
     /// Hold the single-instance advisory lock on a dedicated connection, then
     /// assert `acquire_instance_guard` **refuses** (`Ok(None)`) instead of a
-    /// second `serve` silently starting against the same database. Mirrors the
-    /// lib's `test_pool` gating: skips cleanly when no DB is reachable unless
-    /// `ZIMSERVICE_REQUIRE_DB` is set. Runs in the lib's test context
-    /// (startup.rs is a lib module), so it builds its own dedicated
-    /// connection via `crate::db::pool::connect_dedicated` and serializes via
+    /// second `serve` silently starting against the same database. Gated via
+    /// `crate::testing::test_conn` (counted skip; hard-fails under
+    /// `ZIMSERVICE_REQUIRE_DB`) and serialized via
     /// `crate::testing::DbExclusiveGuard`.
     #[tokio::test]
     async fn smoke_single_instance_refusal() {
         let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
         });
-        // Open the dedicated "first instance" connection (gated skip).
-        let first = match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            crate::db::pool::connect_dedicated(&url),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
-                    panic!("ZIMSERVICE_REQUIRE_DB set but cannot reach {url}: {e}");
-                }
-                eprintln!("skipping smoke_single_instance_refusal: cannot reach {url} ({e})");
-                return;
-            }
-            Err(_) => {
-                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
-                    panic!("ZIMSERVICE_REQUIRE_DB set but timed out reaching {url}");
-                }
-                eprintln!("skipping smoke_single_instance_refusal: timed out reaching {url}");
-                return;
-            }
+        // DB gate (src/testing.rs): counted skip, strict-mode hard-fail.
+        let Some(first) = crate::testing::test_conn("smoke_single_instance_refusal").await else {
+            return;
         };
         // Serialize with other DB tests (cross-process lockfile).
         let _db_gate = crate::testing::DbExclusiveGuard::acquire();
@@ -1264,28 +1204,9 @@ mod tests {
         let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
         });
-        // Open the dedicated "server" connection (gated skip).
-        let server = match tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            crate::db::pool::connect_dedicated(&url),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
-                    panic!("ZIMSERVICE_REQUIRE_DB set but cannot reach {url}: {e}");
-                }
-                eprintln!("skipping smoke_mutating_guard_refusal: cannot reach {url} ({e})");
-                return;
-            }
-            Err(_) => {
-                if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
-                    panic!("ZIMSERVICE_REQUIRE_DB set but timed out reaching {url}");
-                }
-                eprintln!("skipping smoke_mutating_guard_refusal: timed out reaching {url}");
-                return;
-            }
+        // DB gate (src/testing.rs): counted skip, strict-mode hard-fail.
+        let Some(server) = crate::testing::test_conn("smoke_mutating_guard_refusal").await else {
+            return;
         };
         // Serialize with other DB tests (cross-process lockfile).
         let _db_gate = crate::testing::DbExclusiveGuard::acquire();

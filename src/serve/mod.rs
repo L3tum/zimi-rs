@@ -85,6 +85,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Health & info
         .route("/health", axum::routing::get(handlers::health))
+        .route("/diagnostic", axum::routing::get(handlers::diagnostic))
         .route("/list", axum::routing::get(handlers::list_zims))
         // Search
         .route("/search", axum::routing::get(handlers::search))

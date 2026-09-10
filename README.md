@@ -264,6 +264,30 @@ is reachable by any network peer. Open mode is rejected at startup on a
   admin) can read them in full. This is a documented, accepted trade-off —
   the settings table and its backups must be treated as sensitive in both
   access modes (see Access control).
+- **ZIM content is validated structurally, not by integrity or provenance**
+  (Security M-1/M-2) — a malicious swarm peer, torrent, or mirror can serve
+  a ZIM that is structurally valid and therefore accepted, indexed, and
+  served as if it were the real archive; there is no cryptographic signature
+  check and OPDS catalogs carry no hashes. Two independent trust boundaries
+  apply:
+  - **Source trust** — the download source (OPDS feed URL, torrent tracker,
+    user-supplied URL) is the trust boundary, exactly as with a browser
+    download. Prefer pinned, known-good sources (https OPDS endpoints, hash-
+    pinned torrents) over open tracker discovery.
+  - **Served-content containment** — a tampered or malicious article that
+    does get served is contained by the `/w` response headers: CSP
+    `script-src 'none'` + `nosniff` + `X-Frame-Options: DENY` (see Served
+    content), so it cannot run same-origin JavaScript or read the admin
+    token. Search results and article text, however, are returned as-is to
+    any caller that can read them.
+  - **Plaintext `http` downloads** — the SSRF guard validates *where* a
+    download goes, not *what comes back*: over plaintext http a
+    network-positioned attacker can substitute the bytes entirely. Prefer
+    https endpoints wherever the source offers them.
+  Mitigations (known-good OPDS endpoint, per-ZIM SHA-256 + size pinning,
+  https-only sources) are **advisory by design** — the server performs no
+  content-integrity verification itself. See Download SSRF protection and
+  ZIM content trust boundary for the operational checklist.
 
 ### MCP server authentication
 

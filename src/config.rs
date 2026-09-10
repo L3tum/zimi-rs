@@ -199,8 +199,9 @@ impl Config {
     ///
     /// Captured once at startup so a later `reload()` sees the same overrides
     /// the process started with, instead of re-reading the process env (which
-    /// can drift if the env is mutated). `EMBEDDING_DIM` stays a raw string —
-    /// it is parsed at the use site, same as before.
+    /// can drift if the env is mutated). Values stay raw strings; the typed
+    /// parse happens in `settings::apply_env_snapshot` per each key's
+    /// `json_type`.
     pub fn env_settings_snapshot(
         &self,
         get: &dyn Fn(&str) -> Option<String>,

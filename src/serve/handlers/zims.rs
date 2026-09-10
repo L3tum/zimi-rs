@@ -37,6 +37,20 @@ pub struct HealthResponse {
     pub degraded: Vec<String>,
 }
 
+/// `GET /diagnostic` response: operator-facing introspection that `/health`
+/// intentionally does not carry (it is an unauthenticated, rate-limit-exempt
+/// LB probe, so it must not disclose which settings rows are corrupt).
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct DiagnosticResponse {
+    /// Version of the running crate.
+    pub version: String,
+    /// Settings keys whose stored value does not match its expected JSON type
+    /// (ARCH Major #3): each silently runs on its default, and the operator
+    /// needs the signal. Empty (omitted) when every value deserializes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub settings_mismatches: Vec<String>,
+}
+
 /// `GET /list` response: all ZIM archives with metadata.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct ListZimsResponse {
@@ -90,6 +104,38 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
                 .collect(),
         }),
     )
+}
+
+/// `GET /diagnostic` — operator-facing settings diagnostics (ARCH Major #3,
+/// Security High #2): keys whose stored value fails its `json_type` check
+/// (each silently running on its default). Unlike `/health` it requires a
+/// valid admin token — it names internal config keys and must not be
+/// readable by any network peer. In open mode nobody can authenticate, so it
+/// always 401s there (loopback operators read the startup warn instead).
+#[utoipa::path(
+    get,
+    path = "/diagnostic",
+    responses(
+        (status = 200, description = "Diagnostics", body = DiagnosticResponse),
+        (status = 401, description = "Missing or invalid admin token")
+    )
+)]
+pub async fn diagnostic(
+    State(state): State<AppState>,
+    auth: crate::serve::middleware::AuthContext,
+) -> Result<Json<DiagnosticResponse>, (StatusCode, Json<serde_json::Value>)> {
+    if !auth.authenticated {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "authentication required — present the admin token"
+            })),
+        ));
+    }
+    Ok(Json(DiagnosticResponse {
+        version: env!("CARGO_PKG_VERSION").into(),
+        settings_mismatches: state.settings.type_mismatches(),
+    }))
 }
 
 // ─── ZIM List ─────────────────────────────────────────────────────────────────

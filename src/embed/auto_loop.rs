@@ -397,11 +397,9 @@ mod tests {
     }
 
     fn skip_loop_test(test: &str, url: &str, why: &str) -> Option<Pool> {
-        if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
-            panic!("{test}: ZIMSERVICE_REQUIRE_DB is set but cannot reach {url}: {why}");
-        }
-        eprintln!("skipping {test}: cannot reach {url} ({why})");
-        None
+        // The lib's single skip/panic authority: counts LIB_SKIPPED for the
+        // #[dtor] exit summary and hard-fails under ZIMSERVICE_REQUIRE_DB.
+        crate::testing::gate_skip(test, url, why)
     }
 
     /// Current `articles.embedding` column dimension (pgvector stores it as

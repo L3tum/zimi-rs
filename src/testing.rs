@@ -97,9 +97,29 @@ pub fn dead_pool() -> crate::db::Pool {
 #[cfg(test)]
 pub static LIB_SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The DB-gate skip/panic decision, shared by [`test_pool`], [`test_conn`],
+/// and any DB-gated test with custom pool options (e.g. `embed::auto_loop`):
+/// `ZIMSERVICE_REQUIRE_DB` set → a hard failure; unset → counted in
+/// [`LIB_SKIPPED`] (the `#[dtor]` exit summary reads it) + a skip notice.
+/// Every DB-connection skip in the lib suite goes through here so the exit
+/// summary never under-reports on a DB-less machine (env-condition skips,
+/// e.g. the IVFFlat-ceiling and multi-instance opt-outs, are counted
+/// separately). Generic in the return type so each caller's `Option<T>` arm
+/// can delegate to it directly.
+#[cfg(test)]
+pub fn gate_skip<T>(test: &str, url: &str, why: &str) -> Option<T> {
+    if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
+        panic!("{test}: ZIMSERVICE_REQUIRE_DB is set but cannot reach {url}: {why}");
+    }
+    LIB_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("skipping {test}: cannot reach {url} ({why})");
+    None
+}
+
 /// DB-gated helper (mirrors `tests/integration.rs::pool_or_skip`): build a
-/// live pool from `DATABASE_URL` (default: the compose URL), or `None`
-/// when `ZIMSERVICE_REQUIRE_DB` is unset so `cargo test --lib` stays green
+/// live pool from `DATABASE_URL` (default: the compose URL), or `None` when
+/// unreachable — the [`gate_skip`] decision: a counted skip, or a hard
+/// failure under `ZIMSERVICE_REQUIRE_DB` — so `cargo test --lib` stays green
 /// on a DB-less machine. Migrations are applied by the caller. Lives here
 /// (rather than in `torrent::poller`) so DB-gated tests outside the torrent
 /// layer (e.g. `db::downloads`) can share it without depending on it (A-1).
@@ -119,19 +139,37 @@ pub async fn test_pool() -> Option<(crate::db::Pool, DbExclusiveGuard)> {
     .await
     {
         Ok(Ok(pool)) => Some((pool, DbExclusiveGuard::acquire())),
-        Ok(Err(e)) => test_pool_skip(&url, &e.to_string()),
-        Err(_) => test_pool_skip(&url, "timed out connecting"),
+        Ok(Err(e)) => gate_skip("test_pool", &url, &e.to_string()),
+        Err(_) => gate_skip("test_pool", &url, "timed out connecting"),
     }
 }
 
+/// DB-gate for tests that need a **dedicated** connection (not a pool) —
+/// the `test_pool` counterpart for the advisory-lock smoke tests, which hold
+/// a single session-bound connection. Same gating: `DATABASE_URL` (or the
+/// compose default) + 3 s connect timeout + [`gate_skip`] on failure, so a
+/// skip is counted in [`LIB_SKIPPED`] and is a hard failure under
+/// `ZIMSERVICE_REQUIRE_DB`. `test` is the caller's name (skip notice +
+/// strict-mode panic). The caller still serializes with [`DbExclusiveGuard`]
+/// for the test body (the connection itself is only used while the guard is
+/// held). Callers that need pool options `test_pool`/`create_pool` don't
+/// provide (e.g. the auto_loop tests' 24 h acquire timeout under a paused
+/// clock) keep their own connect but must route their skip through
+/// [`gate_skip`].
 #[cfg(test)]
-fn test_pool_skip(url: &str, why: &str) -> Option<(crate::db::Pool, DbExclusiveGuard)> {
-    if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
-        panic!("ZIMSERVICE_REQUIRE_DB is set but cannot reach {url}: {why}");
+pub async fn test_conn(test: &str) -> Option<sqlx::postgres::PgConnection> {
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into());
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        crate::db::pool::connect_dedicated(&url),
+    )
+    .await
+    {
+        Ok(Ok(conn)) => Some(conn),
+        Ok(Err(e)) => gate_skip(test, &url, &e.to_string()),
+        Err(_) => gate_skip(test, &url, "timed out connecting"),
     }
-    LIB_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    eprintln!("skipping test: cannot reach {url} ({why})");
-    None
 }
 
 /// Core test-state factory: the single place an `AppState` is built for

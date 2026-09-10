@@ -16,6 +16,26 @@ const FIELDS = {
     options: ['trace', 'debug', 'info', 'warn', 'error'],
     restart: true,
   },
+  'general.cors_origins': {
+    label: 'CORS origins',
+    desc: 'Comma-separated allowed origins (applied at startup)',
+    restart: true,
+  },
+  'general.trusted_proxy_cidrs': {
+    label: 'Trusted proxy CIDRs',
+    desc: 'Comma-separated reverse-proxy source CIDRs (applied at startup)',
+    restart: true,
+  },
+
+  'downloads.max_bytes': {
+    label: 'Max download size',
+    desc: 'Largest .zim accepted by direct downloads (bytes)',
+    type: 'int',
+  },
+  'downloads.allow_private_networks': {
+    label: 'Allow private networks',
+    desc: 'Permit direct downloads from private/LAN addresses (SSRF opt-in)',
+  },
 
   'search.fts_weight': {
     label: 'Full-text weight',
@@ -76,6 +96,10 @@ const FIELDS = {
     label: 'OPDS catalog URL',
     desc: 'Kiwix catalog polled for new ZIM versions',
   },
+  'torrent.allow_private_networks': {
+    label: 'Allow LAN qBittorrent',
+    desc: 'Permit the qB endpoint on private/LAN addresses (SSRF opt-in)',
+  },
   'torrent.auto_update': {
     label: 'Auto-update ZIMs',
     desc: 'Queue newer catalog versions as downloads automatically',
@@ -111,6 +135,16 @@ const FIELDS = {
     desc: 'Use IVFFlat index above this (less RAM)',
     type: 'int',
   },
+  'embedding.max_concurrency': {
+    label: 'Max concurrent embeds',
+    desc: 'Parallel embedding HTTP calls per batch',
+    type: 'int',
+  },
+  'embedding.timeout_secs': {
+    label: 'Embed timeout (secs)',
+    desc: 'Per-request timeout for the embedding HTTP call',
+    type: 'int',
+  },
 
   'access.mode': {
     label: 'Access mode',
@@ -134,11 +168,16 @@ const FIELDS = {
     desc: 'Max burst of requests before throttling to the rate above',
     type: 'int',
   },
+  'access.require_auth_for_reads': {
+    label: 'Require auth for reads',
+    desc: 'Gate GET/HEAD/OPTIONS (incl. /w/ raw content) behind the token',
+  },
 };
-const CAT_ORDER = ['general', 'search', 'torrent', 'embedding', 'access'];
+const CAT_ORDER = ['general', 'search', 'downloads', 'torrent', 'embedding', 'access'];
 const CAT_NAMES = {
   general: 'General',
   search: 'Search',
+  downloads: 'Downloads',
   torrent: 'Torrent (qBittorrent)',
   embedding: 'Embedding',
   access: 'Access',

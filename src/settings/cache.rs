@@ -97,6 +97,13 @@ pub(crate) struct SettingsInner {
     /// (not `std::sync::Mutex`) because the guard is held across `.await` in
     /// `update()` (the transaction + cache-update block).
     pub(crate) write_guard: tokio::sync::Mutex<()>,
+    /// Observability (ARCH Major #3): keys whose stored value failed its
+    /// `json_type` check at the last `reload()` (key → human-readable reason).
+    /// A value that doesn't deserialize to its expected type silently runs on
+    /// its (fail-closed) default; without this record the operator gets no
+    /// signal that a stored setting is being ignored. Read by
+    /// [`SettingsCache::type_mismatches`] and surfaced by the authenticated `/diagnostic` route.
+    type_mismatches: RwLock<std::collections::BTreeMap<String, String>>,
     /// M1: whether this process started with the multi-instance opt-out
     /// (`ZIMSERVICE_ALLOW_MULTI_INSTANCE=1`), captured at construction time —
     /// it is a process startup decision, same philosophy as `env_snapshot`
@@ -150,6 +157,30 @@ fn check_zim_update_affected(affected: &[u64], zim_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Collect the keys whose value fails its `json_type` check — the same check
+/// `update()` runs at write time, applied to *stored* contents (a corrupted
+/// row, a bad direct SQL edit, or a migration that wrote the wrong shape). A
+/// failed key silently runs on its (fail-closed) default; this is what makes
+/// that visible (ARCH Major #3). Pure + DB-free, so unit-testable. Ordered by
+/// key so the warn log and the `/diagnostic` report are deterministic.
+fn snapshot_type_mismatches(
+    map: &HashMap<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, String> {
+    map.iter()
+        .filter_map(|(key, value)| type_mismatch(key, value).map(|reason| (key.clone(), reason)))
+        .collect()
+}
+
+/// Log one warn per type-mismatched key (the warn pass `reload()` runs).
+/// Extracted so the format is asserted against the *code path* — `reload()`
+/// and the test both call this — instead of the test verbatim-copying the
+/// log string (which a `reload()` regression could silently diverge from).
+fn warn_type_mismatches(mismatches: &std::collections::BTreeMap<String, String>) {
+    for (key, reason) in mismatches {
+        tracing::warn!("settings value ignored, running on the default: {reason} ({key})");
+    }
+}
+
 impl SettingsCache {
     /// Load all settings from Postgres, seeding defaults for missing keys.
     ///
@@ -169,6 +200,7 @@ impl SettingsCache {
             token_cache: RwLock::new(VerifiedTokenCache::default()),
             generation: std::sync::atomic::AtomicU64::new(0),
             write_guard: tokio::sync::Mutex::new(()),
+            type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
             // M1: the opt-out is a process startup decision — capture it now.
             multi_instance: crate::startup::multi_instance_allowed(),
         });
@@ -197,6 +229,7 @@ impl SettingsCache {
                 token_cache: RwLock::new(VerifiedTokenCache::default()),
                 generation: std::sync::atomic::AtomicU64::new(0),
                 write_guard: tokio::sync::Mutex::new(()),
+                type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
                 // M1: same capture as `load` — the field is the process
                 // startup decision (see the struct doc).
                 multi_instance: crate::startup::multi_instance_allowed(),
@@ -263,9 +296,17 @@ impl SettingsCache {
         // Environment overrides: re-apply the startup env snapshot (non-empty
         // wins). The snapshot is captured once at load time via
         // config::env_settings_snapshot, so a mid-process env mutation cannot
-        // change reload behavior. `embedding.dimension` is parsed here — it is
-        // stored as a raw string in the snapshot.
+        // change reload behavior. Snapshot values are parsed per each key's
+        // `json_type` (raw strings in the snapshot).
         apply_env_snapshot(&mut map, &self.inner.env_snapshot);
+
+        // Observability (ARCH Major #3): a stored value that fails its
+        // `json_type` check silently runs on its default — warn once per
+        // reload and record the keys so the authenticated `/diagnostic` route
+        // can surface them.
+        let mismatches = snapshot_type_mismatches(&map);
+        warn_type_mismatches(&mismatches);
+        self.set_type_mismatches(mismatches);
 
         *self
             .inner
@@ -341,6 +382,50 @@ impl SettingsCache {
     /// Get a setting as a specific type.
     pub fn get_typed<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
         self.get(key).and_then(|v| serde_json::from_value(v).ok())
+    }
+
+    /// Keys whose stored value does not match its expected JSON type, each as
+    /// `"key: reason"`. These settings silently run on their defaults —
+    /// surfaced by the authenticated `/diagnostic` route as `settings_mismatches` so a corrupted settings
+    /// row is not invisible. The record is seeded at each `reload()` (startup)
+    /// and pruned per-key as a successful [`Self::update`] re-validates a row,
+    /// so it tracks the current cache, not a frozen startup view. Empty when
+    /// every value deserializes.
+    pub fn type_mismatches(&self) -> Vec<String> {
+        let g = self
+            .inner
+            .type_mismatches
+            .read()
+            .expect("settings type-mismatch lock poisoned");
+        g.iter()
+            .map(|(key, reason)| format!("{key}: {reason}"))
+            .collect()
+    }
+
+    /// Set the recorded type mismatches (used by `reload()` and tests).
+    pub(crate) fn set_type_mismatches(
+        &self,
+        mismatches: std::collections::BTreeMap<String, String>,
+    ) {
+        *self
+            .inner
+            .type_mismatches
+            .write()
+            .expect("settings type-mismatch lock poisoned") = mismatches;
+    }
+
+    /// Drop the mismatch record for each key (a successful [`Self::update`]
+    /// re-validates the row, so a stale startup flag must not survive the
+    /// fix until a restart). No-op for keys with no record.
+    pub(crate) fn clear_type_mismatches(&self, keys: &[&str]) {
+        let mut mm = self
+            .inner
+            .type_mismatches
+            .write()
+            .expect("settings type-mismatch lock poisoned");
+        for key in keys {
+            mm.remove(*key);
+        }
     }
 
     /// Fast path shared by [`Self::token_verify_cached`] and
@@ -652,6 +737,13 @@ impl SettingsCache {
                 cache.insert(key.clone(), value.clone());
             }
             drop(cache);
+            // A successful write made each touched key type-valid (it passed
+            // `type_mismatch` above), so drop any stale mismatch record: the
+            // record is otherwise a startup `reload()` snapshot, and a row the
+            // operator just fixed must not keep flagging in `/diagnostic` until a
+            // restart.
+            let keys: Vec<&str> = to_update.iter().map(|(k, _)| k.as_str()).collect();
+            self.clear_type_mismatches(&keys);
             // Defense in depth: `access.admin_password` is API-immutable, so a
             // settings write can't change the password — but if it ever could,
             // cached token verifies must not outlive it.
@@ -874,6 +966,7 @@ mod tests {
                 token_cache: RwLock::new(VerifiedTokenCache::default()),
                 generation: std::sync::atomic::AtomicU64::new(0),
                 write_guard: tokio::sync::Mutex::new(()),
+                type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
                 multi_instance: false,
             }),
         }
@@ -971,6 +1064,64 @@ mod tests {
         assert_eq!(
             dim.get(KEY_EMBEDDING_DIMENSION),
             Some(&serde_json::json!(1024))
+        );
+
+        // Bool-typed keys parse to a real boolean (the fail-open regression:
+        // the raw string "true" used to be stored, which
+        // `get_typed::<bool>` cannot deserialize → seed default `false`).
+        let mut bmap = default_settings();
+        let mut bsnap = HashMap::new();
+        bsnap.insert(KEY_ACCESS_REQUIRE_AUTH_FOR_READS.into(), "true".to_string());
+        apply_env_snapshot(&mut bmap, &bsnap);
+        assert_eq!(
+            bmap.get(KEY_ACCESS_REQUIRE_AUTH_FOR_READS),
+            Some(&serde_json::json!(true)),
+            "bool snapshot value must land as Value::Bool, not Value::String"
+        );
+        // Unparseable bool values are dropped (previous value stands).
+        let mut bsnap2 = HashMap::new();
+        bsnap2.insert(
+            KEY_ACCESS_REQUIRE_AUTH_FOR_READS.into(),
+            "maybe".to_string(),
+        );
+        apply_env_snapshot(&mut bmap, &bsnap2);
+        assert_eq!(
+            bmap.get(KEY_ACCESS_REQUIRE_AUTH_FOR_READS),
+            Some(&serde_json::json!(true)),
+            "unparseable bool must not clobber a good value"
+        );
+    }
+
+    #[test]
+    fn m1_snapshot_path_gates_reads_on_non_loopback() {
+        // Fail-open regression (BUGS #1): the default non-loopback
+        // deployment's read-gating rides the M-1 snapshot path —
+        // `apply_require_reads_default` injects the *raw string* "true",
+        // then `reload()`'s `apply_env_snapshot` must parse it to a real
+        // boolean so `require_auth_for_reads()` (a `get_typed::<bool>`)
+        // sees the gated default. Pre-fix, the map held
+        // `Value::String("true")`, deserialization failed, and reads fell
+        // back to the seed default `false` (open) on every network-facing
+        // bind — and an explicit `REQUIRE_AUTH_FOR_READS=true` was a no-op
+        // too.
+        let cfg = crate::config::Config {
+            host: "0.0.0.0".into(),
+            ..Default::default()
+        };
+        let mut snap = HashMap::new();
+        cfg.apply_require_reads_default(&mut snap);
+        assert_eq!(
+            snap.get(KEY_ACCESS_REQUIRE_AUTH_FOR_READS),
+            Some(&"true".to_string()),
+            "M-1 injects the raw string on non-loopback binds"
+        );
+
+        let mut map = default_settings();
+        apply_env_snapshot(&mut map, &snap);
+        let cache = SettingsCache::new_with_map(crate::testing::dead_pool(), map, HashMap::new());
+        assert!(
+            cache.require_auth_for_reads(),
+            "non-loopback bind must gate reads by default (M-1)"
         );
     }
 
@@ -1981,6 +2132,7 @@ mod tests {
                     token_cache: RwLock::new(VerifiedTokenCache::default()),
                     generation: std::sync::atomic::AtomicU64::new(0),
                     write_guard: tokio::sync::Mutex::new(()),
+                    type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
                     multi_instance: true,
                 }),
             };
@@ -2004,5 +2156,106 @@ mod tests {
             text.trim().is_empty(),
             "single-instance mode must stay silent — got: {text:?}"
         );
+    }
+
+    // ── type-mismatch observability (ARCH Major #3) ──────────────────────
+
+    #[test]
+    fn snapshot_type_mismatches_flags_corrupt_values_only() {
+        // Seed defaults all pass their `json_type` check.
+        let mut map = default_settings();
+        assert!(
+            snapshot_type_mismatches(&map).is_empty(),
+            "seed defaults must all pass their json_type check"
+        );
+        // A bool-typed row storing a string (e.g. a direct SQL edit) →
+        // flagged, with the key named and the expected type in the reason.
+        map.insert(
+            KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS.into(),
+            serde_json::json!("yes"),
+        );
+        let bad = snapshot_type_mismatches(&map);
+        assert_eq!(
+            bad.len(),
+            1,
+            "exactly the corrupted key must be flagged: {bad:?}"
+        );
+        let reason = &bad[KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS];
+        assert!(
+            reason.contains("boolean"),
+            "reason must name the expected type: {reason}"
+        );
+    }
+
+    #[test]
+    fn type_mismatches_accessor_surfaces_and_clears() {
+        let cache = cache_with_locks(default_settings(), HashMap::new());
+        assert!(cache.type_mismatches().is_empty());
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            KEY_ACCESS_REQUIRE_AUTH_FOR_READS.to_string(),
+            "expected a boolean, got a string".to_string(),
+        );
+        cache.set_type_mismatches(m);
+        assert_eq!(
+            cache.type_mismatches(),
+            vec![format!(
+                "{KEY_ACCESS_REQUIRE_AUTH_FOR_READS}: expected a boolean, got a string"
+            )]
+        );
+        cache.set_type_mismatches(std::collections::BTreeMap::new());
+        assert!(
+            cache.type_mismatches().is_empty(),
+            "a clean reload must clear the record"
+        );
+    }
+
+    #[test]
+    fn clear_type_mismatches_drops_only_touched_keys() {
+        // The `update()` stale-positive fix: a row the operator just
+        // re-validated must stop flagging, while an untouched corrupt row
+        // keeps its record.
+        let cache = cache_with_locks(default_settings(), HashMap::new());
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            KEY_TORRENT_MAX_ACTIVE.to_string(),
+            "expected an integer, got a string".to_string(),
+        );
+        m.insert(
+            KEY_ACCESS_REQUIRE_AUTH_FOR_READS.to_string(),
+            "expected a boolean, got a string".to_string(),
+        );
+        cache.set_type_mismatches(m);
+        assert_eq!(cache.type_mismatches().len(), 2);
+        cache.clear_type_mismatches(&[KEY_TORRENT_MAX_ACTIVE]);
+        assert_eq!(
+            cache.type_mismatches(),
+            vec![format!(
+                "{KEY_ACCESS_REQUIRE_AUTH_FOR_READS}: expected a boolean, got a string"
+            )],
+            "only the re-validated key is dropped"
+        );
+        // Clearing a key with no record is a no-op.
+        cache.clear_type_mismatches(&[KEY_TORRENT_MAX_ACTIVE]);
+        assert_eq!(cache.type_mismatches().len(), 1);
+    }
+
+    #[test]
+    fn mismatch_warn_names_key_and_expected_type() {
+        // Exercises the *real* warn code path (`warn_type_mismatches`, the
+        // same function `reload()` calls), so a `reload()` regression that
+        // drops or alters the warn fails here instead of silently diverging
+        // from a verbatim log string.
+        let mut map = default_settings();
+        map.insert(KEY_TORRENT_MAX_ACTIVE.into(), serde_json::json!("three"));
+        let mismatches = snapshot_type_mismatches(&map);
+        let text = capture_warnings(|| {
+            warn_type_mismatches(&mismatches);
+        });
+        assert!(
+            text.contains(KEY_TORRENT_MAX_ACTIVE),
+            "warn must name the key: {text:?}"
+        );
+        assert!(text.contains("settings value ignored"), "got: {text:?}");
     }
 }

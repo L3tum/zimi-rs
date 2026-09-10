@@ -13,8 +13,9 @@ mod tests {
     use crate::serve::build_router;
     use crate::settings::{
         KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_MODE, KEY_ACCESS_RATE_LIMIT_BURST,
-        KEY_ACCESS_RATE_LIMIT_RPS, KEY_ACCESS_REQUIRE_AUTH_FOR_READS, KEY_EMBEDDING_ENDPOINT,
-        KEY_SEARCH_MAX_LIMIT, KEY_TORRENT_URL,
+        KEY_ACCESS_RATE_LIMIT_RPS, KEY_ACCESS_REQUIRE_AUTH_FOR_READS,
+        KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS, KEY_EMBEDDING_ENDPOINT, KEY_SEARCH_MAX_LIMIT,
+        KEY_TORRENT_URL,
     };
     use crate::AppState;
 
@@ -73,6 +74,112 @@ mod tests {
             v["multi_instance"],
             crate::startup::multi_instance_allowed(),
             "the /health flag must mirror the process-level opt-out"
+        );
+    }
+
+    /// Security High #2: `/health` is the unauthenticated, rate-limit-exempt
+    /// LB probe, so it must never disclose *which* settings rows are corrupt
+    /// (that names internal config keys) — the detail lives on the
+    /// authenticated `/diagnostic` route.
+    #[tokio::test]
+    async fn health_never_exposes_settings_mismatches() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        // Corrupt a row: /health must not gain a `settings_mismatches` field.
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS.to_string(),
+            "expected a boolean, got a string".to_string(),
+        );
+        state.settings.set_type_mismatches(m);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert!(
+            v.get("settings_mismatches").is_none(),
+            "the open /health probe must not name corrupt settings rows: {v:?}"
+        );
+    }
+
+    /// ARCH Major #3 / Security High #2: `/diagnostic` reports the keys whose
+    /// stored value fails its `json_type` check, but only to a valid admin
+    /// token — unauthenticated callers get 401 with no diagnostic content.
+    #[tokio::test]
+    async fn diagnostic_requires_auth_and_reports_mismatches() {
+        let state = password_state(false);
+        let app = build_router(state.clone());
+
+        // Unauthenticated: 401, and the body must not leak the diagnostic.
+        let resp = app
+            .clone()
+            .oneshot(get_with_token("/diagnostic", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let text = body_text(resp).await;
+        assert!(
+            !text.contains(KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS),
+            "the 401 body must not name the corrupt key: {text:?}"
+        );
+
+        // Corrupt a row: still hidden without a token…
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS.to_string(),
+            "expected a boolean, got a string".to_string(),
+        );
+        state.settings.set_type_mismatches(m);
+        let resp = app
+            .clone()
+            .oneshot(get_with_token("/diagnostic", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let text = body_text(resp).await;
+        assert!(
+            !text.contains(KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS),
+            "the 401 body must not name the corrupt key: {text:?}"
+        );
+
+        // …but named for a valid admin token.
+        let resp = app
+            .oneshot(get_with_token("/diagnostic", Some("pw")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(
+            v["settings_mismatches"],
+            serde_json::json!([format!(
+                "{KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS}: expected a boolean, got a string"
+            )])
+        );
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    /// A clean state omits `settings_mismatches` on the authenticated
+    /// `/diagnostic` (the field is skipped when nothing is corrupt).
+    #[tokio::test]
+    async fn diagnostic_omits_mismatches_when_clean() {
+        let app = build_router(password_state(false));
+        let resp = app
+            .oneshot(get_with_token("/diagnostic", Some("pw")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert!(
+            v.get("settings_mismatches").is_none(),
+            "a clean state must omit the field: {v:?}"
         );
     }
 
