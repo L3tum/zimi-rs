@@ -8,7 +8,7 @@
 //! trigger): regrouping the fields into sub-states (e.g. `core` / `downloads`
 //! / `settings`) was evaluated and rejected — the 11 fields belong to 8
 //! distinct top-level modules (`db`, `settings`, `zim`, `search`, `torrent`,
-//! `serve` ×2, `health` ×2, plus the two `embed` build-state fields
+//! `health` ×2, `access` ×2, plus the two `embed` build-state fields
 //! `build_probe` / `index_building`) and every handler group would still
 //! span more than one sub-state, so sub-states would add indirection without
 //! narrowing any handler's surface. Per-handler extractor narrowing stays
@@ -21,16 +21,18 @@
 //! wait for a size threshold. Checklist: (1) update the field counts stated
 //! in this doc (there are 11 today; re-evaluated when `index_building`
 //! (M-A) was added — same conclusion: no regrouping, it sits next to the
-//! existing `build_probe` embed build-state field), (2) re-decide whether the fields should
+//! existing `build_probe` embed build-state field; re-evaluated at the M-B
+//! `serve` → `access` move of `rate_limiter` / `auth_lockout` — same
+//! conclusion, the tally above is updated but the module count is unchanged), (2) re-decide whether the fields should
 //! be regrouped into sub-states or narrowed via per-handler extractors, (3)
 //! update the handler count above. A handler that ever needs ≥4 fields is a
 //! sign it is doing two jobs — split it.
 use std::sync::Arc;
 
 use crate::{
-    db,
+    access, db,
     health::{DegradationTracker, HealthProbes},
-    search, serve, settings, torrent, zim,
+    search, settings, torrent, zim,
 };
 
 /// Shared application state, passed to all axum handlers.
@@ -49,12 +51,12 @@ pub struct AppState {
     /// client or `None`.
     pub torrent: torrent::QbitClientCache,
     /// Global HTTP rate limiter (live-reloads from settings)
-    pub rate_limiter: Arc<serve::ratelimit::RateLimiterHandle>,
+    pub rate_limiter: Arc<access::ratelimit::RateLimiterHandle>,
     /// Memoized liveness probes for `/health`
     pub probes: HealthProbes,
     /// Per-source-IP auth-failure lockout (SEC-M1). Per-process auth state,
     /// not config data.
-    pub auth_lockout: Arc<serve::middleware::LockoutTracker>,
+    pub auth_lockout: Arc<access::lockout::LockoutTracker>,
     /// Per-branch degradation tracker: surfaces which search capabilities
     /// are silently failing (WI-5).
     pub degradation: DegradationTracker,

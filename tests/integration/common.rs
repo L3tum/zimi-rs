@@ -6,10 +6,10 @@ pub use std::collections::HashMap;
 pub use std::sync::Arc;
 pub use std::time::{Duration, Instant};
 
+pub use zimservice::access::ratelimit::RateLimiterHandle;
 pub use zimservice::db::migrate::run_migrations;
 pub use zimservice::db::pool::Pool;
 pub use zimservice::search::{SearchEngine, SearchParams};
-pub use zimservice::serve::ratelimit::RateLimiterHandle;
 pub use zimservice::settings::SettingsCache;
 pub use zimservice::zim::ZimManager;
 pub use zimservice::{AppState, HealthProbes};

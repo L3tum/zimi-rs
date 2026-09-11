@@ -17,10 +17,10 @@ use std::sync::Arc;
 
 use sqlx::postgres::PgConnection;
 
+use crate::access;
 use crate::config::Config;
 use crate::db;
 use crate::search::SearchEngine;
-use crate::serve;
 use crate::settings::{
     SettingsCache, KEY_ACCESS_ADMIN_PASSWORD, KEY_TORRENT_ALLOW_PRIVATE_NETWORKS, KEY_TORRENT_URL,
 };
@@ -307,7 +307,7 @@ pub async fn build_state(
         zims,
         search,
         torrent,
-        rate_limiter: Arc::new(serve::ratelimit::RateLimiterHandle::new()),
+        rate_limiter: Arc::new(access::ratelimit::RateLimiterHandle::new()),
         probes: crate::HealthProbes::default(),
         auth_lockout: Arc::new(Default::default()),
         degradation,
@@ -871,7 +871,7 @@ pub fn serve_policy_checks(
     require_auth_for_reads: bool,
     trusted_proxy_cidrs: &str,
 ) -> Result<Vec<StartupWarning>, String> {
-    use crate::serve::middleware;
+    use crate::access::cidr;
     use crate::settings;
 
     let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "::1");
@@ -921,7 +921,7 @@ pub fn serve_policy_checks(
     }
 
     // 4. /0 CIDR: refuse.
-    if middleware::has_zero_prefix_cidr(trusted_proxy_cidrs) {
+    if cidr::has_zero_prefix_cidr(trusted_proxy_cidrs) {
         return Err(
             "general.trusted_proxy_cidrs contains a /0 CIDR (prefix length 0, e.g. 0.0.0.0/0 or ::/0): \
              a /0 entry matches every address, so it would trust every X-Forwarded-For value \
@@ -931,7 +931,7 @@ pub fn serve_policy_checks(
     }
 
     // 5. Over-broad CIDR: warn.
-    if middleware::has_over_broad_cidr(trusted_proxy_cidrs) {
+    if cidr::has_over_broad_cidr(trusted_proxy_cidrs) {
         warnings.push(StartupWarning {
             message: "general.trusted_proxy_cidrs contains an over-broad CIDR (≥ /8 IPv4 or ≥ /56 IPv6): \
              this allows X-Forwarded-For lockout bypass. Restrict to your actual proxy IPs."

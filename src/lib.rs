@@ -15,6 +15,9 @@
 //! internal until a `1.0` is cut, when the stability guarantees will be
 //! documented explicitly.
 
+/// Access-control policy objects shared across layers (rate limiter, per-IP
+/// auth-failure lockout, trusted-proxy CIDR / `X-Forwarded-For` resolution).
+pub mod access;
 /// Process configuration: environment overrides + validation.
 pub mod config;
 /// Shared content service: article text reading, ZIM entry reads, and text chunking.

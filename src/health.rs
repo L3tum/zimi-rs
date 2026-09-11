@@ -24,7 +24,7 @@ struct ProbeState {
 /// Real Postgres liveness probe (`SELECT 1`). Deliberately **not**
 /// memoized (PONY-N3): the qbit probe stays 2 s TTL because
 /// `app/version` is a network round-trip; `SELECT 1` is the cheapest
-/// possible probe and `/health` is rate-limit-exempt (ratelimit.rs:190).
+/// possible probe and `/health` is rate-limit-exempt (access/ratelimit.rs).
 /// Free function (not on [`HealthProbes`]): it holds no per-probe state —
 /// the pool is passed in and nothing of `self` is read.
 pub async fn probe_db(db: &db::Pool) -> bool {

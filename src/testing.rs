@@ -192,7 +192,7 @@ pub fn state_from_parts(
         zims,
         search,
         torrent: crate::torrent::QbitClientCache::new(),
-        rate_limiter: std::sync::Arc::new(crate::serve::ratelimit::RateLimiterHandle::new()),
+        rate_limiter: std::sync::Arc::new(crate::access::ratelimit::RateLimiterHandle::new()),
         probes: crate::HealthProbes::default(),
         auth_lockout: std::sync::Arc::new(Default::default()),
         degradation: crate::health::DegradationTracker::default(),

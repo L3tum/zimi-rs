@@ -68,12 +68,18 @@ hardlink-based file sharing, an OpenAI-compatible embedding pipeline, and an MCP
   download lifecycle: `reconcile`, `inflight`, `direct` for plain `.zim` HTTP
   downloads, `complete`, `stats`).
 
+- **`src/access/`** — access-control policy objects held live by `AppState`
+  at the serve layer's level (the `src/health.rs` precedent: policy objects
+  that `serve` applies as HTTP middleware, not inside `serve` — M-B).
+  `ratelimit.rs` (service-wide token bucket, live-reloaded from settings);
+  `lockout.rs` (per-IP auth-failure lockout); `cidr.rs` (trusted-proxy CIDR
+  validation + `X-Forwarded-For` client-IP resolution).
+
 - **`src/serve/`** — the HTTP layer. `mod.rs` builds the axum router (routes +
   layers); `handlers/` (search, content, downloads, settings, zims, web UI
   pages); `middleware.rs` (shared-password auth, `access_token` log
-  sanitization, per-IP auth-failure lockout); `openapi.rs` (utoipa-generated
-  OpenAPI 3.1 served at `/openapi.json`); `ratelimit.rs` (service-wide token
-  bucket, live-reloaded from settings).
+  sanitization, rate-limiting middleware); `openapi.rs` (utoipa-generated
+  OpenAPI 3.1 served at `/openapi.json`).
 
 - **`src/settings/`** — Postgres-backed runtime settings: `defs.rs` (setting
   table, seeds, security-sensitive classification), `cache.rs`
@@ -264,7 +270,7 @@ Explicitly declared out of scope:
   fails fast, not to enable it.
 - **Per-client rate limiting.** The token bucket is service-wide by design
   (single-operator model); one heavy client can 429 every other client
-  (`src/serve/ratelimit.rs`, `README.md` "Threat model").
+  (`src/access/ratelimit.rs`, `README.md` "Threat model").
 - **Content authentication of downloaded ZIMs.** `verify_zim` checks
   structural integrity only — the `zim` crate exposes no checksum/signature
   API. Trust is the source (torrent tracker, OPDS feed), not the file

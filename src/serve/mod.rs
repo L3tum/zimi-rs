@@ -11,8 +11,6 @@ mod handlers_test;
 pub mod middleware;
 /// OpenAPI 3.1 document, generated at compile time by utoipa from the handler attributes.
 pub mod openapi;
-/// Global token-bucket rate limiting for the HTTP API.
-pub mod ratelimit;
 
 use axum::Router;
 use tower_http::cors::CorsLayer;
@@ -162,7 +160,7 @@ pub fn build_router(state: AppState) -> Router {
         // Rate limit sits outside auth so unauthenticated requests are counted too.
         .layer(axum::middleware::from_fn_with_state(
             rate_limit_state,
-            ratelimit::rate_limit,
+            middleware::rate_limit,
         ))
         // Layer middleware — custom span strips access_token from logged URIs
         .layer(TraceLayer::new_for_http().make_span_with(

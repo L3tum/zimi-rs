@@ -1,4 +1,6 @@
-//! Global token-bucket rate limiting for the HTTP API.
+//! Global token-bucket rate limiting policy for the HTTP API (M-B: the
+//! policy object lives in `access`; the axum `rate_limit` middleware that
+//! *applies* it lives in `serve::middleware`).
 //!
 //! tower-http (0.7, the latest) still ships no rate-limiting middleware, so
 //! this is a small self-contained limiter: at most `burst` requests per
@@ -16,13 +18,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use axum::extract::Request;
-use axum::http::header;
-
 use crate::settings::{KEY_ACCESS_RATE_LIMIT_BURST, KEY_ACCESS_RATE_LIMIT_RPS};
-use axum::http::StatusCode;
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Json, Response};
 
 /// Token-bucket rate limiter allowing `burst` requests per rolling second,
 /// refilling at `rps` requests/second.
@@ -256,36 +252,8 @@ impl Default for RateLimiterHandle {
 
 /// Convert a millisecond wait into a valid `Retry-After` delta-seconds
 /// value: round up (never tell a client to retry too early), minimum 1s.
-fn ms_to_retry_after_secs(ms: u64) -> u64 {
+pub(crate) fn ms_to_retry_after_secs(ms: u64) -> u64 {
     ms.div_ceil(1000).max(1)
-}
-
-/// Axum middleware: enforces the global rate limit on all routes except
-/// `/health` (and any future `/health/…` subroute — load-balancer probes must
-/// never be throttled). The health-path predicate is shared with the auth
-/// middleware so the two exemptions can't drift.
-pub async fn rate_limit(
-    axum::extract::State(state): axum::extract::State<crate::AppState>,
-    req: Request,
-    next: Next,
-) -> Response {
-    if crate::serve::middleware::is_health_path(req.uri().path()) {
-        return next.run(req).await;
-    }
-
-    let limiter = state.rate_limiter.limiter(&state.settings);
-    match limiter.try_acquire() {
-        Ok(()) => next.run(req).await,
-        Err(retry_after_ms) => {
-            let retry_after_secs = ms_to_retry_after_secs(retry_after_ms);
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(header::RETRY_AFTER, retry_after_secs.to_string())],
-                Json(serde_json::json!({ "error": "rate limit exceeded" })),
-            )
-                .into_response()
-        }
-    }
 }
 
 #[cfg(test)]
