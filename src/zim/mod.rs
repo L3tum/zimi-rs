@@ -248,6 +248,8 @@ impl ZimManager {
     /// new entry is stubbed with its **real** on-disk path, so mixed-case
     /// files (`WIKIPEDIA.ZIM`) get a usable `file_path` on case-sensitive
     /// filesystems instead of a rebuilt lowercase `name.zim`.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub async fn scan(&self) -> Result<Vec<String>> {
         let dir = self.zim_dir.clone();
         let entries = tokio::task::spawn_blocking(move || discovery::scan_snapshot_blocking(&dir))
@@ -271,6 +273,8 @@ impl ZimManager {
     }
 
     /// Get all cached ZIM metadata.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn list(&self) -> Vec<ZimMeta> {
         self.cache
             .read()
@@ -282,6 +286,8 @@ impl ZimManager {
 
     /// Count of ZIMs and total indexed articles, computed under a single read
     /// lock without cloning the metadata `Vec` (used by `/health`).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn summary(&self) -> (usize, i64) {
         let cache = self.cache.read().expect("zim cache lock poisoned");
         let count = cache.len();
@@ -290,6 +296,8 @@ impl ZimManager {
     }
 
     /// Get a single ZIM's metadata by name.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn get(&self, name: &str) -> Option<ZimMeta> {
         self.cache
             .read()
@@ -319,6 +327,8 @@ impl ZimManager {
     /// `updated_at = now()` server-side, and the `ON CONFLICT (name) DO
     /// UPDATE` arm re-writes `date = $7` — an explicit `NULL` overwrite that
     /// needs raw SQL (as does `col = now()` in the DO UPDATE arm).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     async fn persist_to_db(&self, meta: &ZimMeta) -> Result<()> {
         let entry_count = meta.entry_count as i64;
         let article_count = meta.article_count as i64;
@@ -394,6 +404,8 @@ impl ZimManager {
     /// Async because the cold-path `zim::Zim::new` (multi-GB central-dir parse)
     /// runs on the blocking pool; both fast paths (stat-TTL, mtime compare)
     /// stay sync.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub async fn open_zim(&self, name: &str) -> Result<Arc<zim::Zim>> {
         let meta = self
             .get(name)
@@ -493,6 +505,8 @@ impl ZimManager {
     /// metadata) survives server restarts. DB values take precedence over
     /// cache entries; an optional `resync()` then reconciles against the
     /// actual files (see `populate_zims` in main.rs).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub async fn load_from_db(&self) -> Result<()> {
         let rows: Vec<ZimRow> = raw::fetch_all(
             &self.db,
@@ -541,6 +555,8 @@ impl ZimManager {
     /// `found` entries carry each file's real on-disk path, so the stored
     /// `file_path` is never rebuilt from the name (mixed-case files like
     /// `WIKIPEDIA.ZIM` stay openable on case-sensitive filesystems).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     fn reconcile(&self, found: &[discovery::ScanEntry]) -> (Vec<String>, Vec<String>, Vec<String>) {
         let mut cache = self.cache.write().expect("zim cache lock poisoned");
         let mut added = Vec::new();
@@ -605,6 +621,8 @@ impl ZimManager {
     ///   and reset indexing state to `pending` (the old index is stale).
     ///
     /// Returns a human-readable report of what changed (empty when up to date).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub async fn resync(&self) -> Result<Vec<String>> {
         // Never reconcile against a missing directory (e.g. a volume that
         // hasn't mounted yet) — that would look like every ZIM was deleted.
@@ -709,7 +727,7 @@ impl ZimManager {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::path::Path;

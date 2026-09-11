@@ -97,7 +97,9 @@ async fn listener_graceful_shutdown_finishes_in_flight() {
     // Let the request start, then trigger the graceful shutdown. We poll
     // briefly to ensure the server has accepted the TCP connection and the
     // handler has entered its 1 s sleep (deterministic on slow CI where a
-    // fixed 100 ms might be too short for the handshake + HTTP parse).
+    // fixed 100 ms might be too short for the handshake + HTTP parse). The
+    // guard assert below proves the poll window still ends before the
+    // handler's 1 s sleep does, so the request is genuinely in flight.
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(10)).await;
         // If the in-flight task has already completed (shouldn't happen in
@@ -106,6 +108,10 @@ async fn listener_graceful_shutdown_finishes_in_flight() {
             break;
         }
     }
+    assert!(
+        !in_flight.is_finished(),
+        "guard: the request must still be in flight when shutdown is triggered; if the /slow handler's 1 s sleep shrank below the 200 ms poll window, this test no longer proves graceful serve-out"
+    );
     trigger.send(()).expect("trigger send");
 
     // axum serves the in-flight request out before stopping the listener.

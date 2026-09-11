@@ -214,6 +214,8 @@ impl SearchEngine {
 
     /// Fast path: the cached trgm value, if still fresh (see the `trgm_ready`
     /// field for the TTL semantics).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     fn trgm_cached_if_fresh(&self) -> Option<bool> {
         let g = self.trgm_ready.lock().expect("trgm_ready lock poisoned");
         if let Some((val, ts)) = *g {
@@ -226,6 +228,8 @@ impl SearchEngine {
 
     /// Record a probe outcome (a failure feeds the degradation tracker) and
     /// refresh the cache with it.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     fn trgm_store(&self, ok: bool) -> bool {
         if !ok {
             self.degradation.record_failure("pg_trgm_probe");
@@ -243,6 +247,8 @@ impl SearchEngine {
     }
 
     /// Public accessor for the background re-probe task (WI-5).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn trgm_is_degraded(&self) -> bool {
         let g = self.trgm_ready.lock().expect("trgm_ready lock poisoned");
         matches!(*g, Some((false, _)))
@@ -281,6 +287,8 @@ impl SearchEngine {
     /// started after a settings change and is newer, so it wins; the next
     /// request carrying our fingerprint rebuilds. Our own freshly-built
     /// client serves this request regardless of the cache state.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     async fn embed_client_with(&self, fingerprint: &str) -> Option<EmbedClient> {
         {
             let guard = self
@@ -876,7 +884,7 @@ fn merge_results(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::sql::{escape_like, SEARCH_FETCH_HARD_CAP};
     use super::*;

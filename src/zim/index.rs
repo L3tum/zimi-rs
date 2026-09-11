@@ -65,6 +65,8 @@ struct Checkpoint {
 /// Q-ID extraction: matches wikidata.org/wiki/Q12345 or Q12345#identifiers
 static QID_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 
+// LINT-3 (2026-09 sweep): static regex pattern is valid by construction — grandfathered expect_used.
+#[allow(clippy::expect_used)]
 fn get_qid_regex() -> &'static regex::Regex {
     QID_RE.get_or_init(|| {
         Regex::new(r"wikidata\.org/wiki/(Q\d+)(#identifiers)?")
@@ -347,6 +349,8 @@ pub(crate) fn is_wikipedia(
         || name_lc.contains("wiki_")
 }
 
+// LINT-3 (2026-09 sweep): `SELECT now()::text` always returns one row — panic = DB contract violation.
+#[allow(clippy::expect_used)]
 async fn index_body(
     _zims: &Arc<ZimManager>,
     pool: &Pool,
@@ -746,6 +750,8 @@ pub(crate) fn derive_title_from_path(url: &str) -> String {
 
 /// Collapse 3+ consecutive newlines to 2. The regex is compiled once and
 /// reused (it used to be recompiled per article).
+// LINT-3 (2026-09 sweep): static regex pattern is valid by construction — grandfathered expect_used.
+#[allow(clippy::expect_used)]
 fn collapse_newlines(text: &str) -> String {
     static NEWLINE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = NEWLINE_RE
@@ -1198,7 +1204,7 @@ fn file_mtime_u64(path: &Path) -> u64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
         escape_copy_text_into, extract_qid, extract_qid_windowed, generate_snippet, is_wikipedia,

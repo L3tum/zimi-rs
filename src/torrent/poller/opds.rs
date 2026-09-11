@@ -97,7 +97,7 @@ async fn queue_opds_updates(db: &Pool, updates: &[OpdsUpdate]) -> Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{queue_opds_updates, DownloadPoller, OpdsUpdate};
 

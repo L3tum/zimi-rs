@@ -56,6 +56,8 @@ impl HealthProbes {
     /// returns a short version string, so a burst of health checks does not
     /// pull the (potentially large) full torrent list. The 2 s memoization TTL
     /// bounds probe cost either way.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub async fn probe_qbit(&self, qbit: &Option<Arc<torrent::QbitClient>>) -> bool {
         {
             let g = self.inner.lock().expect("health-probes lock poisoned");
@@ -95,6 +97,8 @@ pub struct DegradationTracker {
 impl DegradationTracker {
     /// Record a failure for the given branch, incrementing its consecutive
     /// failure count and updating the last-failure timestamp.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn record_failure(&self, branch: &'static str) {
         let mut g = self
             .inner
@@ -107,6 +111,8 @@ impl DegradationTracker {
 
     /// Record a success for the given branch, resetting its consecutive
     /// failure count to zero.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn record_success(&self, branch: &'static str) {
         let mut g = self
             .inner
@@ -119,6 +125,8 @@ impl DegradationTracker {
 
     /// Return a snapshot of all branches with ≥ 3 consecutive failures,
     /// as `(branch_name, failure_count)` pairs.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn degraded_snapshot(&self) -> Vec<(String, u32)> {
         let g = self
             .inner
@@ -132,7 +140,7 @@ impl DegradationTracker {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::HealthProbes;
     use std::time::{Duration, Instant};

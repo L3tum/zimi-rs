@@ -253,7 +253,7 @@ fn sqlx_error_status_message(e: &sqlx::Error) -> (axum::http::StatusCode, String
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use axum::http::StatusCode;

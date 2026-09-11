@@ -326,5 +326,5 @@ pub(crate) fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<T
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;

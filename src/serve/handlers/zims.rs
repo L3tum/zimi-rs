@@ -52,6 +52,46 @@ pub struct IndexHealth {
     pub building: bool,
 }
 
+/// `GET /diagnostic` → `pool`: shared Postgres pool saturation signal
+/// (Architecture M1). A long reindex `COPY` holding every pooled connection is
+/// invisible until queued acquires hit the pool's 10 s acquire timeout and
+/// surface as 503s; this snapshot is the pre-503 signal an operator can poll.
+///
+/// Semantics (sqlx 0.8 `Pool` — the crate exposes no `pending_acquires`):
+/// `size` is the number of connections currently **active, idle included**
+/// (`Pool::size`), `idle` the idle count (`Pool::num_idle`), so
+/// `checked_out = size - idle`; `max_size` is the configured ceiling
+/// (`PoolOptions::get_max_connections`, i.e. `db_pool_size` clamped by
+/// `db::pool::effective_pool_size`). Saturation is readable as
+/// `checked_out == max_size && idle == 0`.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct PoolHealth {
+    /// Active connections (checked-out + idle); `Pool::size()`.
+    pub size: u32,
+    /// Idle (not in use) connections; `Pool::num_idle()`.
+    pub idle: u32,
+    /// Configured maximum connection count (`PoolOptions::get_max_connections`).
+    pub max_size: u32,
+    /// `size - idle` — connections currently held by in-flight queries.
+    pub checked_out: u32,
+}
+
+/// Snapshot the shared pool's saturation state (Architecture M1). Pure sync
+/// reads of sqlx's atomic pool state — no connection is opened, so this is
+/// safe on a dead/unreachable pool (the unit-test case) and costs nothing on
+/// the hot path (called only by the operator-pulled `/diagnostic` handler).
+fn pool_health(pool: &crate::db::Pool) -> PoolHealth {
+    let size = pool.size();
+    let idle = pool.num_idle() as u32;
+    let max_size = pool.options().get_max_connections();
+    PoolHealth {
+        size,
+        idle,
+        max_size,
+        checked_out: size.saturating_sub(idle),
+    }
+}
+
 /// `GET /diagnostic` response: operator-facing introspection that `/health`
 /// intentionally does not carry (it is an unauthenticated, rate-limit-exempt
 /// LB probe, so it must not disclose which settings rows are corrupt).
@@ -64,6 +104,10 @@ pub struct DiagnosticResponse {
     /// needs the signal. Empty (omitted) when every value deserializes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub settings_mismatches: Vec<String>,
+    /// Shared Postgres pool saturation snapshot (Architecture M1): the
+    /// pre-503 signal for a long query (e.g. a reindex `COPY`) holding the
+    /// pool at its ceiling. Always present (additive).
+    pub pool: PoolHealth,
 }
 
 /// `GET /list` response: all ZIM archives with metadata.
@@ -152,9 +196,27 @@ pub async fn diagnostic(
             })),
         ));
     }
+    // Architecture M1: surface pool saturation while it is still a warning,
+    // not a 503. Emitted here (operator-pulled, authenticated) rather than on
+    // the hot path: no per-request logging on the routes that would queue on
+    // the pool. sqlx 0.8 exposes no pending-acquire count, so "saturated" is
+    // the observable state of a full pool with zero idle connections — the
+    // point at which further acquires queue and then time out (10 s → 503).
+    let pool = pool_health(&state.db);
+    if pool.checked_out > 0 && pool.size == pool.max_size && pool.idle == 0 {
+        tracing::warn!(
+            size = pool.size,
+            max_size = pool.max_size,
+            "db pool saturated: {}/{} in use, 0 idle — queued acquires will hit the \
+             10s acquire timeout and surface as 503s (Architecture M1)",
+            pool.size,
+            pool.max_size
+        );
+    }
     Ok(Json(DiagnosticResponse {
         version: env!("CARGO_PKG_VERSION").into(),
         settings_mismatches: state.settings.type_mismatches(),
+        pool,
     }))
 }
 

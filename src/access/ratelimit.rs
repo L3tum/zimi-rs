@@ -76,6 +76,8 @@ impl RateLimiter {
     /// (capped at the new capacity) and the old refill timestamp (BUG-18: a
     /// runtime rps/burst change must not reset the bucket to full capacity —
     /// the old code's `RateLimiter::new` granted a free burst on every resize).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     fn resized(old: &Self, rps: u64, burst: u64) -> Self {
         let (capacity, refill_per_sec) = scaled_limits(rps, burst);
         // Carry the balance: the old tokens may exceed the new (smaller)
@@ -102,6 +104,8 @@ impl RateLimiter {
     /// elapsed wall-clock window and capped at `capacity`; `last_refill` is
     /// advanced on every call (allowed or not) with the credit already in
     /// `tokens`, so no window is lost or double-charged.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn try_acquire(&self) -> Result<(), u64> {
         const NEED: u64 = SCALE as u64;
         let mut b = self.inner.lock().expect("rate limiter bucket poisoned");
@@ -135,6 +139,8 @@ impl RateLimiter {
 
     /// Test-only accessor for the current scaled token balance.
     #[cfg(test)]
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     fn tokens_for_test(&self) -> u64 {
         self.inner
             .lock()
@@ -145,6 +151,8 @@ impl RateLimiter {
     /// Test-only: pretend `ns` wall-clock time passed without moving
     /// `last_refill`'s reference point (replaces the old atomic stores).
     #[cfg(test)]
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     fn shift_refill_ns(&self, ns: u64) {
         let mut b = self.inner.lock().expect("rate limiter bucket poisoned");
         b.last_refill = b.last_refill.saturating_sub(ns);
@@ -211,6 +219,8 @@ impl RateLimiterHandle {
     /// (fast path: generation compare + Arc clone; slow path: two `get_typed`
     /// reads, no awaits) and is not a contention point at the project's QPS.
     /// Replacing with `ArcSwap`/CAS would not be measurable at this scale.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn limiter(&self, settings: &crate::settings::SettingsCache) -> Arc<RateLimiter> {
         let mut guard = self.inner.lock().expect("rate limiter mutex poisoned");
         let cur_gen = settings.generation();
@@ -257,7 +267,7 @@ pub(crate) fn ms_to_retry_after_secs(ms: u64) -> u64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

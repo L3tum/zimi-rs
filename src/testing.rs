@@ -40,6 +40,8 @@
 //! briefly holds the mutex to flip a process-level "held" flag. The
 //! cross-process `File` is an open descriptor, not a lock, so it is also safe
 //! to hold across `.await`.
+// LINT-3 (2026-09 sweep): test-support scaffolding — lazy dead-pool connect and fallback runtime build are intentional infallible panics; keeps the 19 expects unnoisy.
+#![allow(clippy::expect_used)]
 use std::sync::{Condvar, Mutex};
 
 /// Test seam for the MCP tool pipeline: delegates to the crate-internal

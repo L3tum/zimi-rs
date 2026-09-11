@@ -944,7 +944,7 @@ pub fn serve_policy_checks(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1793,7 +1793,7 @@ mod serve_shutdown_tests {
 // ── serve_policy_checks unit tests ───────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod serve_policy_checks_tests {
     use super::*;
 

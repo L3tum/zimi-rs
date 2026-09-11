@@ -201,7 +201,7 @@ fn check_embed_indices(sorted: &[EmbedData]) -> Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::testing::dead_pool;

@@ -213,7 +213,15 @@ pub async fn run_migrations_on(client: &mut PgConnection) -> Result<()> {
         Some("version") => {
             return Err(Error::Config(LEGACY_SCHEMA_MSG.to_string()));
         }
-        _ => unreachable!("column_name was constrained to 'name' or 'version'"),
+        // Defensive: the query above constrains the result to 'name' or
+        // 'version', so this arm is never reachable from our own query. A
+        // hand-edited/corrupted information_schema row should degrade to an
+        // error, not panic the service on startup.
+        Some(other) => {
+            return Err(Error::Config(format!(
+                "schema_migrations has unexpected column_name shape: {other:?}"
+            )))
+        }
     }
 
     for (name, sql) in MIGRATIONS {
@@ -271,7 +279,7 @@ pub async fn run_migrations_on(client: &mut PgConnection) -> Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

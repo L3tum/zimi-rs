@@ -163,6 +163,8 @@ fn admin_salt_bytes() -> [u8; 16] {
 
 /// OWASP-recommended argon2id parameters (m=19456 KiB, t=2, p=1 — the
 /// OWASP argon2id floor).
+// LINT-3 (2026-09 sweep): static OWASP-floor KDF params — cannot fail for these values; panic = compile-time truth.
+#[allow(clippy::expect_used)]
 fn argon2id() -> Argon2<'static> {
     Argon2::new(
         Algorithm::Argon2id,
@@ -298,7 +300,7 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

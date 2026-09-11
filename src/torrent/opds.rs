@@ -349,7 +349,7 @@ pub async fn check_updates(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
         base_and_version, catalog_name_from_url, find_updates, parse_catalog, OpdsEntry, OpdsLink,

@@ -173,6 +173,8 @@ pub fn install_zim(src: &Path, zim_dir: &Path, strategy: &str) -> Result<PathBuf
 ///   Zero → "no .zim found"; more than one → explicit rejection: a multi-
 ///   file torrent with several ZIMs is ambiguous and must not be silently
 ///   installed.
+// LINT-3 (2026-09 sweep): invariant panic (`found.len()==1` guarantees pop) — grandfathered expect_used.
+#[allow(clippy::expect_used)]
 pub fn locate_torrent_zim(path: &Path) -> Result<PathBuf> {
     if path.is_file() {
         if !is_zim_path(path) {
@@ -281,7 +283,7 @@ pub fn validate_download_name(name: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::io::Write;

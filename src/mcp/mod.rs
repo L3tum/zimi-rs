@@ -534,6 +534,8 @@ async fn tool_get_chunks(state: &AppState, args: &Value) -> Result<Value, (i32, 
     })))
 }
 
+// LINT-3 (2026-09 sweep): propagate a worker-task panic (JoinError) — grandfathered expect_used.
+#[allow(clippy::expect_used)]
 async fn tool_deep_search(state: &AppState, args: &Value) -> Result<Value, (i32, String)> {
     let query = req_query_str(args)?;
     let max_results = args
@@ -557,9 +559,11 @@ async fn tool_deep_search(state: &AppState, args: &Value) -> Result<Value, (i32,
         Ok(r) => r,
         Err(e) => return Ok(tool_error(e.to_string())),
     };
-    let articles: Vec<serde_json::Value> =
-        futures::future::join_all(results.iter().map(|r| async move {
-            let full = crate::content::read_article_payload(state, &r.zim_name, &r.path, 4000)
+    let mut join_set = tokio::task::JoinSet::new();
+    for r in results {
+        let state = state.clone();
+        join_set.spawn(async move {
+            let full = crate::content::read_article_payload(&state, &r.zim_name, &r.path, 4000)
                 .await
                 .ok();
             json!({
@@ -574,8 +578,12 @@ async fn tool_deep_search(state: &AppState, args: &Value) -> Result<Value, (i32,
                     .unwrap_or(Value::Null),
                 "truncated": full.as_ref().map(|v| v.truncated),
             })
-        }))
-        .await;
+        });
+    }
+    let mut articles: Vec<serde_json::Value> = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        articles.push(result.expect("read_article_payload task panicked"));
+    }
     Ok(tool_result(
         &json!({ "query": query, "count": articles.len(), "articles": articles }),
     ))
@@ -622,7 +630,7 @@ async fn tool_list_collections(state: &AppState) -> Value {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;

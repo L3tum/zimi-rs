@@ -74,29 +74,24 @@ pub fn random_id_in_range(lo: i64, hi: i64, seed: u64) -> i64 {
     (lo as u64).wrapping_add(offset as u64) as i64
 }
 
-/// (min_id, max_id) per scope (`None` = global), invalidated when an indexed
-/// article set changes. Stale bounds are safe (the merged seek's backward
-/// branch covers a gap, and `bounds_cached(refresh = true)` self-heals on a
-/// miss). Steady state is one round trip: with fresh bounds `target ∈ [min,max]`
-/// so the forward seek always hits and the fallback branch never fires.
+/// Stale-bounds-tolerant hint: cached (min_id, max_id) per scope
+/// (`None` = global). Entries are never explicitly invalidated; staleness is
+/// safe because the merged seek's backward branch covers a gap and
+/// `bounds_cached(refresh = true)` self-heals on a seek miss. An empty
+/// table/ZIM yields `None`, which is **not** cached so recovery needs no
+/// invalidation. Steady state is one round trip: with fresh bounds
+/// `target ∈ [min,max]` so the forward seek always hits and the fallback
+/// branch never fires.
 type BoundsMap = std::collections::HashMap<Option<String>, (i64, i64)>;
 static BOUNDS_CACHE: std::sync::LazyLock<std::sync::Mutex<BoundsMap>> =
     std::sync::LazyLock::new(std::sync::Mutex::default);
-
-/// Drop the cached bounds for one scope (`None` = global). Called after a
-/// reindex changes a ZIM's scoped bounds and the global min/max. No-op for a
-/// key that was never cached.
-pub fn invalidate_bounds_cache(zim_filter: Option<&str>) {
-    BOUNDS_CACHE
-        .lock()
-        .expect("bounds cache poisoned")
-        .remove(&zim_filter.map(str::to_owned));
-}
 
 /// Read (min_id, max_id) for a scope from the cache, running the
 /// `BOUNDS_SQL_*` query exactly once on a miss (or when `refresh` is set).
 /// An empty table/ZIM yields `None`, which is **not** cached so recovery needs
 /// no invalidation.
+// LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+#[allow(clippy::expect_used)]
 async fn bounds_cached(
     pool: &Pool,
     zim_filter: Option<&str>,
@@ -226,15 +221,7 @@ pub async fn fetch_article_snippet(
 
 #[cfg(test)]
 mod tests {
-    use super::{invalidate_bounds_cache, random_id_in_range};
-
-    /// PERF-9: dropping a bounds-cache key that was never present is a no-op
-    /// (no panic); the empty/unknown keys must not error.
-    #[test]
-    fn invalidate_bounds_cache_noop_for_unknown_keys() {
-        invalidate_bounds_cache(None);
-        invalidate_bounds_cache(Some("__never_cached__"));
-    }
+    use super::random_id_in_range;
 
     #[test]
     fn single_element_range_always_returns_it() {

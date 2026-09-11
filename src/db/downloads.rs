@@ -277,6 +277,8 @@ pub enum InsertOutcome {
 /// The `url = $2 OR name = $1` pre-check is only fast feedback — the 003/011
 /// partial unique indexes are the authority, and the `23505` (unique
 /// violation) path below closes the concurrent-POST race.
+// LINT-3 (2026-09 sweep): `INSERT … RETURNING id` always yields a row — panic = DB contract violation.
+#[allow(clippy::expect_used)]
 pub async fn insert_download(pool: &Pool, name: &str, url: &str) -> Result<InsertOutcome> {
     // The `(url = $1 OR name = $2)` pre-check is only fast feedback — the
     // 003/011 partial unique indexes are the authority, and the `23505`
@@ -372,7 +374,7 @@ pub async fn cancel_download(pool: &Pool, id: i32) -> Result<CancelOutcome> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
     use crate::testing::test_pool;

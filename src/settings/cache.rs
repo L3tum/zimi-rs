@@ -246,6 +246,8 @@ impl SettingsCache {
     /// pre-traffic at startup (the sole caller is [`Self::load`]), so that
     /// race is unreachable today; this note documents the requirement rather
     /// than adding a lock.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub async fn reload(&self) -> Result<()> {
         let _guard = self.inner.write_guard.lock().await;
 
@@ -323,6 +325,8 @@ impl SettingsCache {
     /// Refresh the `general.*` display keys from the process `Config` (the
     /// authoritative source) so the table is not a stale second copy. Called
     /// once from `build_state` right after [`Self::load`].
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn sync_from_config(&self, config: &crate::config::Config) {
         let mut cache = self
             .inner
@@ -339,6 +343,8 @@ impl SettingsCache {
     /// re-runs the 100k-iteration verify + UPDATE on every authenticated
     /// request. DB failure is logged and ignored — this is a convenience, not
     /// a correctness path.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub async fn upgrade_password(&self, hashed: String) {
         // Best-effort: a pool blip is folded into the query error (sqlx has
         // no separate pool-get step), so both failure classes take the same
@@ -370,6 +376,8 @@ impl SettingsCache {
     }
 
     /// Get a single setting value.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn get(&self, key: &str) -> Option<serde_json::Value> {
         self.inner
             .cache
@@ -391,6 +399,8 @@ impl SettingsCache {
     /// and pruned per-key as a successful [`Self::update`] re-validates a row,
     /// so it tracks the current cache, not a frozen startup view. Empty when
     /// every value deserializes.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn type_mismatches(&self) -> Vec<String> {
         let g = self
             .inner
@@ -403,6 +413,8 @@ impl SettingsCache {
     }
 
     /// Set the recorded type mismatches (used by `reload()` and tests).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub(crate) fn set_type_mismatches(
         &self,
         mismatches: std::collections::BTreeMap<String, String>,
@@ -417,6 +429,8 @@ impl SettingsCache {
     /// Drop the mismatch record for each key (a successful [`Self::update`]
     /// re-validates the row, so a stale startup flag must not survive the
     /// fix until a restart). No-op for keys with no record.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub(crate) fn clear_type_mismatches(&self, keys: &[&str]) {
         let mut mm = self
             .inner
@@ -436,6 +450,8 @@ impl SettingsCache {
     /// password returned so the caller can run the KDF (inline or on the
     /// blocking pool). Keeping the rules in one place means a
     /// cache-invalidation rule added later can't drift between variants.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     fn token_verify_fast_path(&self, presented: &str) -> TokenVerifyFast {
         if presented.is_empty() {
             return TokenVerifyFast::Verdict(false);
@@ -458,6 +474,8 @@ impl SettingsCache {
     }
 
     /// Record a KDF result in the token cache and return it.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     fn record_token_verify(&self, presented: &str, ok: bool) {
         self.inner
             .token_cache
@@ -500,6 +518,8 @@ impl SettingsCache {
     /// resolve without any KDF. Used by the auth middleware and
     /// `settings_authed`; `mcp` (a single verify at startup) and tests keep
     /// the synchronous [`Self::token_verify_cached`].
+    // LINT-3 (2026-09 sweep): propagate a worker-task panic (JoinError) — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub async fn token_verify_cached_bg(&self, presented: &str) -> bool {
         match self.token_verify_fast_path(presented) {
             TokenVerifyFast::Verdict(ok) => ok,
@@ -529,6 +549,8 @@ impl SettingsCache {
 
     /// Drop all cached verified tokens. Called on any path that can change
     /// the effective password (see [`Self::token_verify_cached`]).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     fn invalidate_token_cache(&self) {
         self.inner
             .token_cache
@@ -539,6 +561,8 @@ impl SettingsCache {
 
     /// Get all settings grouped by category, redacting topology values for
     /// unauthenticated callers (S6).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn all_grouped_for(&self, authenticated: bool) -> serde_json::Value {
         let cache = self
             .inner
@@ -590,6 +614,8 @@ impl SettingsCache {
     ///
     /// Rejections: unknown keys, API-immutable keys, env-locked keys, and
     /// values whose JSON type doesn't match the key's expected type.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub async fn update(
         &self,
         updates: &HashMap<String, serde_json::Value>,
@@ -937,7 +963,7 @@ impl SettingsCache {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};

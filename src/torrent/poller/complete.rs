@@ -9,6 +9,8 @@ use super::*;
 impl DownloadPoller {
     // ── Completion: verify → install → resync → index ───────────────────────
 
+    // LINT-3 (2026-09 sweep): invariant panic (skip path implies file_path present) — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub(super) async fn handle_complete(
         &self,
         id: i32,
@@ -214,7 +216,7 @@ impl DownloadPoller {
 // at the top of `mod.rs` (reachable here via `use super::*`).
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::super::tests::download::{download_settings, test_pool};
 

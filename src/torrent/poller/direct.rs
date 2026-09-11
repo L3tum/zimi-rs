@@ -281,8 +281,8 @@ async fn stream_part(
     db: &Pool,
     id: i32,
 ) -> Result<StreamOutcome> {
-    use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
+    use tokio_stream::StreamExt;
 
     // Determine the file open mode, the starting `received` offset, the
     // declared `total`, and the bytes stream to consume.
@@ -636,7 +636,7 @@ async fn finalize_direct_download(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::super::tests::download::test_pool;
     use super::{build_download_client, ClientProfile};

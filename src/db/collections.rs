@@ -81,6 +81,8 @@ pub enum InsertOutcome {
 /// Insert a collection. A duplicate `name` hits the UNIQUE constraint and is
 /// surfaced as [`InsertOutcome::Duplicate`] (BUG-9: the handler maps it to a
 /// domain-specific 409, not the generic constraint-derived message).
+// LINT-3 (2026-09 sweep): `INSERT … RETURNING id` always yields a row — panic = DB contract violation.
+#[allow(clippy::expect_used)]
 pub async fn insert_collection(
     pool: &Pool,
     name: &str,
@@ -279,7 +281,7 @@ pub(crate) fn is_unique_violation(e: &sqlx::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::is_unique_violation;
 
     /// A non-DB error (e.g. pool timeout) is never a unique violation.

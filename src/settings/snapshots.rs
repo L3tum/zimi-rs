@@ -175,6 +175,8 @@ impl SettingsCache {
     /// under the single guard (no per-key `Value` clone escapes the function),
     /// applying the same clamps/defaults as the individual accessors — the
     /// `trgm_threshold` 0.3 floor and the `EMBED_DEFAULT_DIMENSION` fallback.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn search_params_snapshot(&self) -> SearchParamsSnapshot {
         let cache = self
             .inner
@@ -222,6 +224,8 @@ impl SettingsCache {
     /// `opds_check()` / `direct_download()` / the `run()` startup resolve so the
     /// body reuses materialised values instead of re-taking the RwLock + cloning
     /// a `Value` + deserialising for each accessor.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn poller_params_snapshot(&self) -> PollerParams {
         let cache = self
             .inner
@@ -282,7 +286,7 @@ impl SettingsCache {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

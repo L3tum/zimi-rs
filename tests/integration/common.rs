@@ -107,8 +107,15 @@ pub fn skip(
 /// secondary optional infra failed (an extra pool build/connect, temp-DB
 /// create, a missing fixture file). Without this counter such a test would
 /// report a clean green pass with 0 skips recorded — the exact hole the
-/// `SKIPPED` counter exists to close.
+/// `SKIPPED` counter exists to close. Under `ZIMSERVICE_REQUIRE_DB` this
+/// panics instead of skipping, mirroring [`skip`]: a strict run must not
+/// pass vacuously even when the bail happens mid-flight.
 pub fn skip_midtest(why: &str) {
+    // In strict mode (CI / `make test-strict`) a mid-flight bail is a hard
+    // failure rather than a silent skip.
+    if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
+        panic!("ZIMSERVICE_REQUIRE_DB is set but test skipped mid-flight: {why}");
+    }
     eprintln!("SKIPPED (mid-test): {why}");
     SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }

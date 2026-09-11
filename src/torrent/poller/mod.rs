@@ -416,6 +416,8 @@ impl DownloadPoller {
     /// [`requeue_guard_step`] and the collision pre-filter is the pure
     /// [`filter_requeue_name_collisions`], so both bugs are unit-testable
     /// without Postgres.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     async fn requeue_stale_errors(&self) -> Result<()> {
         // Lazy-eviction clock: count every pass (also the timestamp stamped
         // on entries observed below), so "not seen for N passes" is measured
@@ -874,7 +876,7 @@ pub(crate) fn seeding_row_action(
 // top of this module.
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{Pool, REQUEUE_ERROR_PATTERN};
     use crate::torrent::TorrentInfo;

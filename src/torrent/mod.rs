@@ -438,6 +438,8 @@ impl QbitClientCache {
     }
 
     /// Sync read of the currently-connected client (no rebuild).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn current(&self) -> Option<std::sync::Arc<QbitClient>> {
         self.inner
             .lock()
@@ -452,12 +454,16 @@ impl QbitClientCache {
     /// `connect_qbit` (re-login) on the next tick. The fingerprint check alone
     /// no longer covers this (same fingerprint, stale session), so this is the
     /// explicit clear for that case.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn invalidate(&self) {
         *self.inner.lock().expect("qbit cache lock poisoned") = None;
     }
 
     /// Store an already-connected client under its fingerprint (used by
     /// `build_state` to seed the cache from the startup connect).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn store(&self, fingerprint: &str, client: std::sync::Arc<QbitClient>) {
         *self.inner.lock().expect("qbit cache lock poisoned") =
             Some((fingerprint.to_string(), client));
@@ -470,6 +476,8 @@ impl QbitClientCache {
     /// fingerprint check handles `torrent.url` changes; a same-fingerprint
     /// session expiry (stale cookie) is cleared explicitly via
     /// [`Self::invalidate`].
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub async fn ensure<F, Fut>(
         &self,
         fingerprint: &str,
@@ -500,7 +508,7 @@ impl Default for QbitClientCache {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
         is_auth_failure, is_direct_zim_url, qbit_fingerprint, resolve_qbit_inputs, QbitClient,

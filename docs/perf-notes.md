@@ -8,11 +8,29 @@ at realistic scale (100k rows), or degrades to a sequential scan.
 **Resolved (DEC-5, Step 4.2):** the single `LIKE … OR similarity() > t`
 predicate was split into three concurrently-run, individually indexable
 queries (btree prefix, GIN contains, GiST similarity), merged by the existing
-`merge_results`. Note: the repo contains **no automated plan-regression
-harness** — earlier CI/docs referenced a `trgm_index_perf_check` test that
-did not exist, and those references were removed. The index usage below must
-be verified manually at scale (recipe further down) if the plan shape is ever
-in doubt.
+`merge_results`.
+
+The plan-shape question (index scan vs sequential scan at 100k rows) is now
+covered by an automated plan-regression test:
+`tests/integration/trgm_plan.rs` (`smoke_trgm_search_arm_no_seq_scan_100k`).
+It creates a dedicated temp database (migrated fresh, created and dropped
+around the test so the shared dev schema is never touched), bulk-loads 100k
+generated articles into `articles` through the production
+staging→`articles` upsert path, runs `ANALYZE`, then `EXPLAIN (FORMAT TEXT)`s
+the exact arm SQL for the two pg_trgm-indexed arms — the contains arm (Q2,
+GIN) and the similarity arm (Q3, GiST) — rebuilt through the same pure public
+builders `run` uses (`trgm_contains_sql` / `trgm_similarity_sql`), so the
+gate EXPLAINs the same query the server issues. It asserts (a) the plan
+contains **no** `Seq Scan on articles` and (b) it references the trgm index
+(`idx_articles_title_trgm` for Q2, `idx_articles_title_gist` for Q3). Like
+the rest of the integration suite it is DB-gated: it skips cleanly without a
+reachable Postgres and hard-fails under `ZIMSERVICE_REQUIRE_DB` (CI's `test`
+job), which always runs with a Postgres service. The Q1 prefix (btree) arm is
+**not** covered by the gate — its builder stays `pub(super)` — so if its plan
+shape is ever in doubt, verify it manually with the recipe further down.
+(Earlier CI/docs referenced a `trgm_index_perf_check` test that did not
+exist; those references were removed. The gap that test was meant to fill is
+what `trgm_plan.rs` now covers.)
 
 ### The predicate
 
@@ -72,19 +90,38 @@ EXPLAIN (ANALYZE, BUFFERS) SELECT a.id … WHERE a.title_lower % 'art 42' AND si
 ```
 
 The regression-relevant result is that none of the three contains `Seq Scan
-on articles`. There is no automated harness — run the statements by hand
-(e.g. `psql`) and paste the plans below.
+on articles`. For that plan-shape question the automated gate in
+`tests/integration/trgm_plan.rs` is the regression net (it asserts
+no-`Seq Scan on articles` + trgm index used for the two pg_trgm arms on a
+100k-row temp DB on every integration run where a database is present). This
+manual recipe is the deeper-dive tool: it adds the `EXPLAIN (ANALYZE,
+BUFFERS)` timing/buffer counters the gate (plain `EXPLAIN (FORMAT TEXT)`) does
+not capture, and it covers the Q1 prefix (btree) arm, which the gate does not.
+Run the statements by hand (e.g. `psql`) and paste the plans below.
 
-### Result (unmeasured)
+### Result
 
-**No plan has been captured.** There is no automated harness, and no manual
-run against the 100k-row fixture has been recorded — the capture metadata
-(Postgres version, row count, `pg_trgm` similarity threshold) and the
-`EXPLAIN (ANALYZE, BUFFERS)` output for Q1/Q2/Q3 are unmeasured, and remain
-to be filled in by whoever runs the recipe above.
+**Plan-shape gate: automated.** The seq-scan-vs-index question is enforced by
+`tests/integration/trgm_plan.rs` in the integration suite: on every run where
+a database is present — including CI's `test` job, which runs the suite
+against a Postgres service with `ZIMSERVICE_REQUIRE_DB=1` (a skip there would
+hard-fail) — the Q2 contains (GIN) and Q3 similarity (GiST) arms on a 100k-row
+temp DB must plan an index scan, never a `Seq Scan on articles`. The gate
+checks plan *shape* only (`EXPLAIN (FORMAT TEXT)`); it captures no timing.
 
-**Verdict:** the split is implemented (DEC-5); there is no automated harness —
-plan capture is pending a manual measurement.
+**`EXPLAIN (ANALYZE)` timing at 100k rows: unmeasured.** No manual run against
+the 100k-row fixture has been recorded — the capture metadata (Postgres
+version, row count, `pg_trgm` similarity threshold) and the `EXPLAIN
+(ANALYZE, BUFFERS)` output for Q1/Q2/Q3 remain to be filled in by whoever runs
+the recipe above. At the time of this revision (2026-09-11) no local Postgres
+was reachable at the default dev DSN (`postgres://zimservice:zimservice@127.0.0.1:5432/zimservice` — see `docker-compose.yml` /
+the `test-integration` target), so a local `cargo test --test integration
+trgm_plan` run was skipped; `make test-integration` boots the compose DB and
+runs the gate for real.
+
+**Verdict:** the split is implemented (DEC-5) and the plan-shape gate is
+automated and enforced in the integration suite; `EXPLAIN (ANALYZE)` timing at
+100k rows remains a pending manual measurement.
 
 ---
 

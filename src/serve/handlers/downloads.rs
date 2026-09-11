@@ -258,7 +258,7 @@ pub async fn cancel_download(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::default_download_name;
 

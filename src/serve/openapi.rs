@@ -85,6 +85,7 @@ impl utoipa::Modify for AddSecuritySchemes {
         crate::serve::handlers::UpdateCollectionBody,
         crate::serve::handlers::AddDownloadBody,
         crate::serve::handlers::DiagnosticResponse,
+        crate::serve::handlers::PoolHealth,
         crate::serve::handlers::HealthResponse,
         crate::serve::handlers::IndexHealth,
         crate::serve::handlers::ListZimsResponse,
@@ -119,6 +120,8 @@ pub struct ApiDoc;
 /// every request was pure waste (PERF-L2). The JSON body is pre-serialized
 /// once too (`SPEC_JSON`); each request returns a cheap byte-clone of it
 /// instead of deep-cloning and re-serializing the whole spec.
+// LINT-3 (2026-09 sweep): checked invariants — static utoipa spec and axum response builder cannot fail.
+#[allow(clippy::expect_used)]
 pub async fn openapi_json() -> Response {
     static SPEC: std::sync::LazyLock<utoipa::openapi::OpenApi> =
         std::sync::LazyLock::new(ApiDoc::openapi);
@@ -133,7 +136,7 @@ pub async fn openapi_json() -> Response {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -195,6 +198,12 @@ mod tests {
         // Security scheme registered by the modifier.
         let components = doc.components.as_ref().expect("components present");
         assert!(components.security_schemes.contains_key("bearer_auth"));
+        // Architecture M1: the /diagnostic `pool` snapshot is a registered
+        // nested schema (a dangling reference would serialize but never resolve).
+        assert!(
+            components.schemas.contains_key("PoolHealth"),
+            "the /diagnostic pool snapshot must be a registered schema"
+        );
         // The spec must serialize to valid JSON.
         let json = serde_json::to_value(&doc).expect("spec serializes");
         assert_eq!(json["openapi"], "3.1.0");

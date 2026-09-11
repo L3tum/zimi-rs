@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! Step 5.2 (T2): qBittorrent client tests backed by wiremock.
 //!
@@ -11,8 +11,9 @@
 //! - `get_torrents("all")` filter contract (pins P1-B2: the poller must fetch
 //!   *all* torrents, not just `active`, so paused ones aren't mass-errored).
 //!
-//! NOTE: test code may use `.unwrap()` (crate-level `#![allow(clippy::unwrap_used)]`,
-//! matching `tests/integration/main.rs`) — but `expect` with a message or match
+//! NOTE: test code may use `.unwrap()`/`.expect()` (file-level
+//! `#![allow(clippy::unwrap_used, clippy::expect_used)]`, matching
+//! `tests/integration/main.rs`) — but `expect` with a message or match
 //! patterns stay preferred where intent is worth stating, consistent with the
 //! rest of the file. `clippy --all-targets -- -D warnings` is a CI gate.
 

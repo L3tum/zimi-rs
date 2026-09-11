@@ -85,6 +85,8 @@ static EMBED_FAILS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashM
 /// *every* claimed id is poison (the caller drops the permit and stops).
 /// Also enforces the fail-open cap: if the map grew past `POISON_FAIL_MAP_CAP`
 /// (a leak), it is logged + cleared.
+// LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+#[allow(clippy::expect_used)]
 fn filter_poisoned_ids(ids: &[i64]) -> Option<Vec<i64>> {
     let mut map = EMBED_FAILS.lock().expect("embed-fails lock poisoned");
     if map.len() > POISON_FAIL_MAP_CAP {
@@ -106,6 +108,8 @@ fn filter_poisoned_ids(ids: &[i64]) -> Option<Vec<i64>> {
 }
 
 /// W6.5: record a failed embed batch — bump each row's poison counter.
+// LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+#[allow(clippy::expect_used)]
 fn record_batch_failure(ids: &[i64]) {
     let mut map = EMBED_FAILS.lock().expect("embed-fails lock poisoned");
     for id in ids {
@@ -114,6 +118,8 @@ fn record_batch_failure(ids: &[i64]) {
 }
 
 /// W6.5: an embed batch succeeded — clear its rows' failure counters.
+// LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+#[allow(clippy::expect_used)]
 fn record_batch_success(ids: &[i64]) {
     let mut map = EMBED_FAILS.lock().expect("embed-fails lock poisoned");
     for id in ids {
@@ -124,6 +130,8 @@ fn record_batch_success(ids: &[i64]) {
 /// Test-only reset of the in-process poison counter (the first in-module
 /// global state; kept behind `#[cfg(test)]` so it never ships).
 #[cfg(test)]
+// LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+#[allow(clippy::expect_used)]
 fn reset_embed_fails() {
     EMBED_FAILS
         .lock()
@@ -349,7 +357,7 @@ pub async fn run_pipeline(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

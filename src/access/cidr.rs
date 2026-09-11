@@ -126,6 +126,8 @@ pub fn has_zero_prefix_cidr(cidrs: &str) -> bool {
 /// fully-trusted peer inside the CIDR can still influence the leftmost
 /// entry — that is inherent to the operator's trust decision to list that
 /// CIDR as trusted.)
+// LINT-3 (2026-09 sweep): invariant panic (entries non-empty, checked above) — grandfathered expect_used.
+#[allow(clippy::expect_used)]
 pub(crate) fn client_ip_from_xff(
     cidrs: &str,
     xff: Option<&str>,
@@ -184,7 +186,7 @@ fn ip6_in_cidr(net: std::net::Ipv6Addr, target: std::net::Ipv6Addr, prefix: u32)
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

@@ -208,6 +208,14 @@ mod tests {
             )])
         );
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        // Architecture M1: the pool saturation signal is always present on the
+        // authenticated 200 body (additive). The dead test pool is configured
+        // with `max_connections(1)` and has never connected, so every counter
+        // is 0 — pin the shape and the idle values, not just presence.
+        assert_eq!(v["pool"]["max_size"], 1, "dead test pool: {v:?}");
+        assert_eq!(v["pool"]["size"], 0, "dead test pool: {v:?}");
+        assert_eq!(v["pool"]["idle"], 0, "dead test pool: {v:?}");
+        assert_eq!(v["pool"]["checked_out"], 0, "dead test pool: {v:?}");
     }
 
     /// A clean state omits `settings_mismatches` on the authenticated

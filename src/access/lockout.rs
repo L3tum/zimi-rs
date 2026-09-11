@@ -38,6 +38,8 @@ impl LockoutTracker {
     /// (worst case: a scanner from many IPs). Expired entries are harmless
     /// here: the per-entry `first.elapsed()` filter below returns `None` for
     /// them, and the map stays bounded by `record_failure`'s cap eviction.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn lockout_remaining(&self, ip: &IpAddr) -> Option<Duration> {
         let m = self.inner.lock().expect("lockout mutex");
         m.get(ip)
@@ -50,6 +52,8 @@ impl LockoutTracker {
     /// the count (no stale-window carry-over). Evicts the oldest
     /// first_failure at the cap — the map is bounded without any O(n) prune
     /// on the read path.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn record_failure(&self, ip: &IpAddr) {
         let mut m = self.inner.lock().expect("lockout mutex");
         let window_active = m
@@ -78,13 +82,15 @@ impl LockoutTracker {
     }
 
     /// Clear any failure count / lockout for `ip` on a successful auth.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
     pub fn record_success(&self, ip: &IpAddr) {
         self.inner.lock().expect("lockout mutex").remove(ip);
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

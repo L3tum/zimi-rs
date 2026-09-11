@@ -30,9 +30,10 @@
 //! DB-gated like every test here: skips without a reachable `DATABASE_URL`,
 //! hard-fails under `ZIMSERVICE_REQUIRE_DB=1` when the base DB is unreachable
 //! (CI's `test` job). If the base user cannot `CREATE DATABASE`, the
-//! `create_temp_db` `None` arm records a mid-test skip instead (the inherited
-//! `migrations.rs` convention — its `skip_midtest` does not consult
-//! `REQUIRE_DB`); CI is unaffected because its service user is a superuser.
+//! `create_temp_db` `None` arm records a mid-test skip via `skip_midtest` —
+//! which itself consults `REQUIRE_DB` and hard-fails in strict mode (the
+//! inherited `migrations.rs` convention); CI is unaffected because its
+//! service user is a superuser.
 //! Holds the `DbExclusiveGuard` for the shared-server `CREATE/DROP DATABASE`.
 
 use super::common::*;

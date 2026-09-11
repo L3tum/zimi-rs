@@ -10,10 +10,13 @@
 //! # API stability
 //!
 //! This crate is currently `0.x`: **no public API is stable across minor
-//! versions**. The module marked `#[doc(hidden)]` (`testing`) is internal
-//! test support, not a public API. Treat the remaining public surface as
-//! internal until a `1.0` is cut, when the stability guarantees will be
-//! documented explicitly.
+//! versions**. The `testing` module is internal test support, not a public
+//! API: it is `#[doc(hidden)]` *and* `cfg`-gated behind the `testing` cargo
+//! feature, so it is not compiled into the production library build at all
+//! (the feature is enabled for `#[cfg(test)]` unit tests and for integration
+//! tests via the self-referential dev-dependency). Treat the remaining
+//! public surface as internal until a `1.0` is cut, when the stability
+//! guarantees will be documented explicitly.
 
 /// Access-control policy objects shared across layers (rate limiter, per-IP
 /// auth-failure lockout, trusted-proxy CIDR / `X-Forwarded-For` resolution).
@@ -46,7 +49,10 @@ pub mod settings;
 pub mod startup;
 /// Shared application state passed to all axum handlers.
 pub mod state;
-/// Internal test support; hidden from rustdoc. Not a public API.
+/// Internal test support. Not a public API: gated behind the `testing` cargo
+/// feature (active for unit tests via `cfg(test)`), hidden from rustdoc, and
+/// absent from the production library build.
+#[cfg(any(test, feature = "testing"))]
 #[doc(hidden)]
 pub mod testing;
 /// qBittorrent integration: REST client, download helpers, OPDS, and poller.

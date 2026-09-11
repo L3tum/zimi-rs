@@ -59,7 +59,8 @@ sha2 = "0.11"
 argon2 = "0.5"
 # salt generation for argon2id (OsRng) — feature unifies with argon2's dep
 password-hash = { version = "0.5", features = ["getrandom"] }
-futures = "0.3"
+# StreamExt::next over reqwest's bytes_stream() in the torrent poller's stream_part
+tokio-stream = "0.1"
 
 url = "2"
 
@@ -71,7 +72,18 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 # instance lock): covers macOS/FreeBSD in addition to Linux.
 libc = "0.2"
 
+# Internal test support (`#[cfg(test)]` unit tests + the integration test
+# target via the self-referential dev-dependency below). Not a public API —
+# the `testing` module is excluded from the production library build.
+[features]
+testing = []
+
 [dev-dependencies]
+# Self-referential dev-dependency: activates the `testing` feature when
+# compiling the integration test target, so `tests/integration/` can use
+# `zimservice::testing::...` while the production library build (no features)
+# still excludes the module entirely.
+zimservice = { path = ".", features = ["testing"] }
 # test-util: `#[tokio::test(start_paused = true)]` mock time for the
 # auto_embed_loop lifecycle tests (the loop's cadence is a plain
 # tokio::time::sleep, so the paused clock fast-forwards its ticks; test-only —
@@ -96,13 +108,17 @@ unsafe_code = "deny"
 missing_docs = "warn"
 
 [lints.clippy]
-correctness = "warn"
-suspicious = "warn"
-style = "warn"
-complexity = "warn"
-perf = "warn"
+correctness = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
 unwrap_used = "warn"
-# expect_used is deliberately not enabled (LINT-3, 2026-08-30 review): ~40 sites
-# use expect() as the intentional panic-on-poisoned-lock idiom plus 15 production
-# expects; enabling it would fail `make clippy` (-D warnings) without a multi-file sweep.
+expect_used = "warn"
+# LINT-3 (2026-09-14 sweep): enabled at "warn" (CI promotes via -D warnings).
+# Grandfathered per site: test modules carry `expect_used` alongside
+# `unwrap_used`; production sites with a deliberate panic (poisoned-lock
+# idiom, checked invariants, JoinError propagation) carry a targeted
+# `#[allow(clippy::expect_used)]` with a one-line LINT-3 comment.
+# Groups use priority = -1 so per-lint overrides take effect (Rust 1.96).
 

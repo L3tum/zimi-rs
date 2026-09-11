@@ -315,7 +315,7 @@ fn resumable_part_paths(rows: &[(String, Option<String>)], zim_dir: &Path) -> Ha
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::resumable_part_paths;
 

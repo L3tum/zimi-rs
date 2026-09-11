@@ -98,9 +98,7 @@ fn web_html_response(body: &'static str) -> Response {
     let mut resp = Response::new(axum::body::Body::from(body));
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
-        "text/html; charset=utf-8"
-            .parse()
-            .expect("valid static content-type"),
+        header::HeaderValue::from_static("text/html; charset=utf-8"),
     );
     for (name, value) in web_security_headers() {
         resp.headers_mut().insert(name, value);
@@ -114,15 +112,11 @@ fn web_js_response(body: &'static str) -> Response {
     let mut resp = Response::new(axum::body::Body::from(body));
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
-        "application/javascript"
-            .parse()
-            .expect("valid static content-type"),
+        header::HeaderValue::from_static("application/javascript"),
     );
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
-        "public, max-age=300"
-            .parse()
-            .expect("valid static cache-control"),
+        header::HeaderValue::from_static("public, max-age=300"),
     );
     for (name, value) in web_security_headers() {
         resp.headers_mut().insert(name, value);
@@ -172,7 +166,7 @@ pub async fn web_settings_js() -> Response {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
