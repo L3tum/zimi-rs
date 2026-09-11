@@ -809,7 +809,10 @@ pub async fn run_sql_on<'e, E>(
 where
     E: Executor<'e, Database = sqlx::Postgres>,
 {
-    let mut query = sqlx::query_as::<_, SearchRow>(&sq.sql); // RAW-OK: runtime-built FTS/vector hybrid branch query (dynamic SQL + dynamic `$n` binds) — unexpressible via the db::raw helpers
+    // sqlx 0.9: runtime SQL must be wrapped in `AssertSqlSafe` (the `db::raw`
+    // helpers are the central audit point; this hybrid branch query cannot go
+    // through them, so it asserts itself).
+    let mut query = sqlx::query_as::<_, SearchRow>(sqlx::AssertSqlSafe(sq.sql.as_str())); // RAW-OK: runtime-built FTS/vector hybrid branch query (dynamic SQL + dynamic `$n` binds) — unexpressible via the db::raw helpers
     for p in &sq.params {
         query = query.bind(p);
     }

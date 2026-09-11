@@ -48,16 +48,20 @@ pub mod raw {
     use sqlx::{Database, Decode, Executor, FromRow, Type};
 
     /// Raw Postgres query with the default (bindable) argument list.
-    pub type PgQuery<'q> = sqlx::query::Query<'q, Postgres, <Postgres as Database>::Arguments<'q>>;
+    ///
+    /// sqlx 0.9: `Arguments` lost its lifetime parameter (it is `PgArguments`,
+    /// a flat struct, no more `<'q>`), but `Query`/`QueryAs`/`QueryScalar`
+    /// still carry the SQL lifetime `<'q>`.
+    pub type PgQuery<'q> = sqlx::query::Query<'q, Postgres, <Postgres as Database>::Arguments>;
 
     /// Raw Postgres query whose rows decode as `R` (tuple or `FromRow` struct).
     pub type PgQueryAs<'q, R> =
-        sqlx::query::QueryAs<'q, Postgres, R, <Postgres as Database>::Arguments<'q>>;
+        sqlx::query::QueryAs<'q, Postgres, R, <Postgres as Database>::Arguments>;
 
     /// Raw Postgres query extracting the first column of each row as `O`
     /// (`O: Type<Postgres> + Decode`; any extra columns are ignored).
     pub type PgScalarQuery<'q, O> =
-        sqlx::query::QueryScalar<'q, Postgres, O, <Postgres as Database>::Arguments<'q>>;
+        sqlx::query::QueryScalar<'q, Postgres, O, <Postgres as Database>::Arguments>;
 
     /// Execute a raw SQL statement (optionally binding `$1..$n` through
     /// `bind`) and return the number of affected rows.
@@ -66,7 +70,12 @@ pub mod raw {
         E: Executor<'c, Database = Postgres>,
         B: FnOnce(PgQuery<'q>) -> PgQuery<'q>,
     {
-        let query = bind(sqlx::query(sql));
+        // sqlx 0.9: `query*` takes `impl SqlSafeStr` (`&'static str` /
+        // `AssertSqlSafe` only). These helpers are the sanctioned dynamic-SQL
+        // escape hatch (the raw-sql lint keeps call sites here), so the
+        // runtime `&str` is wrapped in `AssertSqlSafe` — the central
+        // injection-audit point for the whole crate.
+        let query = bind(sqlx::query(sqlx::AssertSqlSafe(sql)));
         Ok(query
             .execute(executor)
             .await
@@ -85,7 +94,7 @@ pub mod raw {
         E: Executor<'c, Database = Postgres>,
         B: FnOnce(PgQueryAs<'q, R>) -> PgQueryAs<'q, R>,
     {
-        let query = bind(sqlx::query_as::<_, R>(sql));
+        let query = bind(sqlx::query_as::<_, R>(sqlx::AssertSqlSafe(sql)));
         query
             .fetch_optional(executor)
             .await
@@ -99,7 +108,7 @@ pub mod raw {
         E: Executor<'c, Database = Postgres>,
         B: FnOnce(PgQueryAs<'q, R>) -> PgQueryAs<'q, R>,
     {
-        let query = bind(sqlx::query_as::<_, R>(sql));
+        let query = bind(sqlx::query_as::<_, R>(sqlx::AssertSqlSafe(sql)));
         query.fetch_all(executor).await.map_err(Error::Database)
     }
 
@@ -119,7 +128,7 @@ pub mod raw {
         E: 'e + Executor<'c, Database = Postgres>,
         B: FnOnce(PgScalarQuery<'q, O>) -> PgScalarQuery<'q, O>,
     {
-        let query = bind(sqlx::query_scalar::<_, O>(sql));
+        let query = bind(sqlx::query_scalar::<_, O>(sqlx::AssertSqlSafe(sql)));
         query
             .fetch_optional(executor)
             .await
@@ -138,7 +147,7 @@ pub mod raw {
         E: 'e + Executor<'c, Database = Postgres>,
         B: FnOnce(PgScalarQuery<'q, O>) -> PgScalarQuery<'q, O>,
     {
-        let query = bind(sqlx::query_scalar::<_, O>(sql));
+        let query = bind(sqlx::query_scalar::<_, O>(sqlx::AssertSqlSafe(sql)));
         query.fetch_all(executor).await.map_err(Error::Database)
     }
 

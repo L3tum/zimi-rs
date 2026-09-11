@@ -2,7 +2,7 @@
 name = "zimservice"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.94"
 description = "Cross-ZIM search and serve platform with Postgres FTS, semantic search, and qBittorrent integration"
 license = "MIT"
 
@@ -18,9 +18,11 @@ tower-http = { version = "0.7", features = ["cors", "limit", "trace"] }
 utoipa = { version = "5", features = ["preserve_path_order", "chrono"] }
 
 # Database (sqlx Postgres — the only data-access layer; see db::raw)
-# runtime-tokio-rustls-ring-native-roots: load the OS trust store via
-# rustls-native-certs (pre-deadpool parity; webpki roots are superseded).
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "tls-rustls-ring-native-roots", "chrono", "json"] }
+# sqlx 0.9: the combined runtime+TLS features were deleted; runtime and TLS
+# are independent features. tls-rustls-ring-native-roots loads the OS trust
+# store via rustls-native-certs (pre-deadpool parity; webpki roots are
+# superseded).
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-native-roots", "chrono", "json"] }
 
 # ZIM
 zim = "0.5"
@@ -93,7 +95,7 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 wiremock = "0.6"
-dtor = "0.0.6"
+dtor = "0.0.7"
 
 [profile.release]
 lto = true
