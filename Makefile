@@ -131,13 +131,25 @@ web-check:
 	@node --check web/common.js web/index.js web/search.js web/settings.js)
 	@echo "web-check: OK"
 
-# Behavioral unit tests for the pure helpers in web/common.js (node --test,
-# no external dependencies). Requires node; skips with a warning when node is
-# absent, same policy as web-check. Set ZIMSERVICE_WEB_CHECK_STRICT=1 to fail
-# without node.
+# Behavioral unit tests for the pure helpers in web/common.js (node --test
+# plus jsdom for the DOM-backed smoke tests). Requires node and
+# `npm install` (node_modules) first, same as web-lint; skips with a warning
+# when node or jsdom is absent. Set ZIMSERVICE_WEB_CHECK_STRICT=1 to fail
+# without node/jsdom. The guards share the test line: make runs each recipe
+# line in its own shell, so an `exit 0` on a SEPARATE guard line would not
+# stop `node --test` (the WEB_WRAP targets above carry that latent quirk);
+# chaining on one logical line makes the skip real.
 web-test:
-	$(call WEB_WRAP,web-test,,web UI unit tests,\
-	node --test tests/web/*.test.mjs)
+	@if ! command -v node >/dev/null 2>&1; then \
+	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
+	    echo "web-test: node not found (strict mode)" >&2; exit 1; \
+	  fi; echo "web-test: node not found — skipping web UI unit tests"; exit 0; \
+	fi && \
+	if ! node -e "import('jsdom')" >/dev/null 2>&1; then \
+	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
+	    echo "web-test: jsdom not installed (run: npm install; strict mode)" >&2; exit 1; \
+	  fi; echo "web-test: jsdom not installed (npm install) — skipping web UI unit tests"; exit 0; \
+	fi && node --test tests/web/*.test.mjs
 
 # Real lint (eslint) of the embedded web UI: web/common.js + the per-page
 # scripts (web/index.js, web/search.js, web/settings.js). Requires
@@ -179,7 +191,7 @@ help:
 	@echo "  make test-strict      Strict mode: DB required (missing DB is a hard failure)"
 	@echo "  make test-strict-ci    Mirrors the CI test job: strict DB, lib+bins+wiremock+integration"
 	@echo "  make web-check    JS syntax check of the embedded web UI (web/*.js; needs node; skips if absent)"
-	@echo "  make web-test     Behavioral unit tests for web/common.js helpers (node --test; skips if absent)"
+	@echo "  make web-test     Behavioral unit tests for web/common.js helpers (node --test + jsdom; needs npm install; skips if absent)"
 	@echo "  make web-fmt      eslint --fix for the web UI (JS half of make fmt; needs npm install; skips if absent)"
 	@echo "  make web-lint     JS lint of web UI via eslint (needs npm install; skips if absent)"
 	@echo "  make doc          Build docs"

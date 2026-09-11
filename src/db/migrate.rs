@@ -78,7 +78,7 @@ pub const MIGRATION_COUNT: usize = MIGRATIONS.len();
 const LEGACY_SCHEMA_MSG: &str = "found legacy schema_migrations (version INTEGER) — \
      zimservice no longer auto-upgrades. Manual recipe: \
      `pg_dump --schema-only -t schema_migrations` the DB, `DROP TABLE schema_migrations`, \
-     run `zimservice serve` once to apply migrations 001-012, then restore your rows into \
+     run `zimservice serve` once to apply migrations 001-013, then restore your rows into \
      schema_migrations(name, hash) — or re-download your ZIMs and rebuild the database \
      from scratch.";
 

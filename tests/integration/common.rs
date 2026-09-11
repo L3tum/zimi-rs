@@ -204,6 +204,7 @@ pub fn assemble_state(
         auth_lockout: Arc::new(Default::default()),
         degradation: zimservice::health::DegradationTracker::default(),
         build_probe: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        index_building: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
 

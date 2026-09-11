@@ -145,6 +145,7 @@ pub async fn run_pipeline(
     settings: SettingsCache,
     zim_name: &str,
     probe: &std::sync::atomic::AtomicU64,
+    in_flight: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     let Some(config) = EmbedConfig::from_settings(&settings) else {
         return Err(Error::Embedding("embedding not configured".into()));
@@ -342,7 +343,7 @@ pub async fn run_pipeline(
     // covers the common case without waiting for a full pipeline run. The
     // shared 10-minute backoff gate inside `maybe_build_vector_index`
     // bounds how often this probe + attempt runs (was: every 60 s tick).
-    maybe_build_vector_index(&pool, &settings, VECTOR_INDEX_MIN_ROWS, probe).await;
+    maybe_build_vector_index(&pool, &settings, VECTOR_INDEX_MIN_ROWS, probe, in_flight).await;
 
     Ok(())
 }

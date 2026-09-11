@@ -273,7 +273,12 @@ pub(super) fn trgm_prefix_sql(
 /// Build a trigram contains-match query (GIN trgm index on `title_lower`).
 ///
 /// Raw SQL: the score is pg_trgm `similarity()` (see `trgm_prefix_sql`).
-pub(super) fn trgm_contains_sql(
+///
+/// `pub` (not `pub(super)`): the query-plan regression gate in
+/// `tests/integration/trgm_plan.rs` EXPLAINs this exact arm SQL against a
+/// 100k-row temp DB — it must build the arm the same way `run` does, not
+/// re-transcribe the SQL by hand (drift would make the gate meaningless).
+pub fn trgm_contains_sql(
     query_lower: &str,
     zim: Option<&str>,
     lang: Option<&str>,
@@ -319,7 +324,12 @@ pub(super) fn trgm_contains_sql(
 /// conjunct **silently excludes** rows the `similarity > t` half would have
 /// kept. Don't raise that GUC — or drop the `%` prefilter from this
 /// predicate.
-pub(super) fn trgm_similarity_sql(
+///
+/// `pub` (not `pub(super)`): the query-plan regression gate in
+/// `tests/integration/trgm_plan.rs` EXPLAINs this exact arm SQL against a
+/// 100k-row temp DB (see [`trgm_contains_sql`] for why it must stay in
+/// lockstep with `run`).
+pub fn trgm_similarity_sql(
     query_lower: &str,
     threshold: f64,
     zim: Option<&str>,

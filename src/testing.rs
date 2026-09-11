@@ -197,6 +197,7 @@ pub fn state_from_parts(
         auth_lockout: std::sync::Arc::new(Default::default()),
         degradation: crate::health::DegradationTracker::default(),
         build_probe: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        index_building: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
 

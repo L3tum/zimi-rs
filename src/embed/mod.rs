@@ -5,14 +5,14 @@
 //!
 //! Module tree (same pattern as `torrent::poller`):
 //!
-//! - [`client`] — endpoint config + HTTP client, vector-literal formatting,
+//! - `client` — endpoint config + HTTP client, vector-literal formatting,
 //!   batch-index guard.
-//! - [`column`] — `articles.embedding` dimension probe + reconciliation.
-//! - [`pipeline`] — per-ZIM claim → embed → bulk-write pipeline (with the
+//! - `column` — `articles.embedding` dimension probe + reconciliation.
+//! - `pipeline` — per-ZIM claim → embed → bulk-write pipeline (with the
 //!   W6.5 bounded poison-row guard).
-//! - [`vector_index`] — `idx_articles_embedding` catalog state + the
+//! - `vector_index` — `idx_articles_embedding` catalog state + the
 //!   `CREATE INDEX CONCURRENTLY` build paths.
-//! - [`auto_loop`] — the 60 s background auto-embed loop and the shared
+//! - `auto_loop` — the 60 s background auto-embed loop and the shared
 //!   10-minute build-probe backoff gate.
 //!
 //! Everything below is re-exported so the external surface

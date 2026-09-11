@@ -3,7 +3,7 @@
 //!
 //! Served at `GET /openapi.json`.
 
-use axum::Json;
+use axum::response::Response;
 use utoipa::OpenApi;
 
 use crate::search::SearchResult;
@@ -86,6 +86,7 @@ impl utoipa::Modify for AddSecuritySchemes {
         crate::serve::handlers::AddDownloadBody,
         crate::serve::handlers::DiagnosticResponse,
         crate::serve::handlers::HealthResponse,
+        crate::serve::handlers::IndexHealth,
         crate::serve::handlers::ListZimsResponse,
         crate::serve::handlers::SearchResponse,
         crate::serve::handlers::SuggestResponse,
@@ -115,11 +116,20 @@ pub struct ApiDoc;
 ///
 /// The spec is built once and cached: it is static for the life of the
 /// process (the utoipa macro expands at compile time), so rebuilding it on
-/// every request was pure waste (PERF-L2).
-pub async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
+/// every request was pure waste (PERF-L2). The JSON body is pre-serialized
+/// once too (`SPEC_JSON`); each request returns a cheap byte-clone of it
+/// instead of deep-cloning and re-serializing the whole spec.
+pub async fn openapi_json() -> Response {
     static SPEC: std::sync::LazyLock<utoipa::openapi::OpenApi> =
         std::sync::LazyLock::new(ApiDoc::openapi);
-    Json(SPEC.clone())
+    static SPEC_JSON: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        serde_json::to_string(&*SPEC).expect("OpenApi spec serializes to JSON")
+    });
+    Response::builder()
+        .status(200)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(SPEC_JSON.clone()))
+        .expect("static response builder never fails")
 }
 
 #[cfg(test)]

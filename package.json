@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "lint": "eslint web/common.js web/index.js web/search.js web/settings.js"
+    "lint": "eslint web/common.js web/index.js web/search.js web/settings.js",
+    "test": "node --test tests/web/*.test.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9",

@@ -17,10 +17,15 @@ use crate::error::{Error, Result};
 use crate::settings::{SearchParamsSnapshot, SettingsCache};
 
 pub use self::sql::SqlQuery;
+// Re-exported (T-3) so the query-plan regression gate in
+// `tests/integration/trgm_plan.rs` can EXPLAIN the exact trgm arm SQL
+// without re-transcribing it. The private `use` below still serves the
+// in-module call sites and unit tests.
 use self::sql::{
-    branch_fetch_limit, build_trgm_arms, fts_sql, trgm_contains_sql, trgm_prefix_sql,
-    trgm_similarity_sql, vector_fetch_limit, vector_sql, SEARCH_HARD_LIMIT, SEARCH_HARD_OFFSET,
+    branch_fetch_limit, build_trgm_arms, fts_sql, trgm_prefix_sql, vector_fetch_limit, vector_sql,
+    SEARCH_HARD_LIMIT, SEARCH_HARD_OFFSET,
 };
+pub use self::sql::{trgm_contains_sql, trgm_similarity_sql};
 
 /// PERF-2: the trigram *contains*/*similarity* arms need at least 3 chars to
 /// be index-useful (Postgres trigrams are built from 3-char windows), so gate

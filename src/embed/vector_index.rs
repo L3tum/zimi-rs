@@ -177,6 +177,12 @@ pub(crate) async fn index_build_worth_probing(pool: &Pool) -> bool {
 /// so it is dropped (concurrently, falling back to a plain drop if that is
 /// refused) before the fresh build.
 ///
+/// While the build itself runs (the pre-build invalid-index drop and the
+/// `CREATE INDEX CONCURRENTLY`), the shared in-flight flag (`AppState`
+/// `index_building`, passed as `in_flight`) is held set via RAII so
+/// `/health` can report `index.building`; it is cleared on completion,
+/// failure, or cancellation.
+///
 /// Both build paths (the `auto_embed_loop` early-build and the
 /// `run_pipeline` post-run build) funnel through this one CAS claim — the
 /// only place that stamps the shared build-probe backoff timestamp on
@@ -190,6 +196,7 @@ pub async fn maybe_build_vector_index(
     settings: &SettingsCache,
     min_rows: i64,
     probe: &std::sync::atomic::AtomicU64,
+    in_flight: &std::sync::atomic::AtomicBool,
 ) -> bool {
     // The single CAS claim for the shared 10-minute backoff: a probe/build
     // attempt from *either* build path within the last 10 minutes skips the
@@ -227,6 +234,9 @@ pub async fn maybe_build_vector_index(
     // the entry belongs to an in-progress build on another connection),
     // the create below still no-ops/errors harmlessly and a later tick
     // retries.
+    // M-A: hold the in-flight flag across the whole build (drop + create)
+    // so `/health` reports `index.building` for its full duration.
+    let _in_flight = BuildInFlight::new(in_flight);
     if matches!(state, VectorIndexState::PresentInvalid) {
         match raw::execute(
             pool,
@@ -291,6 +301,29 @@ pub async fn maybe_build_vector_index(
     }
 }
 
+/// RAII holder for the shared in-flight build flag: sets it on creation and
+/// clears it on drop — so every exit path (build complete, build failed, an
+/// early `return`, or the `tokio::timeout` in `auto_embed_loop` dropping the
+/// future mid-build) leaves the flag cleared. A `&AtomicBool` (not a lock)
+/// so `maybe_build_vector_index` can hold it across `.await` without
+/// blocking anyone; only one build can run at a time (the shared backoff
+/// CAS inside `maybe_build_vector_index`), so no caller ever clears another
+/// build's flag.
+struct BuildInFlight<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> BuildInFlight<'a> {
+    fn new(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for BuildInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -327,5 +360,18 @@ mod tests {
         assert!(should_spawn_build(Absent, 10_000));
         assert!(should_spawn_build(PresentInvalid, 10_000));
         assert!(should_spawn_build(Absent, 999_999));
+    }
+
+    // ── M-A: in-flight build flag guard ────────────────────────────────────
+
+    #[test]
+    fn build_in_flight_guard_sets_and_clears() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+        {
+            let _guard = BuildInFlight::new(&flag);
+            assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

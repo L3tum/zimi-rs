@@ -33,6 +33,9 @@ jobs:
       - run: make web-check
         env:
           ZIMSERVICE_WEB_CHECK_STRICT: "1"
+      # web-test needs jsdom from node_modules (the smoke test boots a JSDOM
+      # document); web-check above is dependency-free and needs no install.
+      - run: npm install --no-audit --no-fund
       # Behavioral unit tests for web/common.js helpers (apiFetch admin-auth
       # flow, esc, formatters) — same strict policy: CI always has node.
       - run: make web-test

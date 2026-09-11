@@ -35,6 +35,21 @@ pub struct HealthResponse {
     /// Branches with ≥ 3 consecutive failures (WI-5).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<String>,
+    /// Vector-index build signal (M-A): a `CREATE INDEX CONCURRENTLY` on a
+    /// large library can run for hours while everything else looks healthy;
+    /// `building: true` is the only /health-visible sign that the service is
+    /// busy building (rather than stuck). Always present (additive).
+    pub index: IndexHealth,
+}
+
+/// `GET /health` → `index`: in-flight vector-index build state (M-A). Only
+/// the boolean the process already tracks (`AppState::index_building`, held
+/// for the duration of the build by `embed::vector_index::maybe_build_vector_index`)
+/// is surfaced — no progress percentage is invented.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct IndexHealth {
+    /// `true` while a vector-index build is running in this process.
+    pub building: bool,
 }
 
 /// `GET /diagnostic` response: operator-facing introspection that `/health`
@@ -102,6 +117,11 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
                 .into_iter()
                 .map(|(name, _)| name)
                 .collect(),
+            index: IndexHealth {
+                building: state
+                    .index_building
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            },
         }),
     )
 }

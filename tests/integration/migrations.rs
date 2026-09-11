@@ -53,7 +53,11 @@ async fn drop_db(base_pool: &Pool, name: &str) {
 /// Create a temp database on the shared server and build a pool for it.
 /// Returns `None` (after recording a mid-test skip) when the server user
 /// cannot `CREATE DATABASE` or the fresh database is unreachable.
-async fn create_temp_db(base_pool: &Pool) -> Option<(Pool, String)> {
+///
+/// `pub` for sibling temp-DB tests (e.g. `trgm_plan.rs`): the pattern is
+/// deliberate — a private database per test keeps the shared dev schema
+/// untouched, and the caller already holds the `DbExclusiveGuard`.
+pub async fn create_temp_db(base_pool: &Pool) -> Option<(Pool, String)> {
     let name = temp_db_name();
     // CREATE/DROP DATABASE cannot run inside a transaction; the plain pooled
     // statement is exactly that (sqlx opens no implicit BEGIN).
@@ -92,8 +96,9 @@ async fn create_temp_db(base_pool: &Pool) -> Option<(Pool, String)> {
 }
 
 /// Close `pool` (releasing its connections), then drop the database
-/// best-effort on the shared server.
-async fn close_and_drop(base_pool: &Pool, pool: &Pool, name: &str) {
+/// best-effort on the shared server. `pub` for sibling temp-DB tests (see
+/// [`create_temp_db`]).
+pub async fn close_and_drop(base_pool: &Pool, pool: &Pool, name: &str) {
     pool.close().await;
     drop_db(base_pool, name).await;
 }

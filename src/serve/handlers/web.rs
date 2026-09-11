@@ -74,6 +74,11 @@ const ASSET_STAMP: &str = concat!("?v=", env!("CARGO_PKG_VERSION"));
 /// (see cache-busting above). Only the four `src="…"` references are
 /// touched; everything else passes through untouched. The raw `web/*.html`
 /// files stay unstamped — the stamping happens only at serve time.
+///
+/// Caching: both the page body (`include_str!` constant) and the stamp are
+/// compile-time constants, so each handler memoizes its stamped body in a
+/// per-page [`std::sync::LazyLock`] (see `web_index` et al.); this rewrite
+/// runs exactly once per page for the life of the process.
 fn stamp_assets(page: &str) -> String {
     const ASSETS: [&str; 4] = ["/common.js", "/index.js", "/search.js", "/settings.js"];
     let mut out = page.to_string();
@@ -87,11 +92,10 @@ fn stamp_assets(page: &str) -> String {
 }
 
 /// Build a `text/html` response for an embedded page carrying the SEC L3
-/// security headers, with the embedded asset URLs version-stamped
+/// security headers. The body must be the version-stamped page body
 /// (see [`stamp_assets`]).
 fn web_html_response(body: &'static str) -> Response {
-    let stamped = stamp_assets(body);
-    let mut resp = Response::new(axum::body::Body::from(stamped));
+    let mut resp = Response::new(axum::body::Body::from(body));
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
         "text/html; charset=utf-8"
@@ -128,17 +132,23 @@ fn web_js_response(body: &'static str) -> Response {
 
 /// Serve the embedded web UI index page (`web/index.html`).
 pub async fn web_index() -> Response {
-    web_html_response(include_str!("../../../web/index.html"))
+    const PAGE: &str = include_str!("../../../web/index.html");
+    static STAMPED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| stamp_assets(PAGE));
+    web_html_response(&STAMPED)
 }
 
 /// Serve the embedded web UI search page (`web/search.html`).
 pub async fn web_search() -> Response {
-    web_html_response(include_str!("../../../web/search.html"))
+    const PAGE: &str = include_str!("../../../web/search.html");
+    static STAMPED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| stamp_assets(PAGE));
+    web_html_response(&STAMPED)
 }
 
 /// Serve the embedded web UI settings page (`web/settings.html`).
 pub async fn web_settings() -> Response {
-    web_html_response(include_str!("../../../web/settings.html"))
+    const PAGE: &str = include_str!("../../../web/settings.html");
+    static STAMPED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| stamp_assets(PAGE));
+    web_html_response(&STAMPED)
 }
 
 /// Serve the embedded shared UI script (`web/common.js`).

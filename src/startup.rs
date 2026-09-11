@@ -12,6 +12,7 @@
 //! that two concurrently-starting instances must not interleave. The guards
 //! need only `Config` (the DSN + `zim_dir`), so they come first.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use sqlx::postgres::PgConnection;
@@ -207,6 +208,10 @@ pub async fn build_state(
     // M-1: non-loopback binds default `access.require_auth_for_reads` to
     // true unless REQUIRE_AUTH_FOR_READS was set explicitly.
     config.apply_require_reads_default(&mut env_snapshot);
+    // SEC L-1: an env-seeded legacy plaintext password must never ride the
+    // snapshot (and the lazy upgrade write) into the settings table as
+    // plaintext — hash it here, before `SettingsCache::load` applies it.
+    hash_legacy_env_seeded_password(&mut env_snapshot);
     let settings = SettingsCache::load(pool.clone(), env_locked, env_snapshot).await?;
     settings.sync_from_config(config); // ARCH-1: general.* display keys <- Config
 
@@ -225,7 +230,9 @@ pub async fn build_state(
     // to argon2id. The operator may not know a plaintext secret still sits
     // in the DB, so warn at serve startup (SEC L-3). One-shot CLI subcommands
     // don't get it: they don't keep the credential warm for an operator to
-    // act on.
+    // act on. Env-seeded plaintext is hashed at startup (SEC L-1, above), so
+    // this only fires for non-env legacy values (DB rows, or `sha2:`-prefixed
+    // AUTH_PASSWORD values, which stay on the lazy upgrade path).
     if mode == StartupMode::Serve
         && legacy_password_startup_warn(&settings.access_mode(), &admin_password)
     {
@@ -305,6 +312,7 @@ pub async fn build_state(
         auth_lockout: Arc::new(Default::default()),
         degradation,
         build_probe: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        index_building: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -797,6 +805,40 @@ pub(crate) fn legacy_password_startup_warn(mode: &str, password: &str) -> bool {
         && crate::settings::is_legacy_password(password)
 }
 
+/// SEC L-1: hash an env-seeded legacy **plaintext** `access.admin_password`
+/// in the startup env snapshot, before [`SettingsCache::load`] applies it —
+/// so a plaintext secret from `AUTH_PASSWORD` is stored (and re-applied on
+/// every `reload()` from the env-locked snapshot) as an argon2id hash from
+/// first boot, instead of persisting plaintext until the middleware's lazy
+/// upgrade on the first successful auth. Pure + DB-free, like the other
+/// snapshot helpers. Passthrough for every non-plaintext value:
+///
+/// - absent/empty — untouched (`env_settings_snapshot` skips empty vars, so
+///   this is the defensive arm only);
+/// - current argon2id hash — untouched (`is_legacy_password` is false);
+/// - `sha2:`-prefixed legacy hash — untouched (out of scope; it still
+///   verifies and stays upgradable via the existing lazy path);
+/// - the `CHANGE_ME` placeholder — **deliberately** not hashed, so
+///   [`admin_password_startup_check`] still refuses to start on it (hashing
+///   it would convert "unfinished setup" into a valid credential).
+///
+/// Verification is unaffected: `verify_admin_password` accepts the argon2id
+/// PHC string produced by `hash_admin_password` for the original plaintext.
+pub(crate) fn hash_legacy_env_seeded_password(snapshot: &mut HashMap<String, String>) {
+    let Some(raw) = snapshot.get(KEY_ACCESS_ADMIN_PASSWORD) else {
+        return;
+    };
+    if raw.is_empty()
+        || raw == "CHANGE_ME"
+        || raw.starts_with("sha2:")
+        || !crate::settings::is_legacy_password(raw)
+    {
+        return;
+    }
+    let hashed = crate::settings::hash_admin_password(raw);
+    snapshot.insert(KEY_ACCESS_ADMIN_PASSWORD.into(), hashed);
+}
+
 /// Log level for a [`StartupWarning`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WarnLevel {
@@ -925,6 +967,73 @@ mod tests {
         assert!(admin_password_startup_check("open", "").is_ok());
         // open mode, placeholder → refuse (unfinished setup must not start silently)
         assert!(admin_password_startup_check("open", "CHANGE_ME").is_err());
+    }
+
+    // ── SEC L-1: env-seeded plaintext hashed at startup ──────────────────
+
+    #[test]
+    fn env_seeded_plaintext_password_hashed_at_startup() {
+        // (a) plaintext in the snapshot is replaced by a salted argon2id
+        // hash that verifies against the original plaintext.
+        let mut snap = HashMap::from([(KEY_ACCESS_ADMIN_PASSWORD.into(), "plainpw".to_string())]);
+        hash_legacy_env_seeded_password(&mut snap);
+        let hashed = snap
+            .get(KEY_ACCESS_ADMIN_PASSWORD)
+            .expect("value must stay present");
+        assert_ne!(hashed, "plainpw", "the plaintext must not survive");
+        assert!(
+            !crate::settings::is_legacy_password(hashed),
+            "must be current-format"
+        );
+        assert!(crate::settings::verify_admin_password(hashed, "plainpw"));
+        assert!(!crate::settings::verify_admin_password(hashed, "wrong"));
+    }
+
+    #[test]
+    fn env_seeded_sha2_password_passes_through() {
+        // (b) `sha2:`-prefixed values stay upgradable via the existing lazy
+        // path — the startup transform must not touch them.
+        let legacy = "sha2:100000$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000";
+        let mut snap = HashMap::from([(KEY_ACCESS_ADMIN_PASSWORD.into(), legacy.to_string())]);
+        hash_legacy_env_seeded_password(&mut snap);
+        assert_eq!(
+            snap.get(KEY_ACCESS_ADMIN_PASSWORD),
+            Some(&legacy.to_string()),
+            "sha2: values must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn env_seeded_empty_or_absent_password_unchanged() {
+        // (c) absent key stays absent; a current argon2id hash is untouched.
+        let mut snap: HashMap<String, String> = HashMap::new();
+        hash_legacy_env_seeded_password(&mut snap);
+        assert!(
+            !snap.contains_key(KEY_ACCESS_ADMIN_PASSWORD),
+            "absent key must stay absent"
+        );
+        let hashed = crate::settings::hash_admin_password("s3cret");
+        let mut snap2 = HashMap::from([(KEY_ACCESS_ADMIN_PASSWORD.into(), hashed.clone())]);
+        hash_legacy_env_seeded_password(&mut snap2);
+        assert_eq!(
+            snap2.get(KEY_ACCESS_ADMIN_PASSWORD),
+            Some(&hashed),
+            "current-format hashes must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn env_seeded_placeholder_password_not_hashed() {
+        // The CHANGE_ME placeholder must survive the transform un-hashed, so
+        // `admin_password_startup_check` still refuses to start on it.
+        let mut snap = HashMap::from([(KEY_ACCESS_ADMIN_PASSWORD.into(), "CHANGE_ME".to_string())]);
+        hash_legacy_env_seeded_password(&mut snap);
+        assert_eq!(
+            snap.get(KEY_ACCESS_ADMIN_PASSWORD),
+            Some(&"CHANGE_ME".to_string()),
+            "the placeholder must reach the startup check un-hashed"
+        );
+        assert!(admin_password_startup_check("password", "CHANGE_ME").is_err());
     }
 
     #[test]

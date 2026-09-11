@@ -370,6 +370,17 @@ pin the downloaded artifacts themselves by **size + SHA-256** (a pinned list
 checked out-of-band, per the Download SSRF section) since the server performs
 no content-integrity verification of its own.
 
+### Content integrity
+
+zimservice trusts the **source** of a ZIM or mirror, not file integrity: it
+does not verify checksums or hashes of downloaded or torrent-acquired ZIMs.
+LAN mirrors are plaintext HTTP and torrent swarm peers are untrusted, so a
+network-positioned or malicious peer can serve different bytes. The impact is
+bounded to defacement or malicious *content* — the sandboxed render path
+(see Served content) blocks script execution, so there is no RCE/XSS from
+served ZIM entries. High-trust operators should use hash-pinned torrents and
+pinned TLS mirrors.
+
 ### TLS termination
 
 zimservice speaks plain HTTP. For network-facing deployments (password mode +

@@ -163,6 +163,7 @@ pub async fn auto_embed_loop(state: Arc<crate::AppState>) {
                     let db = state.db.clone();
                     let settings = state.settings.clone();
                     let probe = state.build_probe.clone();
+                    let index_building = state.index_building.clone();
                     in_flight = Some(tokio::spawn(async move {
                         // A hung `CREATE INDEX CONCURRENTLY` (e.g. waiting
                         // on a lock held by a long-running query) must not
@@ -178,7 +179,13 @@ pub async fn auto_embed_loop(state: Arc<crate::AppState>) {
                         // and we don't want to give up on a legitimate one.
                         if tokio::time::timeout(
                             Duration::from_secs(INDEX_BUILD_TIMEOUT_SECS),
-                            maybe_build_vector_index(&db, &settings, MIN_INDEX_BUILD_ROWS, &probe),
+                            maybe_build_vector_index(
+                                &db,
+                                &settings,
+                                MIN_INDEX_BUILD_ROWS,
+                                &probe,
+                                &index_building,
+                            ),
                         )
                         .await
                         .is_err()
@@ -201,6 +208,7 @@ pub async fn auto_embed_loop(state: Arc<crate::AppState>) {
                 state.settings.clone(),
                 &name,
                 &state.build_probe,
+                &state.index_building,
             )
             .await
             {

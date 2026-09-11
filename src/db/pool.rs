@@ -23,7 +23,7 @@ pub type Pool = PgPool;
 /// All `require`/`verify-ca` (and the `+tls` schemes) map to the `Tls` variant,
 /// which enforces chain validation against the native root store
 /// (sqlx's `SslMode::VerifyCa`). `verify-full` also maps to `Tls` but is
-/// promoted to `SslMode::VerifyFull` in [`connect_options`], which additionally
+/// promoted to `SslMode::VerifyFull` in `connect_options`, which additionally
 /// validates the server certificate's hostname.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsMode {

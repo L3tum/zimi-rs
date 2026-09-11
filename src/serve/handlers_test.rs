@@ -77,6 +77,50 @@ mod tests {
         );
     }
 
+    /// M-A: `/health` carries an additive `index` signal — `building` is
+    /// `true` only while a `CREATE INDEX CONCURRENTLY` is in flight (the flag
+    /// is the `AppState::index_building` field held by the build path, so
+    /// the test sets it directly; no DB needed). All pre-existing fields
+    /// stay, so this also guards the additive-only contract.
+    #[tokio::test]
+    async fn health_reports_index_build_flag() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        // Idle: `index.building` is present and false.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(v["index"]["building"], false, "idle /health: {v:?}");
+        assert_eq!(v["db_connected"], false, "existing fields must stay: {v:?}");
+        assert_eq!(v["status"], "degraded");
+
+        // Simulate an in-flight build: the same flag the build path holds.
+        // Fresh router: `oneshot` consumes the previous one.
+        state
+            .index_building
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(v["index"]["building"], true, "building /health: {v:?}");
+    }
+
     /// Security High #2: `/health` is the unauthenticated, rate-limit-exempt
     /// LB probe, so it must never disclose *which* settings rows are corrupt
     /// (that names internal config keys) — the detail lives on the

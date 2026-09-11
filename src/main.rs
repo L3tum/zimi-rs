@@ -472,6 +472,7 @@ async fn cmd_embed(config: Config, zim: Option<String>) -> anyhow::Result<()> {
             state.settings.clone(),
             name,
             &state.build_probe,
+            &state.index_building,
         )
         .await?;
         println!("Done: {name}");

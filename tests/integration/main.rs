@@ -39,4 +39,5 @@ mod migrations;
 mod raw;
 mod search;
 mod serve;
+mod trgm_plan;
 mod zims;
