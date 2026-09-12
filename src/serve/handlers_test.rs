@@ -1185,7 +1185,8 @@ mod tests {
 
     #[tokio::test]
     async fn web_common_js_has_cache_control() {
-        // Locks in the deploy-time-only cache policy (requires Step 5).
+        // Locks in the immutable per-version-stamp cache policy: the URL
+        // carries ?v=<crate version>, so a given URL's content never changes.
         let app = build_router(test_state());
         let resp = app
             .oneshot(
@@ -1203,7 +1204,43 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "public, max-age=300"
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_style_css_returns_200_css() {
+        // Round-trip: the shared stylesheet route serves the embedded file
+        // with the right content type (no DB needed).
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/style.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/css"
+        );
+        let text = body_text(resp).await;
+        // Must be the real stylesheet, not an empty/placeholder body: it
+        // carries the shared design tokens every page relies on.
+        assert!(
+            text.contains(":root"),
+            "style.css lost its :root token block"
+        );
+        assert!(
+            text.contains("--accent"),
+            "style.css lost the --accent token"
         );
     }
 

@@ -5,15 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Library — zimservice</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%2358a6ff'/%3E%3Ctext x='50' y='70' font-size='62' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EZ%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
 <style>
-:root { --bg: #0d1117; --fg: #c9d1d9; --card: #161b22; --border: #30363d; --accent: #58a6ff; --green: #3fb950; --yellow: #d29922; --red: #f85149; --muted: #8b949e; --purple: #a371f7; }
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--fg); min-height: 100vh; }
-.nav { display: flex; align-items: center; gap: 20px; padding: 12px 24px; border-bottom: 1px solid var(--border); background: var(--card); }
-.nav a { color: var(--accent); text-decoration: none; font-size: 14px; padding: 4px 2px; }
-.nav a:hover { text-decoration: underline; }
-.nav a.active { color: var(--fg); font-weight: 600; border-bottom: 2px solid var(--accent); }
-.nav .brand { font-weight: 700; font-size: 18px; color: var(--fg); margin-right: 8px; }
 .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
 h1 { font-size: 24px; margin-bottom: 8px; }
 .status-bar { display: flex; align-items: center; gap: 16px; margin: 12px 0 20px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
@@ -25,6 +18,7 @@ h2 { font-size: 18px; margin: 28px 0 12px; }
 .zim-card h3 { font-size: 16px; margin-bottom: 8px; color: var(--accent); }
 .zim-card .meta { font-size: 13px; color: var(--muted); line-height: 1.7; }
 .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; background: #21262d; border: 1px solid var(--border); color: var(--muted); }
+.badge-green { color: var(--green); }
 .status { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
 .status-ready { background: #1a3a2a; color: var(--green); }
 .status-pending { background: #3d2e00; color: var(--yellow); }
@@ -42,6 +36,11 @@ h2 { font-size: 18px; margin: 28px 0 12px; }
 .btn-primary { background: #238636; border-color: #2ea043; color: white; }
 .btn-danger { color: var(--red); }
 .btn-danger:hover { border-color: var(--red); }
+.btn-sm { padding: 2px 10px; }
+.btn-xs { padding: 3px 10px; }
+.mt4 { margin-top: 4px; }
+.mt8 { margin-top: 8px; }
+.zim-actions { margin-top: 12px; display: flex; gap: 8px; }
 .toggle { position: relative; width: 34px; height: 19px; flex: none; }
 .toggle input { opacity: 0; width: 0; height: 0; }
 .toggle .slider { position: absolute; inset: 0; background: #30363d; border-radius: 10px; cursor: pointer; transition: .2s; }
@@ -53,6 +52,7 @@ h2 { font-size: 18px; margin: 28px 0 12px; }
 .dl-form { display: flex; gap: 8px; margin-bottom: 14px; }
 .dl-form input { padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border); background: #0d1117; color: var(--fg); font-size: 13px; }
 .dl-form input.url { flex: 1; }
+.dl-form input.name { width: 180px; }
 .dl-form input:focus { outline: none; border-color: var(--accent); }
 .dl-list { display: flex; flex-direction: column; gap: 8px; }
 .dl-item { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }
@@ -61,11 +61,8 @@ h2 { font-size: 18px; margin: 28px 0 12px; }
 .dl-item .url { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
 .dl-item .detail { font-size: 12px; color: var(--muted); margin-top: 6px; }
 .dl-item .detail .err { color: var(--red); }
+.dl-item .status { background: #21262d; }
 .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
-.toast { position: fixed; bottom: 24px; right: 24px; padding: 10px 16px; border-radius: 6px; font-size: 13px; display: none; z-index: 100; }
-.toast.show { display: block; }
-.toast.ok { background: #1a3a2a; color: var(--green); border: 1px solid #2ea043; }
-.toast.err { background: #3a1a1a; color: var(--red); border: 1px solid #da3633; }
 </style>
 </head>
 <body>
@@ -82,8 +79,8 @@ h2 { font-size: 18px; margin: 28px 0 12px; }
 
   <h2>Downloads</h2>
   <div class="dl-form">
-    <input type="text" class="url" id="dlUrl" placeholder="https://…/.zim  or  magnet: / torrent URL">
-    <input type="text" id="dlName" placeholder="name (optional)" style="width:180px">
+    <input type="text" class="url" id="dlUrl" aria-label="ZIM download URL or magnet link" placeholder="https://…/.zim  or  magnet: / torrent URL">
+    <input type="text" class="name" id="dlName" aria-label="Download name (optional)" placeholder="name (optional)">
     <button class="btn btn-primary" id="dlAdd">Add</button>
   </div>
   <div class="dl-list" id="dlList"></div>

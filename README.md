@@ -479,6 +479,32 @@ double-install/double-index the same ZIMs (same `zim_dir` on disk, two writers).
 Run at most one `serve` per `zim_dir`, not just per database. The server logs a
 one-time startup warning about this.
 
+### Legacy databases / upgrades
+
+`serve` (and the other mutating subcommands) apply pending migrations from
+`migrations/` in order on startup. zimservice does **not** auto-upgrade a
+*legacy* database whose `schema_migrations` table still uses the old
+`version INTEGER` column — on startup it detects that shape (the tracking
+table's leading column is `version` rather than `name`) and bails with an
+explanatory error instead of guessing how to migrate it.
+
+The current tracking table is `schema_migrations (name TEXT PRIMARY KEY,
+hash TEXT, applied_at TIMESTAMPTZ)`, keyed by migration filename + content
+hash. The legacy `(version INTEGER)` table can't be mapped onto it in place,
+so the supported upgrade is a **rebuild**:
+
+1. **Back it up** — `pg_dump` the database. The Postgres contents are a
+   *derived index*; your real data is the ZIM source files under `ZIM_DIR`.
+2. **Rebuild** — point zimservice at a fresh database (or drop and recreate
+   the legacy one), then run `zimservice` once. It creates the current
+   `schema_migrations` table, applies every numbered file in `migrations/`,
+   and re-indexes from your ZIMs.
+3. **Verify** — confirm your libraries are searchable again (`zimservice
+   list` / the `/list` endpoint) before discarding the backup.
+
+Rebuilding is safe and idempotent because the database is derived from the
+ZIM files.
+
 ### Pool sizing
 
 The default connection pool size is **20** (`db_pool_size`). All subsystems — the

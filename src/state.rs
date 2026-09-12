@@ -1,32 +1,22 @@
-//! Shared application state (ARCH-7: moved out of `lib.rs`; re-exported at the
+//! Shared application state (moved out of `lib.rs`; re-exported at the
 //! crate root so `zimservice::AppState` / `crate::AppState` stay stable).
 //!
 //! The fields are intentionally broad for handler convenience — each handler
 //! uses only 1–3 of the 11 fields.
 //!
-//! M-5 threshold revisit (2026-09-04, at 26 handlers — past the original ~20
-//! trigger): regrouping the fields into sub-states (e.g. `core` / `downloads`
-//! / `settings`) was evaluated and rejected — the 11 fields belong to 8
+//! Regrouping the fields into sub-states (e.g. `core` / `downloads` /
+//! `settings`) was evaluated and rejected: the 11 fields belong to 8
 //! distinct top-level modules (`db`, `settings`, `zim`, `search`, `torrent`,
 //! `health` ×2, `access` ×2, plus the two `embed` build-state fields
 //! `build_probe` / `index_building`) and every handler group would still
 //! span more than one sub-state, so sub-states would add indirection without
-//! narrowing any handler's surface. Per-handler extractor narrowing stays
+//! narrowing any handler's surface. Per-handler extractor narrowing is
 //! deferred for the same reason: each handler reads only 1–3 fields, so
 //! extractors would duplicate the struct's doc comments rather than remove
-//! coupling.
-//!
-//! **Active trigger (not a passive revisit):** re-run this M-5 evaluation
-//! **every time a field is added to or removed from `AppState`** — do not
-//! wait for a size threshold. Checklist: (1) update the field counts stated
-//! in this doc (there are 11 today; re-evaluated when `index_building`
-//! (M-A) was added — same conclusion: no regrouping, it sits next to the
-//! existing `build_probe` embed build-state field; re-evaluated at the M-B
-//! `serve` → `access` move of `rate_limiter` / `auth_lockout` — same
-//! conclusion, the tally above is updated but the module count is unchanged), (2) re-decide whether the fields should
-//! be regrouped into sub-states or narrowed via per-handler extractors, (3)
-//! update the handler count above. A handler that ever needs ≥4 fields is a
-//! sign it is doing two jobs — split it.
+//! coupling. Re-evaluate the same question whenever a field is added to or
+//! removed from `AppState` (update the field/module counts stated above);
+//! a handler that ever needs ≥4 fields is a sign it is doing two jobs —
+//! split it.
 use std::sync::Arc;
 
 use crate::{
@@ -58,13 +48,13 @@ pub struct AppState {
     /// not config data.
     pub auth_lockout: Arc<access::lockout::LockoutTracker>,
     /// Per-branch degradation tracker: surfaces which search capabilities
-    /// are silently failing (WI-5).
+    /// are silently failing.
     pub degradation: DegradationTracker,
     /// Shared vector-index build-probe backoff timestamp (moved from
     /// `embed::LAST_BUILD_PROBE` process-global static to `AppState` for
     /// testability — the old `#[cfg(test)]` reset raced parallel test threads).
     pub build_probe: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// In-flight vector-index build flag (M-A): set while
+    /// In-flight vector-index build flag: set while
     /// `embed::vector_index::maybe_build_vector_index` is executing the
     /// `CREATE INDEX CONCURRENTLY` (and its pre-build invalid-index drop),
     /// cleared on completion, failure, or cancellation. `/health` surfaces

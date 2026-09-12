@@ -1,5 +1,13 @@
 'use strict';
 
+// ── Magic constants (sizes / timing) ────────────────────────────────────
+// Shortest query (chars) before the autocomplete starts suggesting.
+const SUGGEST_MIN_QUERY_LENGTH = 2;
+// How many suggestions to request from the server.
+const SUGGEST_LIMIT = 8;
+// Debounce before a search-as-you-type suggestion fetch fires (ms).
+const SUGGEST_DEBOUNCE_MS = 200;
+
 let zims = [];
 const params = new URLSearchParams(location.search);
 const initialQ = params.get('q') || '';
@@ -109,14 +117,14 @@ function closeSuggestions() {
 qInput.addEventListener('input', function() {
   clearTimeout(suggestTimer);
   const q = this.value.trim();
-  if (q.length < 2) { closeSuggestions(); return; }
+  if (q.length < SUGGEST_MIN_QUERY_LENGTH) { closeSuggestions(); return; }
   suggestTimer = setTimeout(async () => {
     try {
-      const data = await apiJson(`/suggest?q=${encodeURIComponent(q)}&limit=8`);
+      const data = await apiJson(`/suggest?q=${encodeURIComponent(q)}&limit=${SUGGEST_LIMIT}`);
       if (qInput.value.trim() !== q) return; // user kept typing
       renderSuggestions(data.suggestions || []);
     } catch { /* non-fatal */ }
-  }, 200);
+  }, SUGGEST_DEBOUNCE_MS);
 });
 
 function renderSuggestions(items) {

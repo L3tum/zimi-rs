@@ -87,6 +87,14 @@ pub use crate::db::downloads::ZIM_URL_PREDICATE;
 
 /// Background poller that reconciles the `downloads` table with qBittorrent
 /// state, direct-download progress, and the ZIM library on each tick.
+///
+/// **KNOWN behavior (restart-reset):** the bounded-retry requeue guard
+/// (`last_error`) and its pass clock (`requeue_passes`) are process-local;
+/// both reset when the process restarts, so the give-up-after-N-consecutive-
+/// transient-failures policy does not survive a restart. The `downloads`
+/// table persists the last error message but not the consecutive-failure
+/// count — a row that had almost given up before a restart starts its retry
+/// count over again after one.
 pub struct DownloadPoller {
     pub(crate) db: Pool,
     pub(crate) settings: SettingsCache,
@@ -102,18 +110,29 @@ pub struct DownloadPoller {
     torrent_password: String,
     http: Option<reqwest::Client>,
     /// Cooperative shutdown for [`run`](Self::run): set via
-    /// [`cancel`](Self::cancel) and polled between ticks (BUG-5).
+    /// [`cancel`](Self::cancel) and polled between ticks.
     stopping: Arc<AtomicBool>,
-    /// BUG-6 requeue guard, keyed by row id: the last transient error
-    /// message, its consecutive count, and the pass on which the row was
-    /// last observed as an error row ([`GuardEntry`]). Replaced (count
-    /// reset) when the message changes, removed when the guard gives up or
-    /// when lazy eviction sweeps an entry whose row left `error` by other
+    /// Bounded-retry requeue guard, keyed by row id: the last transient
+    /// error message, its consecutive count, and the pass on which the row
+    /// was last observed as an error row ([`GuardEntry`]). Replaced (count
+    /// reset) when the message changes; on give-up the entry is RETAINED
+    /// (sticky — give-up keeps re-asserting on later passes) and is only
+    /// reclaimed by lazy eviction once the row leaves `error` by other
     /// means (e.g. a manual re-queue); capped at `MAX_LAST_ERROR_TRACKED`.
+    ///
+    /// **KNOWN behavior (restart-reset):** process-local — the map is empty
+    /// at startup, so a row's consecutive transient-failure count resets to
+    /// zero on process restart and the give-up-after-N policy does not
+    /// survive it (only the error message persists, in `downloads.error`).
     last_error: Arc<std::sync::Mutex<HashMap<i32, GuardEntry>>>,
-    /// BUG-6 requeue pass counter (the lazy-eviction clock for the guard
-    /// map): incremented once per `requeue_stale_errors` pass and compared
+    /// Requeue pass counter (the lazy-eviction clock for the guard map):
+    /// incremented once per `requeue_stale_errors` pass and compared
     /// against [`GuardEntry::last_seen`] by the cap sweep.
+    ///
+    /// **KNOWN behavior (restart-reset):** process-local — starts at zero
+    /// on every startup (with an empty guard map, see
+    /// [`last_error`](Self::last_error)); see the struct doc for the
+    /// resulting restart-reset of the requeue give-up policy.
     requeue_passes: AtomicU64,
 }
 
@@ -158,7 +177,7 @@ impl DownloadPoller {
     }
 
     /// Request a cooperative stop: [`run`](Self::run) breaks out of its loop
-    /// at the next between-ticks poll (BUG-5). No tokio-util `CancellationToken`
+    /// at the next between-ticks poll. No tokio-util `CancellationToken`
     /// — a process-lifetime flag is all the run loop needs.
     pub fn cancel(&self) {
         self.stopping.store(true, Ordering::SeqCst);
@@ -216,7 +235,7 @@ impl DownloadPoller {
         .is_some()
     }
 
-    /// BUG-5: atomically check whether this row is still `downloading`; if the
+    /// Atomically check whether this row is still `downloading`; if the
     /// status changed (cancel/finalize raced), log it, drop the qB item, and
     /// return `false` so the caller bails before any further mutation.
     ///
@@ -284,7 +303,7 @@ impl DownloadPoller {
                     tracing::debug!("OPDS update check failed: {e}");
                 }
             }
-            // BUG-5: poll for cancellation between ticks (no tokio::select! — keep
+            // Poll for cancellation between ticks (no tokio::select! — keep
             // the loop shape simple; granularity = tick time).
             if self.cancelled() {
                 tracing::info!("poller cancelled, stopping");
@@ -308,7 +327,7 @@ impl DownloadPoller {
         // failed connect). See [`Self::qbit_configured`].
         let qb_configured = self.qbit_configured(&p);
 
-        // Bounded error-row retry (BUG-6): re-queue stale connection-level
+        // Bounded error-row retry: re-queue stale connection-level
         // errors with a bounded retry guard. This runs BEFORE the early-exit
         // below on purpose: `should_skip_tick` does not count stale `error`
         // rows, so a single failed download with an otherwise-idle queue
@@ -405,17 +424,15 @@ impl DownloadPoller {
 
     /// LINT-2 extraction (`tick()` requeue block): re-queue error rows that
     /// hit a connection-level failure more than 10 minutes ago, bounded by
-    /// `REQUEUE_GIVE_UP_AFTER` (BUG-6) so a persistently-failing row
-    /// eventually stays `error` for manual intervention instead of cycling
-    /// forever — and give-up is *sticky* (FIX-B): the guard entry is retained
-    /// on give-up, so the row is not re-queued again on the next pass. A
-    /// 401/403 session expiry is always exempt — the next re-login is the fix,
-    /// not a human.
+    /// `REQUEUE_GIVE_UP_AFTER` so a persistently-failing row eventually stays
+    /// `error` for manual intervention instead of cycling forever — and
+    /// give-up is *sticky*: the guard entry is retained on give-up, so the row
+    /// is not re-queued again on the next pass. A 401/403 session expiry is
+    /// always exempt — the next re-login is the fix, not a human.
     ///
-    /// FIX-A (requeue 23505): the per-row guard decision is the pure
-    /// [`requeue_guard_step`] and the collision pre-filter is the pure
-    /// [`filter_requeue_name_collisions`], so both bugs are unit-testable
-    /// without Postgres.
+    /// The per-row guard decision is the pure [`requeue_guard_step`] and the
+    /// collision pre-filter is the pure [`filter_requeue_name_collisions`], so
+    /// both are unit-testable without Postgres.
     // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
     #[allow(clippy::expect_used)]
     async fn requeue_stale_errors(&self) -> Result<()> {
@@ -426,7 +443,7 @@ impl DownloadPoller {
         // Raw SQL (db::raw): the case-insensitive regex match `error ~* $1`
         // has no `db::raw` helper shape (the guarded UPDATE lives in
         // `downloads_lifecycle::requeue_stale_errors`). `name` is fetched too
-        // so the FIX-A collision filter below can match it against active rows.
+        // so the collision filter below can match it against active rows.
         let stale: Vec<(i32, String, String)> = crate::db::raw::fetch_all(
             &self.db,
             &format!(
@@ -442,7 +459,7 @@ impl DownloadPoller {
         if stale.is_empty() {
             return Ok(());
         }
-        // FIX-A (requeue 23505): the partial unique `uq_downloads_active_name`
+        // The partial unique `uq_downloads_active_name`
         // (name UNIQUE where status IN queued/downloading) covers active-vs-
         // active only, so an `error` row may share a `name` with an active one.
         // Re-queueing that row would trip 23505 — an error the guarded UPDATE
@@ -587,7 +604,7 @@ impl DownloadPoller {
             let Some(hash) = hash.as_deref() else {
                 continue;
             };
-            // BUG-5: the helper owns the two-statement cleanup — confirm the
+            // The helper owns the two-statement cleanup — confirm the
             // row left `downloading`, drop the torrent from qB, and clear the
             // stale `hash` binding (kept when the removal can't be confirmed).
             let _ = self.status_if_changed(id, hash).await;
@@ -1190,7 +1207,7 @@ mod tests {
         const IT_INFLIGHT_PREFIX: &str = "__it_inflight__";
 
         /// `TorrentInfo` with explicit fields (size/downloaded 2 MiB / 1 MiB → exact `eta_secs`).
-        #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments)] // one parameter per hand-set `TorrentInfo` field (8 of them)
         fn it_torrent(
             hash: &str,
             name: &str,
@@ -1258,7 +1275,7 @@ mod tests {
         /// the torrent's own hash; the rebind test feeds the row's stale one.
         /// `stale` ages the inserted row's `updated_at` past
         /// `MISSING_TORRENT_GRACE` so the missing-torrent expiry arms can fire.
-        #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments)] // one parameter per row/torrent field the harness drives
         async fn it_inflight_case<F>(
             name: &str,
             hash: Option<&str>,
@@ -2420,7 +2437,7 @@ mod tests {
             let _ = tmp;
         }
 
-        /// BUG-5: after `cancel()`, `run` must exit at the next between-ticks
+        /// After `cancel()`, `run` must exit at the next between-ticks
         /// poll — even when every DB and qB call fails (dead pool + dead qB
         /// port). DB-less: no live Postgres is needed because the cancel check
         /// runs regardless of tick success.
@@ -2450,11 +2467,11 @@ mod tests {
                 tokio::time::timeout(std::time::Duration::from_secs(10), poller.run()).await;
             assert!(
                 finished.is_ok(),
-                "run() must stop at the between-ticks cancel poll (BUG-5)"
+                "run() must stop at the between-ticks cancel poll"
             );
         }
 
-        /// BUG-5 (CI-DB): a row that moved to `cancelled` between claim and tick
+        /// A row that moved to `cancelled` between claim and tick
         /// is dropped from qBittorrent and its stale `hash` cleared in the same
         /// tick; no progress UPDATE is issued for it (it no longer matches the
         /// in-flight row query).
@@ -2542,7 +2559,7 @@ mod tests {
             let _ = tmp;
         }
 
-        /// BUG-6 (CI-DB): the requeue guard stops the bounded retry loop after
+        /// The requeue guard stops the bounded retry loop after
         /// `REQUEUE_GIVE_UP_AFTER` consecutive identical transient errors — the
         /// row stays `error` with its message intact (a requeued row's `error`
         /// would be nulled) — while a fresh message and a 401 session-expiry
@@ -2680,7 +2697,7 @@ mod tests {
                 .expect("last_error lock")
                 .get(&guarded)
                 .is_some();
-            // FIX-B: the give-up row must STAY in the guard map (its entry is
+            // The give-up row must STAY in the guard map (its entry is
             // retained, not removed), so the next pass still sees the give-up
             // state and does not reset the count to 1 and re-queue it. The
             // entry is reclaimed later by the lazy stale sweep once the row
@@ -2715,7 +2732,7 @@ mod tests {
             let _ = tmp;
         }
 
-        /// BUG-7 (CI-DB): the tick's bounded-retry requeue is scoped to rows still
+        /// The tick's bounded-retry requeue is scoped to rows still
         /// in `error` state (`WHERE id = ANY($1) AND status = 'error'`) — a row
         /// that carries a stale transient-error message but is `cancelled` or
         /// `complete`, or whose error is non-transient, is never resurrected by

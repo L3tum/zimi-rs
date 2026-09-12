@@ -17,6 +17,15 @@ pub use zimservice::{AppState, HealthProbes};
 pub use tower::ServiceExt;
 
 pub const DEFAULT_URL: &str = "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice";
+
+/// The one-shot vacuous-green banner printed when no database is reachable
+/// (see the skip path in [`pool_or_skip`]).
+///
+/// **Coupling:** the `make test` target greps the suite output for the
+/// substring `INTEGRATION SUITE SKIPPED` to detect this banner and warn —
+/// the test below pins that substring, so changing the wording here fails a
+/// test and forces the Makefile grep to be updated in the same change.
+pub const SKIP_BANNER: &str = "================ INTEGRATION SUITE SKIPPED ================";
 /// Dedicated fixture ZIM name — cleaned up at the end of the test.
 pub const ZIM: &str = "__itest__";
 /// Committed fixture ZIMs directory, resolved at compile time to an absolute
@@ -26,6 +35,22 @@ pub const FIXTURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtu
 /// Live counter of DB-gated tests that were skipped (no database available).
 /// Read by the `#[dtor::dtor]` exit summary at process end.
 pub static SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::SKIP_BANNER;
+
+    /// Pins the substring the `make test` target greps for (see the
+    /// `SKIP_BANNER` doc). If the banner wording changes, this fails and the
+    /// Makefile grep must be updated in the same change.
+    #[test]
+    fn skip_banner_keeps_the_makefile_grep_substring() {
+        assert!(
+            SKIP_BANNER.contains("INTEGRATION SUITE SKIPPED"),
+            "SKIP_BANNER lost the substring the Makefile `test` target greps for"
+        );
+    }
+}
 
 /// The **single** entry point for every DB-gated test in this suite. It is the
 /// only place that builds a pool *and* acquires the cross-process
@@ -90,7 +115,7 @@ pub fn skip(
     static BANNER_PRINTED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     if !BANNER_PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("\n================ INTEGRATION SUITE SKIPPED ================");
+        eprintln!("\n{SKIP_BANNER}");
         eprintln!("No reachable Postgres at {url} ({why}).");
         eprintln!("Every DB-gated test below passes vacuously (no-op, ~0 ms).");
         eprintln!("Database behavior was NOT verified in this run — a 'clean pass'");

@@ -1,5 +1,14 @@
 'use strict';
 
+// ── Magic constants (timing) ─────────────────────────────────────
+// How long the save-bar success/error message lingers before clearing (ms).
+const SAVE_MESSAGE_CLEAR_MS = 6000;
+// How long a ZIM row's flash highlight stays on after scrolling to it (ms).
+const ZIM_FLASH_DURATION_MS = 1600;
+// Delay before flashing the row targeted by a #zim-<name> anchor (ms), so the
+// layout settles first.
+const ANCHOR_FLASH_DELAY_MS = 60;
+
 // Field metadata: label, description, input type. `int`/`float`/`password`/
 // `select` default to text. `restart` marks settings read only at startup.
 const FIELDS = {
@@ -338,7 +347,7 @@ async function saveAll() {
   } finally {
     delete btn.dataset.saving;
     updateSaveBtn();
-    setTimeout(() => { msg.textContent = ''; msg.className = 'msg'; }, 6000);
+    setTimeout(() => { msg.textContent = ''; msg.className = 'msg'; }, SAVE_MESSAGE_CLEAR_MS);
   }
 }
 
@@ -385,13 +394,13 @@ function flashZim(name) {
   if (!row) return;
   row.classList.add('flash');
   row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  setTimeout(() => row.classList.remove('flash'), 1600);
+  setTimeout(() => row.classList.remove('flash'), ZIM_FLASH_DURATION_MS);
 }
 function handleAnchor() {
   if (!location.hash) return;
   const name = location.hash.slice(1);
   if (name.startsWith('zim-')) {
-    setTimeout(() => flashZim(decodeURIComponent(name.slice(4))), 60);
+    setTimeout(() => flashZim(decodeURIComponent(name.slice(4))), ANCHOR_FLASH_DELAY_MS);
   }
 }
 
@@ -401,7 +410,7 @@ async function putZim(name, patch) {
     body: JSON.stringify(patch),
   });
   const msg = document.querySelector(`[data-zmsg="${CSS.escape(name)}"]`);
-  if (msg) { msg.style.opacity = 1; setTimeout(() => msg.style.opacity = 0, 1200); }
+  if (msg) { msg.style.opacity = 1; setTimeout(() => msg.style.opacity = 0, SAVED_MARKER_FADE_MS); }
 }
 
 document.getElementById('zimRows').addEventListener('change', async (e) => {
@@ -430,7 +439,7 @@ document.getElementById('zimRows').addEventListener('input', (e) => {
       await putZim(name, { category: val || null });
       z.category = val || null;
     } catch (err) { toast('Category save failed: ' + err.message, false); }
-  }, 800);
+  }, CATEGORY_SAVE_DEBOUNCE_MS);
 });
 
 // No inline handlers: the save button is static, the show/hide password

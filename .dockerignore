@@ -6,5 +6,13 @@ target
 docs
 .github
 
+# Keep the build context small: these trees/deps are multi-GB and not needed
+# to build the image — without these, every `docker build` / `docker compose
+# build` uploads a multi-GB context for nothing.
+node_modules
+zims
+downloads
+.env
+
 # NOTE: do NOT ignore `web/` (compile-time include_str! at serve/handlers/web.rs) or
 # `examples/` (compiled under --all-targets locally).

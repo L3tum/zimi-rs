@@ -64,16 +64,17 @@ pub fn raw_content_security_headers(content_type: &str) -> Vec<(header::HeaderNa
 }
 
 /// Version stamp appended to the embedded asset URLs in the served pages
-/// (`?v=<crate version>`). The JS files are served from their own routes
-/// with `Cache-Control: public, max-age=300`, so stamping them with the
-/// crate version busts stale browser caches across deploys: a new version
-/// is a new URL.
+/// (`?v=<crate version>`). The asset files are served from their own routes
+/// with `Cache-Control: public, max-age=31536000, immutable`, so stamping
+/// them with the crate version busts stale browser caches across deploys: a
+/// new version is a new URL, and per URL the content is immutable.
 const ASSET_STAMP: &str = concat!("?v=", env!("CARGO_PKG_VERSION"));
 
 /// Rewrite the known embedded asset URLs in a page to carry [`ASSET_STAMP`]
-/// (see cache-busting above). Only the four `src="…"` references are
-/// touched; everything else passes through untouched. The raw `web/*.html`
-/// files stay unstamped — the stamping happens only at serve time.
+/// (see cache-busting above). The four `src="…"` script references and the
+/// shared stylesheet's `href="/style.css"` are touched; everything else passes
+/// through untouched. The raw `web/*.html` files stay unstamped — the stamping
+/// happens only at serve time.
 ///
 /// Caching: both the page body (`include_str!` constant) and the stamp are
 /// compile-time constants, so each handler memoizes its stamped body in a
@@ -88,6 +89,12 @@ fn stamp_assets(page: &str) -> String {
             &format!("src=\"{asset}{ASSET_STAMP}\""),
         );
     }
+    // The shared stylesheet is linked via `href=` (not `src=`); stamp it the
+    // same way so cache-busting covers the CSS, not just the JS.
+    out = out.replace(
+        "href=\"/style.css\"",
+        &format!("href=\"/style.css{ASSET_STAMP}\""),
+    );
     out
 }
 
@@ -106,17 +113,22 @@ fn web_html_response(body: &'static str) -> Response {
     resp
 }
 
-/// Build an `application/javascript` response for an embedded JS file
-/// carrying the SEC L3 security headers.
-fn web_js_response(body: &'static str) -> Response {
+/// Build an immutable-cached response for a version-stamped embedded asset
+/// (JS or CSS) carrying the SEC L3 security headers. One-line-per-asset
+/// wrappers around this keep the header policy (content type + caching) in a
+/// single place.
+///
+/// `immutable`: the URLs are version-stamped by [`stamp_assets`], so a given
+/// URL's content never changes — the browser may cache it indefinitely.
+fn web_asset_response(content_type: &'static str, body: &'static str) -> Response {
     let mut resp = Response::new(axum::body::Body::from(body));
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
-        header::HeaderValue::from_static("application/javascript"),
+        header::HeaderValue::from_static(content_type),
     );
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
-        header::HeaderValue::from_static("public, max-age=300"),
+        header::HeaderValue::from_static("public, max-age=31536000, immutable"),
     );
     for (name, value) in web_security_headers() {
         resp.headers_mut().insert(name, value);
@@ -145,24 +157,44 @@ pub async fn web_settings() -> Response {
     web_html_response(&STAMPED)
 }
 
+/// Serve the embedded shared UI stylesheet (`web/style.css`). Mirrors the
+/// embedded JS files: SEC L3 security headers + immutable caching (the
+/// `?v=` stamp applied by [`stamp_assets`] to each page's `<link>` busts
+/// stale caches across deploys).
+pub async fn web_style_css() -> Response {
+    web_asset_response("application/css", include_str!("../../../web/style.css"))
+}
+
 /// Serve the embedded shared UI script (`web/common.js`).
 pub async fn web_common_js() -> Response {
-    web_js_response(include_str!("../../../web/common.js"))
+    web_asset_response(
+        "application/javascript",
+        include_str!("../../../web/common.js"),
+    )
 }
 
-/// Serve the embedded index-page script (`web/index.js`).
+/// Serve the embedded web UI index script (`web/index.js`).
 pub async fn web_index_js() -> Response {
-    web_js_response(include_str!("../../../web/index.js"))
+    web_asset_response(
+        "application/javascript",
+        include_str!("../../../web/index.js"),
+    )
 }
 
-/// Serve the embedded search-page script (`web/search.js`).
+/// Serve the embedded web UI search script (`web/search.js`).
 pub async fn web_search_js() -> Response {
-    web_js_response(include_str!("../../../web/search.js"))
+    web_asset_response(
+        "application/javascript",
+        include_str!("../../../web/search.js"),
+    )
 }
 
-/// Serve the embedded settings-page script (`web/settings.js`).
+/// Serve the embedded web UI settings script (`web/settings.js`).
 pub async fn web_settings_js() -> Response {
-    web_js_response(include_str!("../../../web/settings.js"))
+    web_asset_response(
+        "application/javascript",
+        include_str!("../../../web/settings.js"),
+    )
 }
 
 #[cfg(test)]
@@ -211,8 +243,8 @@ mod tests {
 
     #[tokio::test]
     async fn web_js_files_have_security_headers() {
-        // Every embedded JS file keeps its own content-type + caching, but
-        // also gets the shared security headers.
+        // Every embedded asset file keeps its own content-type + immutable
+        // caching, but also gets the shared security headers.
         let resp = web_common_js().await;
         assert_eq!(
             resp.headers()
@@ -224,7 +256,7 @@ mod tests {
             resp.headers()
                 .get(header::CACHE_CONTROL)
                 .and_then(|v| v.to_str().ok()),
-            Some("public, max-age=300")
+            Some("public, max-age=31536000, immutable")
         );
         assert_web_security_headers(&resp);
         for resp in [
@@ -234,6 +266,26 @@ mod tests {
         ] {
             assert_web_security_headers(&resp);
         }
+    }
+
+    #[tokio::test]
+    async fn web_style_css_has_content_type_cache_and_security_headers() {
+        // The shared stylesheet mirrors the JS files: its own content-type +
+        // immutable caching, plus the shared security headers.
+        let resp = web_style_css().await;
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/css")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=31536000, immutable")
+        );
+        assert_web_security_headers(&resp);
     }
 
     // ── CSP inline-script hashes (SEC L-2) ───────────────────────────────
@@ -303,6 +355,10 @@ mod tests {
                 "page has an inline <script> block — extract it to a web/*.js file"
             );
             assert!(
+                page.contains("<link rel=\"stylesheet\" href=\"/style.css\">"),
+                "page lost its shared stylesheet link"
+            );
+            assert!(
                 page.contains("<script src=\"/common.js\"></script>"),
                 "page lost its common.js tag"
             );
@@ -354,8 +410,18 @@ mod tests {
                 "{page_js} tag lost its version stamp"
             );
             assert!(
+                html.contains(&format!(
+                    "<link rel=\"stylesheet\" href=\"/style.css?v={v}\">"
+                )),
+                "stylesheet link lost its version stamp"
+            );
+            assert!(
                 !html.contains("src=\"/common.js\">"),
                 "unstamped common.js reference remains"
+            );
+            assert!(
+                !html.contains("href=\"/style.css\">"),
+                "unstamped stylesheet reference remains"
             );
         }
     }
@@ -399,28 +465,32 @@ mod tests {
         None
     }
 
-    // Drift guard: the three pages' `:root` token blocks must stay
-    // byte-identical so a token added to one page (e.g. `--yellow`) is
-    // mirrored in all of them and no page renders `var(--…)` against an
-    // undefined token.
+    // Drift guard: the `:root` design-token block now lives in the shared
+    // `web/style.css` (extracted from the per-page `<style>` blocks). Guard
+    // that the shared block exists and is non-trivial, and that no page still
+    // carries its own (now redundant) `:root` — so a token added to one page
+    // is instead added to the one shared source and every page sees it.
     #[test]
-    fn root_blocks_identical_across_pages() {
-        let blocks: Vec<&str> = [
-            include_str!("../../../web/index.html"),
-            include_str!("../../../web/search.html"),
-            include_str!("../../../web/settings.html"),
-        ]
-        .iter()
-        .map(|page| root_block(page).expect("page lost its :root block"))
-        .collect();
-        assert_eq!(
-            blocks[0], blocks[1],
-            "index.html and search.html :root blocks diverged"
+    fn shared_root_lives_only_in_style_css() {
+        let shared = root_block(include_str!("../../../web/style.css"))
+            .expect("shared style.css lost its :root block");
+        // Non-trivial: carries the core palette tokens the pages reference.
+        assert!(
+            shared.contains("--accent") && shared.contains("--muted") && shared.contains("--green"),
+            ":root token block is non-trivial (has the shared design tokens)"
         );
-        assert_eq!(
-            blocks[0], blocks[2],
-            "index.html and settings.html :root blocks diverged"
-        );
+        // No page may keep a private :root — that is the drift this shared
+        // stylesheet is meant to eliminate.
+        for (page, name) in [
+            (include_str!("../../../web/index.html"), "index.html"),
+            (include_str!("../../../web/search.html"), "search.html"),
+            (include_str!("../../../web/settings.html"), "settings.html"),
+        ] {
+            assert!(
+                root_block(page).is_none(),
+                "{name} still carries a per-page :root block — it should live in web/style.css"
+            );
+        }
     }
 
     // ── Raw-content sandbox headers (SEC-M2) ──────────────────────────────────

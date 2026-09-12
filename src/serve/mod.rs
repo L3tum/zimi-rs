@@ -134,6 +134,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", axum::routing::get(handlers::web_index))
         .route("/search.html", axum::routing::get(handlers::web_search))
         .route("/settings.html", axum::routing::get(handlers::web_settings))
+        .route("/style.css", axum::routing::get(handlers::web_style_css))
         .route("/common.js", axum::routing::get(handlers::web_common_js))
         .route("/index.js", axum::routing::get(handlers::web_index_js))
         .route("/search.js", axum::routing::get(handlers::web_search_js))

@@ -1,6 +1,18 @@
 /* exported apiFetch, apiJson, esc, fmtBytes, fmtEta, fmtNum, snippetHtml, toast, zimControls */
 'use strict';
 
+// ── Magic constants (sizes / timing) ───────────────────────────────────────
+// How long a toast stays on screen before auto-dismissing (ms).
+const TOAST_AUTO_DISMISS_MS = 3000;
+// Base unit for human-readable byte formatting (1 KB = 1024 B, and so on).
+const BYTES_PER_UNIT = 1024;
+// Debounce before an auto-saved category is PUT to the server (ms).
+// Shared by the library page and the settings page.
+const CATEGORY_SAVE_DEBOUNCE_MS = 800;
+// How long the "saved ✓" marker stays visible before fading (ms).
+// Shared by the library page and the settings page.
+const SAVED_MARKER_FADE_MS = 1200;
+
 // ── HTML escape ──────────────────────────────────────────────────────────
 function esc(s) {
   const map = {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'};
@@ -51,7 +63,7 @@ async function apiFetch(url, opts) {
 function fmtBytes(n) {
   if (n == null || isNaN(n)) return '–';
   const u = ['B','KB','MB','GB','TB']; let i = 0;
-  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  while (n >= BYTES_PER_UNIT && i < u.length - 1) { n /= BYTES_PER_UNIT; i++; }
   return n.toFixed(n >= 100 || i === 0 ? 0 : 1) + ' ' + u[i];
 }
 function fmtNum(n) { return n == null ? '–' : n.toLocaleString(); }
@@ -70,7 +82,7 @@ function toast(msg, ok = true) {
   t.textContent = msg;
   t.className = 'toast show ' + (ok ? 'ok' : 'err');
   clearTimeout(_toastTimer);
-  _toastTimer = setTimeout(() => t.className = 'toast', 3000);
+  _toastTimer = setTimeout(() => t.className = 'toast', TOAST_AUTO_DISMISS_MS);
 }
 
 // ── JSON fetch helper ────────────────────────────────────────────────────

@@ -74,13 +74,15 @@ pub const MIGRATION_COUNT: usize = MIGRATIONS.len();
 /// before the 005 removal). Legacy versions 1..5 corresponded to the first
 /// five migrations (001, 002, 003, 004, 006 — 005 is the permanent gap).
 /// Returned at runtime as an error when a legacy (version INTEGER) schema is
-/// detected — zimservice no longer auto-upgrades (PONY-D2).
+/// detected — zimservice no longer auto-upgrades legacy tracking tables in
+/// place. The supported upgrade is a rebuild (see the README, "Legacy
+/// databases / upgrades"); the message points the operator there.
 const LEGACY_SCHEMA_MSG: &str = "found legacy schema_migrations (version INTEGER) — \
-     zimservice no longer auto-upgrades. Manual recipe: \
-     `pg_dump --schema-only -t schema_migrations` the DB, `DROP TABLE schema_migrations`, \
-     run `zimservice serve` once to apply migrations 001-013, then restore your rows into \
-     schema_migrations(name, hash) — or re-download your ZIMs and rebuild the database \
-     from scratch.";
+     zimservice no longer auto-upgrades legacy tracking tables in place. Back up \
+     with `pg_dump`, then rebuild the database (drop/recreate it and run \
+     `zimservice`, which applies the numbered files in migrations/ and \
+     re-indexes from your ZIMs) — see the README \"Legacy databases / \
+     upgrades\" section for the full recipe.";
 
 /// Fixed key for the startup-migration serialization lock (session-level
 /// advisory lock). Any fixed constant works; this spells "zims".
@@ -181,10 +183,12 @@ pub async fn drop_invalid_indexes(pool: &Pool) -> Result<()> {
 /// lock explicitly on every path).
 pub async fn run_migrations_on(client: &mut PgConnection) -> Result<()> {
     // Normalise the tracking table to the (name, hash) shape. A fresh database
-    // gets the table created; an existing database built by the legacy
-    // (version INTEGER) system is upgraded in place so it keeps its applied
-    // set. The hash is Postgres md5() of the file content, computed
-    // server-side, so no client-side hash crate is needed.
+    // gets the table created; an existing database already on the current
+    // (name, hash) shape is left as-is. A legacy (version INTEGER) database is
+    // NOT migrated in place — that shape bails with LEGACY_SCHEMA_MSG (see the
+    // README "Legacy databases / upgrades" rebuild recipe). The hash is
+    // Postgres md5() of the file content, computed server-side, so no
+    // client-side hash crate is needed.
     let shape: Option<String> = raw::fetch_scalar_optional(
         &mut *client,
         "SELECT column_name FROM information_schema.columns \
@@ -284,11 +288,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_schema_message_carries_manual_recipe() {
+    fn legacy_schema_message_is_actionable() {
         for needle in [
             "legacy schema_migrations (version INTEGER)",
             "pg_dump",
             "no longer auto-upgrades",
+            "migrations/",
         ] {
             assert!(
                 LEGACY_SCHEMA_MSG.contains(needle),

@@ -66,6 +66,30 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94
       - run: cargo test --lib --bins --test wiremock
+  # MSRV gate for the strict-DB half: the `msrv` job above only runs the
+  # DB-less unit tests, so a runtime/toolchain dependency surfaced only by the
+  # DB-backed suite (lib/bins/wiremock + integration under 1.94) would slip
+  # through. Runs the same DB-backed selection as `test`, but pinned to 1.94.
+  msrv-db:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
+        env:
+          POSTGRES_USER: zimservice
+          POSTGRES_PASSWORD: zimservice
+          POSTGRES_DB: zimservice
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U zimservice"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94
+      - run: |
+          ZIMSERVICE_REQUIRE_DB=1 \
+          DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
+          cargo test --lib --bins --test wiremock --test integration
   # Rustdoc gate: catch broken intra-doc links and doc build failures.
   docs:
     runs-on: ubuntu-latest
@@ -144,6 +168,13 @@ jobs:
           DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
           cargo llvm-cov --lib --bins --test wiremock --test integration \
             --fail-under-lines "$(cat .github/coverage_floor.txt)"
+  # Docker image build gate: catch the toolchain (H1) and build-context
+  # (H2) regressions that only surface during an actual image build.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t zimservice:ci .
   # Cross-platform smoke: the crate builds and its DB-less unit tests pass on
   # macOS and Windows (DB-gated tests skip — no Postgres service here). Catches
   # platform-specific compile/link issues a Linux-only CI would miss.

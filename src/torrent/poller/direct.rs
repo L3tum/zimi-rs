@@ -204,7 +204,7 @@ enum FileStream {
 /// not throw away resume progress (PERF-11). If the reissue answers
 /// non-success, the `.part` is removed and the row error-marked (the
 /// fallback has already proven the resume unusable).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // request context (url/client/part) + per-row state (cap/db/row id)
 async fn fresh_fallback(
     url: &str,
     client: &reqwest::Client,
@@ -270,7 +270,7 @@ async fn fresh_fallback(
 /// received means the body was cut short (skipped for a row observed
 /// `cancelled` mid-stream: the file is already gone and the row must not be
 /// error-marked).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // request context (url/client/resp/part) + per-row state (resume/cap/db/row id)
 async fn stream_part(
     url: &str,
     client: &reqwest::Client,

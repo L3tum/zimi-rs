@@ -38,20 +38,28 @@ endef
 # presence, and — when <eslint> is non-empty (only the targets that read
 # node_modules) — guard eslint presence. Either guard fails hard under
 # ZIMSERVICE_WEB_CHECK_STRICT=1, else skips with a warning. <skip-label> is
-# the human phrase after "skipping" in the warning. As with DB_WRAP, the
-# guard lines precede <commands> as separate recipe lines (same skip/exit
-# semantics as the pre-macro recipes). Use only inside recipe lines.
+# the human phrase after "skipping" in the warning.
+#
+# IMPORTANT (the fix for the old skip quirk): make runs each recipe line in
+# its OWN shell, so a guard on one line followed by <commands> on the next
+# line cannot be stopped by the guard's `exit 0` — the command line still ran
+# in a fresh shell and failed. So the guard(s) and <commands> are chained on a
+# SINGLE logical line (backslash continuations) with `&&`: everything runs in
+# one shell, and a guard's `exit 0`/`exit 1` genuinely prevents <commands>.
+# The leading `@` silences the whole one-line command (call sites must NOT
+# re-prefix <commands> with `@`). Use only inside recipe lines.
 define WEB_WRAP
-@command -v node >/dev/null 2>&1 || { \
+@{ if ! command -v node >/dev/null 2>&1; then \
   if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
     echo "$1: node not found (strict mode)" >&2; exit 1; \
-  fi; echo "$1: node not found — skipping $3"; exit 0; }
-$(if $2,\
-@[ -x node_modules/.bin/eslint ] || { \
+  else echo "$1: node not found — skipping $3"; fi; exit 0; \
+  fi; } \
+$(if $2,&& { if [ ! -x node_modules/.bin/eslint ]; then \
   if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
     echo "$1: eslint not installed (run: npm install; strict mode)" >&2; exit 1; \
-  fi; echo "$1: eslint not installed (npm install) — skipping $3"; exit 0; },)
-$4
+  else echo "$1: eslint not installed (npm install) — skipping $3"; fi; exit 0; \
+  fi; },) \
+&& $4 && echo "$1: OK"
 endef
 
 .PHONY: all help check fmt fmt-check clippy raw-sql-lint test test-fast test-integration test-strict test-strict-ci build release install uninstall doc run clean web-check web-fmt web-test web-lint
@@ -94,10 +102,26 @@ raw-sql-lint:
 # dedicated temp DB it drops instead of tampering the shared
 # schema_migrations. Every target here (local and CI) therefore runs with the
 # default parallel --test-threads.
+# M4: `--nocapture` surfaces the one-shot "INTEGRATION SUITE SKIPPED" banner
+# (printed by tests/integration/common.rs, pinned by SKIP_BANNER there) so we
+# can detect a vacuous-green run: when the banner is present (no reachable
+# Postgres) we print a prominent red warning at the end — we do NOT hard-fail
+# (local non-strict behavior is unchanged), but the skip is made loud. The run
+# streams live to the terminal (tee) while a copy lands in a temp file that is
+# grepped afterwards; `bash -c` + `set -o pipefail` is needed so the exit
+# status is cargo's, not tee's (POSIX sh pipelines report the last command).
 test:
 	$(CARGO) test --lib --bins --test wiremock
 	$(CARGO) test --doc
-	$(CARGO) test --test integration -- --nocapture
+	@bash -c 'set -o pipefail; \
+	  out=$$(mktemp); trap "rm -f $$out" EXIT; \
+	  $(CARGO) test --test integration -- --nocapture 2>&1 | tee "$$out"; st=$$?; \
+	  if grep -qF "INTEGRATION SUITE SKIPPED" "$$out"; then \
+	    printf "\033[1;31m\n>>> WARNING: DB-backed integration tests were SKIPPED (no reachable Postgres). <<<\033[0m\n"; \
+	    printf "\033[1;31mThe pass above is VACUOUS for the DB paths — no database behavior was verified.\033[0m\n"; \
+	    printf "\033[1;31mFor a real DB run: make test-integration (boots compose Postgres) or make test-strict.\033[0m\n"; \
+	  fi; \
+	  exit $$st'
 
 test-fast:
 	$(CARGO) test --lib --bins
@@ -124,12 +148,14 @@ test-strict-ci:
 
 # JS syntax check for the embedded web UI (web/*.js — the pages carry no
 # inline <script> blocks; the `pages_have_no_inline_scripts` Rust unit test
-# guards that). Requires node; skips with a warning when node is absent.
+# guards that). Also syntax-checks the embedded CSS: web/style.css plus every
+# page's inline <style> block (web/check-css.mjs is a dependency-free parse
+# check). Requires node; skips with a warning when node is absent.
 # Set ZIMSERVICE_WEB_CHECK_STRICT=1 to fail without node.
 web-check:
-	$(call WEB_WRAP,web-check,,JS syntax checks,\
-	@node --check web/common.js web/index.js web/search.js web/settings.js)
-	@echo "web-check: OK"
+	$(call WEB_WRAP,web-check,,web syntax checks,\
+	node --check web/common.js web/index.js web/search.js web/settings.js && \
+	node web/check-css.mjs web/style.css web/index.html web/search.html web/settings.html)
 
 # Behavioral unit tests for the pure helpers in web/common.js (node --test
 # plus jsdom for the DOM-backed smoke tests). Requires node and
@@ -137,8 +163,9 @@ web-check:
 # when node or jsdom is absent. Set ZIMSERVICE_WEB_CHECK_STRICT=1 to fail
 # without node/jsdom. The guards share the test line: make runs each recipe
 # line in its own shell, so an `exit 0` on a SEPARATE guard line would not
-# stop `node --test` (the WEB_WRAP targets above carry that latent quirk);
-# chaining on one logical line makes the skip real.
+# stop `node --test`; chaining on one logical line makes the skip real. The
+# WEB_WRAP macro (web-check/web-lint/web-fmt) now uses the same one-line
+# chaining for the same reason.
 web-test:
 	@if ! command -v node >/dev/null 2>&1; then \
 	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
@@ -158,7 +185,6 @@ web-test:
 web-lint:
 	$(call WEB_WRAP,web-lint,yes,JS lint,\
 	./node_modules/.bin/eslint web/common.js web/index.js web/search.js web/settings.js)
-	@echo "web-lint: OK"
 
 # eslint --fix for the embedded web UI (the JS half of `make fmt`): auto-fixes
 # fixable rules in web/common.js and the per-page scripts — all real files,
@@ -169,7 +195,6 @@ web-lint:
 web-fmt:
 	$(call WEB_WRAP,web-fmt,yes,JS auto-fix,\
 	./node_modules/.bin/eslint --fix web/common.js web/index.js web/search.js web/settings.js)
-	@echo "web-fmt: OK"
 
 # Full pre-merge check suite: type-check, format check, lint, full test run,
 # and the web UI checks (syntax, unit tests, eslint).
@@ -190,7 +215,7 @@ help:
 	@echo "  make test-integration  Boot compose Postgres, run DB integration tests"
 	@echo "  make test-strict      Strict mode: DB required (missing DB is a hard failure)"
 	@echo "  make test-strict-ci    Mirrors the CI test job: strict DB, lib+bins+wiremock+integration"
-	@echo "  make web-check    JS syntax check of the embedded web UI (web/*.js; needs node; skips if absent)"
+	@echo "  make web-check    JS syntax + CSS syntax check of the embedded web UI (needs node; skips if absent)"
 	@echo "  make web-test     Behavioral unit tests for web/common.js helpers (node --test + jsdom; needs npm install; skips if absent)"
 	@echo "  make web-fmt      eslint --fix for the web UI (JS half of make fmt; needs npm install; skips if absent)"
 	@echo "  make web-lint     JS lint of web UI via eslint (needs npm install; skips if absent)"

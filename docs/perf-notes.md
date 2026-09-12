@@ -1,17 +1,12 @@
 # Performance notes
 
-## C12 — trgm/prefix `OR similarity()` plan at scale
+## C12 — trgm/prefix search plan at scale
 
-**Goal:** confirm whether the trigram/prefix search predicate uses its indexes
-at realistic scale (100k rows), or degrades to a sequential scan.
+The single `LIKE … OR similarity() > t` predicate was split into three
+concurrently-run, individually indexable queries (btree prefix, GIN contains,
+GiST similarity), merged by the existing `merge_results`.
 
-**Resolved (DEC-5, Step 4.2):** the single `LIKE … OR similarity() > t`
-predicate was split into three concurrently-run, individually indexable
-queries (btree prefix, GIN contains, GiST similarity), merged by the existing
-`merge_results`.
-
-The plan-shape question (index scan vs sequential scan at 100k rows) is now
-covered by an automated plan-regression test:
+The plan-shape question (index scan vs sequential scan at 100k rows) is covered by an automated plan-regression test:
 `tests/integration/trgm_plan.rs` (`smoke_trgm_search_arm_no_seq_scan_100k`).
 It creates a dedicated temp database (migrated fresh, created and dropped
 around the test so the shared dev schema is never touched), bulk-loads 100k
@@ -28,9 +23,6 @@ reachable Postgres and hard-fails under `ZIMSERVICE_REQUIRE_DB` (CI's `test`
 job), which always runs with a Postgres service. The Q1 prefix (btree) arm is
 **not** covered by the gate — its builder stays `pub(super)` — so if its plan
 shape is ever in doubt, verify it manually with the recipe further down.
-(Earlier CI/docs referenced a `trgm_index_perf_check` test that did not
-exist; those references were removed. The gap that test was meant to fill is
-what `trgm_plan.rs` now covers.)
 
 ### The predicate
 
@@ -133,9 +125,7 @@ serve `LIKE 'q%'` too. Is the btree redundant — can we drop it (migration 014)
 and let the GIN index cover the prefix shape as well?
 
 **How it is measured (manual).** Seed the 100k-row `__itrge__` fixture in the
-dev DB and EXPLAIN (ANALYZE) the five shapes below, printing each plan's node
-(the `trgm_index_perf_check` harness referenced here previously did not exist
-in the repo and its references were removed):
+dev DB and EXPLAIN (ANALYZE) the five shapes below, printing each plan's node:
 
 | Shape | Predicate / ordering | Index it may use |
 |-------|----------------------|------------------|
@@ -190,10 +180,8 @@ intentionally deferred to a future pass:
    deployments.
 2. **`raw_content` 64 MB `to_vec` → streaming** – Streaming large article
    bodies chunk-by-chunk would reduce peak memory, but depends on the `zim`
-   crate exposing a stable streaming/borrow API (it currently requires an
-   owned copy). Revisit when the crate stabilises.
-   *(Re-checked 2026-08-29 against `zim` 0.5.0: `Content` still exposes no
-   range/slice API — only an owned `bytes()`; this item remains blocked.)*
+   crate exposing a stable streaming/borrow API (it currently exposes only an
+   owned `bytes()`; blocked on the crate). Revisit when it stabilises.
 3. **`content_preview` payload gating** – The search API returns a 2 000-char
    preview per result. Gating this behind a query parameter would reduce
    response size for clients that only need titles, but adds API surface.

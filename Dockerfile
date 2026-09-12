@@ -1,5 +1,5 @@
 # Multi-stage build for zimservice
-FROM rust:1.91-slim AS builder
+FROM rust:1.96.0-slim AS builder
 WORKDIR /build
 # Dependency-layer caching: fetch the manifest-only layer first so the
 # Cargo.lock-driven download layer stays valid across source-only changes.

@@ -171,6 +171,9 @@ async fn smoke_trgm_search_arm_no_seq_scan_100k() {
         .await
         .expect("ANALYZE articles");
 
+    // The plan-shape assertions below are PG-16-specific: other Postgres
+    // versions may plan the same query differently (and can fail here).
+
     // (1) Contains arm — `title_lower LIKE '%quixotic granite%'`, served by
     // the GIN trgm index (idx_articles_title_trgm).
     let contains = trgm_contains_sql(PROBE, None, None, 100, 1.0);

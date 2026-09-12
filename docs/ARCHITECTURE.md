@@ -271,6 +271,19 @@ Explicitly declared out of scope:
 - **Per-client rate limiting.** The token bucket is service-wide by design
   (single-operator model); one heavy client can 429 every other client
   (`src/access/ratelimit.rs`, `README.md` "Threat model").
+- **Persistent bounded-retry counts for the download requeue guard.** The
+  give-up-after-N-consecutive-transient-failures policy is process-local
+  (`DownloadPoller::last_error` / `requeue_passes`) and **resets on process
+  restart**: a row whose error message keeps changing across restarts is not
+  counted toward give-up, and a restarting operator can in theory cycle a row
+  past the N-failure bound. Accepted trade-off (2026-09 review): the
+  alternative — persisting a per-row `retry_count` column — was judged not
+  worth a migration for a single-instance operator tool, since `downloads.error`
+  still carries the last message and the bounded retry window (10 min) plus the
+  single-instance invariant keep the blast radius small. Do not "fix" this by
+  deleting the restart-reset notes in `src/torrent/poller/mod.rs` / `requeue.rs`.
+  If the operator model ever changes (unattended long-running deployments),
+  revisit persisting the count.
 - **Content authentication of downloaded ZIMs.** `verify_zim` checks
   structural integrity only — the `zim` crate exposes no checksum/signature
   API. Trust is the source (torrent tracker, OPDS feed), not the file

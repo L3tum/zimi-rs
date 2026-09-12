@@ -1,5 +1,13 @@
 'use strict';
 
+// ── Magic constants (timing / sizes) ─────────────────────────────────
+// Upper bound for a progress percentage (index + download bars).
+const MAX_PERCENT = 100;
+// How often the download list is re-polled while something is in flight (ms).
+const DOWNLOAD_POLL_INTERVAL_MS = 3000;
+// How often the library refreshes while the tab is visible (ms).
+const LIBRARY_REFRESH_INTERVAL_MS = 15000;
+
 // ── Library ─────────────────────────────────────────────────────────────
 // Per-page parts of the shared zimControls() markup (see web/common.js).
 const ZIM_CARD_CONTROLS = {
@@ -27,7 +35,7 @@ async function loadLibrary() {
       `<span>${fmtNum(health.articles_count)} articles indexed</span>` +
       `<span><span class="dot ${health.qbit_connected ? 'ok' : 'bad'}"></span>qBittorrent ` +
       `${health.qbit_connected ? 'connected' : 'not configured'}</span>` +
-      `<a class="btn" style="padding:2px 10px" href="/openapi.json">API</a>`;
+      `<a class="btn btn-sm" href="/openapi.json">API</a>`;
     renderZims();
   } catch (e) {
     bar.innerHTML =
@@ -44,7 +52,7 @@ function renderZims() {
     return;
   }
   grid.innerHTML = zimsData.map(z => {
-    const pct = Math.min(100, Math.round((z.index_progress || 0) * 100));
+    const pct = Math.min(MAX_PERCENT, Math.round((z.index_progress || 0) * 100));
     const bar = (z.index_status === 'indexing' || z.index_status === 'pending')
       ? `<div class="prog"><div style="width:${pct}%"></div></div>` : '';
     const metaBadges =
@@ -52,7 +60,7 @@ function renderZims() {
       + ` ${z.category ? `<span class="badge">${esc(z.category)}</span>` : ''}`
       + ` ${z.date ? `<span class="badge">${esc(z.date)}</span>` : ''}`;
     const embedBadge = z.embed_enabled
-      ? '<span class="badge" style="color:var(--green)">embedding on</span>'
+      ? '<span class="badge badge-green">embedding on</span>'
       : '';
     return `
     <div class="zim-card">
@@ -62,7 +70,7 @@ function renderZims() {
         <div>${fmtNum(z.entry_count)} entries · ${fmtBytes(z.file_size)}</div>
         <div>${fmtNum(z.indexed_entries)} indexed · ${pct}%</div>
         ${bar}
-        <div style="margin-top:8px">
+        <div class="mt8">
           <span class="status status-${esc(z.index_status)}">${esc(z.index_status)}</span>
           ${embedBadge}
         </div>
@@ -70,7 +78,7 @@ function renderZims() {
       <div class="zim-settings">
         ${zimControls(z, ZIM_CARD_CONTROLS)}
       </div>
-      <div style="margin-top:12px;display:flex;gap:8px">
+      <div class="zim-actions">
         <a class="btn" href="/search.html?q=&zim=${encodeURIComponent(z.name)}">Search</a>
         <a class="btn" href="/settings.html#zim-${encodeURIComponent(z.name)}">Settings</a>
       </div>
@@ -99,7 +107,7 @@ document.getElementById('zims').addEventListener('input', (e) => {
   const name = e.target.dataset.cat;
   if (!name) return;
   clearTimeout(catTimers[name]);
-  catTimers[name] = setTimeout(() => saveCategory(name, e.target), 800);
+  catTimers[name] = setTimeout(() => saveCategory(name, e.target), CATEGORY_SAVE_DEBOUNCE_MS);
 });
 async function saveCategory(name, input) {
   const z = zimsData.find(x => x.name === name);
@@ -113,7 +121,10 @@ async function saveCategory(name, input) {
     });
     z.category = val || null;
     const msg = document.querySelector(`[data-catmsg="${CSS.escape(name)}"]`);
-    if (msg) { msg.style.opacity = 1; setTimeout(() => msg.style.opacity = 0, 1200); }
+    if (msg) {
+      msg.style.opacity = 1;
+      setTimeout(() => { msg.style.opacity = 0; }, SAVED_MARKER_FADE_MS);
+    }
   } catch (err) { toast('Category save failed: ' + err.message, false); }
 }
 
@@ -131,7 +142,7 @@ async function loadDownloads() {
   const active = dl.some(
     d => d.status === 'queued' || d.status === 'downloading' || d.status === 'seeding'
   );
-  if (active && !dlPoll) dlPoll = setInterval(loadDownloads, 3000);
+  if (active && !dlPoll) dlPoll = setInterval(loadDownloads, DOWNLOAD_POLL_INTERVAL_MS);
   if (!active && dlPoll) { clearInterval(dlPoll); dlPoll = null; }
 }
 
@@ -139,7 +150,7 @@ function renderDownloads(dl) {
   const list = document.getElementById('dlList');
   if (!dl.length) { list.innerHTML = '<div class="empty">No downloads yet.</div>'; return; }
   list.innerHTML = dl.map(d => {
-    const pct = Math.min(100, Math.round((d.progress || 0) * 100));
+    const pct = Math.min(MAX_PERCENT, Math.round((d.progress || 0) * 100));
     const inFlight = d.status === 'queued' || d.status === 'downloading';
     const speed = d.speed_bps ? ` · ${fmtBytes(d.speed_bps)}/s` : '';
     const upSpeed = d.up_speed_bps ? ` · ▲ ${fmtBytes(d.up_speed_bps)}/s` : '';
@@ -165,16 +176,16 @@ function renderDownloads(dl) {
       seedDetail = `<div class="detail">${up}${ratio}${seeds}${down}</div>`;
     }
     const cancelBtn = inFlight
-      ? `<button class="btn btn-danger" style="padding:3px 10px" data-id="${d.id}">Cancel</button>`
+      ? `<button class="btn btn-danger btn-xs" data-id="${d.id}">Cancel</button>`
       : '';
     return `
     <div class="dl-item">
       <div class="row1">
-        <span class="status" style="background:#21262d;color:${statusColor}">${esc(d.status)}</span>
+        <span class="status" style="color:${statusColor}">${esc(d.status)}</span>
         <span class="name">${esc(d.name)}</span>
         ${cancelBtn}
       </div>
-      <div class="row1" style="margin-top:4px"><span class="url">${esc(d.url)}</span></div>
+      <div class="row1 mt4"><span class="url">${esc(d.url)}</span></div>
       ${prog}
       ${inFlight ? `<div class="detail">${pct}%${speed}${upSpeed}${eta}</div>` : ''}
       ${seedDetail}
@@ -220,5 +231,5 @@ async function cancelDownload(id) {
 
 loadLibrary();
 loadDownloads();
-setInterval(() => { if (!document.hidden) loadLibrary(); }, 15000);
+setInterval(() => { if (!document.hidden) loadLibrary(); }, LIBRARY_REFRESH_INTERVAL_MS);
 // keep index progress / new files fresh (paused while the tab is hidden)

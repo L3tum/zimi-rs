@@ -1,15 +1,15 @@
-//! BUG-6 bounded-retry requeue guard (pure state machine, no DB/IO).
+//! Bounded-retry requeue guard (pure state machine, no DB/IO).
 //!
 //! A download row in `error` state whose message matches
 //! [`REQUEUE_ERROR_PATTERN`] is re-queued for a **bounded** retry: after
 //! `REQUEUE_GIVE_UP_AFTER` consecutive identical non-auth errors the guard
 //! gives up and leaves the row in `error` for manual intervention (401/403
 //! session-expiry messages are always exempt — a re-login is the fix, not a
-//! human). Give-up is *sticky* (FIX-B): the row's guard entry is retained so
+//! human). Give-up is *sticky*: the row's guard entry is retained so
 //! the next pass keeps seeing the give-up state instead of resetting to a
 //! fresh failure. Entries are evicted **lazily**: only when the map hits
 //! `MAX_LAST_ERROR_TRACKED` are entries not observed as error rows within
-//! the last `GUARD_STALE_AFTER_PASSES` requeue passes swept. FIX-A's 23505
+//! the last `GUARD_STALE_AFTER_PASSES` requeue passes swept. The 23505
 //! collision pre-filter ([`filter_requeue_name_collisions`]) lives here too,
 //! so the requeue UPDATE never trips the partial unique
 //! `uq_downloads_active_name`.
@@ -24,18 +24,18 @@ use std::collections::{HashMap, HashSet};
 /// check would be wrong) can be unit-tested independently of the DB.
 pub(crate) const REQUEUE_ERROR_PATTERN: &str = "connect|timeout|refused|unreachable|connection";
 
-/// BUG-6: after this many consecutive bounded-retry cycles with the SAME
+/// After this many consecutive bounded-retry cycles with the SAME
 /// error message, the row is left `error` (manual intervention) instead of
 /// being re-queued again. 401/403 session-expiry messages are exempt — a
 /// re-login is the fix, not a human.
 const REQUEUE_GIVE_UP_AFTER: u32 = 3;
-/// Hard cap on the BUG-6 guard map (one entry per row id cycling transient
-/// errors). Entries are removed when the guard gives up and lazily evicted
-/// when the cap is reached (rows that leave `error` by other means — e.g. a
-/// manual re-queue — keep their entry until that sweep runs), so the cap
-/// only stops pathological pile-up.
+/// Hard cap on the requeue guard map (one entry per row id cycling transient
+/// errors). Entries are RETAINED on give-up (the give-up state must survive to
+/// the next pass) and are only reclaimed by the lazy sweep once the row stops
+/// appearing as an `error` row; the cap (with its pre-admission sweep of stale
+/// entries) only stops pathological pile-up.
 const MAX_LAST_ERROR_TRACKED: usize = 10_000;
-/// BUG-6 guard lazy-eviction window, in requeue passes: when the map hits
+/// Guard lazy-eviction window, in requeue passes: when the map hits
 /// `MAX_LAST_ERROR_TRACKED`, entries not observed as error rows for this
 /// many passes are swept before a new entry is admitted.
 const GUARD_STALE_AFTER_PASSES: u64 = 100;
@@ -52,7 +52,7 @@ fn is_auth_error(msg: &str) -> bool {
     })
 }
 
-/// BUG-6 requeue guard (pure): given the row's previous guard entry
+/// Requeue guard (pure): given the row's previous guard entry
 /// (`Some((previous_message, consecutive_count))`) and the row's current
 /// `error` message, whether the bounded retry loop should stop.
 ///
@@ -69,12 +69,11 @@ fn should_give_up(prev: Option<(&str, u32)>, msg: &str, is_auth: bool) -> bool {
     matches!(prev, Some((pm, n)) if pm == msg && n >= REQUEUE_GIVE_UP_AFTER - 1)
 }
 
-/// One entry of the BUG-6 requeue guard (keyed by row id in
+/// One entry of the requeue guard (keyed by row id in
 /// [`crate::torrent::poller::DownloadPoller::last_error`]): the last transient
 /// error message observed for the row, how many times in a row, and the
-/// requeue pass it was last observed on (the lazy-eviction timestamp for rows
-/// that leave `error` by other means — give-up is the only other removal
-/// path).
+/// requeue pass it was last observed on (the lazy-sweep timestamp: the sweep
+/// is the only removal path — give-up retains the entry).
 #[derive(Debug, Clone)]
 pub(crate) struct GuardEntry {
     pub(crate) prev_msg: String,
@@ -85,7 +84,7 @@ pub(crate) struct GuardEntry {
     pub(crate) last_seen: u64,
 }
 
-/// BUG-6 guard lazy eviction (pure): remove entries not observed as error
+/// Guard lazy eviction (pure): remove entries not observed as error
 /// rows within the last `GUARD_STALE_AFTER_PASSES` requeue passes and
 /// return how many were evicted. Called only when the map hits
 /// `MAX_LAST_ERROR_TRACKED`, so a recently-observed entry is never swept.
@@ -102,7 +101,7 @@ fn sweep_stale_guard_entries(guard: &mut HashMap<i32, GuardEntry>, pass: u64) ->
     stale.len()
 }
 
-/// Outcome of one stale `error` row passing through the BUG-6 requeue guard.
+/// Outcome of one stale `error` row passing through the requeue guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequeueDecision {
     /// Re-queue the row (it goes into the `id = ANY(…)` requeue batch).
@@ -111,7 +110,7 @@ pub(crate) enum RequeueDecision {
     GiveUp,
 }
 
-/// BUG-6 requeue guard, one row at a time (pure — no DB, no lock, so the
+/// Bounded-retry requeue guard, one row at a time (pure — no DB, no lock, so the
 /// give-up contract is unit-testable without Postgres).
 ///
 /// Decides whether the row is re-queued this pass and updates `guard` in
@@ -119,7 +118,7 @@ pub(crate) enum RequeueDecision {
 ///
 /// - **Give up** (`should_give_up`): the row is *not* re-queued and its guard
 ///   entry is **retained** — *not* removed — with its `last_seen` refreshed to
-///   `pass`. Retention is the whole point (FIX-B): a give-up row stays `error`
+///   `pass`. Retention is the whole point: a give-up row stays `error`
 ///   with the same message, so the *next* pass must still see the give-up state
 ///   (count already at the cap) instead of treating it as a fresh failure
 ///   (`prev = None` → count resets to 1) and re-queueing it — that one-shot
@@ -146,7 +145,7 @@ pub(crate) fn requeue_guard_step(
             download_id = id,
             "requeue guard: same error {msg:?} {REQUEUE_GIVE_UP_AFTER}x in a row — leaving row in error state"
         );
-        // FIX-B: retain the entry (never remove) so the give-up state survives
+        // Retain the entry (never remove) so the give-up state survives
         // to the next pass; refresh `last_seen` so the lazy sweep reclaims it
         // once the row leaves `error` by other means. On give-up the entry is
         // always present (`should_give_up` needs a prior count ≥ 2).
@@ -186,7 +185,7 @@ pub(crate) fn requeue_guard_step(
     RequeueDecision::Requeue
 }
 
-/// FIX-A (requeue 23505), pure: drop stale `error` rows that would trip the
+/// 23505 name-collision pre-filter, pure: drop stale `error` rows that would trip the
 /// partial unique `uq_downloads_active_name` if re-queued in this batch —
 /// either because their `name` is already held by an ACTIVE row, or because
 /// another stale `error` row in the same batch shares it.
@@ -233,7 +232,7 @@ pub(crate) fn filter_requeue_name_collisions(
 mod tests {
     use super::*;
 
-    /// BUG-6: the pure requeue guard gives up only on the
+    /// The pure requeue guard gives up only on the
     /// `REQUEUE_GIVE_UP_AFTER`-th consecutive IDENTICAL non-auth error; a
     /// different message resets the count, and 401/403 is always exempt.
     #[test]
@@ -256,7 +255,7 @@ mod tests {
         assert!(!super::should_give_up(None, AUTH, true));
     }
 
-    /// BUG-6 lazy eviction: the sweep removes only entries not observed
+    /// Lazy eviction: the sweep removes only entries not observed
     /// as error rows within the last `GUARD_STALE_AFTER_PASSES` requeue
     /// passes (rows that left `error` by other means — e.g. a manual
     /// re-queue — otherwise leak until the cap); the horizon saturates to
@@ -298,7 +297,7 @@ mod tests {
         assert!(!super::is_auth_error("download failed"));
     }
 
-    /// BUG-6 give-up is STICKY, not one-shot (FIX-B): the moment a row
+    /// Give-up is STICKY, not one-shot: the moment a row
     /// gives up, its guard entry is retained (not removed), so the very
     /// next pass — the row still `error` with the same message — keeps
     /// giving up instead of treating it as a fresh failure (count resets
@@ -367,7 +366,7 @@ mod tests {
         );
     }
 
-    /// FIX-A (requeue 23505): a stale `error` row whose `name` is already
+    /// 23505 name-collision pre-filter: a stale `error` row whose `name` is already
     /// held by an ACTIVE (`queued`/`downloading`) row must be skipped, and
     /// two stale `error` rows sharing a name must collapse to the newest —
     /// re-queueing both would trip the partial unique `uq_downloads_active_name`
