@@ -21,8 +21,7 @@ use crate::embed::vector_index::{
 /// timestamp on `AppState`. Same 10 minutes the loop's old
 /// per-tick `last_attempt` used; sharing it keeps the every-60-s
 /// pipeline-end probe from re-running the `COUNT(*)` + build attempt
-/// (no-op + warn while a build is in flight, or repeated IVFFlat-threshold
-/// warns) on every tick.
+/// (no-op + warn while a build is in flight) on every tick.
 const BUILD_BACKOFF_SECS: u64 = 600;
 
 /// Pure backoff decision for the shared build-probe gate: `true` when no
@@ -826,8 +825,10 @@ mod tests {
         // (fresh AtomicU64::new(0)) so this test's tick can spawn the build
         // regardless of earlier tests' probes.
 
-        // At/above the IVFFlat ceiling no build is attempted at all (the
-        // documented skip), so the test can only make sense below it.
+        // At/above the IVFFlat threshold the loop *would* build an IVFFlat
+        // index (lists = √count, the documented kind preference) — but that
+        // is expensive against a dev DB that already holds millions of
+        // vectors, so this test only makes sense on a small DB.
         let preexisting: i64 = raw::fetch_scalar_optional(
             &pool,
             "SELECT count(*) FROM articles WHERE embedding IS NOT NULL",
@@ -837,7 +838,10 @@ mod tests {
         .expect("embedded count")
         .expect("row present");
         if preexisting + 10_000 >= EMBED_DEFAULT_IVFFLAT_THRESHOLD {
-            eprintln!("skipping: dev DB already holds {preexisting} vectors (IVFFlat ceiling)");
+            eprintln!(
+                "skipping: dev DB already holds {preexisting} vectors (an IVFFlat build at \
+                 this scale would be expensive)"
+            );
             return;
         }
 

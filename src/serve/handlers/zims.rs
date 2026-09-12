@@ -92,6 +92,62 @@ fn pool_health(pool: &crate::db::Pool) -> PoolHealth {
     }
 }
 
+/// `GET /diagnostic` → `vector_index`: the partial `idx_articles_embedding`
+/// degradation state. A missing (or invalid) vector index makes every
+/// vector search a brute-force sequential cosine scan — the most expensive
+/// query shape in the system, invisible from `/health`; the `degraded` note
+/// (≥ 10k embedded rows, no valid index) is the operator-facing signal.
+/// Omitted entirely when the catalog probe itself fails (DB unreachable —
+/// `/health`'s `db_connected` already reports that).
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct VectorIndexDiagnostic {
+    /// `articles` rows with a non-NULL embedding.
+    pub embedded_rows: i64,
+    /// Catalog state of `idx_articles_embedding`: `absent`, `present`
+    /// (valid and usable), or `present_invalid` (a failed/in-progress
+    /// `CONCURRENTLY` build that must be dropped before a fresh build takes
+    /// effect).
+    pub index: crate::embed::VectorIndexState,
+    /// Present only when `index` is not `present` and `embedded_rows >=
+    /// 10 000`: the planner cannot use a vector index, so vector search is
+    /// a full sequential cosine scan over `embedded_rows` rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
+}
+
+/// `GET /diagnostic` → `checkout_wait`: explicit `pool.acquire()` wait times
+/// since process start (Architecture M1). The number behind the "the shared
+/// 20-connection pool is the main scalability limiter" revisit decision (the
+/// PERF-10 trigger in `search::SearchEngine::search`): a non-trivial
+/// `max_us`/`avg_us` under sustained search QPS is the signal to move the
+/// search arms onto separate connections. Only explicit checkouts are
+/// measured (the `search` DB arm + vector ANN seek, `suggest`, the
+/// `ensure_trgm` slow path, and the `/health` db probe); failed acquires
+/// (10 s timeout → 503) are not — those surface via the `pool` saturation
+/// snapshot instead.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct CheckoutWait {
+    /// Explicit checkouts completed since process start.
+    pub count: u64,
+    /// Longest single checkout wait since start, microseconds.
+    pub max_us: u64,
+    /// Average checkout wait since start, microseconds (0 when `count == 0`).
+    pub avg_us: u64,
+}
+
+/// Snapshot the process-global explicit-checkout-wait metric (Architecture
+/// M1). Pure atomic reads — no connection is opened, so this is safe on a
+/// dead/unreachable pool and costs nothing (called only by the
+/// operator-pulled `/diagnostic` handler, like [`pool_health`]).
+fn checkout_wait_snapshot() -> CheckoutWait {
+    let s = crate::db::pool::checkout_wait_stats();
+    CheckoutWait {
+        count: s.count,
+        max_us: s.max_us,
+        avg_us: s.avg_us(),
+    }
+}
+
 /// `GET /diagnostic` response: operator-facing introspection that `/health`
 /// intentionally does not carry (it is an unauthenticated, rate-limit-exempt
 /// LB probe, so it must not disclose which settings rows are corrupt).
@@ -108,6 +164,17 @@ pub struct DiagnosticResponse {
     /// pre-503 signal for a long query (e.g. a reindex `COPY`) holding the
     /// pool at its ceiling. Always present (additive).
     pub pool: PoolHealth,
+    /// Partial vector-index degradation state (Architecture M1): the
+    /// embedded row count, the `idx_articles_embedding` catalog state, and —
+    /// when no valid index exists over ≥ 10k embedded rows — an explicit
+    /// note that vector search is a sequential cosine scan. Omitted when
+    /// the catalog probe itself fails (DB unreachable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_index: Option<VectorIndexDiagnostic>,
+    /// Explicit pool checkout-wait metric since process start (Architecture
+    /// M1): the number behind the pool-size revisit decision. Always
+    /// present (additive).
+    pub checkout_wait: CheckoutWait,
 }
 
 /// `GET /list` response: all ZIM archives with metadata.
@@ -170,9 +237,12 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     )
 }
 
-/// `GET /diagnostic` — operator-facing settings diagnostics (ARCH Major #3,
-/// Security High #2): keys whose stored value fails its `json_type` check
-/// (each silently running on its default). Unlike `/health` it requires a
+/// `GET /diagnostic` — operator-facing diagnostics (ARCH Major #3,
+/// Security High #2): settings keys whose stored value fails its
+/// `json_type` check (each silently running on its default), the shared
+/// pool saturation snapshot (Architecture M1), the vector-index
+/// degradation state (Architecture M1), and the explicit pool
+/// checkout-wait metric (Architecture M1). Unlike `/health` it requires a
 /// valid admin token — it names internal config keys and must not be
 /// readable by any network peer. In open mode nobody can authenticate, so it
 /// always 401s there (loopback operators read the startup warn instead).
@@ -213,10 +283,31 @@ pub async fn diagnostic(
             pool.max_size
         );
     }
+    // Architecture M1 (vector index): surface the degradation state — no
+    // valid index at scale means every vector search is a brute-force
+    // sequential cosine scan. One extra `COUNT(*)` + catalog probe is fine
+    // here: this route is authenticated, operator-pulled, and off the hot
+    // path. On probe failure the field is omitted (the DB is unreachable —
+    // `/health`'s `db_connected` already reports that).
+    let vector_index = match crate::embed::vector_index_state(&state.db).await {
+        Ok((embedded_rows, index)) => Some(VectorIndexDiagnostic {
+            degraded: crate::embed::vector_index_degradation_note(embedded_rows, index),
+            embedded_rows,
+            index,
+        }),
+        Err(e) => {
+            tracing::warn!("vector index diagnostic probe failed: {e}");
+            None
+        }
+    };
+    // Architecture M1 (checkout wait): pure atomic reads — no connection.
+    let checkout_wait = checkout_wait_snapshot();
     Ok(Json(DiagnosticResponse {
         version: env!("CARGO_PKG_VERSION").into(),
         settings_mismatches: state.settings.type_mismatches(),
         pool,
+        vector_index,
+        checkout_wait,
     }))
 }
 

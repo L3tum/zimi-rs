@@ -185,7 +185,7 @@ test('_getToken/_setToken: falsy arg clears the token', () => {
 test('apiJson: happy path returns parsed JSON body', async () => {
   const body = { results: [1, 2, 3], total: 3 };
   const { apiJson } = loadCommon({
-    fetch: async (url, opts) => ({ status: 200, ok: true, json: async () => body }),
+    fetch: async () => ({ status: 200, ok: true, json: async () => body }),
   });
   const data = await apiJson('/search?q=test');
   assert.deepEqual(data, body);
@@ -240,7 +240,7 @@ test('apiJson: 401 triggers the apiFetch auth-retry path', async () => {
   let calls = 0;
   const { apiJson } = loadCommon({
     prompt: () => 'newtoken',
-    fetch: async (url, opts) => {
+    fetch: async () => {
       calls += 1;
       if (calls === 1) return { status: 401, ok: false, json: async () => ({ error: 'unauthorized' }) };
       return { status: 200, ok: true, json: async () => ({ token: 'newtoken' }) };

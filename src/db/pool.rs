@@ -1,7 +1,8 @@
 //! Postgres connection pool configuration and TLS handling.
 
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::ConnectOptions;
@@ -235,6 +236,108 @@ pub async fn connect_dedicated(database_url: &str) -> Result<PgConnection> {
     Ok(conn)
 }
 
+// ─── Explicit checkout-wait metric (Architecture M1) ────────────────────────
+
+/// Explicit `pool.acquire()` wait statistics since process start, in
+/// microseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckoutWaitStats {
+    /// Checkouts that completed (failed/timed-out acquires are not counted).
+    pub count: u64,
+    /// Sum of all checkout waits, µs (saturating add).
+    pub total_us: u64,
+    /// Longest single checkout wait since start, µs (0 = never waited).
+    pub max_us: u64,
+}
+
+impl CheckoutWaitStats {
+    /// Mean checkout wait, µs (0 when no checkout has been recorded).
+    pub fn avg_us(&self) -> u64 {
+        self.total_us / self.count.max(1)
+    }
+}
+
+/// Process-global explicit pool-checkout-wait metric (Architecture M1).
+///
+/// This is the number behind the "the shared 20-connection pool is the main
+/// scalability limiter" revisit decision (the PERF-10 trigger in
+/// `search::SearchEngine::search`): a non-trivial `max`/`avg` checkout wait
+/// under sustained search QPS is the signal to move the search arms onto
+/// separate connections. Only **explicit** `pool.acquire()` sites are
+/// instrumented — via [`acquire_timed`] — because the implicit per-query
+/// acquires inside sqlx's `Executor` impl for `&Pool` are not visible from
+/// call sites. Failed acquires (10 s acquire timeout → 503) are not
+/// recorded: their wait is the known timeout and they surface through the
+/// `/diagnostic` `pool` saturation snapshot instead.
+#[derive(Debug)]
+pub struct CheckoutWaitCounter {
+    count: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+impl CheckoutWaitCounter {
+    const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            total_us: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one completed checkout's wait (saturating; the wait is bounded
+    /// by the pool's 10 s acquire timeout, so real waits cannot saturate).
+    pub fn record(&self, wait: Duration) {
+        let wait_us = wait.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.count.fetch_add(1, Ordering::SeqCst);
+        self.total_us.fetch_add(wait_us, Ordering::SeqCst);
+        let mut cur = self.max_us.load(Ordering::SeqCst);
+        while wait_us > cur {
+            match self.max_us.compare_exchange_weak(
+                cur,
+                wait_us,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(fresh) => cur = fresh,
+            }
+        }
+    }
+
+    /// Point-in-time snapshot (count, total, max).
+    pub fn snapshot(&self) -> CheckoutWaitStats {
+        CheckoutWaitStats {
+            count: self.count.load(Ordering::SeqCst),
+            total_us: self.total_us.load(Ordering::SeqCst),
+            max_us: self.max_us.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// The process-global counter (instrumented via [`acquire_timed`]).
+static CHECKOUT_WAIT: CheckoutWaitCounter = CheckoutWaitCounter::new();
+
+/// Explicit-checkout-wait statistics since process start.
+pub fn checkout_wait_stats() -> CheckoutWaitStats {
+    CHECKOUT_WAIT.snapshot()
+}
+
+/// `pool.acquire()` with the wait recorded into the process-global
+/// checkout-wait metric (surfaced by `/diagnostic`, Architecture M1).
+/// Use at explicit checkout sites; failed acquires are not recorded (see
+/// [`CheckoutWaitCounter`]).
+pub async fn acquire_timed(
+    pool: &Pool,
+) -> std::result::Result<sqlx::pool::PoolConnection<sqlx::Postgres>, sqlx::Error> {
+    let started = Instant::now();
+    let acquired = pool.acquire().await;
+    if acquired.is_ok() {
+        CHECKOUT_WAIT.record(started.elapsed());
+    }
+    acquired
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -258,6 +361,55 @@ mod tests {
     // Pool construction is now async and connection-backed, so the old
     // deadpool `build()` regression test no longer applies; the 10 s acquire
     // timeout is covered by the DB-gated tests.
+
+    // ── explicit checkout-wait metric (Architecture M1) ────────────────────
+
+    #[test]
+    fn checkout_wait_counter_tracks_count_total_max() {
+        let counter = CheckoutWaitCounter::new();
+        assert_eq!(counter.snapshot(), CheckoutWaitStats::default());
+        counter.record(Duration::from_micros(10));
+        counter.record(Duration::from_micros(40));
+        counter.record(Duration::from_micros(30));
+        let s = counter.snapshot();
+        assert_eq!(s.count, 3);
+        assert_eq!(s.total_us, 80);
+        assert_eq!(s.max_us, 40);
+        assert_eq!(s.avg_us(), 80 / 3);
+    }
+
+    #[test]
+    fn checkout_wait_counter_zero_count_avg_is_zero() {
+        // 0/0 must be 0, not a division panic (a fresh process has
+        // `count == 0` until the first explicit checkout).
+        let s = CheckoutWaitCounter::new().snapshot();
+        assert_eq!(s.avg_us(), 0);
+    }
+
+    #[test]
+    fn checkout_wait_counter_records_max_under_contention() {
+        // Two threads racing the max CAS: the final max is the largest
+        // recorded wait, the count is the sum of both threads.
+        let counter = std::sync::Arc::new(CheckoutWaitCounter::new());
+        let counter1 = counter.clone();
+        let counter2 = counter.clone();
+        let t1 = std::thread::spawn(move || {
+            for _ in 0..100 {
+                counter1.record(Duration::from_micros(50));
+            }
+        });
+        let t2 = std::thread::spawn(move || {
+            for _ in 0..100 {
+                counter2.record(Duration::from_micros(7));
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let s = counter.snapshot();
+        assert_eq!(s.count, 200);
+        assert_eq!(s.max_us, 50);
+        assert_eq!(s.total_us, 100 * 50 + 100 * 7);
+    }
 
     #[test]
     fn normalize_sslmode_off_to_disable() {

@@ -33,3 +33,6 @@ pub use vector_index::{
     index_state, maybe_build_vector_index, vector_index_state, VectorIndexState,
     VECTOR_INDEX_MIN_ROWS,
 };
+// /diagnostic degradation note: crate-internal (serve handler), not part of
+// the public embed surface.
+pub(crate) use vector_index::vector_index_degradation_note;

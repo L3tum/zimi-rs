@@ -15,6 +15,8 @@ pub const EMBED_DEFAULT_DIMENSION: u32 = 768;
 /// Vector-index strategy thresholds (article count): below HNSW, at/above IVFFlat.
 pub const EMBED_DEFAULT_HNSW_THRESHOLD: i64 = 1_000_000;
 /// Article-count threshold at which the IVFFlat index is preferred over HNSW.
+/// The index is **still built** at/above it (IVFFlat is chosen over HNSW) —
+/// there is no seq-scan fallback.
 pub const EMBED_DEFAULT_IVFFLAT_THRESHOLD: i64 = 10_000_000;
 
 /// Default `downloads.max_bytes` — 1 EiB, i.e. effectively unbounded.
@@ -177,7 +179,7 @@ pub const KEY_EMBEDDING_MAX_CONCURRENCY: &str = "embedding.max_concurrency";
 pub const KEY_EMBEDDING_TIMEOUT_SECS: &str = "embedding.timeout_secs";
 /// `embedding.hnsw_threshold` — article count at/below which an HNSW index is used.
 pub const KEY_EMBEDDING_HNSW_THRESHOLD: &str = "embedding.hnsw_threshold";
-/// `embedding.ivfflat_threshold` — article count at/above which IVFFlat is preferred over HNSW.
+/// `embedding.ivfflat_threshold` — article count at/above which IVFFlat is preferred over HNSW (the index is still built at/above it — no seq-scan fallback).
 pub const KEY_EMBEDDING_IVFFLAT_THRESHOLD: &str = "embedding.ivfflat_threshold";
 
 // access.* — auth mode, rate limits, admin password, and read-gating.

@@ -194,7 +194,7 @@ test('embed toggle: change → PUT /settings/zim/<name> + success toast', async 
     ...libraryRoutes(),
     { path: '/settings/zim/wiki_en', body: {} },
   ]);
-  const { sandbox, elements, timers } = loadIndex({ fetch: fetchStub });
+  const { sandbox, elements } = loadIndex({ fetch: fetchStub });
   await sandbox.loadLibrary();
   elements.get('zims').dispatch('change', { target: { dataset: { embed: 'wiki_en' }, checked: true } });
   await tick();
@@ -210,7 +210,7 @@ test('embed toggle: API failure → error toast + checkbox reverted', async () =
   const { fetchStub } = routingFetch(libraryRoutes([
     { path: '/settings/zim/wiki_en', body: () => { throw new Error('denied'); } },
   ]));
-  const { sandbox, elements, timers } = loadIndex({ fetch: fetchStub });
+  const { sandbox, elements } = loadIndex({ fetch: fetchStub });
   await sandbox.loadLibrary();
   const target = { dataset: { embed: 'wiki_en' }, checked: true };
   elements.get('zims').dispatch('change', { target });

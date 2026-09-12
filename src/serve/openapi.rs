@@ -86,6 +86,9 @@ impl utoipa::Modify for AddSecuritySchemes {
         crate::serve::handlers::AddDownloadBody,
         crate::serve::handlers::DiagnosticResponse,
         crate::serve::handlers::PoolHealth,
+        crate::serve::handlers::VectorIndexDiagnostic,
+        crate::serve::handlers::CheckoutWait,
+        crate::embed::VectorIndexState,
         crate::serve::handlers::HealthResponse,
         crate::serve::handlers::IndexHealth,
         crate::serve::handlers::ListZimsResponse,
@@ -203,6 +206,31 @@ mod tests {
         assert!(
             components.schemas.contains_key("PoolHealth"),
             "the /diagnostic pool snapshot must be a registered schema"
+        );
+        // Architecture M1 (vector index + checkout wait): the nested
+        // /diagnostic schemas — including the re-exported embed enum that
+        // `VectorIndexDiagnostic.index` references — must all resolve.
+        for schema in ["VectorIndexDiagnostic", "CheckoutWait", "VectorIndexState"] {
+            assert!(
+                components.schemas.contains_key(schema),
+                "the /diagnostic {schema} schema must be registered"
+            );
+        }
+        // The schema's enum values must match the serde runtime names
+        // (`#[serde(rename_all = "snake_case")]` on `VectorIndexState`) —
+        // a drift would document one wire format and emit another.
+        let doc2 = serde_json::to_value(ApiDoc::openapi()).expect("spec serializes");
+        let state_schema = &doc2["components"]["schemas"]["VectorIndexState"]["enum"];
+        assert_eq!(
+            state_schema,
+            &serde_json::json!(["absent", "present", "present_invalid"]),
+            "schema enum drifted from the serde wire format"
+        );
+        // And the serde runtime actually emits those names.
+        assert_eq!(
+            serde_json::to_value(crate::embed::VectorIndexState::PresentInvalid)
+                .expect("enum serializes"),
+            serde_json::json!("present_invalid")
         );
         // The spec must serialize to valid JSON.
         let json = serde_json::to_value(&doc).expect("spec serializes");

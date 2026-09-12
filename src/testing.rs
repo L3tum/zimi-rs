@@ -105,8 +105,8 @@ pub static LIB_SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 /// [`LIB_SKIPPED`] (the `#[dtor]` exit summary reads it) + a skip notice.
 /// Every DB-connection skip in the lib suite goes through here so the exit
 /// summary never under-reports on a DB-less machine (env-condition skips,
-/// e.g. the IVFFlat-ceiling and multi-instance opt-outs, are counted
-/// separately). Generic in the return type so each caller's `Option<T>` arm
+/// e.g. the IVFFlat-threshold dev-DB guard and multi-instance opt-outs, are
+/// counted separately). Generic in the return type so each caller's `Option<T>` arm
 /// can delegate to it directly.
 #[cfg(test)]
 pub fn gate_skip<T>(test: &str, url: &str, why: &str) -> Option<T> {

@@ -1,4 +1,4 @@
-/* exported apiFetch, apiJson, esc, fmtBytes, fmtEta, fmtNum, snippetHtml, toast, zimControls */
+/* exported apiFetch, apiJson, esc, fmtBytes, fmtEta, fmtNum, snippetHtml, toast, zimControls, CATEGORY_SAVE_DEBOUNCE_MS, SAVED_MARKER_FADE_MS */ // eslint-disable-line max-len
 'use strict';
 
 // ── Magic constants (sizes / timing) ───────────────────────────────────────

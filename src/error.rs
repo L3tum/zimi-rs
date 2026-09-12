@@ -3,6 +3,9 @@
 //! `Error` is the crate-wide error enum; `status_and_message()` maps each
 //! variant to an HTTP status + user-safe message — client errors keep their
 //! text, while internal/DB errors are redacted so details never leak.
+//! Operator logging happens exactly once per surfaced response, at the
+//! `IntoResponse` boundary (`Error::log`), so an error inspected elsewhere
+//! (pool error mapping, tests) is never double-logged.
 use thiserror::Error;
 
 /// Classification of a [`Error::Torrent`]: `SessionExpired` marks a 401/403
@@ -107,9 +110,37 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Map our errors to axum HTTP responses.
 impl axum::response::IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
+        // The one and only operator log for this error: `status_and_message`
+        // is pure, so the same error surfaced twice is not logged twice.
+        self.log();
         let (status, message) = self.status_and_message();
         let body = serde_json::json!({ "error": message });
         (status, axum::Json(body)).into_response()
+    }
+}
+
+impl Error {
+    /// Operator log for a surfaced HTTP error, emitted exactly once at the
+    /// [`IntoResponse`] boundary. Level/field mapping per variant:
+    /// `Torrent` to warn (`kind` + upstream `msg`, SEC-L2); `Http`, `Zim`,
+    /// `Config`, `Io`, `Json`, `Embedding`, `Mcp`, `Internal` to error (full
+    /// `{self:?}`); the client-error variants (their text goes to the
+    /// response) and `Database` (details handled at the fault site) log
+    /// nothing.
+    fn log(&self) {
+        match self {
+            Error::Torrent { kind, msg } => {
+                // SEC-L2: raw upstream text (qBittorrent API bodies, HTTP failure
+                // strings) is logged for the operator but never returned to clients.
+                tracing::warn!("torrent error ({kind:?}): {msg}");
+            }
+            Error::NotFound(_)
+            | Error::Forbidden(_)
+            | Error::InvalidInput(_)
+            | Error::Conflict(_)
+            | Error::Database(_) => {}
+            _ => tracing::error!("internal error: {self:?}"),
+        }
     }
 }
 
@@ -170,9 +201,11 @@ pub(crate) fn duplicate_field(constraint: &str) -> String {
 impl Error {
     /// HTTP status + client-safe message for this error.
     ///
-    /// Internal errors (database, upstream HTTP, pool, anything else) never
-    /// leak their raw text to the client — that goes to the log instead, so
-    /// constraint names, SQL state and driver internals stay server-side.
+    /// Pure (no side effects): operator logging lives in [`Self::log`],
+    /// called once at the `IntoResponse` boundary. Internal errors (database,
+    /// upstream HTTP, pool, anything else) never leak their raw text to the
+    /// client — that goes to the log instead, so constraint names, SQL state
+    /// and driver internals stay server-side.
     fn status_and_message(&self) -> (axum::http::StatusCode, String) {
         use axum::http::StatusCode;
 
@@ -190,17 +223,11 @@ impl Error {
             // Decision 2026-08-27 (B6.9): keep 502 — upstream qBittorrent /
             // download failures dominate; client-data validation via torrent
             // is the rare case, so 502 is the more honest status.
-            Error::Torrent { kind, msg } => {
-                // SEC-L2: raw upstream text (qBittorrent API bodies, HTTP failure
-                // strings) is logged for the operator but never returned to clients.
-                tracing::warn!("torrent error ({kind:?}): {msg}");
-                (
-                    StatusCode::BAD_GATEWAY,
-                    "upstream torrent service failed".into(),
-                )
-            }
+            Error::Torrent { .. } => (
+                StatusCode::BAD_GATEWAY,
+                "upstream torrent service failed".into(),
+            ),
             _ => {
-                tracing::error!("internal error: {self:?}");
                 let (status, msg) = match self {
                     Error::Http(_) => (StatusCode::BAD_GATEWAY, "upstream request failed"),
                     _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),

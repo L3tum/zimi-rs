@@ -40,7 +40,8 @@ pub(crate) const INDEX_BUILD_TIMEOUT_SECS: u64 = 3_600;
 /// index with that name, valid or not, so the build path must drop the
 /// invalid entry first or every subsequent attempt silently no-ops until
 /// someone manually drops it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum VectorIndexState {
     /// No `idx_articles_embedding` entry in the catalog at all.
     Absent,
@@ -63,6 +64,37 @@ pub(crate) fn classify_index_state(valid: bool, invalid: bool) -> VectorIndexSta
     } else {
         VectorIndexState::Absent
     }
+}
+
+/// Pure `idx_articles_embedding` build-statement selection: HNSW below
+/// `hnsw_threshold`, IVFFlat at/above (with `lists = √count`, floored at
+/// 100). This is the *only* threshold that chooses an index kind — the
+/// separate `embedding.ivfflat_threshold` merely documents that IVFFlat is
+/// preferred over HNSW at/above it; it never suppresses a build (there is
+/// no seq-scan fallback above it).
+pub(crate) fn index_build_sql(count: i64, hnsw_threshold: i64) -> String {
+    if count < hnsw_threshold {
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_articles_embedding ON articles USING hnsw (embedding vector_cosine_ops) WHERE embedding IS NOT NULL".to_string()
+    } else {
+        let lists = ((count as f64).sqrt() as i32).max(100);
+        format!(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_articles_embedding ON articles USING ivfflat (embedding vector_cosine_ops) WITH (lists = {lists}) WHERE embedding IS NOT NULL"
+        )
+    }
+}
+
+/// Operator-facing degradation note (for `/diagnostic`): `Some` when no
+/// **valid** vector index covers a non-trivial number of embedded rows
+/// (≥ [`MIN_INDEX_BUILD_ROWS`]) — i.e. the planner cannot use a vector
+/// index and every vector search is a brute-force sequential cosine scan
+/// over `count` rows.
+pub(crate) fn vector_index_degradation_note(count: i64, state: VectorIndexState) -> Option<String> {
+    (count >= MIN_INDEX_BUILD_ROWS && !matches!(state, VectorIndexState::Present)).then(|| {
+        format!(
+            "no valid vector index over {count} embedded rows — vector search \
+                 is a sequential cosine scan over every embedded row"
+        )
+    })
 }
 
 /// Pure gate for whether the vector-index build should be spawned, given
@@ -167,15 +199,22 @@ pub(crate) async fn index_build_worth_probing(pool: &Pool) -> bool {
 }
 
 /// Decide whether a vector index is needed (≥ `min_rows` embedded vectors,
-/// no **valid** index yet per the catalog, below the IVFFlat ceiling) and,
-/// if so, build it with `CREATE INDEX CONCURRENTLY` so search stays live
-/// during the build. Returns `true` if a build completed. Tolerates a
+/// no **valid** index yet per the catalog) and, if so, build it with
+/// `CREATE INDEX CONCURRENTLY` so search stays live during the build.
+/// Returns `true` if a build completed. Tolerates a
 /// pre-existing valid or in-progress index (no-op via `IF NOT EXISTS`), and
 /// **repairs a failed one**: an `indisvalid = false` catalog entry
 /// (left by a failed/in-progress `CONCURRENTLY` build) would otherwise make
 /// every `CREATE INDEX CONCURRENTLY IF NOT EXISTS` silently no-op forever,
 /// so it is dropped (concurrently, falling back to a plain drop if that is
 /// refused) before the fresh build.
+///
+/// The index *kind* is threshold-driven ([`index_build_sql`]): HNSW below
+/// `embedding.hnsw_threshold`, IVFFlat at/above it. `embedding.ivfflat_threshold`
+/// only documents that IVFFlat is preferred over HNSW at/above it — a build
+/// is **always** attempted once the row-count and catalog gates pass
+/// (including at/above the IVFFlat threshold); there is no seq-scan
+/// fallback at any scale.
 ///
 /// While the build itself runs (the pre-build invalid-index drop and the
 /// `CREATE INDEX CONCURRENTLY`), the shared in-flight flag (`AppState`
@@ -215,15 +254,6 @@ pub async fn maybe_build_vector_index(
         }
     };
     if count < min_rows || matches!(state, VectorIndexState::Present) {
-        return false;
-    }
-    let ivfflat_threshold = settings
-        .get_typed(KEY_EMBEDDING_IVFFLAT_THRESHOLD)
-        .unwrap_or(EMBED_DEFAULT_IVFFLAT_THRESHOLD);
-    if count >= ivfflat_threshold {
-        tracing::warn!(
-            "{count} vectors exceeds IVFFlat threshold — skipping vector index (will use seq scan)"
-        );
         return false;
     }
     // A failed (or in-progress) `CONCURRENTLY` build leaves a catalog entry
@@ -276,14 +306,19 @@ pub async fn maybe_build_vector_index(
     let hnsw_threshold = settings
         .get_typed(KEY_EMBEDDING_HNSW_THRESHOLD)
         .unwrap_or(EMBED_DEFAULT_HNSW_THRESHOLD);
-    let sql = if count < hnsw_threshold {
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_articles_embedding ON articles USING hnsw (embedding vector_cosine_ops) WHERE embedding IS NOT NULL".to_string()
-    } else {
-        let lists = ((count as f64).sqrt() as i32).max(100);
-        format!(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_articles_embedding ON articles USING ivfflat (embedding vector_cosine_ops) WITH (lists = {lists}) WHERE embedding IS NOT NULL"
-        )
-    };
+    let ivfflat_threshold = settings
+        .get_typed(KEY_EMBEDDING_IVFFLAT_THRESHOLD)
+        .unwrap_or(EMBED_DEFAULT_IVFFLAT_THRESHOLD);
+    // Strategy is pure and threshold-driven (`index_build_sql`): IVFFlat is
+    // preferred over HNSW at/above the IVFFlat threshold — the index is
+    // still built; a brute-force seq scan is never the fallback.
+    let sql = index_build_sql(count, hnsw_threshold);
+    if count >= ivfflat_threshold {
+        tracing::info!(
+            "{count} vectors ≥ IVFFlat threshold — building an IVFFlat index \
+             (preferred over HNSW at this scale; no seq-scan fallback)"
+        );
+    }
     tracing::info!("building vector index CONCURRENTLY for {count} vectors");
     // CONCURRENTLY must not run inside an explicit transaction; a fresh
     // pooled connection is in autocommit, so this is safe.
@@ -342,6 +377,79 @@ mod tests {
         assert_eq!(classify_index_state(false, false), VectorIndexState::Absent);
         // Defensive: impossible for one index name (indisvalid is per index).
         assert_eq!(classify_index_state(true, true), VectorIndexState::Present);
+    }
+
+    // ── index kind selection (the IVFFlat threshold picks the kind, never skips) ──
+
+    #[test]
+    fn index_build_sql_hnsw_below_threshold() {
+        let sql = index_build_sql(999_999, 1_000_000);
+        assert!(
+            sql.contains("USING hnsw"),
+            "below the HNSW threshold: {sql}"
+        );
+        assert!(!sql.contains("ivfflat"));
+    }
+
+    #[test]
+    fn index_build_sql_ivfflat_at_and_above_threshold() {
+        // At the HNSW threshold, IVFFlat wins; lists = √count = 1000.
+        let sql = index_build_sql(1_000_000, 1_000_000);
+        assert!(sql.contains("USING ivfflat"), "at the threshold: {sql}");
+        assert!(sql.contains("lists = 1000"), "lists = √count: {sql}");
+        // √100 = 10 < 100 → the 100-list floor applies.
+        let sql_small = index_build_sql(100, 100);
+        assert!(
+            sql_small.contains("lists = 100"),
+            "lists floor: {sql_small}"
+        );
+    }
+
+    #[test]
+    fn index_build_sql_never_skips_above_the_ivfflat_threshold() {
+        // Regression: the old code built *no* index above
+        // `embedding.ivfflat_threshold` (10M), degrading vector search to a
+        // sequential scan. The threshold only picks the kind (IVFFlat), it
+        // never suppresses the build. √10_000_000 ≈ 3162.27 → 3162.
+        let sql = index_build_sql(10_000_000, 1_000_000);
+        assert!(
+            sql.contains("USING ivfflat"),
+            "at the IVFFlat threshold: {sql}"
+        );
+        assert!(sql.contains("lists = 3162"), "{sql}");
+    }
+
+    // ── /diagnostic degradation note ───────────────────────────────────────
+
+    #[test]
+    fn degradation_note_only_without_valid_index_at_scale() {
+        // Below the 10k build threshold: no note (the index is simply not
+        // worth building; seq scan on < 10k rows is cheap).
+        assert_eq!(
+            vector_index_degradation_note(0, VectorIndexState::Absent),
+            None
+        );
+        assert_eq!(
+            vector_index_degradation_note(9_999, VectorIndexState::Absent),
+            None
+        );
+        // A valid index at any scale: no note.
+        assert_eq!(
+            vector_index_degradation_note(10_000, VectorIndexState::Present),
+            None
+        );
+        assert_eq!(
+            vector_index_degradation_note(i64::MAX, VectorIndexState::Present),
+            None
+        );
+        // No index (or an invalid one) at scale: explicit note naming the
+        // seq scan and the row count.
+        for st in [VectorIndexState::Absent, VectorIndexState::PresentInvalid] {
+            let note = vector_index_degradation_note(123_456, st)
+                .expect("degraded at scale without a valid index");
+            assert!(note.contains("123456"), "{note}");
+            assert!(note.contains("sequential"), "{note}");
+        }
     }
 
     #[test]

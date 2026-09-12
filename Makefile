@@ -157,34 +157,48 @@ web-check:
 	node --check web/common.js web/index.js web/search.js web/settings.js && \
 	node web/check-css.mjs web/style.css web/index.html web/search.html web/settings.html)
 
-# Behavioral unit tests for the pure helpers in web/common.js (node --test
-# plus jsdom for the DOM-backed smoke tests). Requires node and
-# `npm install` (node_modules) first, same as web-lint; skips with a warning
-# when node or jsdom is absent. Set ZIMSERVICE_WEB_CHECK_STRICT=1 to fail
-# without node/jsdom. The guards share the test line: make runs each recipe
-# line in its own shell, so an `exit 0` on a SEPARATE guard line would not
-# stop `node --test`; chaining on one logical line makes the skip real. The
-# WEB_WRAP macro (web-check/web-lint/web-fmt) now uses the same one-line
-# chaining for the same reason.
+# Behavioral unit tests for the web UI helpers + page scripts (node --test).
+# Two DOM harnesses coexist (dev-only): the hand-rolled, dependency-free shim
+# (tests/web/dom.mjs) backs common/index/search/settings, while the real-DOM
+# jsdom harness (tests/web/jsdom.mjs) backs smoke.test.mjs. Requires node.
+#
+# WHY keep jsdom (and not port smoke to the shim): smoke loads each page's
+# HTML, executes the <script src> files in document load order, and asserts on
+# the browser-PARSED element tree (class/attribute querySelectorAll, bubbling
+# Event). The shim does not parse HTML or run the page scripts — reproducing
+# that there would mean rebuilding an HTML parser + script runtime (a browser).
+# jsdom is the only reasonable way to get real parsed-DOM behavior.
+#
+# Consequence: `npm install` (jsdom) is needed ONLY for smoke.test.mjs. When
+# jsdom is absent we still run the other four (shim-backed) suites and skip
+# just smoke.test.mjs — so the web UI is testable without a full install.
+# Set ZIMSERVICE_WEB_CHECK_STRICT=1 to fail hard without node/jsdom. The node
+# guard and the run stay chained on ONE logical line: make runs each recipe
+# line in its own shell, so an `exit 0` on a separate guard line would not
+# stop the test run (same reason WEB_WRAP uses one-line chaining).
 web-test:
 	@if ! command -v node >/dev/null 2>&1; then \
 	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
 	    echo "web-test: node not found (strict mode)" >&2; exit 1; \
 	  fi; echo "web-test: node not found — skipping web UI unit tests"; exit 0; \
 	fi && \
-	if ! node -e "import('jsdom')" >/dev/null 2>&1; then \
-	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
-	    echo "web-test: jsdom not installed (run: npm install; strict mode)" >&2; exit 1; \
-	  fi; echo "web-test: jsdom not installed (npm install) — skipping web UI unit tests"; exit 0; \
-	fi && node --test tests/web/*.test.mjs
+	if node -e "import('jsdom')" >/dev/null 2>&1; then \
+	  node --test tests/web/*.test.mjs; \
+	elif [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
+	  echo "web-test: jsdom not installed (run: npm install; strict mode)" >&2; exit 1; \
+	else \
+	  echo "web-test: jsdom not installed (npm install) — skipping tests/web/smoke.test.mjs only"; \
+	  node --test tests/web/common.test.mjs tests/web/index.test.mjs tests/web/search.test.mjs tests/web/settings.test.mjs; \
+	fi
 
 # Real lint (eslint) of the embedded web UI: web/common.js + the per-page
-# scripts (web/index.js, web/search.js, web/settings.js). Requires
-# `npm install` first (populates node_modules). Skips with a warning when
-# eslint isn't installed; strict mode (CI) fails instead.
+# scripts (web/index.js, web/search.js, web/settings.js), plus the web-UI test
+# suite (tests/web/*.mjs). Requires `npm install` first (populates
+# node_modules). Skips with a warning when eslint isn't installed; strict
+# mode (CI) fails instead.
 web-lint:
 	$(call WEB_WRAP,web-lint,yes,JS lint,\
-	./node_modules/.bin/eslint web/common.js web/index.js web/search.js web/settings.js)
+	./node_modules/.bin/eslint web/common.js web/index.js web/search.js web/settings.js tests/web/*.mjs)
 
 # eslint --fix for the embedded web UI (the JS half of `make fmt`): auto-fixes
 # fixable rules in web/common.js and the per-page scripts — all real files,
@@ -216,9 +230,9 @@ help:
 	@echo "  make test-strict      Strict mode: DB required (missing DB is a hard failure)"
 	@echo "  make test-strict-ci    Mirrors the CI test job: strict DB, lib+bins+wiremock+integration"
 	@echo "  make web-check    JS syntax + CSS syntax check of the embedded web UI (needs node; skips if absent)"
-	@echo "  make web-test     Behavioral unit tests for web/common.js helpers (node --test + jsdom; needs npm install; skips if absent)"
+	@echo "  make web-test     Behavioral unit tests for web UI helpers + page scripts (node --test; shim suites always run, jsdom-backed smoke skipped only if jsdom absent)"
 	@echo "  make web-fmt      eslint --fix for the web UI (JS half of make fmt; needs npm install; skips if absent)"
-	@echo "  make web-lint     JS lint of web UI via eslint (needs npm install; skips if absent)"
+	@echo "  make web-lint     JS lint of web UI + tests/web via eslint (needs npm install; skips if absent)"
 	@echo "  make doc          Build docs"
 	@echo "  make build        Build (debug)"
 	@echo "  make release      Build (optimized, LTO)"

@@ -322,7 +322,7 @@ test('saveAll: PUTs only changed keys, shows success, reloads, re-enables button
         : ok(saved ? SETTINGS_SAVED : SETTINGS)),
     },
   ]);
-  const { sandbox, elements, timers } = loadSettings({ fetch: fetchStub });
+  const { elements, timers } = loadSettings({ fetch: fetchStub });
   await tick();
   withOneChangedField(elements);
 

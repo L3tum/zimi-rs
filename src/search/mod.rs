@@ -4,10 +4,11 @@
 //! keeping the highest score, and interleaves results by score descending;
 //! the SQL builders are pure and unit-tested (placeholder shapes, not
 //! interpolated).
+mod query_cache;
 mod sql;
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sqlx::Executor;
 
@@ -15,6 +16,8 @@ use crate::db::pool::Pool;
 use crate::embed::{format_vector, EmbedClient, EmbedConfig};
 use crate::error::{Error, Result};
 use crate::settings::{SearchParamsSnapshot, SettingsCache};
+
+use self::query_cache::QueryEmbedCache;
 
 pub use self::sql::SqlQuery;
 // Re-exported (T-3) so the query-plan regression gate in
@@ -49,6 +52,15 @@ type SearchRow = (
     String,
     f64,
 );
+
+/// Short timeout for the search-path embed HTTP call (3 s).
+///
+/// A slow embed must not stall interactive search: the vector branch degrades
+/// to empty results and FTS+trgm still answer in ms. The batch pipeline keeps
+/// its own longer client-level timeout (`embedding.timeout_secs`, default 60 s)
+/// via `EmbedConfig` — this constant applies only to the per-query call on the
+/// search path.
+const SEARCH_EMBED_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Merge the three suggest branches into the final list, preserving the old
 /// single-query `ORDER BY CASE WHEN prefix THEN 0 ELSE 1 END, similarity
@@ -88,6 +100,11 @@ pub struct SearchEngine {
     /// Lazily-built embedding client, keyed by a settings fingerprint so it
     /// is rebuilt when the endpoint/key/model/dimension change at runtime.
     embed_client: Arc<Mutex<Option<(String, EmbedClient)>>>,
+    /// Bounded LRU cache of normalised query → embedding vector for the
+    /// SEARCH path only (not the batch pipeline). Keyed on
+    /// `(model, dimension, trimmed_query)` so a model/dimension change
+    /// naturally produces misses. 256 entries × ~3 KB (768-dim) ≈ 768 KB.
+    query_embed_cache: Arc<std::sync::Mutex<QueryEmbedCache>>,
     /// Whether the `pg_trgm` extension is available, resolved once per engine
     /// and cached (`WI-37`). Uses a TTL-based cache (WI-5): when the cached
     /// value is `false` (trgm unavailable), a background task re-probes every
@@ -154,6 +171,7 @@ impl SearchEngine {
             pool,
             settings,
             embed_client: Arc::new(Mutex::new(None)),
+            query_embed_cache: Arc::new(std::sync::Mutex::new(QueryEmbedCache::default())),
             trgm_ready: Arc::new(std::sync::Mutex::new(None)),
             degradation,
         }
@@ -176,8 +194,10 @@ impl SearchEngine {
         if let Some(val) = self.trgm_cached_if_fresh() {
             return val;
         }
-        // Slow path: probe the DB on a checked-out connection.
-        let ok = match self.pool.acquire().await {
+        // Slow path: probe the DB on a checked-out connection
+        // (`acquire_timed`: explicit checkout behind the /diagnostic
+        // checkout-wait metric, Architecture M1).
+        let ok = match crate::db::pool::acquire_timed(&self.pool).await {
             Ok(mut client) => self.trgm_probe(&mut *client).await,
             Err(_) => false,
         };
@@ -447,18 +467,24 @@ impl SearchEngine {
         // parallel arms would need 4–5 of the pool's 20 connections per request,
         // which is not justified by the few-ms of sequential DB time (the slow
         // arm is the embed HTTP, already concurrent via `join!`). Revisit
-        // trigger: sustained search QPS with visible pool saturation (non-trivial
-        // p95 pool-checkout wait) — then move the arms to separate connections
-        // (or pipelined queries in one transaction).
+        // trigger: sustained search QPS with visible pool saturation
+        // (non-trivial pool-checkout wait) — `/diagnostic`'s `checkout_wait`
+        // (max/avg since process start) is the measurement — then move the
+        // arms to separate connections (or pipelined queries in one
+        // transaction).
         let fingerprint = self.embed_fingerprint(&snap);
         let embed_arm = VectorEmbedArm {
             engine: self,
             fingerprint,
             query: query.to_string(),
             enabled: run_vector,
+            model: snap.embed_model.clone(),
+            dimension: snap.embed_dimension,
         };
         let (query_vec, db_arm) = tokio::join!(embed_arm.run(), async {
-            let mut client = match self.pool.acquire().await {
+            // `acquire_timed`: the DB arm's checkout is the primary input
+            // to the /diagnostic checkout-wait metric (PERF-10 trigger).
+            let mut client = match crate::db::pool::acquire_timed(&self.pool).await {
                 Ok(c) => c,
                 Err(e) => return Err(e.into()),
             };
@@ -559,7 +585,9 @@ impl SearchEngine {
             // from the concurrent phase above was already returned to the pool
             // at the end of that arm. A pool-get failure degrades this branch
             // only (no early return), matching the embed-failure path above.
-            match self.pool.acquire().await {
+            // `acquire_timed`: explicit checkout behind the /diagnostic
+            // checkout-wait metric (Architecture M1).
+            match crate::db::pool::acquire_timed(&self.pool).await {
                 Ok(mut client) => {
                     run_sql_on(
                         &mut *client,
@@ -632,8 +660,9 @@ impl SearchEngine {
         }
 
         // H3: one pooled connection for all three arms (sequential on the
-        // single-in-flight client).
-        let mut client = match self.pool.acquire().await {
+        // single-in-flight client). `acquire_timed`: explicit checkout
+        // behind the /diagnostic checkout-wait metric (Architecture M1).
+        let mut client = match crate::db::pool::acquire_timed(&self.pool).await {
             Ok(c) => c,
             Err(e) => return Err(e.into()),
         };
@@ -719,27 +748,97 @@ struct VectorEmbedArm<'a> {
     /// Whether the vector branch runs at all (the mode + embedding-enabled
     /// gate computed in `search()`); `false` skips the embed HTTP entirely.
     enabled: bool,
+    /// Embedding model name (for the query cache key — a model change
+    /// changes the vector space).
+    model: String,
+    /// Embedding dimension (for the query cache key — a dimension change
+    /// changes the vector shape).
+    dimension: u32,
 }
 
 impl<'a> VectorEmbedArm<'a> {
-    /// Run the embed arm: cached client → embed → `format_vector`, with the
-    /// `vector_embed` success/failure degradation recording (the logic
-    /// previously inlined in the `tokio::join!` inside `search()`).
+    /// Run the embed arm: cached client → cache check → embed (3 s timeout)
+    /// → `format_vector`, with the `vector_embed` success/failure degradation
+    /// recording.
+    ///
+    /// Cache: a bounded LRU of `(model, dimension, trimmed_query) → Vec<f32>`
+    /// avoids the HTTP round-trip on repeated searches (the dominant p95 cost
+    /// for hybrid/None modes). Only successful embeddings are cached.
+    ///
+    /// Timeout: `SEARCH_EMBED_TIMEOUT` (3 s) wraps the HTTP call so a slow
+    /// embed API cannot stall interactive search; the vector branch degrades
+    /// to empty and FTS+trgm still answer. The batch pipeline is unaffected
+    /// (its client keeps the `embedding.timeout_secs` default of 60 s).
     async fn run(self) -> Option<String> {
-        if self.enabled {
-            match self.engine.embed_client_with(&self.fingerprint).await {
-                Some(ec) => match ec.embed(&[self.query]).await {
-                    Ok(vecs) => vector_from_response(&self.engine.degradation, vecs),
-                    Err(e) => {
-                        self.engine.degradation.record_failure("vector_embed");
-                        tracing::warn!("vector search disabled for this query: {e}");
-                        None
+        if !self.enabled {
+            return None;
+        }
+        let ec = match self.engine.embed_client_with(&self.fingerprint).await {
+            Some(c) => c,
+            None => return None,
+        };
+        // Build the cache key: model|dimension|trimmed_query.
+        // Case is preserved (embedding models are typically case-sensitive).
+        let cache_key = format!("{}|{}|{}", self.model, self.dimension, self.query.trim());
+        // Check the LRU cache (short lock, no await while held).
+        // LINT-3: intentional panic-on-poisoned-lock idiom.
+        #[allow(clippy::expect_used)]
+        let cached = {
+            let mut g = self
+                .engine
+                .query_embed_cache
+                .lock()
+                .expect("query embed cache mutex poisoned");
+            g.get(&cache_key).cloned()
+        };
+        if let Some(vec) = cached {
+            tracing::debug!(
+                "search embed cache hit (model={}, dim={}, query_len={})",
+                self.model,
+                self.dimension,
+                self.query.len()
+            );
+            return Some(format_vector(&vec));
+        }
+        // Cache miss: embed with a short timeout so a slow API cannot stall
+        // the interactive search. The batch pipeline (auto_loop/pipeline) is
+        // unaffected — it uses the client-level `embedding.timeout_secs`.
+        let query_owned = self.query.clone();
+        let embed_result =
+            tokio::time::timeout(SEARCH_EMBED_TIMEOUT, ec.embed(&[query_owned])).await;
+        match embed_result {
+            Ok(Ok(vecs)) => {
+                // Cache the successful embedding (only non-empty vectors are
+                // meaningful; `vector_from_response` handles the empty case).
+                if let Some(first) = vecs.first() {
+                    if !first.is_empty() {
+                        // LINT-3: intentional panic-on-poisoned-lock idiom.
+                        #[allow(clippy::expect_used)]
+                        let mut g = self
+                            .engine
+                            .query_embed_cache
+                            .lock()
+                            .expect("query embed cache mutex poisoned");
+                        g.insert(cache_key, first.clone());
                     }
-                },
-                None => None,
+                }
+                vector_from_response(&self.engine.degradation, vecs)
             }
-        } else {
-            None
+            Ok(Err(e)) => {
+                self.engine.degradation.record_failure("vector_embed");
+                tracing::warn!("vector search disabled for this query: {e}");
+                None
+            }
+            Err(_) => {
+                // Timeout elapsed: degrade the vector branch. FTS+trgm still
+                // answer, so the overall search is not affected.
+                self.engine.degradation.record_failure("vector_embed");
+                tracing::debug!(
+                    "search embed timed out after {:?} — vector branch degraded",
+                    SEARCH_EMBED_TIMEOUT
+                );
+                None
+            }
         }
     }
 }
@@ -1556,5 +1655,69 @@ mod tests {
         // Unicode passes through unchanged
         let sq = trgm_prefix_sql("日本語", None, None, 10, 1.0);
         assert_eq!(sq.params[1], "日本語%");
+    }
+
+    // ── SEARCH_EMBED_TIMEOUT (search-path short timeout) ───────────────
+
+    #[test]
+    fn search_embed_timeout_is_three_seconds() {
+        assert_eq!(SEARCH_EMBED_TIMEOUT, Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_degrades_slow_embed_to_elapsed() {
+        // Verify the mechanism: a future that takes longer than
+        // SEARCH_EMBED_TIMEOUT produces `Err(elapsed)` — which
+        // `VectorEmbedArm::run` maps to `None` (degraded vector branch).
+        let slow = tokio::time::sleep(Duration::from_secs(100));
+        let result = tokio::time::timeout(SEARCH_EMBED_TIMEOUT, slow).await;
+        assert!(
+            result.is_err(),
+            "a 100 s sleep must exceed the 3 s search timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_embed_completes_before_timeout() {
+        // A fast future (1 ms) completes well within the 3 s window.
+        let fast = tokio::time::sleep(Duration::from_millis(1));
+        let result = tokio::time::timeout(SEARCH_EMBED_TIMEOUT, fast).await;
+        assert!(
+            result.is_ok(),
+            "a 1 ms future must complete before the 3 s timeout"
+        );
+    }
+
+    // ── Query embed cache on SearchEngine ─────────────────────────────
+
+    #[test]
+    fn search_engine_initializes_query_embed_cache() {
+        use crate::settings::{default_settings, SettingsCache};
+        let pool = crate::testing::dead_pool();
+        let settings = SettingsCache::new_with_map(
+            pool.clone(),
+            default_settings(),
+            std::collections::HashMap::new(),
+        );
+        let engine =
+            SearchEngine::new(pool, settings, crate::health::DegradationTracker::default());
+        let cache = engine.query_embed_cache.lock().unwrap();
+        assert_eq!(cache.cap(), query_cache::QUERY_EMBED_CACHE_CAP);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn cache_key_includes_model_and_dimension() {
+        // The key format is `{model}|{dimension}|{trimmed_query}`.
+        // Different model or dimension → different key → no false hits.
+        let mk = |model: &str, dim: u32, q: &str| format!("{model}|{dim}|{}", q.trim());
+        assert_eq!(mk("nomic", 768, "hello"), "nomic|768|hello");
+        assert_eq!(mk("bge-m3", 1024, "hello"), "bge-m3|1024|hello");
+        assert_ne!(mk("nomic", 768, "hello"), mk("nomic", 1024, "hello"));
+        assert_ne!(mk("nomic", 768, "hello"), mk("bge-m3", 768, "hello"));
+        // Whitespace is trimmed.
+        assert_eq!(mk("nomic", 768, "  hello  "), mk("nomic", 768, "hello"));
+        // Case is preserved (embedding models are case-sensitive).
+        assert_ne!(mk("nomic", 768, "Hello"), mk("nomic", 768, "hello"));
     }
 }

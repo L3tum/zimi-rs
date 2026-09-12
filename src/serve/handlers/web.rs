@@ -159,7 +159,7 @@ pub async fn web_settings() -> Response {
 
 /// Serve the embedded shared UI stylesheet (`web/style.css`). Mirrors the
 /// embedded JS files: SEC L3 security headers + immutable caching (the
-/// `?v=` stamp applied by [`stamp_assets`] to each page's `<link>` busts
+/// `?v=` stamp applied by `stamp_assets` to each page's `<link>` busts
 /// stale caches across deploys).
 pub async fn web_style_css() -> Response {
     web_asset_response("application/css", include_str!("../../../web/style.css"))
