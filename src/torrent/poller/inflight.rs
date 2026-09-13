@@ -2,7 +2,11 @@
 
 use crate::torrent::TorrentInfo;
 
-use super::*;
+use super::{
+    apply_stats_batch, eta_secs, kibs_to_bps, seeding_row_action, stats_changed,
+    MISSING_TORRENT_GRACE, Arc, DownloadPoller, HashMap, HashSet, QbitClient, Result, SeedingAction,
+    StatsRow,
+};
 use crate::db::downloads::DownloadRecord;
 
 impl DownloadPoller {

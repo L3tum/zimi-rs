@@ -3,7 +3,10 @@
 
 use crate::torrent::TorrentInfo;
 
-use super::*;
+use super::{
+    kibs_to_bps, MISSING_TORRENT_GRACE, ZIM_URL_PREDICATE, Arc, DownloadPoller, HashMap, HashSet,
+    Path, QbitClient, Result,
+};
 
 /// Download row snapshot used by reconcile:
 /// `(id, name, url, hash, status, file_path, updated_at)`.

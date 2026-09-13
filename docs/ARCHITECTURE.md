@@ -196,18 +196,10 @@ advisory lock best-effort (different-database deployments sharing a `zim_dir`);
 `ZIMSERVICE_ALLOW_MULTI_INSTANCE=1` disables all guards. Read-only subcommands
 (`status`, `mcp`, plain `list`) never take the lock — warn-only.
 
-One process-global survives the opt-out: `src/db/random_article.rs` keeps
-`BOUNDS_CACHE`, a `LazyLock<Mutex<...>>` of cached MIN/MAX `articles.id`
-bounds keyed only by scope (`None` = global, or ZIM name) — not scoped to the
-`AppState`/`Pool`/database it was measured on. Under the single-instance
-invariant that is safe (one process holds exactly one pool and one database,
-and staleness self-heals: the merged seek's backward branch covers a gap and
-`bounds_cached(refresh = true)` re-measures on a miss). Under
-`ZIMSERVICE_ALLOW_MULTI_DB=1`, if one process ever serves more than one
-database, a bounds entry measured against one DB's article set can be served
-for another DB whose article set was removed or reindexed — random-article
-picks then target a stale id range (still answered, via the fallback branch
-and one refresh round trip, until the entry is re-measured).
+No process-global state survives the opt-out: `src/db/random_article.rs`
+re-measures MIN/MAX `articles.id` bounds from the shared pool on each request,
+so a `ZIMSERVICE_ALLOW_MULTI_DB=1` deployment can never serve bounds measured
+against another database's article set.
 
 ## Persistence layer
 

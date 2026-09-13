@@ -405,9 +405,10 @@ async fn connect_and_try_instance_lock(config: &Config) -> anyhow::Result<(PgCon
 
 /// S1: open a *dedicated* non-pooled connection for the advisory lock,
 /// honoring the DSN's TLS mode (same as the pool), and try to take the lock.
-/// Returns `Ok(Some((client, driver)))` when the lock was acquired,
+/// Returns `Ok(Some(conn))` when the lock was acquired (`conn` is the
+/// dedicated `PgConnection` holding the advisory lock),
 /// `Ok(None)` when another instance already holds it (the connection is
-/// closed in both cases — an unacquired lock releases nothing, and the
+/// closed in that case — an unacquired lock releases nothing, and the
 /// caller decides what `None` means: hard refusal, or a warned opt-out).
 /// `Err` on connect/lock-query failure.
 async fn try_acquire_advisory_lock(config: &Config) -> anyhow::Result<Option<PgConnection>> {
@@ -750,13 +751,9 @@ pub async fn acquire_instance_guard_multi_db(
 /// self-healing PID lock was a no-op on macOS/Windows dev boxes). On non-Unix, it
 /// conservatively returns `true` (assumes alive) so the operator deletes the
 /// file manually.
-pub fn pid_is_alive(pid: u32) -> bool {
-    pid_probe(pid)
-}
-
 #[cfg(unix)]
 #[allow(unsafe_code)] // one narrow, well-documented POSIX probe
-fn pid_probe(pid: u32) -> bool {
+pub fn pid_is_alive(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     match rc {
         0 => true, // process exists and we may signal it
@@ -766,7 +763,7 @@ fn pid_probe(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn pid_probe(_pid: u32) -> bool {
+pub fn pid_is_alive(_pid: u32) -> bool {
     // No portable std PID check on this platform; assume alive so the
     // operator deletes the file manually.
     true

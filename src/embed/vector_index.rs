@@ -209,7 +209,7 @@ pub(crate) async fn index_build_worth_probing(pool: &Pool) -> bool {
 /// so it is dropped (concurrently, falling back to a plain drop if that is
 /// refused) before the fresh build.
 ///
-/// The index *kind* is threshold-driven ([`index_build_sql`]): HNSW below
+/// The index *kind* is threshold-driven (`index_build_sql`): HNSW below
 /// `embedding.hnsw_threshold`, IVFFlat at/above it. `embedding.ivfflat_threshold`
 /// only documents that IVFFlat is preferred over HNSW at/above it — a build
 /// is **always** attempted once the row-count and catalog gates pass

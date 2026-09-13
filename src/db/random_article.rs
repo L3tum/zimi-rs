@@ -19,7 +19,7 @@ const BOUNDS_SQL_OPT: &str =
 /// permits `ORDER BY … LIMIT 1` on each union member, and branch order makes
 /// the forward result row 0 (preferred); `query_opt` returns that first row.
 /// The forward branch serves `id >= $target`; the backward branch (only
-/// reached with stale cached bounds) serves the largest `id <= $target`.
+/// reached when the target falls in an id gap) serves the largest `id <= $target`.
 /// Two variants (global / ZIM-scoped) differ only in the trailing
 /// `AND z.name = $2` — kept as consts so the SQL is byte-stable.
 const SEEK_SQL_GLOBAL: &str = "SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z.name \
@@ -74,38 +74,12 @@ pub fn random_id_in_range(lo: i64, hi: i64, seed: u64) -> i64 {
     (lo as u64).wrapping_add(offset as u64) as i64
 }
 
-/// Stale-bounds-tolerant hint: cached (min_id, max_id) per scope
-/// (`None` = global). Entries are never explicitly invalidated; staleness is
-/// safe because the merged seek's backward branch covers a gap and
-/// `bounds_cached(refresh = true)` self-heals on a seek miss. An empty
-/// table/ZIM yields `None`, which is **not** cached so recovery needs no
-/// invalidation. Steady state is one round trip: with fresh bounds
-/// `target ∈ [min,max]` so the forward seek always hits and the fallback
-/// branch never fires.
-type BoundsMap = std::collections::HashMap<Option<String>, (i64, i64)>;
-static BOUNDS_CACHE: std::sync::LazyLock<std::sync::Mutex<BoundsMap>> =
-    std::sync::LazyLock::new(std::sync::Mutex::default);
-
-/// Read (min_id, max_id) for a scope from the cache, running the
-/// `BOUNDS_SQL_*` query exactly once on a miss (or when `refresh` is set).
-/// An empty table/ZIM yields `None`, which is **not** cached so recovery needs
-/// no invalidation.
-// LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-#[allow(clippy::expect_used)]
-async fn bounds_cached(
+/// Read (min_id, max_id) for a scope from the database.
+/// An empty table/ZIM yields `None`.
+async fn fetch_bounds(
     pool: &Pool,
     zim_filter: Option<&str>,
-    refresh: bool,
 ) -> Result<Option<(i64, i64)>> {
-    let key = zim_filter.map(str::to_owned);
-    {
-        let cache = BOUNDS_CACHE.lock().expect("bounds cache poisoned");
-        if !refresh {
-            if let Some(v) = cache.get(&key) {
-                return Ok(Some(*v));
-            }
-        }
-    }
     let row = match zim_filter {
         Some(zim) => {
             raw::fetch_optional::<(Option<i64>, Option<i64>), _, _>(pool, BOUNDS_SQL_OPT, |q| {
@@ -118,16 +92,11 @@ async fn bounds_cached(
                 .await
         }
     };
-    let (min_id, max_id) = match row {
-        Ok(Some((Some(min_id), Some(max_id)))) => (min_id, max_id),
-        Ok(_) => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    BOUNDS_CACHE
-        .lock()
-        .expect("bounds cache poisoned")
-        .insert(key, (min_id, max_id));
-    Ok(Some((min_id, max_id)))
+    match row {
+        Ok(Some((Some(min_id), Some(max_id)))) => Ok(Some((min_id, max_id))),
+        Ok(_) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// One merged seek-or-fallback round trip: `fetch_optional` on
@@ -163,8 +132,8 @@ async fn seek(pool: &Pool, target: i64, zim_filter: Option<&str>) -> Result<Opti
 /// never return an article from another ZIM. This also avoids the O(n log n)
 /// `ORDER BY random() LIMIT 1` full-table scan.
 pub async fn fetch_random_article(pool: &Pool, zim_filter: Option<&str>) -> Result<RandomArticle> {
-    // 1. Bounds, from the per-scope cache (steady state = 0 RT).
-    let (min_id, max_id) = match bounds_cached(pool, zim_filter, false).await? {
+    // 1. Bounds: one index MIN/MAX probe, scoped when a ZIM filter is given.
+    let (min_id, max_id) = match fetch_bounds(pool, zim_filter).await? {
         Some(b) => b,
         None => return Err(Error::NotFound("no articles found".into())),
     };
@@ -183,10 +152,11 @@ pub async fn fetch_random_article(pool: &Pool, zim_filter: Option<&str>) -> Resu
     let article = match seek(pool, target, zim_filter).await? {
         Some(article) => article,
         None => {
-            // Only `None` is possible with stale cached bounds (an id was
-            // deleted). Refresh the bounds once and retry; the backward
-            // branch of the merged statement still covers a partial gap.
-            let (min_id, max_id) = match bounds_cached(pool, zim_filter, true).await? {
+            // Only `None` is possible when an id was deleted between the
+            // bounds query and the seek. Re-measure the bounds once and
+            // retry; the backward branch of the merged statement still
+            // covers a partial gap.
+            let (min_id, max_id) = match fetch_bounds(pool, zim_filter).await? {
                 Some(b) => b,
                 None => return Err(Error::NotFound("no articles found".into())),
             };

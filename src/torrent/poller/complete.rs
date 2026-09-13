@@ -4,7 +4,10 @@
 
 use crate::torrent::TorrentInfo;
 
-use super::*;
+use super::{
+    client_from_option, direct_download, index, install_zim, kibs_to_bps, locate_torrent_zim,
+    mark_error, verify_zim, Arc, DownloadPoller, Error, Path, QbitClient, Result,
+};
 
 impl DownloadPoller {
     // ── Completion: verify → install → resync → index ───────────────────────

@@ -1,6 +1,10 @@
 //! Direct-HTTP download path: client build, Range-resume streaming, finalize.
 
-use super::*;
+use super::{
+    follow_pinned_get, index, mark_error, status_checked, status_if_changed, validate_download_url,
+    verify_zim, Arc, Duration, Error, Instant, Path, PinnedResponse, Pool, Result, SettingsCache,
+    TorrentKind, ZimManager,
+};
 
 /// Build a download HTTP client. Redirects are **not** followed by this
 /// client (`Policy::none`): user-influenced URLs (direct `.zim` downloads,

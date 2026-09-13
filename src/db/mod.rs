@@ -1,10 +1,17 @@
 //! Database layer: migrations, connection pooling, and query helpers.
 //!
-//! The pool is a [`sqlx::PgPool`](sqlx::postgres::PgPool) (see `pool`), and `raw` is the data-access layer: every application
-//! query goes through the `raw` helpers (or through a module in `src/db/`
-//! that owns the raw helpers and is therefore exempt from the
-//! `scripts/check-raw-sql.sh` lint; everything else marks its
-//! `sqlx::query*` call sites `// RAW-OK`).
+//! The pool is a [`sqlx::PgPool`](sqlx::postgres::PgPool) (see `pool`), and
+//! `raw` provides the shared query helpers. The lint boundary
+//! (`scripts/check-raw-sql.sh`) enforces two rules:
+//!
+//! 1. **Presentation layer** (`src/serve/handlers/`) must not own SQL —
+//!    any `db::raw::*` call there needs a `// RAW-OK: <reason>` marker.
+//!    The intended fix is to move SQL into a named helper in `src/db/`.
+//!
+//! 2. **Direct `sqlx::query*` calls** outside `src/db/` need a
+//!    `// RAW-OK: <reason>` marker. Background layers (torrent, zim,
+//!    search, embed, startup) call `db::raw::*` directly as the intended
+//!    path and are exempt from this rule.
 
 /// User-collection data access (ARCH M1 repository extraction).
 pub mod collections;
@@ -23,10 +30,11 @@ pub mod random_article;
 
 pub use pool::Pool;
 
-/// Shared raw-SQL helper — the data-access layer: every application query
-/// goes through these helpers, including SQL the generic helper shapes
-/// cannot take (session-level advisory locks, batch DDL — multi-statement
-/// migration files, `DROP INDEX CONCURRENTLY` — and catalog probes).
+/// Shared raw-SQL helpers that the lint enforces as the boundary between
+/// presentation and persistence layers, including SQL the generic helper
+/// shapes cannot take (session-level advisory locks, batch DDL —
+/// multi-statement migration files, `DROP INDEX CONCURRENTLY` — and
+/// catalog probes).
 ///
 /// Executor argument: pass `&pool` (`&Pool` implements `Executor`),
 /// `&mut conn` (a `&mut sqlx::PgConnection`), or `&mut *tx` / `&mut *conn`

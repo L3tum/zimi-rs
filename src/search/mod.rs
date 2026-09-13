@@ -274,6 +274,14 @@ impl SearchEngine {
         matches!(*g, Some((false, _)))
     }
 
+    /// Current entry count in the query-embedding LRU cache (reported by `/diagnostic`).
+    // LINT-3: intentional panic-on-poisoned-lock idiom.
+    #[must_use]
+    #[allow(clippy::expect_used)]
+    pub fn query_embed_cache_len(&self) -> usize {
+        self.query_embed_cache.lock().expect("query embed cache mutex poisoned").len()
+    }
+
     /// Settings fingerprint for the embed client cache key. Read from the
     /// per-request [`SearchParamsSnapshot`] (WI-35) so `search()` reuses the
     /// single-pass read instead of re-hitting the cache per field.
@@ -1702,8 +1710,7 @@ mod tests {
         let engine =
             SearchEngine::new(pool, settings, crate::health::DegradationTracker::default());
         let cache = engine.query_embed_cache.lock().unwrap();
-        assert_eq!(cache.cap(), query_cache::QUERY_EMBED_CACHE_CAP);
-        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0, "a fresh engine's cache is empty");
     }
 
     #[test]

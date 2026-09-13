@@ -83,25 +83,10 @@ impl QueryEmbedCache {
         self.order.push_front(key);
     }
 
-    /// Number of entries currently cached.
+    /// Number of entries currently cached. Reported by `/diagnostic`.
     #[must_use]
-    #[allow(dead_code)] // used in tests; kept for future metrics
     pub fn len(&self) -> usize {
         self.map.len()
-    }
-
-    /// Whether the cache is empty.
-    #[must_use]
-    #[allow(dead_code)] // used in tests; kept for future metrics
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-
-    /// The configured capacity.
-    #[must_use]
-    #[allow(dead_code)] // used in tests; kept for future metrics
-    pub fn cap(&self) -> usize {
-        self.cap
     }
 }
 
@@ -189,14 +174,17 @@ mod tests {
 
     #[test]
     fn min_capacity_is_one() {
-        let c = QueryEmbedCache::new(0);
-        assert_eq!(c.cap(), 1);
+        let mut c = QueryEmbedCache::new(0);
+        // A cache with cap 0 is clamped to 1: inserting 2 items leaves only 1.
+        c.insert("a".into(), vec(1));
+        c.insert("b".into(), vec(1));
+        assert_eq!(c.len(), 1, "cap-0 cache should hold at most 1 entry");
     }
 
     #[test]
     fn default_capacity() {
-        let c = QueryEmbedCache::default();
-        assert_eq!(c.cap(), QUERY_EMBED_CACHE_CAP);
         assert_eq!(QUERY_EMBED_CACHE_CAP, 256);
+        let c = QueryEmbedCache::default();
+        assert_eq!(c.len(), 0, "a fresh default cache is empty");
     }
 }

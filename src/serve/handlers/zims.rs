@@ -175,6 +175,9 @@ pub struct DiagnosticResponse {
     /// M1): the number behind the pool-size revisit decision. Always
     /// present (additive).
     pub checkout_wait: CheckoutWait,
+    /// Query-embedding LRU cache entry count (operator signal for cache
+    /// effectiveness). Always present (additive).
+    pub query_embed_cache_entries: usize,
 }
 
 /// `GET /list` response: all ZIM archives with metadata.
@@ -308,6 +311,7 @@ pub async fn diagnostic(
         pool,
         vector_index,
         checkout_wait,
+        query_embed_cache_entries: state.search.query_embed_cache_len(),
     }))
 }
 

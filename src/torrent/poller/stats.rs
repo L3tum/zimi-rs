@@ -2,7 +2,7 @@
 
 use crate::torrent::TorrentInfo;
 
-use super::*;
+use super::{Pool, Result};
 
 /// Convert qBittorrent KiB/s speed to bytes per second.
 pub(super) fn kibs_to_bps(kibs: i64) -> i64 {

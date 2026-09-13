@@ -5,6 +5,35 @@
 //! the pure map helpers (redaction, type-checking, env/config sync) are
 //! shared by the cache, and [`default_value`] + `typed_getter!` back the
 //! typed accessors.
+//!
+//! ## Settings precedence & policy
+//!
+//! A setting's effective value comes from three layers, highest first:
+//!
+//! 1. **Env var at startup** — for env-backed keys (a row of
+//!    `config::ENV_SETTING_KEYS`), a non-empty value is captured once into
+//!    the startup env snapshot and re-applied over the DB on every
+//!    `reload()` via [`apply_env_snapshot`] (a mid-process env mutation has
+//!    no effect). When a key's env var is set, the key enters the cache's
+//!    `env_locked` map and its DB value is locked — API writes are rejected
+//!    and the env value wins.
+//! 2. **DB-stored value** — the row in Postgres, mutable via the API for
+//!    keys with no lock. Seeded on first load from layer 3.
+//! 3. **Seed default** — the `default` column of this table
+//!    ([`SETTING_DEFS`], exposed by [`default_settings`]). It is only the
+//!    initial DB value, never a runtime fallback that hides a stored row.
+//!
+//! The per-key policy flags (columns of [`SETTING_DEFS`], see
+//! [`SettingPolicy`]) control how each key behaves in the above flow:
+//!
+//! | Policy flag          | Meaning                                                                  | Enforcement                                                                                          |
+//! |----------------------|--------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
+//! | `env_locked`         | The key is env-backed and its env var was set at startup                 | Locked against API writes ("locked by environment variable"); the env value wins over the DB         |
+//! | `api_immutable`      | Seeded from the environment at startup, shown as locked in the UI        | Never changeable via the API                                                                          |
+//! | `config_only`        | Fixed by the environment at startup; no runtime effect if changed        | Stored for reference; rejected on API update (the server already bound / ZIM dir already opened)      |
+//! | `security_sensitive` | Gating auth / SSRF policy / secret-bearing integrations                  | Unauthenticated writes rejected (403 up front in `put_settings`)                                      |
+//! | `secret`             | Never returned with its real value in API responses                      | Set values become `"***"` (unset values pass through) — see [`redact`]                                 |
+//! | `topology`           | Redacted for unauthenticated callers (S6 topology leak guard)            | Unauthenticated reads see `"[redacted]"` in `all_grouped_for` output                                   |
 
 use std::collections::HashMap;
 
