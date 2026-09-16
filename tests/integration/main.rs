@@ -35,6 +35,7 @@
 mod common;
 mod embedding;
 mod health;
+mod invalid_index;
 mod migrations;
 mod raw;
 mod search;

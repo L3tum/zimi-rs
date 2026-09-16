@@ -30,8 +30,9 @@ struct ProbeState {
 pub async fn probe_db(db: &db::Pool) -> bool {
     // `acquire_timed` (not `acquire`): the /health db probe is one of the
     // explicit checkouts behind the `/diagnostic` checkout-wait metric
-    // (Architecture M1).
-    match db::pool::acquire_timed(db).await {
+    // (Architecture M1); the `"health:db_probe"` site label keeps its waits
+    // attributable per-site, separate from search/suggest checkouts.
+    match db::pool::acquire_timed(db, "health:db_probe").await {
         Ok(mut pg) => sqlx::query("SELECT 1").execute(&mut *pg).await.is_ok(), // RAW-OK: `SELECT 1` liveness probe — the cheapest possible statement, run on a raw pooled connection (db::raw helpers are for query builders, not a one-word probe)
         Err(_) => false,
     }

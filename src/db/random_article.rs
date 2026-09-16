@@ -15,25 +15,27 @@ const BOUNDS_SQL_GLOBAL: &str = "SELECT MIN(id), MAX(id) FROM articles";
 const BOUNDS_SQL_OPT: &str =
     "SELECT MIN(a.id), MAX(a.id) FROM articles a JOIN zims z ON z.id = a.zim_id WHERE z.name = $1";
 
-/// Article-row SELECT for the merged seek-or-fallback statement. Postgres
-/// permits `ORDER BY … LIMIT 1` on each union member, and branch order makes
-/// the forward result row 0 (preferred); `query_opt` returns that first row.
+/// Article-row SELECT for the merged seek-or-fallback statement. Each branch
+/// is parenthesized — Postgres requires parens for a per-branch
+/// `ORDER BY … LIMIT 1` inside a `UNION` (bare `select_no_parens` excludes
+/// ORDER BY/LIMIT) — and branch order makes the forward result row 0
+/// (preferred); `query_opt` returns that first row.
 /// The forward branch serves `id >= $target`; the backward branch (only
 /// reached when the target falls in an id gap) serves the largest `id <= $target`.
 /// Two variants (global / ZIM-scoped) differ only in the trailing
 /// `AND z.name = $2` — kept as consts so the SQL is byte-stable.
-const SEEK_SQL_GLOBAL: &str = "SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z.name \
+const SEEK_SQL_GLOBAL: &str = "(SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z.name \
      FROM articles a JOIN zims z ON z.id = a.zim_id \
-     WHERE a.id >= $1 ORDER BY a.id ASC LIMIT 1 \
-     UNION ALL SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z.name \
+     WHERE a.id >= $1 ORDER BY a.id ASC LIMIT 1) \
+     UNION ALL (SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z.name \
      FROM articles a JOIN zims z ON z.id = a.zim_id \
-     WHERE a.id <= $1 ORDER BY a.id DESC LIMIT 1";
-const SEEK_SQL_OPT: &str = "SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z.name \
+     WHERE a.id <= $1 ORDER BY a.id DESC LIMIT 1)";
+const SEEK_SQL_OPT: &str = "(SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z.name \
      FROM articles a JOIN zims z ON z.id = a.zim_id \
-     WHERE a.id >= $1 AND z.name = $2 ORDER BY a.id ASC LIMIT 1 \
-     UNION ALL SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z.name \
+     WHERE a.id >= $1 AND z.name = $2 ORDER BY a.id ASC LIMIT 1) \
+     UNION ALL (SELECT a.id, a.zim_id, a.path, a.title, a.snippet, z.name \
      FROM articles a JOIN zims z ON z.id = a.zim_id \
-     WHERE a.id <= $1 AND z.name = $2 ORDER BY a.id DESC LIMIT 1";
+     WHERE a.id <= $1 AND z.name = $2 ORDER BY a.id DESC LIMIT 1)";
 
 /// A single article row returned by `fetch_random_article`.
 pub struct RandomArticle {
@@ -76,10 +78,7 @@ pub fn random_id_in_range(lo: i64, hi: i64, seed: u64) -> i64 {
 
 /// Read (min_id, max_id) for a scope from the database.
 /// An empty table/ZIM yields `None`.
-async fn fetch_bounds(
-    pool: &Pool,
-    zim_filter: Option<&str>,
-) -> Result<Option<(i64, i64)>> {
+async fn fetch_bounds(pool: &Pool, zim_filter: Option<&str>) -> Result<Option<(i64, i64)>> {
     let row = match zim_filter {
         Some(zim) => {
             raw::fetch_optional::<(Option<i64>, Option<i64>), _, _>(pool, BOUNDS_SQL_OPT, |q| {

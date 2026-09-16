@@ -73,20 +73,50 @@ async fn listener_five_bad_passwords_lock_out_client() {
 
 /// TEST-6: graceful shutdown serves out the in-flight request before stopping
 /// the listener, and afterwards refuses new connections. DB-less.
+///
+/// Barrier-based (no wall-clock polling): the `/slow` handler first signals
+/// "I am now in flight" via a `tokio::sync::Notify` and then blocks on a
+/// second `Notify` release barrier before returning 200. The test (1) fires
+/// the request (registering the in-flight `notified()` waiter first, so the
+/// handler's `notify_waiters` can never land unobserved), (2) awaits the
+/// in-flight signal (5 s bound — a deadlock guard, not a scheduler),
+/// (3) triggers the graceful shutdown, (4) releases the handler, (5) asserts
+/// the in-flight request completed with 200, (6) asserts a new connection is
+/// refused. The critical ordering — request in flight BEFORE shutdown, served
+/// out AFTER the shutdown trigger — is event-driven, so a stalled runner
+/// cannot flip it. A `notify_one` that lands before the handler registers
+/// `notified()` is safe: `Notify` stores one permit.
 #[tokio::test]
 async fn listener_graceful_shutdown_finishes_in_flight() {
+    let in_flight = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
     let app = axum::Router::new().route(
         "/slow",
-        axum::routing::get(async || {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            "ok"
+        axum::routing::get({
+            let in_flight = in_flight.clone();
+            let release = release.clone();
+            move || {
+                let in_flight = in_flight.clone();
+                let release = release.clone();
+                async move {
+                    // Barrier: signal "handler entered, request is in
+                    // flight", then block until the test releases us.
+                    in_flight.notify_waiters();
+                    release.notified().await;
+                    "ok"
+                }
+            }
         }),
     );
     let (base, trigger) = boot_server(app).await;
     let client = reqwest::Client::new();
 
+    // Register the in-flight waiter BEFORE firing the request: the handler
+    // only runs after the server task has accepted the connection, so this
+    // guarantees the handler's `notify_waiters` finds a registered waiter.
+    let in_flight_wait = in_flight.notified();
     let (task_client, task_base) = (client.clone(), base.clone());
-    let in_flight = tokio::spawn(async move {
+    let in_flight_req = tokio::spawn(async move {
         task_client
             .get(format!("{task_base}/slow"))
             .send()
@@ -94,30 +124,23 @@ async fn listener_graceful_shutdown_finishes_in_flight() {
             .expect("in-flight request accepted")
     });
 
-    // Let the request start, then trigger the graceful shutdown. We poll
-    // briefly to ensure the server has accepted the TCP connection and the
-    // handler has entered its 1 s sleep (deterministic on slow CI where a
-    // fixed 100 ms might be too short for the handshake + HTTP parse). The
-    // guard assert below proves the poll window still ends before the
-    // handler's 1 s sleep does, so the request is genuinely in flight.
-    for _ in 0..20 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        // If the in-flight task has already completed (shouldn't happen in
-        // 200 ms), bail early.
-        if in_flight.is_finished() {
-            break;
-        }
-    }
-    assert!(
-        !in_flight.is_finished(),
-        "guard: the request must still be in flight when shutdown is triggered; if the /slow handler's 1 s sleep shrank below the 200 ms poll window, this test no longer proves graceful serve-out"
-    );
+    // Wait for the in-flight signal from the handler. The 5 s bound is only a
+    // deadlock guard (a hang means a hard failure); it does not schedule the
+    // critical event — the handler proves it is in flight itself.
+    tokio::time::timeout(Duration::from_secs(5), in_flight_wait)
+        .await
+        .expect("handler must signal in-flight within 5 s (deadlock guard)");
+
+    // The request is now provably inside the handler (awaiting release).
+    // Trigger the graceful shutdown: the listener must stop accepting new
+    // connections while this in-flight request is still outstanding.
     trigger.send(()).expect("trigger send");
 
-    // axum serves the in-flight request out before stopping the listener.
-    let resp = tokio::time::timeout(Duration::from_secs(5), in_flight)
+    // axum serves the in-flight request out before stopping.
+    release.notify_one();
+    let resp = tokio::time::timeout(Duration::from_secs(5), in_flight_req)
         .await
-        .expect("in-flight request must finish within 5 s of the shutdown trigger")
+        .expect("in-flight request must finish within 5 s of the release")
         .expect("in-flight task must not panic");
     assert_eq!(resp.status(), 200);
 

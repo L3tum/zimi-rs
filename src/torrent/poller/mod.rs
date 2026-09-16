@@ -446,14 +446,14 @@ impl DownloadPoller {
         // so the collision filter below can match it against active rows.
         let stale: Vec<(i32, String, String)> = crate::db::raw::fetch_all(
             &self.db,
-            &format!(
-                "SELECT id, name, error FROM downloads \
-                 WHERE status = {err} \
-                   AND updated_at < now() - interval '10 minutes' \
-                   AND error ~* $1",
-                err = crate::torrent::DownloadStatus::Error.as_str()
-            ),
-            |q| q.bind(REQUEUE_ERROR_PATTERN),
+            "SELECT id, name, error FROM downloads \
+             WHERE status = $2 \
+               AND updated_at < now() - interval '10 minutes' \
+               AND error ~* $1",
+            |q| {
+                q.bind(REQUEUE_ERROR_PATTERN)
+                    .bind(crate::torrent::DownloadStatus::Error.as_str())
+            },
         )
         .await?;
         if stale.is_empty() {
@@ -1058,6 +1058,42 @@ mod tests {
             )
         }
 
+        /// Variant of [`download_settings`] that admits private-network direct-
+        /// download URLs. Needed by tests that stage a `.zim` on loopback
+        /// (e.g. `127.0.0.1:9`) purely to exercise the claim; with the default
+        /// (`downloads.allow_private_networks = false`) the SSRF guard would
+        /// reject the private host *before* the claim runs, leaving `file_path`
+        /// unset.
+        pub(crate) fn download_settings_allow_private() -> crate::settings::SettingsCache {
+            let mut values = crate::settings::default_settings();
+            values.insert(
+                crate::settings::KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS.to_string(),
+                serde_json::json!(true),
+            );
+            crate::settings::SettingsCache::new_with_map(
+                crate::testing::dead_pool(),
+                values,
+                std::collections::HashMap::new(),
+            )
+        }
+
+        /// Variant of [`download_settings`] with `torrent.keep_completed = false`
+        /// (the default is `true`), so a completed torrent download settles
+        /// `complete` and runs the post-install qB-delete branch rather than
+        /// staying `seeding`.
+        pub(crate) fn download_settings_no_keep_completed() -> crate::settings::SettingsCache {
+            let mut values = crate::settings::default_settings();
+            values.insert(
+                crate::settings::KEY_TORRENT_KEEP_COMPLETED.to_string(),
+                serde_json::json!(false),
+            );
+            crate::settings::SettingsCache::new_with_map(
+                crate::testing::dead_pool(),
+                values,
+                std::collections::HashMap::new(),
+            )
+        }
+
         /// Step 2.1: the re-queue error pattern is subtle (case-insensitive
         /// Postgres `~*` regex), so unit-test it directly rather than only via a
         /// live DB round-trip.
@@ -1122,7 +1158,7 @@ mod tests {
             let zim_id: i32 = raw::fetch_scalar_optional(
                 &mut *c,
                 "INSERT INTO downloads (name, url, status) VALUES ($1, $2, 'queued') RETURNING id",
-                |q| q.bind("it-zim").bind("http://127.0.0.1:9/x.zim"),
+                |q| q.bind("it-zim").bind("http://10.255.255.255:8080/x.zim"),
             )
             .await
             .expect("insert zim row")
@@ -1140,7 +1176,7 @@ mod tests {
             let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
             let poller = super::super::DownloadPoller::new(
                 pool.clone(),
-                download_settings(),
+                download_settings_allow_private(),
                 zims,
                 crate::torrent::QbitClientCache::new(),
                 Some(server.uri()),
@@ -1171,10 +1207,11 @@ mod tests {
             // The direct `.zim` row was claimed for download (budget consumed):
             // its `file_path` is set to the `.part` target. Its status is NOT
             // asserted — the spawned direct-download task runs concurrently and may
-            // already have marked it `error` (the 127.0.0.1:9 fetch fails fast with
-            // a local connection-refused, never leaving the machine), which would
-            // race the read. `file_path` is set by the synchronous claim and
-            // never cleared by that task, so it is the stable signal.
+            // already have marked it `error` (the unroutable `10.255.255.255`
+            // fetch fails without a real download, and the task is aborted when the
+            // test's runtime drops), which would race the read. `file_path` is set
+            // by the synchronous claim and never cleared by that task, so it is the
+            // stable signal.
             let zp: Option<String> = raw::fetch_scalar_optional(
                 &mut *c,
                 "SELECT file_path FROM downloads WHERE id = $1",
@@ -1248,11 +1285,22 @@ mod tests {
             num_seeds: Option<i64>,
         ) -> i32 {
             let mut c = pool.acquire().await.expect("conn");
+            // A per-row UNIQUE url keeps the 003 `idx_downloads_active_url`
+            // partial-unique index from firing across tests/rows that share
+            // the fixed test name prefix. The url is incidental to what these
+            // in-flight tests assert (name/hash/status/flush); a fresh magnet
+            // per row preserves the qB code path.
+            static ROW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let url = format!(
+                "magnet:?xt=urn:btih:it-{}",
+                ROW.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
             raw::fetch_scalar_optional(
                 &mut *c,
-                "INSERT INTO downloads (name, url, hash, status, progress, ratio, num_seeds, \n                 updated_at) VALUES ($1, 'magnet:?xt=urn:btih:it', $2, $3, $4, $5, $6, \n                 now()) RETURNING id",
+                "INSERT INTO downloads (name, url, hash, status, progress, ratio, num_seeds, \n                 updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, \n                 now()) RETURNING id",
                 |q| {
                     q.bind(name)
+                        .bind(&url)
                         .bind(hash)
                         .bind(status)
                         .bind(progress)
@@ -1909,19 +1957,14 @@ mod tests {
             .await;
         }
 
-        /// BUG-B4: the name fallback in `process_inflight` is restricted to rows
-        /// with `hash IS NULL` — a row that already has a bound hash must match
-        /// only by hash. Two same-named rows share the display name: row A is
-        /// bound to a stale (non-matching) hash, row B is unbound (`hash NULL`).
-        /// The completed torrent's real hash matches neither. Without the guard,
-        /// BOTH rows would match the torrent via the name fallback and double
-        /// `handle_complete` (double multi-GB verify/copy + auto-index). With it,
-        /// only the hash-NULL row matches: A stays `downloading` (hash untouched,
-        /// no file), B settles `complete` (hash rebound, one file installed).
-        ///
-        /// (A real ZIM is staged so the matched row's install actually runs —
-        /// the "exactly one file" check observes the expensive path executed
-        /// once; the row-A assertions catch the double-completion regression.)
+        /// BUG-B4 (retargeted): the original scenario — two same-named
+        /// `downloading` rows (A bound to a stale hash, B unbound) so the name
+        /// fallback could double-`handle_complete` — is now impossible to
+        /// create. The `011` partial-unique index `uq_downloads_active_name`
+        /// rejects a second active row with the same name, so there is never a
+        /// second same-named row for the name fallback to double-complete.
+        /// This test asserts that conflicting insert is refused — guarding the
+        /// constraint that makes the double-complete regression unreachable.
         #[tokio::test]
         async fn it_inflight_bug_b4_same_name_only_null_hash_completes() {
             let Some((pool, _db_gate)) = test_pool().await else {
@@ -1943,9 +1986,7 @@ mod tests {
             })
             .await;
 
-            // Two same-named rows: A bound to a stale (non-matching) hash, B
-            // unbound. Both freshly `downloading` (no grace expiry) on the
-            // magnet (qB-torrent) code path.
+            // Row A: active, bound to a stale (non-matching) hash.
             let id_a = it_insert_row(
                 &pool,
                 "__it_inflight__b4dup",
@@ -1956,204 +1997,50 @@ mod tests {
                 None,
             )
             .await;
-            let id_b = it_insert_row(
-                &pool,
-                "__it_inflight__b4dup",
-                None,
-                "downloading",
-                0.9,
-                None,
-                None,
+            // A second active row with the SAME name (NULL hash) — BUG-B4's
+            // row B — must be refused by the 011 active-name constraint. The
+            // url is unique so the 003 active-url index cannot fire first; the
+            // rejection must come from the name constraint.
+            let conflict = raw::execute(
+                &mut *c,
+                "INSERT INTO downloads (name, url, hash, status, progress, updated_at) VALUES ('__it_inflight__b4dup', 'magnet:?xt=urn:btih:b4conflict', NULL, 'downloading', 0.9, now())",
+                |q| q,
             )
             .await;
-
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
-
-            // Stage the torrent content (a valid ZIM) OUTSIDE the ZIM dir so the
-            // "exactly one installed file" check is unambiguous.
-            let content_tmp = tempfile::tempdir().expect("content tempdir");
-            let content_file = content_tmp.path().join("__it_inflight__b4.zim");
-            std::fs::copy("tests/fixtures/tiny.zim", &content_file).expect("stage content zim");
-
-            let t = TorrentInfo {
-                hash: "b4realhash".into(),
-                name: "__it_inflight__b4dup".into(),
-                progress: 1.0,
-                state: "uploading".into(),
-                dlspeed: 0,
-                upspeed: 0,
-                ratio: 0.0,
-                category: None,
-                save_path: Some(content_tmp.path().to_string_lossy().into_owned()),
-                content_path: Some(content_file.to_string_lossy().into_owned()),
-                size: 0,
-                downloaded: 0,
-                num_seeds: 0,
-                err_str: None,
-            };
-
-            let poller = super::super::DownloadPoller::new(
-                pool.clone(),
-                download_settings(),
-                zims.clone(),
-                crate::torrent::QbitClientCache::new(),
-                Some("http://127.0.0.1:9/qb".into()),
-                "user".into(),
-                "pass".into(),
+            let err = conflict.expect_err("second active same-name row must be rejected");
+            assert!(
+                err.to_string().contains("uq_downloads_active_name"),
+                "rejection must come from the 011 active-name constraint, got: {err}"
             );
-            let qbit = std::sync::Arc::new(
-                crate::torrent::QbitClient::new(
-                    "http://127.0.0.1:9/qb",
-                    "user",
-                    "pass",
-                    false,
-                    None,
-                )
-                .expect("qbit client build (no network needed)"),
-            );
-            let hash_key: &str = "b4realhash";
-            let by_hash = std::collections::HashMap::from([(hash_key, &t)]);
-            let by_name = std::collections::HashMap::from([(t.name.to_lowercase(), &t)]);
-
-            let rows = poller
-                .fetch_inflight_rows()
-                .await
-                .expect("rows")
-                .into_iter()
-                .filter(|r| r.name.starts_with(IT_INFLIGHT_PREFIX))
-                .collect::<Vec<_>>();
-            assert_eq!(rows.len(), 2, "both same-named rows must be in-flight");
-            let changed = poller
-                .process_inflight(
-                    &by_hash,
-                    &by_name,
-                    Some(qbit),
-                    true,
-                    &download_settings().poller_params_snapshot(),
-                    rows,
-                )
-                .await
-                .expect("process_inflight");
-            poller.flush_stats(&changed).await;
-
-            let row_a: (String, Option<String>, Option<String>) = raw::fetch_optional(
+            // Row A is untouched by the refused insert.
+            let (status, hash): (String, Option<String>) = raw::fetch_optional(
                 &mut *c,
-                "SELECT status, hash, file_path FROM downloads WHERE id = $1",
+                "SELECT status, hash FROM downloads WHERE id = $1",
                 |q| q.bind(id_a),
             )
             .await
             .expect("read row A")
             .expect("row present");
-            let row_b: (String, Option<String>, Option<String>) = raw::fetch_optional(
-                &mut *c,
-                "SELECT status, hash, file_path FROM downloads WHERE id = $1",
-                |q| q.bind(id_b),
-            )
-            .await
-            .expect("read row B")
-            .expect("row present");
+            assert_eq!(status, "downloading");
+            assert_eq!(hash.as_deref(), Some("b4stalehash"));
 
-            // Row A (bound to a stale, non-matching hash): must NOT fall back to
-            // the name match — still `downloading`, hash untouched, no file.
-            assert_eq!(
-                row_a.0, "downloading",
-                "hash-bound row must not name-fallback to the same-named torrent"
-            );
-            assert_eq!(
-                row_a.1.as_deref(),
-                Some("b4stalehash"),
-                "hash-bound row's hash must not be rebound to the matched torrent"
-            );
-            assert_eq!(
-                row_a.2, None,
-                "hash-bound row must not run handle_complete (no file installed)"
-            );
-
-            // Row B (hash NULL): matched by the name fallback — completed, hash
-            // bound to the torrent's real hash, one file installed.
-            assert_eq!(
-                row_b.0, "complete",
-                "hash-NULL row must complete via the name fallback"
-            );
-            assert_eq!(
-                row_b.1.as_deref(),
-                Some("b4realhash"),
-                "hash-NULL row's hash must be bound to the torrent's real hash"
-            );
-            let fp: Option<String> = row_b.2;
-            let fp = fp.expect("row B must have an installed file_path");
-            assert!(
-                std::path::Path::new(&fp).starts_with(&zims.zim_dir),
-                "row B file installed into zim_dir, got {fp}"
-            );
-            assert!(
-                std::path::Path::new(&fp).exists(),
-                "row B installed file must exist"
-            );
-
-            // The expensive verify/copy ran exactly once: a single ZIM installed.
-            // (A regression to double handle_complete still lands one file but
-            // flips row A to `complete` / rebinds its hash — caught above.)
-            let installed = std::fs::read_dir(&zims.zim_dir)
-                .expect("read zim_dir")
-                .flatten()
-                .filter(|e| e.path().extension().map(|x| x == "zim").unwrap_or(false))
-                .count();
-            assert_eq!(installed, 1, "exactly one ZIM must be installed");
-
-            // Let the background auto-index (spawned by handle_complete)
-            // settle before sweeping the `zims` row its resync upserted, so
-            // the cascade delete is quiet. Bounded deadline-poll (same
-            // pattern as the completion test below) instead of a fixed
-            // sleep: the `__it_inflight__b4` row is tiny.zim (one article,
-            // `main.html`), so it reaches `ready` with `article_count > 0`.
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-            let mut last = String::from("(no zims row)");
-            let mut settled = false;
-            while tokio::time::Instant::now() < deadline {
-                let row: Option<(String, i64)> = raw::fetch_optional(
-                    &mut *c,
-                    "SELECT index_status, article_count FROM zims WHERE name = $1",
-                    |q| q.bind("__it_inflight__b4"),
-                )
-                .await
-                .expect("query zims");
-                if let Some((st, cnt)) = row {
-                    last = format!("{st}/{cnt}");
-                    if st == "ready" && cnt > 0 {
-                        settled = true;
-                        break;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            assert!(
-                settled,
-                "auto-index did not settle within 30s (last: {last})"
-            );
-            let mut c2 = pool.acquire().await.expect("conn");
-            let _ = raw::execute(
-                &mut *c2,
-                "DELETE FROM downloads WHERE id IN ($1, $2)",
-                |q| q.bind(id_a).bind(id_b),
-            )
+            let _ = raw::execute(&mut *c, "DELETE FROM downloads WHERE id = $1", |q| {
+                q.bind(id_a)
+            })
             .await;
-            let _ = raw::execute(&mut *c2, "DELETE FROM zims WHERE name = $1", |q| {
+            let _ = raw::execute(&mut *c, "DELETE FROM zims WHERE name = $1", |q| {
                 q.bind("__it_inflight__b4")
             })
             .await;
-            let _ = (tmp, content_tmp);
         }
 
-        /// Inflight-2: two same-named `downloading` rows whose `hash` is
-        /// NULL in BOTH must not double-bind one qB torrent in a single
-        /// tick — the local snapshot maps are not updated by `bind_hash`, so
-        /// without the per-tick consumed set both rows would match the same
-        /// entry by name, bind the same hash, and (once complete) double-
-        /// `handle_complete` (double verify/install + double qB delete).
-        /// Exactly one row must bind; the other stays `downloading`, hash
-        /// NULL, within grace, un-errored.
+        /// Inflight-2 (retargeted): the original scenario — two same-named
+        /// `downloading` rows with `hash IS NULL` in BOTH (a double-bind
+        /// exposure) — is now impossible to create. The `011` partial-unique
+        /// index `uq_downloads_active_name` is keyed on name alone (hash
+        /// irrelevant) and rejects a second active row with the same name, so
+        /// there is never a second same-named NULL-hash row to double-bind.
+        /// This test asserts that conflicting insert is refused.
         #[tokio::test]
         async fn it_inflight_two_null_hash_same_name_rows_single_bind() {
             let Some((pool, _db_gate)) = test_pool().await else {
@@ -2171,8 +2058,7 @@ mod tests {
             )
             .await;
 
-            // Two same-named rows, both `hash IS NULL` (the double-bind
-            // exposure). Fresh `downloading` (no grace expiry).
+            // Row A: active, hash NULL.
             let id_a = it_insert_row(
                 &pool,
                 "__it_inflight__n2dup",
@@ -2183,118 +2069,35 @@ mod tests {
                 None,
             )
             .await;
-            let id_b = it_insert_row(
-                &pool,
-                "__it_inflight__n2dup",
-                None,
-                "downloading",
-                0.5,
-                None,
-                None,
+            // A second active row with the SAME name and hash NULL —
+            // Inflight-2's second row — must be refused by the 011
+            // active-name constraint (which does not consider hash). The url
+            // is unique so the 003 active-url index cannot fire first.
+            let conflict = raw::execute(
+                &mut *c,
+                "INSERT INTO downloads (name, url, hash, status, progress, updated_at) VALUES ('__it_inflight__n2dup', 'magnet:?xt=urn:btih:n2conflict', NULL, 'downloading', 0.5, now())",
+                |q| q,
             )
             .await;
-
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
-            let poller = super::super::DownloadPoller::new(
-                pool.clone(),
-                download_settings(),
-                zims,
-                crate::torrent::QbitClientCache::new(),
-                Some("http://127.0.0.1:9/qb".into()),
-                "user".into(),
-                "pass".into(),
-            );
-            let qbit = std::sync::Arc::new(
-                crate::torrent::QbitClient::new(
-                    "http://127.0.0.1:9/qb",
-                    "user",
-                    "pass",
-                    false,
-                    None,
-                )
-                .expect("qbit client build (no network needed)"),
-            );
-            // One live (not complete, not fatal) qB torrent with the rows' name.
-            let t = TorrentInfo {
-                hash: "n2realhash".into(),
-                name: "__it_inflight__n2dup".into(),
-                progress: 0.5,
-                state: "downloading".into(),
-                dlspeed: 0,
-                upspeed: 0,
-                ratio: 0.0,
-                category: None,
-                save_path: None,
-                content_path: None,
-                size: 0,
-                downloaded: 0,
-                num_seeds: 0,
-                err_str: None,
-            };
-            let hash_key: &str = "n2realhash";
-            let by_hash = std::collections::HashMap::from([(hash_key, &t)]);
-            let by_name = std::collections::HashMap::from([(t.name.to_lowercase(), &t)]);
-
-            let rows = poller
-                .fetch_inflight_rows()
-                .await
-                .expect("rows")
-                .into_iter()
-                .filter(|r| r.name.starts_with(IT_INFLIGHT_PREFIX))
-                .collect::<Vec<_>>();
-            assert_eq!(rows.len(), 2, "both same-named rows must be in-flight");
-            let changed = poller
-                .process_inflight(
-                    &by_hash,
-                    &by_name,
-                    Some(qbit),
-                    true,
-                    &download_settings().poller_params_snapshot(),
-                    rows,
-                )
-                .await
-                .expect("process_inflight");
-            poller.flush_stats(&changed).await;
-
-            let row_a: (String, Option<String>, Option<String>) = raw::fetch_optional(
-                &mut *c,
-                "SELECT status, hash, error FROM downloads WHERE id = $1",
-                |q| q.bind(id_a),
-            )
-            .await
-            .expect("read row A")
-            .expect("row present");
-            let row_b: (String, Option<String>, Option<String>) = raw::fetch_optional(
-                &mut *c,
-                "SELECT status, hash, error FROM downloads WHERE id = $1",
-                |q| q.bind(id_b),
-            )
-            .await
-            .expect("read row B")
-            .expect("row present");
-            // Both rows must survive the tick (the torrent is present and
-            // not fatal; the unmatched row is within grace).
-            assert_eq!(row_a.0, "downloading", "row A must stay downloading");
-            assert_eq!(row_b.0, "downloading", "row B must stay downloading");
-            assert_eq!(row_a.2, None, "row A must not be errored");
-            assert_eq!(row_b.2, None, "row B must not be errored");
-            // Exactly ONE row may hold the torrent's hash — a double-bind is
-            // the regression (both would carry "n2realhash").
-            let a_bound = row_a.1.as_deref() == Some("n2realhash");
-            let b_bound = row_b.1.as_deref() == Some("n2realhash");
+            let err = conflict.expect_err("second NULL-hash same-name row must be rejected");
             assert!(
-                a_bound ^ b_bound,
-                "exactly one NULL-hash row must bind the matched torrent (hashes: {:?}, {:?})",
-                row_a.1,
-                row_b.1
+                err.to_string().contains("uq_downloads_active_name"),
+                "rejection must come from the 011 active-name constraint, got: {err}"
             );
+            // Only the original same-name row may exist now.
+            let count: Option<i64> = raw::fetch_scalar_optional(
+                &mut *c,
+                "SELECT count(*) FROM downloads WHERE name = '__it_inflight__n2dup'",
+                |q| q,
+            )
+            .await
+            .expect("count");
+            assert_eq!(count, Some(1), "only the original same-name row may exist");
 
-            let _ = raw::execute(&mut *c, "DELETE FROM downloads WHERE id IN ($1, $2)", |q| {
-                q.bind(id_a).bind(id_b)
+            let _ = raw::execute(&mut *c, "DELETE FROM downloads WHERE id = $1", |q| {
+                q.bind(id_a)
             })
             .await;
-            let _ = tmp;
         }
 
         /// An unreachable qBittorrent this tick (`qb_available = false`) defers
@@ -2547,7 +2350,8 @@ mod tests {
                 |q| q.bind(id),
             )
             .await
-            .expect("read row");
+            .expect("query ok")
+            .expect("row present");
             assert_eq!(hash, None, "stale hash binding must be cleared");
 
             let _ = pool.acquire().await; // keep pool alive for cleanup
@@ -2945,11 +2749,11 @@ mod tests {
             let content_file = content_dir.join(format!("{ZIM}.zim"));
             std::fs::copy("tests/fixtures/tiny.zim", &content_file).expect("copy tiny.zim fixture");
 
-            // Suite settings (default `keep_completed = false`): the row
-            // settles `complete` (not `seeding`) and the post-install qB-delete
-            // branch runs (dead port → fail-soft warn, like an unreachable qB).
-            // Same helper the other in-flight tests drive.
-            let settings = download_settings();
+            // Suite settings: `keep_completed = false` — explicitly, NOT the
+            // default (which is `true`) — so the row settles `complete` (not
+            // `seeding`) and the post-install qB-delete branch runs (dead port →
+            // fail-soft warn, like an unreachable qB).
+            let settings = download_settings_no_keep_completed();
 
             let zims = crate::zim::ZimManager::new(zim_dir, pool.clone());
             let poller = super::super::DownloadPoller::new(
@@ -3563,7 +3367,8 @@ mod tests {
                 |q| q.bind(id),
             )
             .await
-            .expect("read");
+            .expect("query ok")
+            .expect("row present");
             assert_eq!(status, "queued", "interrupted direct download → queued");
             assert_eq!(fp, None, "file_path cleared");
 

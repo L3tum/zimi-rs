@@ -14,6 +14,22 @@ use crate::AppState;
 /// 10 MB body limit stays as a backstop for other parameters.
 const MAX_QUERY_CHARS: usize = 500;
 
+/// Once-per-process rate limit for the deprecated-`query`-parameter warning:
+/// the first request using the old `query` alias logs a `warn!`, every
+/// subsequent one a `debug!` — one warn per process is enough for the
+/// operator to notice, and it stops a client pinned to the alias from
+/// flooding the log on every request.
+static DEPRECATION_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn log_deprecated_query_param() {
+    if DEPRECATION_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!("query parameter 'query' is deprecated, use 'q'");
+    } else {
+        tracing::warn!("query parameter 'query' is deprecated, use 'q'");
+    }
+}
+
 // ─── Search + random + interlanguage: response DTOs (OpenAPI schemas) ────────
 
 /// `GET /search` response: the merged multi-engine result page.
@@ -132,7 +148,7 @@ pub async fn search(
     Query(params): Query<SearchQuery>,
 ) -> Result<Json<SearchResponse>, crate::error::Error> {
     if params.q.is_none() && params.query.is_some() {
-        tracing::warn!("query parameter 'query' is deprecated, use 'q'");
+        log_deprecated_query_param();
     }
     let query = params.q.or(params.query).ok_or_else(|| {
         crate::error::Error::InvalidInput("query parameter 'q' is required".into())
@@ -221,7 +237,7 @@ pub async fn suggest(
     Query(params): Query<SuggestQuery>,
 ) -> Result<Json<SuggestResponse>, crate::error::Error> {
     if params.q.is_none() && params.query.is_some() {
-        tracing::warn!("query parameter 'query' is deprecated, use 'q'");
+        log_deprecated_query_param();
     }
     let query = params.q.or(params.query).ok_or_else(|| {
         crate::error::Error::InvalidInput("query parameter 'q' is required".into())

@@ -116,9 +116,9 @@ pub const INSTANCE_LOCK_SQL: &str = "SELECT pg_try_advisory_lock(hashtext('zimse
 /// two halves. Both `pg_locks` probes in this file share this fragment so
 /// the two predicates cannot drift apart.
 const ADVISORY_LOCK_MATCH: &str = "l.locktype = 'advisory' AND l.objsubid = 1 \
-     AND l.classid = (hashtext('zimservice:instance')::bigint >> 32)::oid \
+     AND l.classid = ((hashtext('zimservice:instance')::bigint >> 32) & 4294967295)::oid \
      AND l.objid = (hashtext('zimservice:instance')::bigint & 4294967295)::oid \
-     AND a.pid <> pg_backend_id()";
+     AND a.pid <> pg_backend_pid()";
 
 /// Build the full application state (DB pool, settings, ZIM manager, etc.)
 ///

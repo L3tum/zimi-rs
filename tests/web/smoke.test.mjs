@@ -169,7 +169,8 @@ test('search: page scripts boot and populate the ZIM + language filters', async 
   assert.ok([...zimSel.querySelectorAll('option')].some((o) => o.value === 'wikipedia_en'));
   assert.ok([...zimSel.querySelectorAll('option')].some((o) => o.value === 'wiktionary_fr'));
 
-  const langs = [...booted.doc.getElementById('lang').querySelectorAll('option')].map((o) => o.value);
+  const langSel = booted.doc.getElementById('lang');
+  const langs = [...langSel.querySelectorAll('option')].map((o) => o.value);
   assert.ok(langs.includes('en'), 'en language option present');
   assert.ok(langs.includes('fr'), 'fr language option present');
   assert.equal(booted.doc.getElementById('q').value, '', 'q starts empty with no ?q=');

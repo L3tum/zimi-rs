@@ -102,7 +102,11 @@ pub async fn list_embeddable_zims(pool: &Pool) -> Result<Vec<String>> {
 /// Background task: periodically embed any indexed articles that lack
 /// vectors, whenever embedding is enabled. Runs the full pipeline per ZIM,
 /// which is itself resumable (skips rows that already have vectors).
-pub async fn auto_embed_loop(state: Arc<crate::AppState>) {
+///
+/// `tick` is the cadence between passes. Production passes 60 s; the loop
+/// tests pass a small value (e.g. 50 ms) so they run on a *real* clock and
+/// stay green on a remote (slow-RTT) DB — see the module's test note.
+pub async fn auto_embed_loop(state: Arc<crate::AppState>, tick: Duration) {
     // Track the in-flight index build so we don't spawn overlapping builds.
     // The 10-minute backoff between build attempts is the shared
     // module-level gate (`build_probe_within_backoff`), so the loop's
@@ -110,7 +114,7 @@ pub async fn auto_embed_loop(state: Arc<crate::AppState>) {
     let mut in_flight: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        tokio::time::sleep(tick).await;
         if !state.settings.embedding_enabled() {
             continue;
         }
@@ -315,40 +319,38 @@ mod tests {
 
     // ─── auto_embed_loop lifecycle (Tests Major #4) ─────────────────────────
     //
-    // The loop's 60 s cadence is a plain `tokio::time::sleep`, so these tests
-    // run under `#[tokio::test(start_paused = true)]` (mock time — the code
-    // already supports it; no production restructuring). Two tokio
-    // auto-advance facts drive the plumbing below (verified against the
-    // tokio 1.53 runtime source *and* a scratch repro):
+    // The loop's cadence is a plain `tokio::time::sleep(tick)`, where `tick`
+    // is a *parameter* (60 s in production, `TEST_TICK` = 50 ms here). These
+    // tests run on a **real clock** (`#[tokio::test]`, *not* paused) with the
+    // small `TEST_TICK` cadence.
     //
-    // 1. A parked worker with no ready tasks JUMPS the paused clock to the
-    //    next timer (no real time elapses); a real I/O event landing while
-    //    the worker is parked (or about to park) wins the race — the park
-    //    returns via that wake and no jump happens. So real loopback I/O
-    //    (DB probes, embed HTTP) always completes in real time, while pure
-    //    waits (the loop's 60 s tick, the poll sleeps) jump instantly.
-    // 2. While a `spawn_blocking` task runs, auto-advance is INHIBITED and
-    //    the clock stays frozen — so any `tokio::time` deadline inside a
-    //    `Handle::block_on` on a blocking thread can never fire. A connect
-    //    gate built on `spawn_blocking` + `Handle::block_on` therefore
-    //    *deadlocks* against a downed DB (sqlx's pool connect touches
-    //    timers internally), not "measures real time". That is why
-    //    `loop_pool_or_skip` uses the plain established pattern instead.
+    // Why a real clock, not a paused one: the loop is a *spawned* background
+    // task, and tokio's paused-clock auto-advance does not reliably wake a
+    // *spawned* task's timer. A scratch repro (a spawned `sleep(60s)` + a
+    // main task driving the clock) shows the virtual clock advancing far past
+    // the deadline while the spawned task is never woken — so a spawned loop
+    // under `start_paused = true` never ticks. On a *local* DB this was masked
+    // (fast loopback I/O kept the worker busy enough that the loop happened
+    // to run), but on a *remote* DB the slow real I/O let the wait budget
+    // expire before the spawned loop ever ticked. A real clock sidesteps the
+    // whole class of problem: the loop's `sleep(TEST_TICK)` is wall-clock, the
+    // pipeline's real I/O is wall-clock, and the poll waits are wall-clock —
+    // no paused-clock/auto-advance interaction at all, on any host.
     //
-    // Consequences the helpers rely on:
-    // - a real DB probe from the test task parks the worker with the loop's
-    //   60 s tick as the next timer; either the probe's loopback response
-    //   wins (no jump) or the park yields the 60 s jump — either way one
-    //   probe cycle ≈ one loop tick, in milliseconds of real time;
-    // - `loop_pool_or_skip` uses a plain `tokio::time::timeout(3 s, connect)`
-    //   (the repo's established DB-gate pattern): a downed DB yields a
-    //   skip in ~1 ms of real time, and a live DB's real handshake wins
-    //   the race against the virtual deadline;
-    // - `embedding.timeout_secs` is huge, so a virtual jump can never trip
-    //   an in-flight request's timeout.
+    // Plumbing that follows from the real clock:
+    // - `loop_pool_or_skip` is a plain wall-clock connect timeout (no
+    //   `tokio::time::resume()`/`pause()` dance — those only make sense under
+    //   a paused clock). The pool is pre-opened (`min_connections =
+    //   max_connections`) so the initial `acquire` is immediate.
+    // - `TEST_TICK` (50 ms) keeps the tests fast: each pass does a handful of
+    //   real DB round-trips, so a pass takes a few ms of real time even on a
+    //   remote host, and a 50 ms cadence means the loop embeds new work
+    //   within tens of ms.
+    // - `LOOP_WAIT_BUDGET` (60 s real) bounds the real-time poll waits — it is
+    //   a generous safety net, not the expected duration.
     //
     // All three are DB-gated with the lib's established pattern
-    // (`DATABASE_URL` + 3 s connect timeout + `ZIMSERVICE_REQUIRE_DB`
+    // (`DATABASE_URL` + a wall-clock connect timeout + `ZIMSERVICE_REQUIRE_DB`
     // hard-fail) and serialize via `DbExclusiveGuard` like every other DB
     // test in the crate. The 500-endpoint test also bumps the in-process
     // `EMBED_FAILS` poison counters (via the pipeline's failure path), which
@@ -356,38 +358,41 @@ mod tests {
     // guard as well, so the shared static never races.
 
     const LOOP_ZIM: &str = "__embedloop__";
-    /// Real-time budget for polling a live condition. Ticks themselves are
-    /// virtual (milliseconds of real time); this bounds real I/O waits.
+    /// Real-time budget for polling a live condition. The loop tests run on a
+    /// real clock, so this bounds the wall-clock poll waits; it is a generous
+    /// safety net, not the expected duration.
     const LOOP_WAIT_BUDGET: Duration = Duration::from_secs(60);
+    /// Small real-time cadence for the loop tests (production uses 60 s). A small
+    /// tick keeps the tests fast and, running on a *real* clock, immune to the
+    /// paused-clock auto-advance limitation that breaks a spawned loop under a
+    /// paused clock on a remote (slow-RTT) DB.
+    const TEST_TICK: Duration = Duration::from_millis(50);
 
     /// DB gate for the loop tests — the lib's established pattern
     /// (`smoke_single_instance_refusal` & co. and `tests/integration/common.rs`):
-    /// `DATABASE_URL` + 3 s connect timeout around the eager connect +
+    /// `DATABASE_URL` + a wall-clock connect timeout around the eager connect +
     /// `ZIMSERVICE_REQUIRE_DB` hard-fail, then serialize via
     /// `DbExclusiveGuard` like every other DB test in the crate.
     ///
-    /// The timeout is a plain `tokio::time::timeout` in the test task — no
-    /// `spawn_blocking`/`Handle::block_on` indirection. That indirection is
-    /// a *deadlock* under the paused clock, not a real-time measurement:
-    /// while a blocking task runs, auto-advance is inhibited, so the virtual
-    /// 3 s deadline never fires and any connect path that touches a tokio
-    /// timer internally (sqlx pool connect does) hangs forever. The plain
-    /// timeout is safe under auto-advance: the clock only jumps when the
-    /// worker's park *times out* (no real I/O event within the window), so a
-    /// slow-but-live DB still completes its handshake in real time and wins
-    /// the race, while a refused/black-holed connect yields an error/timeout
-    /// within 3 s of real time.
+    /// The loop tests run on a **real clock** (not paused — see the module's
+    /// test note), so the gate is a plain wall-clock timeout: a downed DB
+    /// yields a skip/timeout in ≤ 15 s of real time, and a live DB (local or
+    /// remote) completes its real handshake well inside that. The pool is
+    /// pre-opened (`min_connections = max_connections`) so the initial
+    /// `acquire` below is immediate.
     async fn loop_pool_or_skip(test: &str) -> Option<Pool> {
         let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
         });
+        // Real clock (the loop tests run on a real clock, not a paused one —
+        // see the module's test note), so the gate is a plain wall-clock
+        // timeout. `min_connections = max_connections` pre-opens the pool so
+        // the initial `acquire` is immediate.
         let pool = match tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(15),
             sqlx::postgres::PgPoolOptions::new()
                 .max_connections(8)
-                // Virtual-time guard: the paused clock can jump while the
-                // worker parks, so the (virtual) acquire timeout sits far
-                // away from any plausible tick window.
+                .min_connections(8)
                 .acquire_timeout(Duration::from_secs(86_400))
                 .connect(&url),
         )
@@ -395,7 +400,7 @@ mod tests {
         {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => return skip_loop_test(test, &url, &format!("connect failed: {e}")),
-            Err(_) => return skip_loop_test(test, &url, "connect timed out (3s)"),
+            Err(_) => return skip_loop_test(test, &url, "connect timed out (15s)"),
         };
         if pool.acquire().await.is_err() {
             return skip_loop_test(test, &url, "pool acquire failed");
@@ -409,9 +414,11 @@ mod tests {
         crate::testing::gate_skip(test, url, why)
     }
 
-    /// Current `articles.embedding` column dimension (pgvector stores it as
-    /// typmod - VARHDRSZ). Matching it keeps `ensure_vector_dimension` a
-    /// no-op, so the tests never ALTER the shared dev column.
+    /// Current `articles.embedding` column dimension. pgvector stores the
+    /// dimension **directly** as the column `atttypmod` (no VARHDRSZ offset),
+    /// so this returns `atttypmod` as-is. Matching it keeps
+    /// `ensure_vector_dimension` a no-op, so the tests never ALTER the shared
+    /// dev column.
     async fn embedding_column_dim(pool: &Pool) -> u32 {
         let typmod: i32 = raw::fetch_scalar_optional(
             pool,
@@ -422,7 +429,7 @@ mod tests {
         .await
         .expect("pg_attribute probe")
         .expect("articles.embedding column present");
-        typmod.saturating_sub(4) as u32
+        typmod as u32
     }
 
     /// Settings for the loop under test: endpoint at `endpoint`, enabled per
@@ -573,12 +580,11 @@ mod tests {
         (0..n).map(|_| val.to_string()).collect()
     }
 
-    /// Poll `check` (real DB I/O) within a real-time budget. Each failed
-    /// probe parks the worker with the loop's 60 s tick as the next timer;
-    /// the µs park cycle is usually shorter than the loopback DB round-trip,
-    /// so auto-advance jumps 60 s of virtual time and the loop ticks —
-    /// one probe ≈ one loop tick, in milliseconds of real time. `None` from
-    /// a check (a failed probe) retries.
+    /// Poll `check` (real DB I/O) within a real-time budget (`LOOP_WAIT_BUDGET`).
+    /// The loop tests run on a real clock, so the 25 ms sleep between probes
+    /// is wall-clock: the loop (tick = `TEST_TICK`) makes its real I/O pass
+    /// between polls, and the poll simply waits for it. `None` from a check
+    /// (a failed probe) retries.
     async fn wait_until<F, Fut>(mut check: F, what: &str)
     where
         F: FnMut() -> Fut,
@@ -592,17 +598,15 @@ mod tests {
             if std::time::Instant::now() >= deadline {
                 panic!("loop test: timed out waiting for {what}");
             }
-            // Virtual sleep: a `spawn_blocking` sleep would inhibit
-            // auto-advance and freeze the clock, so the loop could not tick
-            // while the poll waits.
+            // Wall-clock pause between probes (real clock — the loop makes
+            // its pass between polls).
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
-    /// Settle: run `n` probe cycles so the loop has (very likely) ticked at
-    /// least once per cycle — each real DB probe parks the worker with the
-    /// loop's 60 s tick as next timer, so a 60 s virtual jump (and a tick)
-    /// lands while the probe's response is in flight.
+    /// Settle: sleep `n` × 25 ms of wall-clock time (with a `SELECT 1` probe
+    /// per cycle) so the loop (tick = `TEST_TICK`) has very likely made at
+    /// least one pass.
     async fn settle_ticks(pool: &Pool, n: u32) {
         for _ in 0..n {
             // `std::result::Result` (not the module's `Result<T>` alias,
@@ -619,7 +623,7 @@ mod tests {
     /// `list_embeddable_zims`) every tick, so work that appears *after* the
     /// first successful pass is picked up on a later tick, with no config
     /// change and no restart.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn auto_embed_loop_repeats_ticks_and_picks_up_new_work() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -647,7 +651,7 @@ mod tests {
             loop_settings(&pool, &server.uri(), true).await,
         );
         let first = seed_zim_article(&pool, "A/wave1").await;
-        let loop_task = tokio::spawn(auto_embed_loop(state));
+        let loop_task = tokio::spawn(auto_embed_loop(state, TEST_TICK));
 
         // Wave 1: the first tick's pipeline pass embeds the seeded article.
         wait_until(|| article_embedded(&pool, first), "wave-1 article embedded").await;
@@ -681,7 +685,7 @@ mod tests {
     /// up by the already-running loop on its next tick — enabling starts a
     /// pipeline pass, and re-disabling stops the loop from claiming new work
     /// again (the setting is re-read every tick, never latched).
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn auto_embed_loop_re_evaluates_enabled_setting() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -708,7 +712,7 @@ mod tests {
         let settings = loop_settings(&pool, &server.uri(), false).await;
         let first = seed_zim_article(&pool, "A/phase-off").await;
         let state = loop_state(pool.clone(), settings.clone());
-        let loop_task = tokio::spawn(auto_embed_loop(state));
+        let loop_task = tokio::spawn(auto_embed_loop(state, TEST_TICK));
 
         // Let the loop tick a few times while disabled: each tick re-reads
         // `embedding.enabled` and must skip — no claim, no HTTP.
@@ -807,7 +811,7 @@ mod tests {
     /// endpoint makes the attribution exact: `run_pipeline` returns early on
     /// embed failure and never reaches its post-run build, so only the
     /// loop's early-build path can have created the index.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn auto_embed_loop_early_builds_index_at_10k() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -892,7 +896,7 @@ mod tests {
         .await;
 
         let state = loop_state(pool.clone(), settings);
-        let loop_task = tokio::spawn(auto_embed_loop(state));
+        let loop_task = tokio::spawn(auto_embed_loop(state, TEST_TICK));
 
         // The early build lands as a valid index in the background.
         wait_until(

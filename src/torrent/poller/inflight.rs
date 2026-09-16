@@ -3,9 +3,9 @@
 use crate::torrent::TorrentInfo;
 
 use super::{
-    apply_stats_batch, eta_secs, kibs_to_bps, seeding_row_action, stats_changed,
-    MISSING_TORRENT_GRACE, Arc, DownloadPoller, HashMap, HashSet, QbitClient, Result, SeedingAction,
-    StatsRow,
+    apply_stats_batch, eta_secs, kibs_to_bps, seeding_row_action, stats_changed, Arc,
+    DownloadPoller, HashMap, HashSet, QbitClient, Result, SeedingAction, StatsRow,
+    MISSING_TORRENT_GRACE,
 };
 use crate::db::downloads::DownloadRecord;
 

@@ -4,8 +4,9 @@
 //! variant to an HTTP status + user-safe message — client errors keep their
 //! text, while internal/DB errors are redacted so details never leak.
 //! Operator logging happens exactly once per surfaced response, at the
-//! `IntoResponse` boundary (`Error::log`), so an error inspected elsewhere
-//! (pool error mapping, tests) is never double-logged.
+//! `IntoResponse` boundary (`Error::log`) — including `Database` errors,
+//! which log their full sqlx error at `debug!` there — so an error
+//! inspected elsewhere (pool error mapping, tests) is never double-logged.
 use thiserror::Error;
 
 /// Classification of a [`Error::Torrent`]: `SessionExpired` marks a 401/403
@@ -124,8 +125,9 @@ impl Error {
     /// [`IntoResponse`] boundary. Level/field mapping per variant:
     /// `Torrent` to warn (`kind` + upstream `msg`, SEC-L2); `Http`, `Zim`,
     /// `Config`, `Io`, `Json`, `Embedding`, `Mcp`, `Internal` to error (full
-    /// `{self:?}`); the client-error variants (their text goes to the
-    /// response) and `Database` (details handled at the fault site) log
+    /// `{self:?}`); `Database` to debug (full `{e:?}` — the sqlx `Debug`
+    /// impl carries the SQLSTATE, so no fault-site logging is required);
+    /// the client-error variants (their text goes to the response) log
     /// nothing.
     fn log(&self) {
         match self {
@@ -134,11 +136,17 @@ impl Error {
                 // strings) is logged for the operator but never returned to clients.
                 tracing::warn!("torrent error ({kind:?}): {msg}");
             }
+            Error::Database(e) => {
+                // DEBUG, not error: surfaced DB errors are mostly expected
+                // (23505 duplicates, pool timeout under load) and the client
+                // already saw a redacted message; the full sqlx error (with
+                // SQLSTATE in the Debug output) is for operators digging in.
+                tracing::debug!("database error surfaced to client: {e:?}");
+            }
             Error::NotFound(_)
             | Error::Forbidden(_)
             | Error::InvalidInput(_)
-            | Error::Conflict(_)
-            | Error::Database(_) => {}
+            | Error::Conflict(_) => {}
             _ => tracing::error!("internal error: {self:?}"),
         }
     }
@@ -174,19 +182,58 @@ pub(crate) fn sqlstate_message(code: Option<&str>) -> &'static str {
     }
 }
 
-/// Table prefixes a 23505 constraint may carry, in first-match order. Add a
-/// new table's prefix here (one line) so its constraint names map cleanly.
+/// Explicit registry of every unique constraint / unique index defined in
+/// `migrations/*.sql`, mapping the full constraint name to the human field
+/// label a 409 `"duplicate value for '…'"` message should name. Postgres
+/// reports the constraint name on 23505; auto-generated unique-constraint
+/// names use the `<table>_<column(s)>_key` convention, while pkeys and the
+/// hand-named partial uniques keep their declared names.
+///
+/// Add an entry here when a migration introduces a new unique constraint or
+/// index — without one, `duplicate_field` falls back to prefix-stripping and
+/// the client sees a raw constraint fragment instead of a field name.
+const CONSTRAINT_FIELDS: &[(&str, &str)] = &[
+    // zims (001)
+    ("zims_pkey", "id"),
+    ("zims_name_key", "name"),
+    // articles (001)
+    ("articles_pkey", "id"),
+    ("articles_zim_id_path_key", "zim_id_path"),
+    // search_history (001)
+    ("search_history_pkey", "id"),
+    // collections (001)
+    ("collections_pkey", "id"),
+    ("collections_name_key", "name"),
+    // qid_index / qid_cache (001) — composite pkeys on (zim_id, path)
+    ("qid_index_pkey", "zim_id_path"),
+    ("qid_cache_pkey", "zim_id_path"),
+    // settings (001)
+    ("settings_pkey", "key"),
+    // downloads (001, 003, 011)
+    ("downloads_pkey", "id"),
+    ("idx_downloads_active_url", "url"),
+    ("uq_downloads_active_name", "name"),
+];
+
+/// Table prefixes a 23505 constraint may carry, in first-match order.
+/// Fallback only — the [`CONSTRAINT_FIELDS`] registry is the primary mapping;
+/// this keeps NEW, unregistered constraint names from degrading to raw text.
 const TABLE_PREFIXES: &[&str] = &["zims_", "collections_", "articles_"];
 
 /// Field name for a 23505 message from a Postgres constraint name (BUG-14):
-/// strip `_key` then a known table prefix, so `collections_name_key` → "name"
-/// (not "collections_name"). Partial-unique indexes without a suffix map
-/// explicitly.
+/// exact lookup in [`CONSTRAINT_FIELDS`] first (so every migrated constraint
+/// names its field, partial uniques included), then a fallback that strips
+/// `_key` and a known table prefix so unknown NEW constraints degrade
+/// gracefully — `collections_name_key` → "name", `widgets_name_key` →
+/// "widgets_name".
 pub(crate) fn duplicate_field(constraint: &str) -> String {
-    let s = constraint.strip_suffix("_key").unwrap_or(constraint);
-    if s == "idx_downloads_active_url" {
-        return "url".into();
+    if let Some((_, field)) = CONSTRAINT_FIELDS
+        .iter()
+        .find(|(name, _)| *name == constraint)
+    {
+        return (*field).into();
     }
+    let s = constraint.strip_suffix("_key").unwrap_or(constraint);
     let f = TABLE_PREFIXES
         .iter()
         .find_map(|p| s.strip_prefix(p))
@@ -383,10 +430,12 @@ mod tests {
 
     #[test]
     fn duplicate_field_matrix() {
-        assert_eq!(duplicate_field("zims_name_key"), "name");
-        assert_eq!(duplicate_field("collections_name_key"), "name");
-        assert_eq!(duplicate_field("articles_zim_id_path_key"), "zim_id_path");
-        assert_eq!(duplicate_field("idx_downloads_active_url"), "url");
+        // Every registry entry maps to its human field label.
+        for (name, field) in CONSTRAINT_FIELDS {
+            assert_eq!(duplicate_field(name), *field);
+        }
+        // Fallback path for names that are NOT registry entries (old
+        // strip-`_key`-then-prefix behavior, unchanged for unknown names).
         assert_eq!(duplicate_field("collections_name"), "name");
         assert_eq!(duplicate_field("widgets_name_key"), "widgets_name");
         assert_eq!(duplicate_field("_key"), "value");

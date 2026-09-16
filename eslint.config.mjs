@@ -57,5 +57,11 @@ export default [
       sourceType: 'module',
       globals: globals.node,
     },
+    rules: {
+      // Same 100-col limit as the page scripts: the test harness is project
+      // code too, so keep it in the same style lane (the old gap let ~20+
+      // over-length lines slip through unlinted).
+      'max-len': ['error', { code: 100 }],
+    },
   },
 ];

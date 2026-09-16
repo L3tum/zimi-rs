@@ -1,7 +1,9 @@
 //! Postgres connection pool configuration and TLS handling.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgSslMode};
@@ -239,7 +241,8 @@ pub async fn connect_dedicated(database_url: &str) -> Result<PgConnection> {
 // ─── Explicit checkout-wait metric (Architecture M1) ────────────────────────
 
 /// Explicit `pool.acquire()` wait statistics since process start, in
-/// microseconds.
+/// microseconds. Describes either the process-wide aggregate or one
+/// per-site bucket (see [`checkout_wait_stats_by_site`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CheckoutWaitStats {
     /// Checkouts that completed (failed/timed-out acquires are not counted).
@@ -257,18 +260,21 @@ impl CheckoutWaitStats {
     }
 }
 
-/// Process-global explicit pool-checkout-wait metric (Architecture M1).
+/// Explicit pool-checkout-wait metric (Architecture M1).
 ///
 /// This is the number behind the "the shared 20-connection pool is the main
 /// scalability limiter" revisit decision (the PERF-10 trigger in
 /// `search::SearchEngine::search`): a non-trivial `max`/`avg` checkout wait
 /// under sustained search QPS is the signal to move the search arms onto
-/// separate connections. Only **explicit** `pool.acquire()` sites are
-/// instrumented — via [`acquire_timed`] — because the implicit per-query
-/// acquires inside sqlx's `Executor` impl for `&Pool` are not visible from
-/// call sites. Failed acquires (10 s acquire timeout → 503) are not
-/// recorded: their wait is the known timeout and they surface through the
-/// `/diagnostic` `pool` saturation snapshot instead.
+/// separate connections. One instance is the process-global aggregate
+/// ([`CHECKOUT_WAIT`]); [`record_checkout_wait`] additionally keeps one
+/// instance per call-site label in [`CHECKOUT_WAIT_BY_SITE`], so `/diagnostic`
+/// can attribute the wait to the checkout that caused it. Only **explicit**
+/// `pool.acquire()` sites are instrumented — via [`acquire_timed`] — because
+/// the implicit per-query acquires inside sqlx's `Executor` impl for `&Pool`
+/// are not visible from call sites. Failed acquires (10 s acquire timeout →
+/// 503) are not recorded: their wait is the known timeout and they surface
+/// through the `/diagnostic` `pool` saturation snapshot instead.
 #[derive(Debug)]
 pub struct CheckoutWaitCounter {
     count: AtomicU64,
@@ -291,18 +297,9 @@ impl CheckoutWaitCounter {
         let wait_us = wait.as_micros().min(u128::from(u64::MAX)) as u64;
         self.count.fetch_add(1, Ordering::SeqCst);
         self.total_us.fetch_add(wait_us, Ordering::SeqCst);
-        let mut cur = self.max_us.load(Ordering::SeqCst);
-        while wait_us > cur {
-            match self.max_us.compare_exchange_weak(
-                cur,
-                wait_us,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => break,
-                Err(fresh) => cur = fresh,
-            }
-        }
+        // `fetch_max` (stable since 1.45) replaces the old
+        // compare_exchange_weak retry loop for the max.
+        self.max_us.fetch_max(wait_us, Ordering::SeqCst);
     }
 
     /// Point-in-time snapshot (count, total, max).
@@ -315,25 +312,75 @@ impl CheckoutWaitCounter {
     }
 }
 
-/// The process-global counter (instrumented via [`acquire_timed`]).
+/// The process-global aggregate counter (every [`acquire_timed`] record
+/// lands here and in the caller's per-site bucket).
 static CHECKOUT_WAIT: CheckoutWaitCounter = CheckoutWaitCounter::new();
 
-/// Explicit-checkout-wait statistics since process start.
+/// Per-site checkout-wait counters, keyed by the `&'static str` label each
+/// [`acquire_timed`] call site passes. One bucket per call site, never
+/// growing under load — the label set is fixed by construction (there is a
+/// finite number of explicit checkout sites). `Mutex` (not atomics): the
+/// guard is held only across the cheap [`CheckoutWaitCounter::record`],
+/// never across an `.await`.
+static CHECKOUT_WAIT_BY_SITE: LazyLock<Mutex<HashMap<&'static str, CheckoutWaitCounter>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Record one completed checkout's wait into BOTH the aggregate
+/// [`CHECKOUT_WAIT`] counter and the per-site bucket for `site`, so the
+/// aggregate always equals the sum of all per-site buckets.
+fn record_checkout_wait(site: &'static str, wait: Duration) {
+    CHECKOUT_WAIT.record(wait);
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom —
+    // grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    {
+        let mut g = CHECKOUT_WAIT_BY_SITE
+            .lock()
+            .expect("checkout-wait by-site lock poisoned");
+        g.entry(site)
+            .or_insert_with(CheckoutWaitCounter::new)
+            .record(wait);
+    }
+}
+
+/// Aggregate explicit-checkout-wait statistics since process start (all
+/// call sites combined).
 pub fn checkout_wait_stats() -> CheckoutWaitStats {
     CHECKOUT_WAIT.snapshot()
 }
 
-/// `pool.acquire()` with the wait recorded into the process-global
-/// checkout-wait metric (surfaced by `/diagnostic`, Architecture M1).
+/// Per-site explicit-checkout-wait statistics since process start (surfaced
+/// by `/diagnostic`), sorted by site label for stable output.
+// LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom —
+// grandfathered expect_used.
+#[allow(clippy::expect_used)]
+pub fn checkout_wait_stats_by_site() -> Vec<(String, CheckoutWaitStats)> {
+    let g = CHECKOUT_WAIT_BY_SITE
+        .lock()
+        .expect("checkout-wait by-site lock poisoned");
+    let mut v: Vec<(String, CheckoutWaitStats)> = g
+        .iter()
+        .map(|(site, c)| (site.to_string(), c.snapshot()))
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// `pool.acquire()` with the wait recorded into the explicit-checkout-wait
+/// metric (surfaced by `/diagnostic`, Architecture M1): once into the
+/// process-global aggregate, once into the per-site bucket named by `site`
+/// (a `&'static str` unique to this call site, e.g. `"health:db_probe"`), so
+/// per-site attribution shows which checkout is holding the pool.
 /// Use at explicit checkout sites; failed acquires are not recorded (see
 /// [`CheckoutWaitCounter`]).
 pub async fn acquire_timed(
     pool: &Pool,
+    site: &'static str,
 ) -> std::result::Result<sqlx::pool::PoolConnection<sqlx::Postgres>, sqlx::Error> {
     let started = Instant::now();
     let acquired = pool.acquire().await;
     if acquired.is_ok() {
-        CHECKOUT_WAIT.record(started.elapsed());
+        record_checkout_wait(site, started.elapsed());
     }
     acquired
 }
@@ -388,8 +435,8 @@ mod tests {
 
     #[test]
     fn checkout_wait_counter_records_max_under_contention() {
-        // Two threads racing the max CAS: the final max is the largest
-        // recorded wait, the count is the sum of both threads.
+        // Two threads racing the max (`fetch_max`): the final max is the
+        // largest recorded wait, the count is the sum of both threads.
         let counter = std::sync::Arc::new(CheckoutWaitCounter::new());
         let counter1 = counter.clone();
         let counter2 = counter.clone();
@@ -409,6 +456,65 @@ mod tests {
         assert_eq!(s.count, 200);
         assert_eq!(s.max_us, 50);
         assert_eq!(s.total_us, 100 * 50 + 100 * 7);
+    }
+
+    #[test]
+    fn checkout_wait_by_site_isolates_labels_and_matches_aggregate() {
+        // Unique labels: this test never collides with real call sites (or
+        // other tests) recording into the process-global statics.
+        const SITE_A: &str = "pool-test:site-a";
+        const SITE_B: &str = "pool-test:site-b";
+        let agg_before = checkout_wait_stats();
+
+        record_checkout_wait(SITE_A, Duration::from_micros(10));
+        record_checkout_wait(SITE_A, Duration::from_micros(30));
+        record_checkout_wait(SITE_B, Duration::from_micros(40));
+
+        let by_site = checkout_wait_stats_by_site();
+        let a = by_site
+            .iter()
+            .find(|(s, _)| s == SITE_A)
+            .expect("site A bucket recorded")
+            .1;
+        let b = by_site
+            .iter()
+            .find(|(s, _)| s == SITE_B)
+            .expect("site B bucket recorded")
+            .1;
+        // Per-site isolation: each label sees only its own count/total/max.
+        assert_eq!(
+            a,
+            CheckoutWaitStats {
+                count: 2,
+                total_us: 40,
+                max_us: 30
+            }
+        );
+        assert_eq!(
+            b,
+            CheckoutWaitStats {
+                count: 1,
+                total_us: 40,
+                max_us: 40
+            }
+        );
+        // Output is sorted by site label for stable `/diagnostic` rendering.
+        let labels: Vec<&str> = by_site.iter().map(|(s, _)| s.as_str()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        assert_eq!(labels, sorted);
+
+        // The aggregate records every checkout: the before/after delta
+        // equals the sum of the per-site deltas. (No other lib test records
+        // into the static counters, so the delta is deterministic even under
+        // parallel test threads.)
+        let agg_after = checkout_wait_stats();
+        assert_eq!(agg_after.count - agg_before.count, a.count + b.count);
+        assert_eq!(
+            agg_after.total_us - agg_before.total_us,
+            a.total_us + b.total_us
+        );
+        assert!(agg_after.max_us >= b.max_us);
     }
 
     #[test]

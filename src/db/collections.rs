@@ -280,8 +280,8 @@ pub(crate) fn is_unique_violation(e: &sqlx::Error) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::is_unique_violation;
 
     /// A non-DB error (e.g. pool timeout) is never a unique violation.

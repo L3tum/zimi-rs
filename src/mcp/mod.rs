@@ -485,7 +485,9 @@ async fn tool_suggest(state: &AppState, args: &Value) -> Result<Value, (i32, Str
 
 fn tool_list_sources(state: &AppState) -> Value {
     let zims = state.zims.list();
-    json!({
+    // Envelope like every other tool (MCP 2025-03-26 `CallToolResult`):
+    // a bare payload here would break spec-conformant clients.
+    tool_result(&json!({
         "sources": zims.iter().map(|z| json!({
             "name": z.name,
             "title": z.display_title,
@@ -495,7 +497,7 @@ fn tool_list_sources(state: &AppState) -> Value {
             "indexed": z.indexed_entries,
             "index_status": z.index_status,
         })).collect::<Vec<_>>(),
-    })
+    }))
 }
 
 async fn tool_random(state: &AppState, args: &Value) -> Result<Value, (i32, String)> {
@@ -776,6 +778,153 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("path"));
+    }
+
+    // ── Spec conformance (MCP 2025-03-26) ────────────────────────────────
+
+    /// A FIXED `initialize` request (with the `clientInfo` and
+    /// `capabilities` fields a real client sends) must get back the exact
+    /// pinned handshake response: jsonrpc "2.0", the matching `id`,
+    /// `protocolVersion` "2025-03-26", `serverInfo` (name + the crate
+    /// version — both deterministic, so the whole object is compared), and
+    /// a `capabilities` object advertising `tools`. Full-object comparison
+    /// keeps any future shape drift a visible diff.
+    #[tokio::test]
+    async fn initialize_response_is_exactly_pinned() {
+        let state = test_state();
+        let responses = run_session(
+            &state,
+            &[
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"clientInfo":{"name":"spec-pinner","version":"1.0.0"}}}"#,
+            ],
+        )
+        .await;
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0],
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": {
+                        "name": "zimservice",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
+            })
+        );
+    }
+
+    /// `tools/list` must advertise exactly the pinned 9-tool set — both
+    /// directions, so a rename, addition, or removal is a visible diff — and
+    /// every tool must carry a non-empty `name`, a non-empty `description`,
+    /// and an `object` `inputSchema`.
+    #[tokio::test]
+    async fn tools_list_pins_exact_tool_set_and_shape() {
+        let state = test_state();
+        let responses = run_session(
+            &state,
+            &[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#],
+        )
+        .await;
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["id"], 2);
+        let tool_list = responses[0]["result"]["tools"].as_array().unwrap();
+        assert_eq!(tool_list.len(), 9);
+        let names: std::collections::BTreeSet<&str> = tool_list
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        let expected = std::collections::BTreeSet::from([
+            "search",
+            "read",
+            "suggest",
+            "list_sources",
+            "random",
+            "get_chunks",
+            "deep_search",
+            "article_languages",
+            "list_collections",
+        ]);
+        assert_eq!(names, expected);
+        for t in tool_list {
+            let name = t["name"].as_str().unwrap();
+            assert!(!name.is_empty(), "empty tool name");
+            let desc = t["description"].as_str().unwrap();
+            assert!(!desc.is_empty(), "tool {name} has no non-empty description");
+            assert_eq!(t["inputSchema"]["type"], "object");
+        }
+    }
+
+    /// A `tools/call` transcript pinned against the MCP 2025-03-26 shapes.
+    /// `list_sources` is hermetic (no DB — it only reads the in-memory ZIM
+    /// registry, which is empty in `test_state()`), so the success path is
+    /// pinned end-to-end: the result is the standard `content`/`isError`
+    /// tool-result envelope (the 2026-09 conformance sweep fixed the bare
+    /// payload `list_sources` used to return) with the `sources` object as
+    /// the text-block JSON.
+    /// The same session pins the JSON-layer error shapes: unknown tool → the
+    /// exact `-32601` error `call_tool` produces, a wrong-typed `method`
+    /// (must be a string) → the exact `-32600` Invalid Request `run_io`
+    /// produces, and an `id`-less `tools/call` (a JSON-RPC notification) →
+    /// no response at all.
+    #[tokio::test]
+    async fn tools_call_transcript_pins_success_and_error_shapes() {
+        let state = test_state();
+        let responses = run_session(
+            &state,
+            &[
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"spec-pinner","version":"1.0.0"}}}"#,
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_sources","arguments":{}}}"#,
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#,
+                r#"{"jsonrpc":"2.0","id":5,"method":123,"params":{}}"#,
+                r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"list_sources","arguments":{}}}"#,
+            ],
+        )
+        .await;
+        // The `id`-less `tools/call` (a notification) yields no response.
+        assert_eq!(responses.len(), 4);
+
+        // 1. initialize (id 1) — handshake pins.
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[0]["result"]["protocolVersion"], "2025-03-26");
+
+        // 2. tools/call list_sources (id 3) — hermetic success transcript:
+        //    standard tool-result envelope, `sources` object as text JSON.
+        let call = &responses[1];
+        assert_eq!(call["id"], 3);
+        assert_eq!(call["result"]["isError"], false);
+        assert_eq!(call["result"]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(call["result"]["content"][0]["type"], "text");
+        let payload: serde_json::Value =
+            serde_json::from_str(call["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload, json!({ "sources": [] }));
+
+        // 3. Unknown tool (id 4) — the exact `-32601` JSON-RPC error.
+        assert_eq!(
+            responses[2],
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "error": { "code": -32601, "message": "Unknown tool: nope" }
+            })
+        );
+
+        // 4. Non-string `method` (id 5) — the exact `-32600` Invalid Request.
+        assert_eq!(
+            responses[3],
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "error": {
+                    "code": -32600,
+                    "message": "Invalid Request: expected a JSON-RPC 2.0 request or notification"
+                }
+            })
+        );
     }
 
     #[tokio::test]

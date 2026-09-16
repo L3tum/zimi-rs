@@ -21,14 +21,14 @@ use self::query_cache::QueryEmbedCache;
 
 pub use self::sql::SqlQuery;
 // Re-exported (T-3) so the query-plan regression gate in
-// `tests/integration/trgm_plan.rs` can EXPLAIN the exact trgm arm SQL
-// without re-transcribing it. The private `use` below still serves the
-// in-module call sites and unit tests.
+// `tests/integration/trgm_plan.rs` can EXPLAIN the exact arm SQL without
+// re-transcribing it. The private `use` below still serves the in-module
+// call sites and unit tests.
 use self::sql::{
-    branch_fetch_limit, build_trgm_arms, fts_sql, trgm_prefix_sql, vector_fetch_limit, vector_sql,
-    SEARCH_HARD_LIMIT, SEARCH_HARD_OFFSET,
+    branch_fetch_limit, build_trgm_arms, trgm_prefix_sql, vector_fetch_limit, SEARCH_HARD_LIMIT,
+    SEARCH_HARD_OFFSET,
 };
-pub use self::sql::{trgm_contains_sql, trgm_similarity_sql};
+pub use self::sql::{fts_sql, trgm_contains_sql, trgm_similarity_sql, vector_sql};
 
 /// PERF-2: the trigram *contains*/*similarity* arms need at least 3 chars to
 /// be index-useful (Postgres trigrams are built from 3-char windows), so gate
@@ -100,7 +100,7 @@ pub struct SearchEngine {
     /// Lazily-built embedding client, keyed by a settings fingerprint so it
     /// is rebuilt when the endpoint/key/model/dimension change at runtime.
     embed_client: Arc<Mutex<Option<(String, EmbedClient)>>>,
-    /// Bounded LRU cache of normalised query → embedding vector for the
+    /// Bounded FIFO cache of normalised query → embedding vector for the
     /// SEARCH path only (not the batch pipeline). Keyed on
     /// `(model, dimension, trimmed_query)` so a model/dimension change
     /// naturally produces misses. 256 entries × ~3 KB (768-dim) ≈ 768 KB.
@@ -197,7 +197,7 @@ impl SearchEngine {
         // Slow path: probe the DB on a checked-out connection
         // (`acquire_timed`: explicit checkout behind the /diagnostic
         // checkout-wait metric, Architecture M1).
-        let ok = match crate::db::pool::acquire_timed(&self.pool).await {
+        let ok = match crate::db::pool::acquire_timed(&self.pool, "trgm_probe").await {
             Ok(mut client) => self.trgm_probe(&mut *client).await,
             Err(_) => false,
         };
@@ -274,12 +274,15 @@ impl SearchEngine {
         matches!(*g, Some((false, _)))
     }
 
-    /// Current entry count in the query-embedding LRU cache (reported by `/diagnostic`).
+    /// Current entry count in the query-embedding FIFO cache (reported by `/diagnostic`).
     // LINT-3: intentional panic-on-poisoned-lock idiom.
     #[must_use]
     #[allow(clippy::expect_used)]
     pub fn query_embed_cache_len(&self) -> usize {
-        self.query_embed_cache.lock().expect("query embed cache mutex poisoned").len()
+        self.query_embed_cache
+            .lock()
+            .expect("query embed cache mutex poisoned")
+            .len()
     }
 
     /// Settings fingerprint for the embed client cache key. Read from the
@@ -492,7 +495,8 @@ impl SearchEngine {
         let (query_vec, db_arm) = tokio::join!(embed_arm.run(), async {
             // `acquire_timed`: the DB arm's checkout is the primary input
             // to the /diagnostic checkout-wait metric (PERF-10 trigger).
-            let mut client = match crate::db::pool::acquire_timed(&self.pool).await {
+            let mut client = match crate::db::pool::acquire_timed(&self.pool, "search_db_arm").await
+            {
                 Ok(c) => c,
                 Err(e) => return Err(e.into()),
             };
@@ -595,7 +599,7 @@ impl SearchEngine {
             // only (no early return), matching the embed-failure path above.
             // `acquire_timed`: explicit checkout behind the /diagnostic
             // checkout-wait metric (Architecture M1).
-            match crate::db::pool::acquire_timed(&self.pool).await {
+            match crate::db::pool::acquire_timed(&self.pool, "search_vector_ann").await {
                 Ok(mut client) => {
                     run_sql_on(
                         &mut *client,
@@ -670,7 +674,7 @@ impl SearchEngine {
         // H3: one pooled connection for all three arms (sequential on the
         // single-in-flight client). `acquire_timed`: explicit checkout
         // behind the /diagnostic checkout-wait metric (Architecture M1).
-        let mut client = match crate::db::pool::acquire_timed(&self.pool).await {
+        let mut client = match crate::db::pool::acquire_timed(&self.pool, "suggest").await {
             Ok(c) => c,
             Err(e) => return Err(e.into()),
         };
@@ -769,7 +773,7 @@ impl<'a> VectorEmbedArm<'a> {
     /// → `format_vector`, with the `vector_embed` success/failure degradation
     /// recording.
     ///
-    /// Cache: a bounded LRU of `(model, dimension, trimmed_query) → Vec<f32>`
+    /// Cache: a bounded FIFO of `(model, dimension, trimmed_query) → Vec<f32>`
     /// avoids the HTTP round-trip on repeated searches (the dominant p95 cost
     /// for hybrid/None modes). Only successful embeddings are cached.
     ///
@@ -788,7 +792,7 @@ impl<'a> VectorEmbedArm<'a> {
         // Build the cache key: model|dimension|trimmed_query.
         // Case is preserved (embedding models are typically case-sensitive).
         let cache_key = format!("{}|{}|{}", self.model, self.dimension, self.query.trim());
-        // Check the LRU cache (short lock, no await while held).
+        // Check the FIFO cache (short lock, no await while held).
         // LINT-3: intentional panic-on-poisoned-lock idiom.
         #[allow(clippy::expect_used)]
         let cached = {

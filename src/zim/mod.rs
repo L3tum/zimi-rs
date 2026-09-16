@@ -335,6 +335,16 @@ impl ZimManager {
         let file_size = meta.file_size as i64;
         let indexed_entries = meta.indexed_entries as i64;
 
+        // `zims.date` is a `DATE` column; bind a real date, not the raw
+        // metadata string (binding a `&str` into `DATE` is a hard 42804
+        // "column is of type date but expression is of type text"). The value
+        // originates from `NaiveDate::to_string()` (`YYYY-MM-DD`); parse it back,
+        // degrading to NULL on any surprise so a bad date can't break indexing.
+        let date: Option<chrono::NaiveDate> = meta
+            .date
+            .as_deref()
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+
         let id: Option<i32> = raw::fetch_scalar_optional(
             &self.db,
             "INSERT INTO zims (
@@ -368,7 +378,7 @@ impl ZimManager {
                     .bind(&meta.language)
                     .bind(&meta.creator)
                     .bind(&meta.publisher)
-                    .bind(&meta.date)
+                    .bind(date)
                     .bind(entry_count)
                     .bind(article_count)
                     .bind(&meta.file_path)

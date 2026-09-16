@@ -4,8 +4,8 @@
 use crate::torrent::TorrentInfo;
 
 use super::{
-    kibs_to_bps, MISSING_TORRENT_GRACE, ZIM_URL_PREDICATE, Arc, DownloadPoller, HashMap, HashSet,
-    Path, QbitClient, Result,
+    kibs_to_bps, Arc, DownloadPoller, HashMap, HashSet, Path, QbitClient, Result,
+    MISSING_TORRENT_GRACE, ZIM_URL_PREDICATE,
 };
 
 /// Download row snapshot used by reconcile:

@@ -58,8 +58,9 @@ mod tests {
 /// fixture mutation across concurrent `cargo test` processes. **Do not build a
 /// pool directly in a test** — that would bypass the guard and reintroduce the
 /// fixture-interleaving the `DbExclusiveGuard` exists to prevent
-/// (Tests Minor #7; `migrations.rs` is the one exception: a private temp DB,
-/// guarded).
+/// (Tests Minor #7; the temp-DB modules — `migrations.rs` and its sibling
+/// temp-DB tests (e.g. `invalid_index.rs`, `trgm_plan.rs`) — are the one
+/// exception: a private temp DB, guarded).
 pub async fn pool_or_skip() -> Option<(Pool, zimservice::testing::DbExclusiveGuard)> {
     let url_explicit = std::env::var("DATABASE_URL").is_ok();
     let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.into());

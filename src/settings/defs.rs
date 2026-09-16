@@ -3,8 +3,7 @@
 //!
 //! [`SETTING_DEFS`] is the policy table (seeded by [`default_settings`]);
 //! the pure map helpers (redaction, type-checking, env/config sync) are
-//! shared by the cache, and [`default_value`] + `typed_getter!` back the
-//! typed accessors.
+//! shared by the cache, and [`default_value`] backs the typed accessors.
 //!
 //! ## Settings precedence & policy
 //!
@@ -821,7 +820,7 @@ pub(crate) fn default_value(key: &str) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    /// The 8 typed-accessor keys (5 `typed_getter!` instantiations + the 3
+    /// The 8 typed-accessor keys (5 plain `get_typed` accessors + the 3
     /// hand-written clamped/Option accessors) with the `JsonType` family their
     /// Rust return type requires: usize/i32/u64 → Int (a Num row also admits
     /// integers), f64 → Num, bool → Bool, String → Str.
@@ -837,13 +836,14 @@ mod tests {
     ];
 
     #[test]
-    fn default_settings_covers_all_typed_getter_keys() {
-        // Safety net for the `typed_getter!` panic arm + table↔accessor
-        // agreement: every typed-accessor key must exist in `SETTING_DEFS` and
-        // its row's `json_type` must be able to serve the accessor's Rust
-        // type (int-typed accessors accept Int or Num; the exact `JsonType`
-        // expected per Rust type is pinned by the pairs list above). Add a
-        // pair whenever a new typed accessor is introduced.
+    fn default_settings_seeds_all_typed_accessor_keys() {
+        // Pins the seed set the typed accessors' `unwrap_or` fallbacks rely
+        // on + table↔accessor agreement: every typed-accessor key must exist
+        // in `SETTING_DEFS` and its row's `json_type` must be able to serve
+        // the accessor's Rust type (int-typed accessors accept Int or Num;
+        // the exact `JsonType` expected per Rust type is pinned by the pairs
+        // list above). Add a pair whenever a new typed accessor is
+        // introduced.
         for (key, want) in ACCESSOR_KEYS {
             let d = def(key)
                 .unwrap_or_else(|| panic!("missing SETTING_DEFS row for accessor key {key:?}"));

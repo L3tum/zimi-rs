@@ -158,37 +158,37 @@ web-check:
 	node web/check-css.mjs web/style.css web/index.html web/search.html web/settings.html)
 
 # Behavioral unit tests for the web UI helpers + page scripts (node --test).
-# Two DOM harnesses coexist (dev-only): the hand-rolled, dependency-free shim
-# (tests/web/dom.mjs) backs common/index/search/settings, while the real-DOM
-# jsdom harness (tests/web/jsdom.mjs) backs smoke.test.mjs. Requires node.
+# Single real-DOM harness: every suite (common/index/search/settings/smoke)
+# boots the page scripts in jsdom against the minimal HTML they touch
+# (tests/web/jsdom.mjs). Requires node; jsdom is a declared devDependency.
 #
-# WHY keep jsdom (and not port smoke to the shim): smoke loads each page's
-# HTML, executes the <script src> files in document load order, and asserts on
-# the browser-PARSED element tree (class/attribute querySelectorAll, bubbling
-# Event). The shim does not parse HTML or run the page scripts — reproducing
-# that there would mean rebuilding an HTML parser + script runtime (a browser).
-# jsdom is the only reasonable way to get real parsed-DOM behavior.
+# WHY jsdom (and not a hand-rolled DOM shim): the suites assert on
+# browser-PARSED element trees (class/attribute querySelectorAll, bubbling
+# Event, real <select> option matching) and run the page scripts as top-level
+# classic scripts in document load order. A fake-DOM shim does not parse
+# innerHTML or run scripts — reproducing that means rebuilding an HTML parser
+# + script runtime (a browser). jsdom is the only reasonable way to get real
+# parsed-DOM behavior, and it is ONE declared devDependency that CI installs
+# via `npm install` anyway, so there is no extra cost to always using it.
 #
-# Consequence: `npm install` (jsdom) is needed ONLY for smoke.test.mjs. When
-# jsdom is absent we still run the other four (shim-backed) suites and skip
-# just smoke.test.mjs — so the web UI is testable without a full install.
-# Set ZIMSERVICE_WEB_CHECK_STRICT=1 to fail hard without node/jsdom. The node
-# guard and the run stay chained on ONE logical line: make runs each recipe
-# line in its own shell, so an `exit 0` on a separate guard line would not
-# stop the test run (same reason WEB_WRAP uses one-line chaining).
+# Consequence: jsdom is required to run the web tests at all. Without node we
+# warn + skip (fail under ZIMSERVICE_WEB_CHECK_STRICT=1); with node but
+# jsdom missing (no `npm install` yet) we warn + skip ALL web tests (strict
+# mode fails). The node guard and the run stay chained on ONE logical line:
+# make runs each recipe line in its own shell, so an `exit 0` on a separate
+# guard line would not stop the test run (same reason WEB_WRAP uses one-line
+# chaining).
 web-test:
 	@if ! command -v node >/dev/null 2>&1; then \
 	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
 	    echo "web-test: node not found (strict mode)" >&2; exit 1; \
 	  fi; echo "web-test: node not found — skipping web UI unit tests"; exit 0; \
-	fi && \
-	if node -e "import('jsdom')" >/dev/null 2>&1; then \
-	  node --test tests/web/*.test.mjs; \
-	elif [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
-	  echo "web-test: jsdom not installed (run: npm install; strict mode)" >&2; exit 1; \
+	elif ! node -e "import('jsdom')" >/dev/null 2>&1; then \
+	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
+	    echo "web-test: jsdom not installed (run: npm install; strict mode)" >&2; exit 1; \
+	  fi; echo "web-test: jsdom not installed (run: npm install) — skipping all web UI unit tests"; \
 	else \
-	  echo "web-test: jsdom not installed (npm install) — skipping tests/web/smoke.test.mjs only"; \
-	  node --test tests/web/common.test.mjs tests/web/index.test.mjs tests/web/search.test.mjs tests/web/settings.test.mjs; \
+	  node --test tests/web/*.test.mjs; \
 	fi
 
 # Real lint (eslint) of the embedded web UI: web/common.js + the per-page
@@ -230,7 +230,7 @@ help:
 	@echo "  make test-strict      Strict mode: DB required (missing DB is a hard failure)"
 	@echo "  make test-strict-ci    Mirrors the CI test job: strict DB, lib+bins+wiremock+integration"
 	@echo "  make web-check    JS syntax + CSS syntax check of the embedded web UI (needs node; skips if absent)"
-	@echo "  make web-test     Behavioral unit tests for web UI helpers + page scripts (node --test; shim suites always run, jsdom-backed smoke skipped only if jsdom absent)"
+	@echo "  make web-test     Behavioral unit tests for web UI helpers + page scripts (node --test, jsdom real-DOM harness)"
 	@echo "  make web-fmt      eslint --fix for the web UI (JS half of make fmt; needs npm install; skips if absent)"
 	@echo "  make web-lint     JS lint of web UI + tests/web via eslint (needs npm install; skips if absent)"
 	@echo "  make doc          Build docs"

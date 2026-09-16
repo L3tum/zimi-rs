@@ -188,9 +188,10 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
     // Background auto-embed: picks up newly indexed articles and generates
     // vectors while the server is running (no-op when embedding is disabled).
     let embed_state = state.clone();
-    let embed_handle = tokio::spawn(zimservice::embed::auto_embed_loop(std::sync::Arc::new(
-        embed_state,
-    )));
+    let embed_handle = tokio::spawn(zimservice::embed::auto_embed_loop(
+        std::sync::Arc::new(embed_state),
+        std::time::Duration::from_secs(60),
+    ));
 
     // Background trgm re-probe (WI-5): when pg_trgm was unavailable at startup,
     // re-probe every 60 s so the trgm arms recover when the extension is

@@ -55,6 +55,19 @@ pub async fn mcp_call_tool(
     crate::mcp::call_tool(state, name, args).await
 }
 
+/// Test seam: [`crate::db::migrate::drop_invalid_indexes`] with an
+/// injectable catalog probe. The integration suite (tests/integration/
+/// invalid_index.rs) passes a deterministically failing probe to pin the
+/// probe-failure degradation (warn + skip, `Ok(())`) without mutating
+/// server-wide catalog grants.
+#[doc(hidden)]
+pub async fn drop_invalid_indexes_with_probe(
+    pool: &crate::db::Pool,
+    probe_sql: &str,
+) -> crate::error::Result<()> {
+    crate::db::migrate::drop_invalid_indexes_with_probe(pool, probe_sql).await
+}
+
 /// A lazy pool pointing at an unreachable URL — used by tests that need a
 /// [`crate::db::Pool`](sqlx) value but never touch the database (or that
 /// expect the write to fail at the pool). `connect_lazy` defers the first

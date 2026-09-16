@@ -114,12 +114,14 @@ pub(crate) fn should_spawn_build(state: VectorIndexState, count: i64) -> bool {
 /// — see [`VectorIndexState`]).
 pub async fn index_state(pool: &Pool) -> Result<VectorIndexState> {
     // pg_catalog index probe; `COUNT(*) FILTER (…)` always returns a row.
+    // `pg_indexes` has no `indexrelid` — join `pg_index` to the index's
+    // `pg_class` row (via `indexrelid = oid`) to look up the index by name.
     let (valid, invalid): (bool, bool) = raw::fetch_optional(
         pool,
         "SELECT (COUNT(*) FILTER (WHERE pi.indisvalid)) > 0, \
                 (COUNT(*) FILTER (WHERE NOT pi.indisvalid)) > 0 \
-         FROM pg_indexes i JOIN pg_index pi ON i.indexrelid = pi.indexrelid \
-         WHERE i.indexname = 'idx_articles_embedding'",
+         FROM pg_index pi JOIN pg_class pcl ON pcl.oid = pi.indexrelid \
+         WHERE pcl.relname = 'idx_articles_embedding'",
         |q| q,
     )
     .await?

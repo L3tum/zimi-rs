@@ -286,9 +286,11 @@ async fn search_branch_soft_fail_keeps_other_branches() {
         params: vec![],
     };
     // Healthy branch on the SAME client: a trivial query whose nine columns
-    // decode as a `SearchRow` (the shape `run_sql_on` decodes into).
+    // decode as a `SearchRow` (the shape `run_sql_on` decodes into). The score
+    // column must be `float8` (a bare `1.0` is Postgres `numeric`, which sqlx
+    // cannot decode as the `f64` score field).
     let healthy = zimservice::search::SqlQuery {
-        sql: "SELECT 1::bigint, 1::int, 'a', 'b', 'c', NULL::text, 'd', 'e', 1.0".into(),
+        sql: "SELECT 1::bigint, 1::int, 'a', 'b', 'c', NULL::text, 'd', 'e', 1.0::float8".into(),
         params: vec![],
     };
 

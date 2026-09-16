@@ -21,9 +21,10 @@
 use super::common::*;
 
 /// Unique temp-database name for this test run (pid + nanosecond clock).
-/// Leftovers from a crashed run are harmless: the next run uses a fresh name
-/// (drop them manually — `DROP DATABASE "zimservice_itest_mig_..."` — if
-/// they accumulate on a long-lived dev server).
+/// Leftovers from a crashed run are harmless: the next `create_temp_db`
+/// sweeps them (`sweep_stale_temp_dbs`) when the embedded pid is no longer
+/// alive; names the sweep can't parse (or whose pid is still live) are
+/// left for manual cleanup (`DROP DATABASE "zimservice_itest_mig_..."`).
 fn temp_db_name() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -54,10 +55,15 @@ async fn drop_db(base_pool: &Pool, name: &str) {
 /// Returns `None` (after recording a mid-test skip) when the server user
 /// cannot `CREATE DATABASE` or the fresh database is unreachable.
 ///
+/// Before creating the new database, best-effort sweeps stale temp DBs
+/// left by crashed/killed runs (see [`sweep_stale_temp_dbs`]) so a
+/// long-lived dev server doesn't accumulate them.
+///
 /// `pub` for sibling temp-DB tests (e.g. `trgm_plan.rs`): the pattern is
 /// deliberate — a private database per test keeps the shared dev schema
 /// untouched, and the caller already holds the `DbExclusiveGuard`.
 pub async fn create_temp_db(base_pool: &Pool) -> Option<(Pool, String)> {
+    sweep_stale_temp_dbs(base_pool).await;
     let name = temp_db_name();
     // CREATE/DROP DATABASE cannot run inside a transaction; the plain pooled
     // statement is exactly that (sqlx opens no implicit BEGIN).
@@ -93,6 +99,77 @@ pub async fn create_temp_db(base_pool: &Pool) -> Option<(Pool, String)> {
         }
     };
     Some((pool, name))
+}
+
+/// Best-effort sweep of temp databases left behind by crashed/killed test
+/// runs. Names follow the `temp_db_name` pattern
+/// `zimservice_itest_mig_{pid}_{nanos}`: the embedded pid is liveness-
+/// probed with `kill -0`, and a database whose pid is no longer a live
+/// process is dropped. Safety rules:
+/// - **never fails**: a probe or drop error is `tracing::warn!`-ed and the
+///   sweep continues — a leftover database must never block test setup;
+/// - **conservative**: unparseable names (wrong shape, non-numeric pid,
+///   pid 0) are SKIPPED, never dropped; a live pid (including a reused one
+///   or an EPERM from another user) is kept.
+///
+/// Runs on the BASE pool (the catalog query is server-wide; temp DB names
+/// are global to the server, not to a database).
+async fn sweep_stale_temp_dbs(base_pool: &Pool) {
+    const PREFIX: &str = "zimservice_itest_mig_";
+    let names: Vec<(String,)> = match zimservice::db::raw::fetch_all(
+        base_pool,
+        "SELECT datname FROM pg_database WHERE datname LIKE 'zimservice_itest_mig\\_%' ESCAPE '\\'",
+        |q| q,
+    )
+    .await
+    {
+        Ok(names) => names,
+        Err(e) => {
+            tracing::warn!("stale temp-DB sweep: pg_database probe failed: {e}");
+            return;
+        }
+    };
+    for (name,) in names {
+        // Exactly `{pid}_{nanos}` after the prefix; anything else is
+        // unparseable → skip (not confirmed stale).
+        let rest = match name.strip_prefix(PREFIX) {
+            Some(rest) => rest,
+            None => continue,
+        };
+        let mut parts = rest.split('_');
+        let (Some(pid_s), Some(_nanos)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if parts.next().is_some() {
+            continue; // more than two fields — unparseable
+        }
+        let Ok(pid) = pid_s.parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 {
+            continue; // `kill -0 0` targets the process group — never a pid
+        }
+        // `kill -0` succeeds iff the pid is a live process we may signal.
+        // A live foreign-user pid answers EPERM (reads as "not alive"); in
+        // this environment the suite only ever runs as the dev-box/CI user,
+        // so the sweep's conservative failure mode is keeping a DB, not
+        // dropping one.
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if alive {
+            continue;
+        }
+        tracing::warn!("stale temp-DB sweep: dropping {name} (pid {pid} not alive)");
+        let _ = zimservice::db::raw::execute(
+            base_pool,
+            &format!("DROP DATABASE IF EXISTS {name}"),
+            |q| q,
+        )
+        .await;
+    }
 }
 
 /// Close `pool` (releasing its connections), then drop the database
@@ -233,4 +310,73 @@ async fn smoke_migration_legacy_schema_refused() {
     );
 
     close_and_drop(&base_pool, &pool, &name).await;
+}
+
+/// Two concurrent `run_migrations` calls against a FRESH temp database must
+/// serialize on the session-level advisory lock: both complete `Ok`, and
+/// `schema_migrations` ends with exactly `MIGRATION_COUNT` rows, all names
+/// distinct.
+///
+/// This is the guard against a regression where the advisory lock is taken
+/// on one pooled connection while the DDL loop runs on a different one (the
+/// lock would then serialize nothing — both runs apply in parallel, and one
+/// of them double-applies a migration, failing on the primary key or
+/// corrupting the tracking table). Both pools must be real, separate pools
+/// so each `run_migrations` acquires its own connection for the lock AND
+/// the DDL.
+#[tokio::test]
+async fn smoke_concurrent_migrations_serialize_on_advisory_lock() {
+    let (base_pool, _db_gate) = match pool_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    let (pool1, name) = match create_temp_db(&base_pool).await {
+        Some(t) => t,
+        None => return,
+    };
+    // Second independent pool to the SAME private temp DB (the pool is the
+    // sanctioned temp-DB exception — see the module doc).
+    let mut url = url::Url::parse(&base_url()).expect("valid base URL");
+    url.set_path(&format!("/{name}"));
+    let pool2 = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(url.as_str())
+        .await
+        .expect("second pool to the private temp DB");
+
+    // Concurrent fresh applies: the loser must block on the advisory lock
+    // until the winner finishes, then no-op — never double-apply.
+    let (first, second) = tokio::join!(run_migrations(&pool1), run_migrations(&pool2));
+    first.expect("first concurrent run_migrations must complete Ok");
+    second.expect("second concurrent run_migrations must complete Ok");
+
+    let expected = zimservice::db::migrate::MIGRATION_COUNT as i64;
+    let count: i64 = zimservice::db::raw::fetch_scalar_optional(
+        &pool1,
+        "SELECT count(*) FROM schema_migrations",
+        |q| q,
+    )
+    .await
+    .expect("count applied migrations")
+    .expect("schema_migrations row");
+    let distinct: i64 = zimservice::db::raw::fetch_scalar_optional(
+        &pool1,
+        "SELECT count(DISTINCT name) FROM schema_migrations",
+        |q| q,
+    )
+    .await
+    .expect("count distinct migration names")
+    .expect("schema_migrations row");
+    assert_eq!(
+        count, expected,
+        "concurrent runs must apply every migration exactly once"
+    );
+    assert_eq!(
+        distinct, expected,
+        "every recorded migration name must be distinct — a lost advisory \
+         lock would double-apply a migration"
+    );
+
+    pool2.close().await;
+    close_and_drop(&base_pool, &pool1, &name).await;
 }

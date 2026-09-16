@@ -534,6 +534,11 @@ async fn embed_pipeline_embeds_then_guard_skips() {
     )
     .await
     .unwrap();
+    // Reset the mock server so run 1's still-mounted (3-vector) mock cannot
+    // answer run 3's identical request — wiremock serves the *first* matching
+    // mock (stable order among equal priorities), so without this the 2-vector
+    // response below is shadowed and the count-guard is never exercised.
+    server.reset().await;
     Mock::given(method("POST"))
         .and(path("/embeddings"))
         .respond_with(ResponseTemplate::new(200).set_body_string(embed_body(&[0, 1])))
@@ -553,8 +558,8 @@ async fn embed_pipeline_embeds_then_guard_skips() {
     assert_eq!(n3, 0, "count-guard skip must leave rows unembedded");
     assert_eq!(
         server.received_requests().await.unwrap().len(),
-        2,
-        "run 3 sends exactly one (mismatched) embed call, then skips"
+        1,
+        "run 3 (post-reset) sends exactly one (mismatched) embed call, then skips"
     );
 
     // Cleanup (cascades to articles).

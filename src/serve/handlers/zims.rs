@@ -120,11 +120,12 @@ pub struct VectorIndexDiagnostic {
 /// 20-connection pool is the main scalability limiter" revisit decision (the
 /// PERF-10 trigger in `search::SearchEngine::search`): a non-trivial
 /// `max_us`/`avg_us` under sustained search QPS is the signal to move the
-/// search arms onto separate connections. Only explicit checkouts are
-/// measured (the `search` DB arm + vector ANN seek, `suggest`, the
-/// `ensure_trgm` slow path, and the `/health` db probe); failed acquires
-/// (10 s timeout → 503) are not — those surface via the `pool` saturation
-/// snapshot instead.
+/// search arms onto separate connections. `by_site` attributes each explicit
+/// checkout to its call site (the `&'static str` label each site passes to
+/// `db::pool::acquire_timed`). Only explicit checkouts are measured (the
+/// `search` DB arm + vector ANN seek, `suggest`, the `ensure_trgm` slow path,
+/// and the `/health` db probe); failed acquires (10 s timeout → 503) are not
+/// — those surface via the `pool` saturation snapshot instead.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct CheckoutWait {
     /// Explicit checkouts completed since process start.
@@ -132,6 +133,25 @@ pub struct CheckoutWait {
     /// Longest single checkout wait since start, microseconds.
     pub max_us: u64,
     /// Average checkout wait since start, microseconds (0 when `count == 0`).
+    pub avg_us: u64,
+    /// Per-call-site breakdown (sorted by `site` for stable output): which
+    /// explicit checkout is actually holding the pool. Omitted until the
+    /// first explicit checkout has been recorded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub by_site: Vec<CheckoutWaitBySite>,
+}
+
+/// One per-site row of `GET /diagnostic` → `checkout_wait.by_site`.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct CheckoutWaitBySite {
+    /// Call-site label (`&'static str` passed to `db::pool::acquire_timed`).
+    pub site: String,
+    /// Explicit checkouts completed by this site since process start.
+    pub count: u64,
+    /// Longest single checkout wait by this site since start, microseconds.
+    pub max_us: u64,
+    /// Average checkout wait by this site since start, microseconds (0 when
+    /// `count == 0`).
     pub avg_us: u64,
 }
 
@@ -145,6 +165,15 @@ fn checkout_wait_snapshot() -> CheckoutWait {
         count: s.count,
         max_us: s.max_us,
         avg_us: s.avg_us(),
+        by_site: crate::db::pool::checkout_wait_stats_by_site()
+            .into_iter()
+            .map(|(site, s)| CheckoutWaitBySite {
+                site,
+                count: s.count,
+                max_us: s.max_us,
+                avg_us: s.avg_us(),
+            })
+            .collect(),
     }
 }
 
@@ -172,10 +201,10 @@ pub struct DiagnosticResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_index: Option<VectorIndexDiagnostic>,
     /// Explicit pool checkout-wait metric since process start (Architecture
-    /// M1): the number behind the pool-size revisit decision. Always
-    /// present (additive).
+    /// M1): the number behind the pool-size revisit decision, with a
+    /// per-call-site breakdown (`by_site`). Always present (additive).
     pub checkout_wait: CheckoutWait,
-    /// Query-embedding LRU cache entry count (operator signal for cache
+    /// Query-embedding FIFO cache entry count (operator signal for cache
     /// effectiveness). Always present (additive).
     pub query_embed_cache_entries: usize,
 }

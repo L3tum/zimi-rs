@@ -4,10 +4,11 @@ use crate::db::pool::Pool;
 use crate::db::raw;
 use crate::error::{Error, Result};
 
-/// Probe the stored dimension of the `articles.embedding` column
-/// (pgvector stores the dimension as typmod - VARHDRSZ (4)), or `None` when
-/// the column does not exist. Factored out of [`ensure_vector_dimension`]
-/// so the pipeline's fail-fast dimension check reuses the same probe.
+/// Probe the stored dimension of the `articles.embedding` column. pgvector
+/// stores the dimension **directly** as the column `atttypmod` (no header
+/// offset), so the typmod value *is* the dimension; `None` when the column
+/// does not exist. Factored out of [`ensure_vector_dimension`] so the
+/// pipeline's fail-fast dimension check reuses the same probe.
 ///
 /// pg_catalog probe (the generic helpers still serve it via db::raw).
 pub(crate) async fn stored_embedding_dimension(pool: &Pool) -> Result<Option<u32>> {
@@ -18,7 +19,7 @@ pub(crate) async fn stored_embedding_dimension(pool: &Pool) -> Result<Option<u32
         |q| q,
     )
     .await?;
-    Ok(typmod.map(|t| t.saturating_sub(4) as u32))
+    Ok(typmod.map(|t| t as u32))
 }
 
 /// Reconcile the `articles.embedding` column dimension with the configured

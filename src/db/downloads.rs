@@ -373,9 +373,8 @@ pub async fn cancel_download(pool: &Pool, id: i32) -> Result<CancelOutcome> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
     use super::*;
     use crate::testing::test_pool;
 

@@ -113,6 +113,24 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
     result
 }
 
+/// True when `name` is a plain SQL identifier safe to splice into DDL:
+/// only ASCII alphanumerics and underscores. Guards against identifier
+/// injection into the `DROP INDEX` in [`drop_invalid_indexes`] — a
+/// non-conforming name is anomalous (the catalog probe only matches
+/// `idx_%`), so it is skipped with a warning instead of being
+/// interpolated into the statement.
+fn is_safe_index_name(name: &str) -> bool {
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Catalog probe for the startup cleanup: invalid (crashed `CONCURRENTLY`
+/// build) `idx_%` indexes. Kept as a const so the test seam
+/// ([`drop_invalid_indexes_with_probe`]) can fail it deterministically
+/// without mutating server-wide catalog grants.
+const PROBE_INVALID_INDEXES: &str =
+    "SELECT c.relname FROM pg_class c JOIN pg_index i ON c.oid = i.indexrelid \
+ WHERE i.indisvalid = false AND c.relname LIKE 'idx\\_%' ESCAPE '\\'";
+
 /// Drop invalid (crashed `CONCURRENTLY` build) indexes left behind by a
 /// prior crashed build. All DDL cleanup lives in the migration layer (ARCH M1)
 /// — the `serve` startup path calls this instead of inlining the DDL in
@@ -121,20 +139,25 @@ pub async fn run_migrations(pool: &Pool) -> Result<()> {
 /// failure skips the cleanup, a failing drop is logged and retried on the
 /// next startup). `CONCURRENTLY` cannot run inside a transaction, so each
 /// drop is a standalone statement on its own pooled connection. Before
-/// splicing, each `relname` is validated as a plain SQL identifier (ASCII
-/// alphanumerics + underscore); a non-conforming name is anomalous (the
-/// probe only matches `idx_%`) and is skipped with a warning instead of
-/// being interpolated into the `DROP INDEX` statement.
+/// splicing, each `relname` is validated as a plain SQL identifier via
+/// [`is_safe_index_name`] (ASCII alphanumerics + underscore); a
+/// non-conforming name is anomalous (the probe only matches `idx_%`) and is
+/// skipped with a warning instead of being interpolated into the `DROP
+/// INDEX` statement.
 pub async fn drop_invalid_indexes(pool: &Pool) -> Result<()> {
+    drop_invalid_indexes_with_probe(pool, PROBE_INVALID_INDEXES).await
+}
+
+/// [`drop_invalid_indexes`] with an injectable catalog probe.
+///
+/// Production calls [`drop_invalid_indexes`] (the real [`PROBE_INVALID_INDEXES`]);
+/// the seam exists so the probe-failure degradation (warn + skip, `Ok(())`)
+/// is testable with a deterministically failing probe — no server-wide
+/// catalog-grant mutation, no superuser requirement. Exposed to the
+/// integration suite through the `testing::` module (see `src/testing.rs`).
+pub(crate) async fn drop_invalid_indexes_with_probe(pool: &Pool, probe_sql: &str) -> Result<()> {
     let mut conn = pool.acquire().await.map_err(Error::Database)?;
-    let rows: Vec<(String,)> = match raw::fetch_all(
-        &mut *conn,
-        "SELECT c.relname FROM pg_class c JOIN pg_index i ON c.oid = i.indexrelid \
-         WHERE i.indisvalid = false AND c.relname LIKE 'idx\\_%' ESCAPE '\\'",
-        |q| q,
-    )
-    .await
-    {
+    let rows: Vec<(String,)> = match raw::fetch_all(&mut *conn, probe_sql, |q| q).await {
         Ok(rows) => rows,
         // Best-effort (the original inline code used `unwrap_or_default`):
         // a failing probe skips the cleanup rather than blocking startup.
@@ -144,14 +167,10 @@ pub async fn drop_invalid_indexes(pool: &Pool) -> Result<()> {
         }
     };
     for (idx_name,) in rows {
-        // Identifier hygiene before splicing into the DDL: a name outside
-        // [A-Za-z0-9_] is anomalous (the probe only matches `idx_%`), so
-        // fail safe and skip it (residual risk only reachable with CREATE
-        // INDEX privilege).
-        if !idx_name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        // Identifier hygiene before splicing into the DDL (see
+        // `is_safe_index_name`): fail safe and skip (residual risk only
+        // reachable with CREATE INDEX privilege).
+        if !is_safe_index_name(&idx_name) {
             tracing::warn!(
                 "invalid-index cleanup: skipping non-conforming identifier {idx_name:?}"
             );
@@ -389,6 +408,36 @@ mod tests {
             "MIGRATIONS number set differs from the pinned set — 005 must stay \
              absent and no other number may be added or removed"
         );
+    }
+
+    /// `is_safe_index_name` is the injection guard `drop_invalid_indexes`
+    /// applies before splicing a catalog name into `DROP INDEX`; this pins
+    /// its accept/reject boundary: exactly `[A-Za-z0-9_]`, nothing else.
+    #[test]
+    fn is_safe_index_name_pins_the_identifier_guard_boundary() {
+        // Accepted: plain ASCII alphanumerics and underscores (leading /
+        // trailing / only-underscore shapes all legal as identifiers).
+        for ok in ["idx_foo", "idx_foo_", "12345", "_"] {
+            assert!(is_safe_index_name(ok), "{ok:?} must be accepted");
+        }
+        // The empty string is vacuously "all chars safe"; the probe's
+        // `idx\_%` LIKE can never yield it, so this pins the pure
+        // predicate, not a reachable drop path.
+        assert!(is_safe_index_name(""), "empty string is vacuously safe");
+        // Rejected: anything outside `[A-Za-z0-9_]` — each is a real
+        // injection vector in the spliced `DROP INDEX` (statement
+        // terminator, quote breakout, comment, …) or simply an invalid
+        // unquoted identifier (hyphen, space, unicode, quote).
+        for bad in [
+            "idx-foo",
+            "idx'foo",
+            "idx;foo",
+            "idx\"foo",
+            "idx foo",
+            "idx_foo_é",
+        ] {
+            assert!(!is_safe_index_name(bad), "{bad:?} must be rejected");
+        }
     }
 
     #[test]

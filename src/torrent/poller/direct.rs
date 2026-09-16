@@ -963,7 +963,7 @@ mod tests {
         .await
         .expect("insert downloading row")
         .unwrap();
-        let part = tmp.path().join("utiny.part");
+        let part = tmp.path().join("utiny.zim.part");
         std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage utiny.zim as .part");
 
         super::finalize_direct_download(&pool, &zims, id, &part)

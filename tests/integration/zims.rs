@@ -46,14 +46,14 @@ async fn mcp_tools_db_backed() {
         // One statement per execute (sqlx has no multi-statement protocol
         // call; `split_statements` replaces the old `batch_execute`).
         for stmt in zimservice::db::raw::split_statements(&format!(
-            "INSERT INTO articles (zim_id, path, title, content_preview, search_vector, title_lower) VALUES
+            "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES
              ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpine', 'Alpine',
-              'The Alps are mountains.', to_tsvector('simple','alpine peaks europe'), 'alpine'),
+              'The Alps are mountains.', to_tsvector('simple','alpine peaks europe')),
              ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Baltic', 'Baltic Sea',
-              'The Baltic is a sea.', to_tsvector('simple','baltic sea'), 'baltic sea'),
+              'The Baltic is a sea.', to_tsvector('simple','baltic sea')),
              ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Andes', 'Andes',
               'The Andes are mountains in South America.',
-              to_tsvector('simple','andes mountains south america'), 'andes')"
+              to_tsvector('simple','andes mountains south america'))"
         )) {
             zimservice::db::raw::execute(&pool, &stmt, |q| q)
                 .await
@@ -114,9 +114,12 @@ async fn mcp_tools_db_backed() {
     .expect("mcp suggest");
     let text = &res["content"][0]["text"];
     let sugg: serde_json::Value = serde_json::from_str(text.as_str().unwrap()).unwrap();
-    assert!(sugg.is_array(), "suggest returns an array");
     assert!(
-        !sugg.as_array().unwrap().is_empty(),
+        sugg["suggestions"].is_array(),
+        "suggest payload is {{suggestions: [...]}}"
+    );
+    assert!(
+        !sugg["suggestions"].as_array().unwrap().is_empty(),
         "suggest should have at least one hit"
     );
 
@@ -126,7 +129,10 @@ async fn mcp_tools_db_backed() {
         .expect("mcp list_sources");
     let text = &res["content"][0]["text"];
     let sources: serde_json::Value = serde_json::from_str(text.as_str().unwrap()).unwrap();
-    assert!(sources.is_array(), "list_sources returns an array");
+    assert!(
+        sources["sources"].is_array(),
+        "list_sources payload is {{sources: [...]}}"
+    );
 
     // Cleanup.
     zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
@@ -159,7 +165,7 @@ async fn put_settings_unauthenticated_response_redacts_topology() {
     zimservice::db::raw::execute(
         &pool,
         "INSERT INTO settings (key, value) VALUES ('torrent.url', $1)\n             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        |q| q.bind(serde_json::json!("http://qb-host:8080").to_string()),
+        |q| q.bind(serde_json::json!("http://qb-host:8080")),
     )
     .await
     .unwrap();
@@ -169,7 +175,7 @@ async fn put_settings_unauthenticated_response_redacts_topology() {
     let res = zimservice::serve::handlers::put_settings(
         axum::extract::State(state.clone()),
         axum::http::HeaderMap::new(),
-        axum::Json(serde_json::json!({"embedding.model": "itest-redact"})),
+        axum::Json(serde_json::json!({"search.max_limit": 25})),
     )
     .await
     .expect("put_settings");
@@ -189,7 +195,7 @@ async fn put_settings_unauthenticated_response_redacts_topology() {
     match original {
         Some(v) => zimservice::db::raw::execute(
             &pool,
-            "UPDATE settings SET value = $1 WHERE key = 'torrent.url'",
+            "UPDATE settings SET value = $1::jsonb WHERE key = 'torrent.url'",
             |q| q.bind(v),
         )
         .await
@@ -229,7 +235,7 @@ async fn settings_update_roundtrip() {
     assert!(
         host_errors
             .iter()
-            .any(|e| e.contains("set via config file")),
+            .any(|e| e.contains("set via environment at startup")),
         "general.host should be rejected as config-only: {host_errors:?}"
     );
 
@@ -310,7 +316,7 @@ async fn random_article_respects_zim_filter() {
         .await
         .unwrap();
         for stmt in zimservice::db::raw::split_statements(&format!(
-            "INSERT INTO articles (zim_id, path, title, content_preview) VALUES\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a1', 'Rand {name} 1', 'x'),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a2', 'Rand {name} 2', 'x'),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a3', 'Rand {name} 3', 'x'),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a4', 'Rand {name} 4', 'x'),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a5', 'Rand {name} 5', 'x')"
+            "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a1', 'Rand {name} 1', 'x', to_tsvector('simple','rand')),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a2', 'Rand {name} 2', 'x', to_tsvector('simple','rand')),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a3', 'Rand {name} 3', 'x', to_tsvector('simple','rand')),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a4', 'Rand {name} 4', 'x', to_tsvector('simple','rand')),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a5', 'Rand {name} 5', 'x', to_tsvector('simple','rand'))"
         )) {
             zimservice::db::raw::execute(&pool, &stmt, |q| q)
                 .await
@@ -574,7 +580,7 @@ async fn cancel_download_non_cancellable_is_409() {
         matches!(
             err,
             zimservice::error::Error::Conflict(ref m)
-                if m == "download {complete_id} is not cancellable (status: complete)"
+                if m == &format!("download {complete_id} is not cancellable (status: complete)")
         ),
         "expected 409 Conflict, got: {err:?}"
     );
@@ -704,13 +710,13 @@ async fn stats_update_writes_changed_only() {
             .unwrap();
     }
     let ids = [
-        insert_download(&pool, TAG, &urls[0], "downloading")
+        insert_download(&pool, &format!("{TAG}_a"), &urls[0], "downloading")
             .await
             .unwrap(),
-        insert_download(&pool, TAG, &urls[1], "downloading")
+        insert_download(&pool, &format!("{TAG}_b"), &urls[1], "downloading")
             .await
             .unwrap(),
-        insert_download(&pool, TAG, &urls[2], "downloading")
+        insert_download(&pool, &format!("{TAG}_c"), &urls[2], "downloading")
             .await
             .unwrap(),
     ];
@@ -892,7 +898,7 @@ async fn collections_crud() {
     assert!(
         matches!(
             dup,
-            zimservice::error::Error::Conflict(ref m) if m == "collection __itest_coll__ already exists"
+            zimservice::error::Error::Conflict(ref m) if m == "collection '__itest_coll__' already exists"
         ),
         "expected a duplicate-name Conflict, got: {dup:?}"
     );
@@ -1030,7 +1036,6 @@ async fn update_torrent_url_batch_enables_flag_in_same_save() {
             |q| q.bind(k),
         )
         .await
-        .unwrap()
         .unwrap();
         original.push((k, v));
     }
@@ -1038,7 +1043,7 @@ async fn update_torrent_url_batch_enables_flag_in_same_save() {
     zimservice::db::raw::execute(
         &pool,
         "INSERT INTO settings (key, value) VALUES ($1, $2)\n             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        |q| q.bind(FLAG).bind(serde_json::json!(false).to_string()),
+        |q| q.bind(FLAG).bind(serde_json::json!(false)),
     )
     .await
     .unwrap();
@@ -1083,7 +1088,7 @@ async fn update_torrent_url_batch_enables_flag_in_same_save() {
             Some(v) => {
                 zimservice::db::raw::execute(
                     &pool,
-                    "UPDATE settings SET value = $1 WHERE key = $2",
+                    "UPDATE settings SET value = $1::jsonb WHERE key = $2",
                     |q| q.bind(v).bind(key),
                 )
                 .await

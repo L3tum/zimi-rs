@@ -101,7 +101,7 @@ fn read<T: serde::de::DeserializeOwned>(
 
 /// The `SETTING_DEFS`-declared default for a key, deserialised into `T`.
 /// The `expect` is an unreachable last-resort while a test pins every key's
-/// seed (`default_settings_covers_all_typed_getter_keys`).
+/// seed (`default_settings_seeds_all_typed_accessor_keys`).
 fn seed_default<T: serde::de::DeserializeOwned>(key: &str) -> T {
     serde_json::from_value::<T>(default_value(key))
         .unwrap_or_else(|_| panic!("broken settings seed for {}", key))
@@ -188,7 +188,7 @@ impl SettingsCache {
         // one source of truth for defaults, so a missing/mistyped key falls
         // back to the declared default. The `expect` last-resort is
         // unreachable while a test pins every key's seed
-        // (`default_settings_covers_all_typed_getter_keys`).
+        // (`default_settings_seeds_all_typed_accessor_keys`).
         let threshold = read_or_seed::<f64>(&cache, KEY_SEARCH_TRGM_THRESHOLD);
         SearchParamsSnapshot {
             generation: self.generation(),

@@ -204,7 +204,12 @@ fn score_query(
 ///
 /// Raw SQL: `websearch_to_tsquery` / `@@` / `ts_rank_cd` / `ts_headline`
 /// have no `db::raw` helper equivalents.
-pub(super) fn fts_sql(
+///
+/// `pub` (not `pub(super)`): the query-plan regression gate in
+/// `tests/integration/trgm_plan.rs` EXPLAINs this exact arm SQL against a
+/// 100k-row temp DB (see [`trgm_contains_sql`] for why it must stay in
+/// lockstep with `run`).
+pub fn fts_sql(
     query: &str,
     highlight: bool,
     zim: Option<&str>,
@@ -352,7 +357,12 @@ pub fn trgm_similarity_sql(
 ///
 /// Raw SQL: the pgvector `<=>` cosine-distance operator (score + ANN
 /// `ORDER BY`) has no `db::raw` helper equivalent.
-pub(super) fn vector_sql(
+///
+/// `pub` (not `pub(super)`): the query-plan regression gate in
+/// `tests/integration/trgm_plan.rs` EXPLAINs this exact arm SQL against a
+/// 100k-row temp DB (see [`trgm_contains_sql`] for why it must stay in
+/// lockstep with `run`).
+pub fn vector_sql(
     vec_str: &str,
     zim: Option<&str>,
     lang: Option<&str>,
