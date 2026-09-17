@@ -80,17 +80,24 @@ async fn search_handler_shape() {
     )
     .await
     .unwrap();
-    // One statement per execute (sqlx has no multi-statement protocol call).
-    for stmt in zimservice::db::raw::split_statements(&format!(
-        "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES
-         ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpha_One', 'Alpha One', 'alpha one text', to_tsvector('simple','alpha one')),
-         ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpha_Two', 'Alpha Two', 'alpha two text', to_tsvector('simple','alpha two')),
-         ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpha_Three', 'Alpha Three', 'alpha three text', to_tsvector('simple','alpha three'))"
-    )) {
-        zimservice::db::raw::execute(&pool, &stmt, |q| q)
-            .await
-            .unwrap();
-    }
+    // Single multi-row INSERT, no binds (extended protocol — only the
+    // raw-string `execute_script` path runs on the simple protocol and relies
+    // on server-side script splitting; see its doc).
+    zimservice::db::raw::execute(
+        &pool,
+        &format!(
+            "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES
+         ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpha_One', 'Alpha One', 'alpha one text',
+         to_tsvector('simple','alpha one')),
+         ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpha_Two', 'Alpha Two', 'alpha two text',
+         to_tsvector('simple','alpha two')),
+         ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpha_Three', 'Alpha Three',
+         'alpha three text', to_tsvector('simple','alpha three'))"
+        ),
+        |q| q,
+    )
+    .await
+    .unwrap();
 
     let state = live_state(pool.clone()).await;
     use zimservice::serve::handlers::{search, SearchQuery};
@@ -191,7 +198,8 @@ async fn search_deep_paging_serves_rows_and_is_deterministic() {
     zimservice::db::raw::execute(
         &pool,
         &format!(
-            "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES {values}"
+            "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES \
+            {values}"
         ),
         |q| q,
     )
@@ -356,7 +364,9 @@ async fn snippet_live_returns_title_and_snippet() {
         .unwrap();
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
         |q| q.bind(ZIM),
     )
     .await
@@ -371,7 +381,9 @@ async fn snippet_live_returns_title_and_snippet() {
     .expect("row present");
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)\n         VALUES ($1, $2, 'Some preview', $3, to_tsvector('simple', $2), 'en', 'C', $4)",
+        "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, \
+        namespace, zim_id)
+         VALUES ($1, $2, 'Some preview', $3, to_tsvector('simple', $2), 'en', 'C', $4)",
         |q| q.bind(PATH).bind(TITLE).bind(SNIP).bind(zim_id),
     )
     .await
@@ -425,7 +437,9 @@ async fn suggest_live_returns_matching_title() {
         .unwrap();
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
         |q| q.bind(ZIM),
     )
     .await
@@ -440,7 +454,9 @@ async fn suggest_live_returns_matching_title() {
     .expect("row present");
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)\n         VALUES ($1, $2, 'p', 's', to_tsvector('simple', $2), 'en', 'C', $3)",
+        "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, \
+        namespace, zim_id)
+         VALUES ($1, $2, 'p', 's', to_tsvector('simple', $2), 'en', 'C', $3)",
         |q| q.bind("A/zebra").bind(TITLE).bind(zim_id),
     )
     .await
@@ -500,7 +516,9 @@ async fn interlanguage_live_no_qid_returns_empty() {
         .unwrap();
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
         |q| q.bind(ZIM),
     )
     .await
@@ -558,7 +576,9 @@ async fn interlanguage_live_returns_qid_and_languages() {
             .unwrap();
         zimservice::db::raw::execute(
             &pool,
-            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                               index_status, indexed_entries, article_count)\n             VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
+            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                               index_status, indexed_entries, article_count)
+             VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
             |q| q.bind(name),
         )
         .await
@@ -583,14 +603,18 @@ async fn interlanguage_live_returns_qid_and_languages() {
     // Articles (so the LEFT JOIN yields a title) + the shared Q-ID rows.
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO articles (path, title, content_preview, search_vector, language, namespace, zim_id)\n         VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'en', 'C', $3)",
+        "INSERT INTO articles (path, title, content_preview, search_vector, language, namespace, \
+        zim_id)
+         VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'en', 'C', $3)",
         |q| q.bind(EN_PATH).bind("Foo (en)").bind(en_id),
     )
     .await
     .unwrap();
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO articles (path, title, content_preview, search_vector, language, namespace, zim_id)\n         VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'fr', 'C', $3)",
+        "INSERT INTO articles (path, title, content_preview, search_vector, language, namespace, \
+        zim_id)
+         VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'fr', 'C', $3)",
         |q| q.bind(FR_PATH).bind("Foo (fr)").bind(fr_id),
     )
     .await
@@ -715,4 +739,111 @@ async fn chunks_live_returns_chunked_article() {
     })
     .await
     .unwrap();
+}
+
+/// Tests (2026-09 review round 2): direct (function-level) DB test for
+/// `db::qid::interlanguage_json` — the HTTP route tests
+/// (`interlanguage_live_no_qid_returns_empty`, `interlanguage_live_returns_qid_
+/// and_languages`) pin the same shapes through the handler; this pins the
+/// function's contract itself so a route refactor can't silently change the
+/// wire shape. Both arms: null QID (`{"qid": null, "languages": []}`) and a
+/// populated cross-language list.
+#[tokio::test]
+async fn interlanguage_json_direct_function_shape() {
+    let (pool, _db_gate) = match pool_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    run_migrations(&pool).await.expect("migrations");
+    const ZIM: &str = "il1";
+    const OTHER: &str = "il2";
+    const PATH: &str = "A/bar";
+    const QID: i64 = 777;
+
+    for name in [ZIM, OTHER] {
+        zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(name))
+            .await
+            .unwrap();
+        zimservice::db::raw::execute(
+            &pool,
+            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime, \
+             index_status, indexed_entries, article_count) \
+             VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
+            |q| q.bind(name),
+        )
+        .await
+        .unwrap();
+    }
+    let id1: i32 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT id FROM zims WHERE name = $1",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
+    let id2: i32 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT id FROM zims WHERE name = $1",
+        |q| q.bind(OTHER),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
+
+    // (1) No qid_index row: the null-QID shape.
+    let v = zimservice::db::qid::interlanguage_json(&pool, ZIM, "A/no-qid")
+        .await
+        .unwrap();
+    assert_eq!(v, serde_json::json!({"qid": null, "languages": []}));
+
+    // (2) Shared Q-ID + the other ZIM's article title via the LEFT JOIN.
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO articles (path, title, content_preview, search_vector, language, \
+         namespace, zim_id) VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'en', 'C', $3)",
+        |q| q.bind(PATH).bind("Bar (en)").bind(id1),
+    )
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO articles (path, title, content_preview, search_vector, language, \
+         namespace, zim_id) VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'fr', 'C', $3)",
+        |q| q.bind("A/bar_fr").bind("Bar (fr)").bind(id2),
+    )
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO qid_index (zim_id, path, qid) VALUES ($1, $2, $3)",
+        |q| q.bind(id1).bind(PATH).bind(QID),
+    )
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO qid_index (zim_id, path, qid) VALUES ($1, $2, $3)",
+        |q| q.bind(id2).bind("A/bar_fr").bind(QID),
+    )
+    .await
+    .unwrap();
+
+    let v = zimservice::db::qid::interlanguage_json(&pool, ZIM, PATH)
+        .await
+        .unwrap();
+    assert_eq!(v["qid"], serde_json::json!("Q777"));
+    let langs = v["languages"].as_array().expect("languages array");
+    assert_eq!(langs.len(), 1, "only the OTHER zim, got: {langs:?}");
+    assert_eq!(langs[0]["zim"], OTHER);
+    assert_eq!(langs[0]["path"], "A/bar_fr");
+    assert_eq!(langs[0]["title"], "Bar (fr)");
+
+    // Cleanup (articles + qid_index cascade off zims).
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+        .await
+        .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(OTHER))
+        .await
+        .unwrap();
 }

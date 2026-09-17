@@ -140,7 +140,7 @@ const PROBE_INVALID_INDEXES: &str =
 /// next startup). `CONCURRENTLY` cannot run inside a transaction, so each
 /// drop is a standalone statement on its own pooled connection. Before
 /// splicing, each `relname` is validated as a plain SQL identifier via
-/// [`is_safe_index_name`] (ASCII alphanumerics + underscore); a
+/// `is_safe_index_name` (ASCII alphanumerics + underscore); a
 /// non-conforming name is anomalous (the probe only matches `idx_%`) and is
 /// skipped with a warning instead of being interpolated into the `DROP
 /// INDEX` statement.
@@ -280,13 +280,16 @@ pub async fn run_migrations_on(client: &mut PgConnection) -> Result<()> {
         // a crash between them can't leave the schema changed but
         // unrecorded (which would re-apply the migration on the next startup).
         // A failure aborts the transaction, rolls the schema back cleanly, and
-        // leaves the file unrecorded. Multi-statement migration files run
-        // through the raw helper's statement splitter (sqlx has no
-        // batch-execute protocol call).
+        // leaves the file unrecorded. Multi-statement migration files are sent
+        // as ONE raw-string script: raw execution runs on the simple query
+        // protocol, and Postgres splits the script server-side (the same
+        // mechanism `sqlx::migrate!` uses for migration scripts) — no
+        // client-side lexer needed (deleted with `split_statements`,
+        // 2026-09 review; pinned by
+        // `smoke_two_statement_script_via_single_execute` in
+        // tests/integration/migrations.rs).
         let mut tx = client.begin().await.map_err(Error::Database)?;
-        for stmt in raw::split_statements(sql) {
-            raw::execute(&mut *tx, &stmt, |q| q).await?;
-        }
+        raw::execute_script(&mut *tx, sql).await?;
         raw::execute(
             &mut *tx,
             "INSERT INTO schema_migrations (name, hash) VALUES ($1, md5($2))",
@@ -321,12 +324,6 @@ mod tests {
         }
     }
 
-    /// The DDL path runs every migration file through
-    /// `raw::split_statements`; the splitter intentionally does NOT support
-    /// E-strings (a backslash has no escape meaning in its plain-string
-    /// rule), so the committed corpus must contain no `E'…'` literals —
-    /// this guard is the net that keeps the plain-string rule sound for
-    /// every migration. Cheap regression net (no DB needed).
     /// The 005 void invariant (see the `MIGRATIONS` doc comment): `005` was
     /// removed/superseded and is RESERVED/VOID — a `005_*.sql` added later
     /// would silently apply *before* `006` on databases that already ran
@@ -354,7 +351,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("migration {name}: shorter than 3 chars"));
             assert!(
                 prefix.chars().all(|c| c.is_ascii_digit()),
-                "migration {name}: first 3 chars {prefix:?} are not all digits (expected NNN_slug.sql)"
+                "migration {name}: first 3 chars {prefix:?} are not all digits (expected \
+                NNN_slug.sql)"
             );
             assert!(
                 name.as_bytes().get(3) == Some(&b'_'),
@@ -437,18 +435,6 @@ mod tests {
             "idx_foo_é",
         ] {
             assert!(!is_safe_index_name(bad), "{bad:?} must be rejected");
-        }
-    }
-
-    #[test]
-    fn committed_migrations_contain_no_e_string_literals() {
-        for (name, sql) in MIGRATIONS {
-            assert!(
-                !sql.contains("E'"),
-                "migration {name} contains an E-string literal — the DDL \
-                 splitter does not support E-strings (see `split_statements`); \
-                 rewrite the literal as a plain string or a dollar-quoted body"
-            );
         }
     }
 }

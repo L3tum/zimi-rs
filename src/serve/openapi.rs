@@ -35,7 +35,11 @@ impl utoipa::Modify for AddSecuritySchemes {
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
                         .description(Some(
-                            "Only active when access.mode=password. Send `Authorization: Bearer <password>` on mutating requests (POST/PUT/DELETE). On read-only requests (GET/HEAD/OPTIONS) `?access_token=<password>` is also accepted; it is ignored on mutating requests (query-string tokens leak via logs and Referer headers — prefer Bearer).",
+                            "Only active when access.mode=password. Send `Authorization: Bearer \
+                            <password>` on mutating requests (POST/PUT/DELETE). On read-only \
+                            requests (GET/HEAD/OPTIONS) `?access_token=<password>` is also \
+                            accepted; it is ignored on mutating requests (query-string tokens \
+                            leak via logs and Referer headers — prefer Bearer).",
                         ))
                         .build(),
                 ),
@@ -123,7 +127,8 @@ pub struct ApiDoc;
 /// every request was pure waste (PERF-L2). The JSON body is pre-serialized
 /// once too (`SPEC_JSON`); each request returns a cheap byte-clone of it
 /// instead of deep-cloning and re-serializing the whole spec.
-// LINT-3 (2026-09 sweep): checked invariants — static utoipa spec and axum response builder cannot fail.
+// LINT-3 (2026-09 sweep): checked invariants — static utoipa spec and axum response builder cannot
+// fail.
 #[allow(clippy::expect_used)]
 pub async fn openapi_json() -> Response {
     static SPEC: std::sync::LazyLock<utoipa::openapi::OpenApi> =

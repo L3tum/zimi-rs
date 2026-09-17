@@ -7,7 +7,8 @@
 pub mod content;
 /// Download-queue handlers: list, enqueue (SSRF guard, URL dedup), and cancel.
 pub mod downloads;
-/// Search handlers: full-text / fuzzy / semantic search, suggestions, random articles, cross-language links.
+/// Search handlers: full-text / fuzzy / semantic search, suggestions, random articles,
+/// cross-language links.
 pub mod search;
 /// Settings and collections handlers (auth-aware redaction, per-ZIM settings, user collections).
 pub mod settings;

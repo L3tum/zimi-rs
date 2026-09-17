@@ -15,6 +15,14 @@ use super::common::*;
 /// prune. Asserts the removed row stays queryable until the finalize prune (no
 /// gap), then that the removed path + qid are gone and the 2 survivors remain
 /// with their qids.
+///
+/// The seeded survivor rows are **byte-identical** to what the re-stage
+/// produces (same title/preview/snippet, and the same weighted-tsvector
+/// formula the upsert computes), and the upsert below is the *production*
+/// `UPSERT_ARTICLES_FROM_STAGING_SQL` — so this test is also the regression
+/// gate for the 2026-09 Perf #2 fix: if the upsert ever skips the
+/// `updated_at` re-stamp for unchanged rows, both survivors get pruned here
+/// and this test fails.
 #[tokio::test]
 async fn reindex_prunes_removed_articles() {
     let (pool, _db_gate) = match pool_or_skip().await {
@@ -28,7 +36,9 @@ async fn reindex_prunes_removed_articles() {
         .unwrap();
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
         |q| q.bind(ZIM),
     )
     .await
@@ -57,7 +67,13 @@ async fn reindex_prunes_removed_articles() {
         for p in ["A/keep-1", "A/keep-2", "A/removed"] {
             zimservice::db::raw::execute(
                 &pool,
-                "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id, updated_at)\n                 VALUES ($1, $1, 'preview', 'snippet', to_tsvector('simple', $1), 'en', 'C', $2, now() - interval '1 hour')",
+                "INSERT INTO articles (path, title, content_preview, snippet, search_vector, \
+                language, namespace, zim_id, updated_at)
+                 VALUES ($1, $1, 'preview', 'snippet',
+                         setweight(to_tsvector('simple', $1), 'A')
+                         || setweight(to_tsvector('simple', 'preview'), 'B'),
+                         'en', 'C', $2,
+                         now() - interval '1 hour')",
                 |q| q.bind(p).bind(zim_id),
             )
             .await
@@ -65,7 +81,8 @@ async fn reindex_prunes_removed_articles() {
         }
         zimservice::db::raw::execute(
             &pool,
-            "INSERT INTO qid_index (zim_id, path, qid) VALUES ($1, 'A/keep-1', 101), ($1, 'A/keep-2', 102), ($1, 'A/removed', 103)",
+            "INSERT INTO qid_index (zim_id, path, qid) VALUES ($1, 'A/keep-1', 101), ($1, \
+            'A/keep-2', 102), ($1, 'A/removed', 103)",
             |q| q.bind(zim_id),
         )
         .await
@@ -97,18 +114,23 @@ async fn reindex_prunes_removed_articles() {
         for p in ["A/keep-1", "A/keep-2"] {
             zimservice::db::raw::execute(
                 &pool,
-                "INSERT INTO articles_staging (path, title, content_preview, snippet, language, namespace, zim_id)\n                 VALUES ($1, $1, 'preview', 'snippet', 'en', 'C', $2)",
+                "INSERT INTO articles_staging (path, title, content_preview, snippet, language, \
+                namespace, zim_id)
+                 VALUES ($1, $1, 'preview', 'snippet', 'en', 'C', $2)",
                 |q| q.bind(p).bind(zim_id),
             )
             .await
             .unwrap();
         }
-        // Phase-2 upsert (same SQL shape as bulk_insert) — updates the 2
-        // survivors in place and bumps their `updated_at` to now(); the removed
-        // article is absent from the ZIM, so its row is left stale.
+        // Phase-2 upsert — the PRODUCTION statement
+        // (`zimservice::zim::index::UPSERT_ARTICLES_FROM_STAGING_SQL`), so
+        // this test exercises exactly what `bulk_insert` runs: the survivors
+        // are byte-identical to the staged rows, so the `DO UPDATE` arm takes
+        // the unchanged-content path — and must still re-stamp
+        // `updated_at` (the `finalize_zim` prune boundary depends on it).
         zimservice::db::raw::execute(
             &pool,
-            "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)\n             SELECT path, title, content_preview, snippet,\n                    setweight(to_tsvector('simple', title), 'A')\n                    || setweight(to_tsvector('simple', coalesce(content_preview, '')), 'B'),\n                    language, namespace, zim_id\n             FROM articles_staging WHERE zim_id = $1\n             ON CONFLICT (zim_id, path) DO UPDATE SET\n                title = EXCLUDED.title, content_preview = EXCLUDED.content_preview,\n                snippet = EXCLUDED.snippet, search_vector = EXCLUDED.search_vector,\n                updated_at = now()",
+            zimservice::zim::index::UPSERT_ARTICLES_FROM_STAGING_SQL,
             |q| q.bind(zim_id),
         )
         .await
@@ -116,7 +138,9 @@ async fn reindex_prunes_removed_articles() {
         // qid rows for the survivors (phase-3 shape, simplified):
         zimservice::db::raw::execute(
             &pool,
-            "INSERT INTO qid_index (zim_id, path, qid) VALUES ($1, 'A/keep-1', 101), ($1, 'A/keep-2', 102)\n             ON CONFLICT (zim_id, path) DO UPDATE SET qid = EXCLUDED.qid",
+            "INSERT INTO qid_index (zim_id, path, qid) VALUES ($1, 'A/keep-1', 101), ($1, \
+            'A/keep-2', 102)
+             ON CONFLICT (zim_id, path) DO UPDATE SET qid = EXCLUDED.qid",
             |q| q.bind(zim_id),
         )
         .await
@@ -148,14 +172,19 @@ async fn reindex_prunes_removed_articles() {
         // `updated_at < index_started_at`, then orphaned qids by NOT EXISTS.
         zimservice::db::raw::execute(
             &pool,
-            "DELETE FROM articles\n             WHERE zim_id = (SELECT id FROM zims WHERE name = $1)\n               AND updated_at < $2::timestamptz",
+            "DELETE FROM articles
+             WHERE zim_id = (SELECT id FROM zims WHERE name = $1)
+               AND updated_at < $2::timestamptz",
             |q| q.bind(ZIM).bind(index_started_at),
         )
         .await
         .unwrap();
         zimservice::db::raw::execute(
             &pool,
-            "DELETE FROM qid_index q\n             WHERE q.zim_id = (SELECT id FROM zims WHERE name = $1)\n               AND NOT EXISTS (SELECT 1 FROM articles a\n                    WHERE a.zim_id = q.zim_id AND a.path = q.path)",
+            "DELETE FROM qid_index q
+             WHERE q.zim_id = (SELECT id FROM zims WHERE name = $1)
+               AND NOT EXISTS (SELECT 1 FROM articles a
+                    WHERE a.zim_id = q.zim_id AND a.path = q.path)",
             |q| q.bind(ZIM),
         )
         .await
@@ -210,7 +239,11 @@ async fn vector_index_is_partial_after_migration() {
     // The legacy non-partial shape (indpred IS NULL) must be gone.
     let legacy: bool = zimservice::db::raw::fetch_scalar_optional(
         &pool,
-        "SELECT EXISTS (\n                SELECT 1 FROM pg_index i\n                JOIN pg_class cl ON cl.oid = i.indexrelid\n                WHERE cl.relname = 'idx_articles_embedding' AND i.indpred IS NULL\n            )",
+        "SELECT EXISTS (
+                SELECT 1 FROM pg_index i
+                JOIN pg_class cl ON cl.oid = i.indexrelid
+                WHERE cl.relname = 'idx_articles_embedding' AND i.indpred IS NULL
+            )",
         |q| q,
     )
     .await
@@ -225,7 +258,11 @@ async fn vector_index_is_partial_after_migration() {
     // shape-agnostic runtime check must agree with pg_index.
     let db_exists: bool = zimservice::db::raw::fetch_scalar_optional(
         &pool,
-        "SELECT EXISTS (\n                SELECT 1 FROM pg_index i\n                JOIN pg_class cl ON cl.oid = i.indexrelid\n                WHERE cl.relname = 'idx_articles_embedding'\n            )",
+        "SELECT EXISTS (
+                SELECT 1 FROM pg_index i
+                JOIN pg_class cl ON cl.oid = i.indexrelid
+                WHERE cl.relname = 'idx_articles_embedding'
+            )",
         |q| q,
     )
     .await
@@ -233,7 +270,11 @@ async fn vector_index_is_partial_after_migration() {
     .expect("row present");
     let partial: bool = zimservice::db::raw::fetch_scalar_optional(
         &pool,
-        "SELECT EXISTS (\n                SELECT 1 FROM pg_index i\n                JOIN pg_class cl ON cl.oid = i.indexrelid\n                WHERE cl.relname = 'idx_articles_embedding' AND i.indpred IS NOT NULL\n            )",
+        "SELECT EXISTS (
+                SELECT 1 FROM pg_index i
+                JOIN pg_class cl ON cl.oid = i.indexrelid
+                WHERE cl.relname = 'idx_articles_embedding' AND i.indpred IS NOT NULL
+            )",
         |q| q,
     )
     .await
@@ -435,7 +476,9 @@ async fn embed_pipeline_embeds_then_guard_skips() {
             .unwrap();
         zimservice::db::raw::execute(
             &pool,
-            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
+            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
             |q| q.bind(ZIM),
         )
         .await
@@ -452,7 +495,10 @@ async fn embed_pipeline_embeds_then_guard_skips() {
     for (path, title) in [("A/one", "One"), ("A/two", "Two"), ("A/three", "Three")] {
         zimservice::db::raw::execute(
             &pool,
-            "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)\n                 VALUES ($1, $2, 'preview '||$2, 'snip '||$2, to_tsvector('simple', $2), 'en', 'C', $3)",
+            "INSERT INTO articles (path, title, content_preview, snippet, search_vector, \
+            language, namespace, zim_id)
+                 VALUES ($1, $2, 'preview '||$2, 'snip '||$2, to_tsvector('simple', $2), 'en', \
+            'C', $3)",
             |q| q.bind(path).bind(title).bind(zim_id),
         )
         .await
@@ -594,7 +640,9 @@ async fn embed_poisoned_rows_not_resent_within_run() {
             .unwrap();
         zimservice::db::raw::execute(
             &pool,
-            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
+            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
             |q| q.bind(ZIM),
         )
         .await
@@ -610,7 +658,10 @@ async fn embed_poisoned_rows_not_resent_within_run() {
     };
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)\n         VALUES ('A/poison', 'Poison', 'preview', 'snip', to_tsvector('simple', 'Poison'), 'en', 'C', $1)",
+        "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, \
+        namespace, zim_id)
+         VALUES ('A/poison', 'Poison', 'preview', 'snip', to_tsvector('simple', 'Poison'), 'en', \
+        'C', $1)",
         |q| q.bind(zim_id),
     )
     .await
@@ -723,7 +774,9 @@ async fn reindex_prune_keeps_live_rows_and_drops_stale() {
         .unwrap();
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
         |q| q.bind(NAME),
     )
     .await
@@ -741,7 +794,10 @@ async fn reindex_prune_keeps_live_rows_and_drops_stale() {
     for (path, title, qid) in [(A, "One", 111i64), (B, "Two", 222i64), (C, "Three", 333i64)] {
         zimservice::db::raw::execute(
             &pool,
-            "INSERT INTO articles (path, title, content_preview, search_vector, language, namespace, zim_id, updated_at)\n             VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'en', 'C', $3, now() - interval '1 hour')",
+            "INSERT INTO articles (path, title, content_preview, search_vector, language, \
+            namespace, zim_id, updated_at)
+             VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'en', 'C', $3, now() - interval \
+            '1 hour')",
             |q| q.bind(path).bind(title).bind(zim_id),
         )
         .await
@@ -775,7 +831,9 @@ async fn reindex_prune_keeps_live_rows_and_drops_stale() {
     }
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO articles (path, title, content_preview, search_vector, language, namespace, zim_id)\n         VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'en', 'C', $3)",
+        "INSERT INTO articles (path, title, content_preview, search_vector, language, namespace, \
+        zim_id)
+         VALUES ($1, $2, 'p', to_tsvector('simple', $2), 'en', 'C', $3)",
         |q| q.bind(D).bind("Four").bind(zim_id),
     )
     .await
@@ -800,14 +858,19 @@ async fn reindex_prune_keeps_live_rows_and_drops_stale() {
     // qids by NOT EXISTS against the just-pruned articles.
     zimservice::db::raw::execute(
         &pool,
-        "DELETE FROM articles\n         WHERE zim_id = (SELECT id FROM zims WHERE name = $1)\n           AND updated_at < $2::timestamptz",
+        "DELETE FROM articles
+         WHERE zim_id = (SELECT id FROM zims WHERE name = $1)
+           AND updated_at < $2::timestamptz",
         |q| q.bind(NAME).bind(index_started_at),
     )
     .await
     .unwrap();
     zimservice::db::raw::execute(
         &pool,
-        "DELETE FROM qid_index q\n         WHERE q.zim_id = (SELECT id FROM zims WHERE name = $1)\n           AND NOT EXISTS (SELECT 1 FROM articles a\n                WHERE a.zim_id = q.zim_id AND a.path = q.path)",
+        "DELETE FROM qid_index q
+         WHERE q.zim_id = (SELECT id FROM zims WHERE name = $1)
+           AND NOT EXISTS (SELECT 1 FROM articles a
+                WHERE a.zim_id = q.zim_id AND a.path = q.path)",
         |q| q.bind(NAME),
     )
     .await

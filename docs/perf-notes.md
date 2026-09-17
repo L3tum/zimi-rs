@@ -101,19 +101,27 @@ hard-fail) — the Q2 contains (GIN) and Q3 similarity (GiST) arms on a 100k-row
 temp DB must plan an index scan, never a `Seq Scan on articles`. The gate
 checks plan *shape* only (`EXPLAIN (FORMAT TEXT)`); it captures no timing.
 
-**`EXPLAIN (ANALYZE)` timing at 100k rows: unmeasured.** No manual run against
-the 100k-row fixture has been recorded — the capture metadata (Postgres
-version, row count, `pg_trgm` similarity threshold) and the `EXPLAIN
-(ANALYZE, BUFFERS)` output for Q1/Q2/Q3 remain to be filled in by whoever runs
-the recipe above. At the time of this revision (2026-09-11) no local Postgres
-was reachable at the default dev DSN (`postgres://zimservice:zimservice@127.0.0.1:5432/zimservice` — see `docker-compose.yml` /
-the `test-integration` target), so a local `cargo test --test integration
-trgm_plan` run was skipped; `make test-integration` boots the compose DB and
-runs the gate for real.
+**`EXPLAIN (ANALYZE)` timing at 100k rows: measured 2026-09.** Recorded
+against the `trgm_plan` 100k-row corpus in a C-collation temp DB (PostgreSQL
+16.15), running the *exact* production arm SQL from the `zimservice::search`
+builders (probe phrase `quixotic granite`, selective: 63/100k titles
+prefix-match) rather than the hand-written psql recipe above — same three
+shapes, no `BUFFERS` counters. Execution times:
 
-**Verdict:** the split is implemented (DEC-5) and the plan-shape gate is
-automated and enforced in the integration suite; `EXPLAIN (ANALYZE)` timing at
-100k rows remains a pending manual measurement.
+- Q1 prefix (`LIKE 'quixotic granite%'`) — `Index Scan using
+  idx_articles_title_prefix`, **0.785 ms**
+- Q2 contains (`LIKE '%quixotic granite%'`) — `Bitmap Index Scan on
+  idx_articles_title_gist`, **16.238 ms**
+- Q3 similarity (`% $1 AND similarity > 0.3`) — `Bitmap Index Scan on
+  idx_articles_title_gist`, **47.848 ms**
+
+None is a `Seq Scan on articles`; the prefix btree is ~20–60× faster than
+the trgm arms for the prefix shape (see the PERF-4 section below for the
+full five-shape record and the keep/drop decision).
+
+**Verdict:** the split is implemented (DEC-5), the plan-shape gate is
+automated and enforced in the integration suite, and the `EXPLAIN (ANALYZE)`
+timing at 100k rows is recorded above (2026-09).
 
 ---
 
@@ -156,16 +164,35 @@ seq scan. Precedent for the drop statement: `009:4`
 `DROP INDEX IF EXISTS idx_articles_title_lower`. Non-`CONCURRENTLY` (single
 transaction migrate harness; `010:16` precedent).
 
-**Outcome.** _PENDING MANUAL MEASUREMENT._ The measurement needs Postgres (the
-100k-row fixture + `EXPLAIN ANALYZE`). The keep/drop call is deferred to a
-manual measurement run — CI has no perf job (the former `test-db-perf` push
-job referenced a test that did not exist and was removed). **Default is KEEP**
-— migration 014 is created *only* in the drop branch,
-and that branch is not reached until the rule's drop condition is
-measured-confirmed. _To fill in after the measurement run:_ paste the five plan
-nodes
-here, tick the decision rule, and either create migration 014 (drop) or record
-KEEP with the reason.
+**Outcome.** **KEEP `idx_articles_title_prefix`** — measured 2026-09 (100k-row
+C-collation temp DB, the `trgm_plan` corpus, `EXPLAIN (ANALYZE)`; PostgreSQL
+16.15). The fixed drop rule is NOT met: the Q1 `LIKE 'q%'` prefix shape plans
+`Index Scan using idx_articles_title_prefix`, so the drop condition ("planner
+uses the GIN trgm index or a seq scan for Q1 **and** never uses the btree in
+any of the five shapes") fails on the first clause. None of the five shapes
+degrades to a `Seq Scan on articles`.
+
+Recorded plan nodes (probe phrase `quixotic granite`, prefix in 63/100k
+titles; corpus = the `trgm_plan` 100k-row fixture):
+
+- **Q1** (`title_lower LIKE 'quixotic granite%'` + `ORDER BY score`) —
+  `Index Scan using idx_articles_title_prefix`, Execution Time **0.785 ms**.
+- **Q2** (`title_lower LIKE '%quixotic granite%'`) —
+  `Bitmap Index Scan on idx_articles_title_gist`, Execution Time 16.238 ms.
+- **Q3** (`title_lower % $1 AND similarity(...) > 0.3`) —
+  `Bitmap Index Scan on idx_articles_title_gist`, Execution Time 47.848 ms.
+- **SUG** (suggestion prefix arm — the same builder/SQL as Q1, weight 1.0) —
+  `Index Scan using idx_articles_title_prefix`, Execution Time 0.272 ms.
+- **Q5** (`ORDER BY title_lower ASC LIMIT 20`, no predicate — hypothetical
+  shape, not seq-scan-gated) —
+  `Index Scan using idx_articles_title_prefix`, Execution Time 0.244 ms.
+
+Reason for KEEP: (1) the btree prefix range serves Q1/SUG ~20–60× faster
+than the trgm bitmap scans serve Q2/Q3, so the btree is *not* redundant for
+the prefix shape; (2) Q5 (pure ordering) also rides the btree — dropping it
+would force a full 100k-row sort for any future ordering-only endpoint.
+`migrations/014_articles_title_prefix_drop.sql` is NOT created; migration
+number 014 remains unused (any future migration is 015 or later).
 
 ---
 

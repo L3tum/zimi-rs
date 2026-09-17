@@ -74,11 +74,15 @@ pub(crate) fn classify_index_state(valid: bool, invalid: bool) -> VectorIndexSta
 /// no seq-scan fallback above it).
 pub(crate) fn index_build_sql(count: i64, hnsw_threshold: i64) -> String {
     if count < hnsw_threshold {
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_articles_embedding ON articles USING hnsw (embedding vector_cosine_ops) WHERE embedding IS NOT NULL".to_string()
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_articles_embedding ON articles USING hnsw \
+        (embedding vector_cosine_ops) WHERE embedding IS NOT NULL"
+            .to_string()
     } else {
         let lists = ((count as f64).sqrt() as i32).max(100);
         format!(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_articles_embedding ON articles USING ivfflat (embedding vector_cosine_ops) WITH (lists = {lists}) WHERE embedding IS NOT NULL"
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_articles_embedding ON articles USING \
+            ivfflat (embedding vector_cosine_ops) WITH (lists = {lists}) WHERE embedding IS NOT \
+            NULL"
         )
     }
 }
@@ -374,7 +378,8 @@ mod tests {
         assert_eq!(
             classify_index_state(false, true),
             VectorIndexState::PresentInvalid,
-            "a failed CONCURRENTLY build (indisvalid = false) is NOT absent — CREATE IF NOT EXISTS would no-op on it"
+            "a failed CONCURRENTLY build (indisvalid = false) is NOT absent — CREATE IF NOT \
+            EXISTS would no-op on it"
         );
         assert_eq!(classify_index_state(false, false), VectorIndexState::Absent);
         // Defensive: impossible for one index name (indisvalid is per index).

@@ -128,7 +128,7 @@ pub async fn auth_middleware(
     };
     let presented = bearer_token(authorization).or(q.as_deref());
     let ok = match presented.filter(|t| !t.is_empty()) {
-        Some(t) => state.settings.token_verify_cached_bg(t).await,
+        Some(t) => state.settings.auth().verify_bg(t).await,
         None => false,
     };
 
@@ -138,14 +138,14 @@ pub async fn auth_middleware(
         }
         // Transparent upgrade: a legacy plaintext value that just verified is
         // re-stored as a salted hash. The middleware reads the password from
-        // the cache, so upgrade_password updates cache + DB together — without
-        // the cache update, every authenticated request would re-run the
-        // 100k-iteration verify + UPDATE until restart. (upgrade_password
-        // also invalidates the token cache, so this legacy value is not
+        // the cache, so `SettingsAuth::upgrade` updates cache + DB together —
+        // without the cache update, every authenticated request would re-run
+        // the 100k-iteration verify + UPDATE until restart. (upgrade also
+        // invalidates the token cache, so this legacy value is not
         // re-verified as plaintext after the upgrade.)
         if crate::settings::is_legacy_password(&password) {
             let hashed = crate::settings::hash_admin_password(&password);
-            state.settings.upgrade_password(hashed).await;
+            state.settings.auth().upgrade(hashed).await;
         }
         return Ok(next.run(request).await);
     }
@@ -328,7 +328,7 @@ pub(crate) fn is_authorized(
 /// per `TOKEN_CACHE_TTL` (60s) per distinct token, via the settings token
 /// cache. The cache is invalidated on `reload()` (the realistic password
 /// change path — `access.admin_password` is API-immutable) and on
-/// `update()`/`upgrade_password()` (defense in depth).
+/// `update()`/`SettingsAuth::upgrade()` (defense in depth).
 pub(crate) async fn settings_authed(
     state: &AppState,
     method: &str,
@@ -350,7 +350,7 @@ pub(crate) async fn settings_authed(
         .or(q.as_deref())
         .filter(|t| !t.is_empty())
     {
-        Some(t) => state.settings.token_verify_cached_bg(t).await,
+        Some(t) => state.settings.auth().verify_bg(t).await,
         None => false,
     }
 }

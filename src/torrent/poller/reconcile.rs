@@ -173,11 +173,13 @@ impl DownloadPoller {
                             );
                         }
                         tracing::warn!(
-                            "reconcile: download {id} ({name}) has no matching torrent in qBittorrent"
+                            "reconcile: download {id} ({name}) has no matching torrent in \
+                            qBittorrent"
                         );
                     } else {
                         tracing::debug!(
-                            "reconcile: download {id} ({name}) torrent missing but within grace — re-check on next tick"
+                            "reconcile: download {id} ({name}) torrent missing but within grace — \
+                            re-check on next tick"
                         );
                     }
                 }

@@ -111,7 +111,9 @@ const FIELDS = {
   },
   'torrent.auto_update': {
     label: 'Auto-update ZIMs',
-    desc: 'Queue newer catalog versions as downloads automatically',
+    desc: 'Queue newer catalog versions as downloads automatically. ' +
+      'Trust model: downloaded ZIMs are structurally verified only — the ' +
+      'OPDS source is trusted, so use a catalog you control',
   },
 
   'embedding.enabled': {

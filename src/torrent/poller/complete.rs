@@ -12,7 +12,8 @@ use super::{
 impl DownloadPoller {
     // ── Completion: verify → install → resync → index ───────────────────────
 
-    // LINT-3 (2026-09 sweep): invariant panic (skip path implies file_path present) — grandfathered expect_used.
+    // LINT-3 (2026-09 sweep): invariant panic (skip path implies file_path present) —
+    // grandfathered expect_used.
     #[allow(clippy::expect_used)]
     pub(super) async fn handle_complete(
         &self,

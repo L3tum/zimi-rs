@@ -157,7 +157,10 @@ impl DownloadPoller {
         let http = match build_download_client(ClientProfile::Transfer, None) {
             Ok(c) => Some(c),
             Err(e) => {
-                tracing::warn!("download HTTP client build failed: {e}; direct downloads and OPDS checks will fail until restart");
+                tracing::warn!(
+                    "download HTTP client build failed: {e}; direct downloads and OPDS \
+                checks will fail until restart"
+                );
                 None
             }
         };
@@ -272,7 +275,8 @@ impl DownloadPoller {
                         crate::db::downloads_lifecycle::clear_hash(&self.db, id).await;
                     }
                     Err(e) => tracing::warn!(
-                        "failed to remove cancelled torrent {torrent_hash}: {e} (hash kept for retry)"
+                        "failed to remove cancelled torrent {torrent_hash}: {e} (hash kept for \
+                        retry)"
                     ),
                 },
                 None => {
@@ -792,7 +796,8 @@ impl DownloadPoller {
                         // adopts it as a fresh row.
                         tracing::info!(
                             download_id = id,
-                            "row no longer queued after add_torrent (cancel won the race) — removing just-added torrent"
+                            "row no longer queued after add_torrent (cancel won the race) — \
+                            removing just-added torrent"
                         );
                         self.remove_just_added_torrent(q, &added).await;
                         continue;
@@ -818,7 +823,8 @@ impl DownloadPoller {
         Ok(())
     }
 
-    /// Compensating removal after a [`mark_downloading`](crate::db::downloads_lifecycle::mark_downloading)
+    /// Compensating removal after a
+    /// [`mark_downloading`](crate::db::downloads_lifecycle::mark_downloading)
     /// guard miss in the enqueue path: the torrent was just added to qB but
     /// the row is no longer `queued` (a cancel won the race). `add_torrent`
     /// returns the qB torrent name (not a hash), so re-fetch the list and
@@ -832,7 +838,8 @@ impl DownloadPoller {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(
-                    "compensating removal: torrent list fetch failed: {e} (leftover may be re-adopted on next reconcile)"
+                    "compensating removal: torrent list fetch failed: {e} (leftover may be \
+                    re-adopted on next reconcile)"
                 );
                 return;
             }
@@ -846,14 +853,12 @@ impl DownloadPoller {
                     )
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "compensating removal failed for torrent {}: {e}",
-                        t.hash
-                    )
+                    tracing::warn!("compensating removal failed for torrent {}: {e}", t.hash)
                 }
             },
             None => tracing::warn!(
-                "compensating removal: no torrent matching {wanted:?} in qBittorrent (already gone?)"
+                "compensating removal: no torrent matching {wanted:?} in qBittorrent (already \
+                gone?)"
             ),
         }
     }
@@ -1244,7 +1249,8 @@ mod tests {
         const IT_INFLIGHT_PREFIX: &str = "__it_inflight__";
 
         /// `TorrentInfo` with explicit fields (size/downloaded 2 MiB / 1 MiB → exact `eta_secs`).
-        #[allow(clippy::too_many_arguments)] // one parameter per hand-set `TorrentInfo` field (8 of them)
+        // one parameter per hand-set `TorrentInfo` field (8 of them)
+        #[allow(clippy::too_many_arguments)]
         fn it_torrent(
             hash: &str,
             name: &str,
@@ -1297,7 +1303,9 @@ mod tests {
             );
             raw::fetch_scalar_optional(
                 &mut *c,
-                "INSERT INTO downloads (name, url, hash, status, progress, ratio, num_seeds, \n                 updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, \n                 now()) RETURNING id",
+                "INSERT INTO downloads (name, url, hash, status, progress, ratio, num_seeds, 
+                 updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 
+                 now()) RETURNING id",
                 |q| {
                     q.bind(name)
                         .bind(&url)
@@ -1323,7 +1331,8 @@ mod tests {
         /// the torrent's own hash; the rebind test feeds the row's stale one.
         /// `stale` ages the inserted row's `updated_at` past
         /// `MISSING_TORRENT_GRACE` so the missing-torrent expiry arms can fire.
-        #[allow(clippy::too_many_arguments)] // one parameter per row/torrent field the harness drives
+        // one parameter per row/torrent field the harness drives
+        #[allow(clippy::too_many_arguments)]
         async fn it_inflight_case<F>(
             name: &str,
             hash: Option<&str>,
@@ -1435,7 +1444,16 @@ mod tests {
                 None,
                 false,
                 "itc1hash",
-                it_torrent("itc1hash", "changed-row", "downloading", 0.75, 100, 50, 0.5, 3),
+                it_torrent(
+                    "itc1hash",
+                    "changed-row",
+                    "downloading",
+                    0.75,
+                    100,
+                    50,
+                    0.5,
+                    3,
+                ),
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
                     let mut c = pool.acquire().await.expect("conn");
                     // 1 MiB remaining at 100 KiB/s → eta 10 s; speeds 1024×'d.
@@ -1444,10 +1462,17 @@ mod tests {
                         vec![(id, 0.75, 102_400, Some(10), Some(0.5), 51_200, 3)],
                         "the changed row must be queued exactly once with the fresh stats"
                     );
-                    let (prog, speed, eta, ratio, up, seeds):
-                        (f32, i64, Option<i64>, Option<f32>, i64, i64) = raw::fetch_optional(
+                    let (prog, speed, eta, ratio, up, seeds): (
+                        f32,
+                        i64,
+                        Option<i64>,
+                        Option<f32>,
+                        i64,
+                        i64,
+                    ) = raw::fetch_optional(
                         &mut *c,
-                        "SELECT progress, speed_bps, eta_secs, ratio, up_speed_bps, \n                            num_seeds FROM downloads WHERE id = $1",
+                        "SELECT progress, speed_bps, eta_secs, ratio, up_speed_bps, 
+                            num_seeds FROM downloads WHERE id = $1",
                         |q| q.bind(id),
                     )
                     .await
@@ -1478,22 +1503,31 @@ mod tests {
                 Some(3),
                 false,
                 "itu1hash",
-                it_torrent("itu1hash", "unchanged-row", "downloading", 0.5, 0, 0, 1.0, 3),
+                it_torrent(
+                    "itu1hash",
+                    "unchanged-row",
+                    "downloading",
+                    0.5,
+                    0,
+                    0,
+                    1.0,
+                    3,
+                ),
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
                     let mut c = pool.acquire().await.expect("conn");
                     assert!(
                         changed.is_empty(),
                         "an unchanged row must not be queued for a stats write"
                     );
-                    let (prog, speed, eta, ratio, up, seeds): StatsTuple =
-                        raw::fetch_optional(
-                            &mut *c,
-                            "SELECT progress, speed_bps, eta_secs, ratio, up_speed_bps, \n                            num_seeds FROM downloads WHERE id = $1",
-                            |q| q.bind(id),
-                        )
-                        .await
-                        .expect("read row")
-                        .expect("row present");
+                    let (prog, speed, eta, ratio, up, seeds): StatsTuple = raw::fetch_optional(
+                        &mut *c,
+                        "SELECT progress, speed_bps, eta_secs, ratio, up_speed_bps, 
+                            num_seeds FROM downloads WHERE id = $1",
+                        |q| q.bind(id),
+                    )
+                    .await
+                    .expect("read row")
+                    .expect("row present");
                     assert_eq!(prog, 0.5, "progress stays untouched");
                     assert_eq!(speed, None, "speed_bps stays NULL");
                     assert_eq!(eta, None, "eta_secs stays NULL");
@@ -1616,7 +1650,8 @@ mod tests {
                         Option<i64>,
                     ) = raw::fetch_optional(
                         &mut *c,
-                        "SELECT status, ratio, up_speed_bps, num_seeds, \n                            speed_bps FROM downloads WHERE id = $1",
+                        "SELECT status, ratio, up_speed_bps, num_seeds, 
+                            speed_bps FROM downloads WHERE id = $1",
                         |q| q.bind(id),
                     )
                     .await
@@ -1774,8 +1809,8 @@ mod tests {
                 0.5,
                 None,
                 None,
-                true,         // stale: past MISSING_TORRENT_GRACE
-                "tou1hash",   // the row's torrent IS in qB
+                true,       // stale: past MISSING_TORRENT_GRACE
+                "tou1hash", // the row's torrent IS in qB
                 it_torrent("tou1hash", "touch1-row", "downloading", 0.5, 0, 0, 0.0, 0),
                 |id, changed: Vec<super::super::StatsRow>, pool: Pool| async move {
                     let mut c = pool.acquire().await.expect("conn");
@@ -1786,7 +1821,9 @@ mod tests {
                     let (status, error, age_secs): (String, Option<String>, i64) =
                         raw::fetch_optional(
                             &mut *c,
-                            "SELECT status, error, \n                             EXTRACT(EPOCH FROM (now() - updated_at))::bigint \n                             FROM downloads WHERE id = $1",
+                            "SELECT status, error, 
+                             EXTRACT(EPOCH FROM (now() - updated_at))::bigint 
+                             FROM downloads WHERE id = $1",
                             |q| q.bind(id),
                         )
                         .await
@@ -1799,7 +1836,8 @@ mod tests {
                     );
                     assert!(
                         age_secs < 5,
-                        "the visibility touch must refresh updated_at (it was 11 min old), age: {age_secs}s"
+                        "the visibility touch must refresh updated_at (it was 11 min old), age: \
+                        {age_secs}s"
                     );
                 },
             )
@@ -2003,7 +2041,9 @@ mod tests {
             // rejection must come from the name constraint.
             let conflict = raw::execute(
                 &mut *c,
-                "INSERT INTO downloads (name, url, hash, status, progress, updated_at) VALUES ('__it_inflight__b4dup', 'magnet:?xt=urn:btih:b4conflict', NULL, 'downloading', 0.9, now())",
+                "INSERT INTO downloads (name, url, hash, status, progress, updated_at) VALUES \
+                ('__it_inflight__b4dup', 'magnet:?xt=urn:btih:b4conflict', NULL, 'downloading', \
+                0.9, now())",
                 |q| q,
             )
             .await;
@@ -2075,7 +2115,9 @@ mod tests {
             // is unique so the 003 active-url index cannot fire first.
             let conflict = raw::execute(
                 &mut *c,
-                "INSERT INTO downloads (name, url, hash, status, progress, updated_at) VALUES ('__it_inflight__n2dup', 'magnet:?xt=urn:btih:n2conflict', NULL, 'downloading', 0.5, now())",
+                "INSERT INTO downloads (name, url, hash, status, progress, updated_at) VALUES \
+                ('__it_inflight__n2dup', 'magnet:?xt=urn:btih:n2conflict', NULL, 'downloading', \
+                0.5, now())",
                 |q| q,
             )
             .await;
@@ -3092,8 +3134,10 @@ mod tests {
             let server = MockServer::start().await;
             // Two torrents: one complete, one still downloading.
             let torrents_json = format!(
-                r#"[{{"hash":"aaa111","name":"complete.zim","progress":1.0,"state":"uploading","category":"{CATEGORY}"}},
-                   {{"hash":"bbb222","name":"downloading.zim","progress":0.5,"state":"downloading","category":"{CATEGORY}"}}]"#
+                r#"[{{"hash":"aaa111","name":"complete.zim","progress":1.0,
+                   "state":"uploading","category":"{CATEGORY}"}},
+                   {{"hash":"bbb222","name":"downloading.zim","progress":0.5,
+                   "state":"downloading","category":"{CATEGORY}"}}]"#
             );
             mount_qb_mocks(&server, &torrents_json).await;
 
@@ -3149,7 +3193,8 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tempdir");
             let server = MockServer::start().await;
             let torrents_json = format!(
-                r#"[{{"hash":"own555hash","name":"reconcile_own.zim","progress":1.0,"state":"uploading","category":"{CATEGORY}"}}]"#
+                r#"[{{"hash":"own555hash","name":"reconcile_own.zim","progress":1.0,
+                   "state":"uploading","category":"{CATEGORY}"}}]"#
             );
             mount_qb_mocks(&server, &torrents_json).await;
 
@@ -3163,11 +3208,9 @@ mod tests {
             .await;
             let id: i32 = raw::fetch_scalar_optional(
                 &mut *c,
-                "INSERT INTO downloads (name, url, hash, status, progress, updated_at) \n                 VALUES ($1, $2, NULL, 'seeding', 1.0, now()) RETURNING id",
-                |q| {
-                    q.bind("reconcile_own.zim")
-                        .bind("magnet:?xt=urn:btih:own")
-                },
+                "INSERT INTO downloads (name, url, hash, status, progress, updated_at) 
+                 VALUES ($1, $2, NULL, 'seeding', 1.0, now()) RETURNING id",
+                |q| q.bind("reconcile_own.zim").bind("magnet:?xt=urn:btih:own"),
             )
             .await
             .expect("insert")
@@ -3279,7 +3322,8 @@ mod tests {
             let server = MockServer::start().await;
             // qB has a torrent with the same name but a different hash.
             let torrents_json = format!(
-                r#"[{{"hash":"newhash999","name":"renamed.zim","progress":0.3,"state":"downloading","category":"{CATEGORY}"}}]"#
+                r#"[{{"hash":"newhash999","name":"renamed.zim","progress":0.3,
+                   "state":"downloading","category":"{CATEGORY}"}}]"#
             );
             mount_qb_mocks(&server, &torrents_json).await;
 

@@ -1,6 +1,8 @@
 //! `SettingsCache`: the in-memory, Postgres-backed settings cache —
-//! load/reload, env-locked write validation, redaction, the token-verify
-//! fast path, and the typed accessors.
+//! load/reload, env-locked write validation, redaction, and the typed
+//! accessors. The admin-auth surface (token-verify KDF call sites,
+//! legacy upgrade) lives in `auth_service` (`SettingsAuth`, Arch M2
+//! 2026-09 review).
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -9,8 +11,8 @@ use crate::db::pool::Pool;
 use crate::db::raw;
 use crate::error::{Error, Result};
 
-use super::auth::verify_admin_password;
 use super::auth::VerifiedTokenCache;
+use super::auth_service::SettingsAuth;
 use super::defs::{
     apply_env_snapshot, def, default_settings, default_value, is_security_sensitive, known_keys,
     normalize_embedding_endpoint, redact, sync_config_values, type_mismatch, ACCESS_MODE_OPEN,
@@ -19,28 +21,6 @@ use super::defs::{
     KEY_TORRENT_ALLOW_PRIVATE_NETWORKS, KEY_TORRENT_ENABLED, KEY_TORRENT_MAX_ACTIVE,
     KEY_TORRENT_OPDS_URL, KEY_TORRENT_URL,
 };
-
-/// SEC (KDF DoS): a 19.5 MiB argon2id verify is expensive in both memory and
-/// CPU, and the token negative cache bounds *distinct* tokens, not *concurrent*
-/// KDFs. A multi-IP burst of distinct Bearer tokens could otherwise launch
-/// hundreds of parallel KDFs (~5 GiB transient on a small host). Cap the
-/// number of in-flight KDFs process-wide; requests that can't get a permit in
-/// time are denied (safe: an unverified token is never admitted). Denied
-/// attempts are still recorded in the negative cache so a flood re-hits the
-/// cache rather than re-queuing.
-///
-/// **DI exception (deliberate):** `KDF_SEM` is a process-global
-/// `LazyLock` static — a deliberate process-global (one of a small set of
-/// such statics) in an otherwise fully dependency-injected codebase.
-/// It is kept outside `SettingsCache`'s fields because the limit must hold
-/// *across the whole process* (every request handler, middleware layer, and
-/// background task verifies tokens through the same cap), not
-/// per-cache-instance; it is a constant (no config dependency) and
-/// nothing else may read or write it.
-const KDF_MAX_CONCURRENT: usize = 16;
-const KDF_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-static KDF_SEM: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(KDF_MAX_CONCURRENT));
 
 /// In-memory settings cache backed by Postgres.
 ///
@@ -70,7 +50,7 @@ pub(crate) struct SettingsInner {
     /// the guard is dropped, so a slow hash never serializes lookups.
     token_cache: RwLock<VerifiedTokenCache>,
     /// Monotonic generation counter bumped after every cache mutation
-    /// (reload/update/upgrade_password). Lets long-lived readers (the search
+    /// (reload/update/upgrade). Lets long-lived readers (the search
     /// snapshot, the poller — WI-44) detect "settings changed" without
     /// re-reading every key. `Relaxed` is enough: we observe *change* only; the
     /// RwLock is the authority per the no-concurrent-reload contract.
@@ -101,16 +81,79 @@ impl SettingsInner {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-}
 
-/// Outcome of the shared token-verify fast path (see
-/// [`SettingsCache::token_verify_fast_path`]): a fresh cached verdict, or the
-/// stored password to run the KDF against.
-enum TokenVerifyFast {
-    /// Fresh cached result (positive hit, negative hit, or empty token).
-    Verdict(bool),
-    /// No fresh cache entry — run the KDF against this stored password.
-    RunKdf(String),
+    /// True if `token` verified successfully within the TTL (O(1) memory
+    /// work; the KDF never runs under the lock — see `auth_service`).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn token_is_fresh(&self, token: &str) -> bool {
+        self.token_cache
+            .read()
+            .expect("token cache rwlock poisoned")
+            .is_fresh(token)
+    }
+
+    /// True if `token` failed verification within the negative TTL.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn token_is_negative_fresh(&self, token: &str) -> bool {
+        self.token_cache
+            .read()
+            .expect("token cache rwlock poisoned")
+            .is_negative_fresh(token)
+    }
+
+    /// Record a KDF verdict for `token` (positive or negative).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn token_record(&self, token: &str, ok: bool) {
+        self.token_cache
+            .write()
+            .expect("token cache rwlock poisoned")
+            .record(token, ok);
+    }
+
+    /// Drop all cached verified tokens (any path that can change the
+    /// effective password: reload/update/upgrade).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn token_invalidate_all(&self) {
+        self.token_cache
+            .write()
+            .expect("token cache rwlock poisoned")
+            .clear();
+    }
+
+    /// The raw (unredacted) stored admin password, or empty when unset. The
+    /// in-memory map always holds the real (possibly `sha2:`-hashed) value —
+    /// `redact()` only applies to `all_grouped_for` output.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn admin_password_raw(&self) -> String {
+        self.cache
+            .read()
+            .expect("settings cache lock poisoned")
+            .get(KEY_ACCESS_ADMIN_PASSWORD)
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default()
+    }
+
+    /// Overwrite the cached admin password (the legacy-upgrade path; the
+    /// sticky in-memory half of `SettingsAuth::upgrade`).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn admin_password_set(&self, hashed: &str) {
+        self.cache
+            .write()
+            .expect("settings cache lock poisoned")
+            .insert(KEY_ACCESS_ADMIN_PASSWORD.into(), serde_json::json!(hashed));
+    }
+
+    /// The shared Postgres pool (the `SettingsAuth::upgrade` DB write goes
+    /// through it).
+    pub(crate) fn pool(&self) -> &Pool {
+        &self.pool
+    }
 }
 
 /// Effective private-network flag for the write-time SSRF check: a bool
@@ -300,7 +343,7 @@ impl SettingsCache {
             .expect("settings cache lock poisoned") = map;
         // A reload can change the stored password (env/config) — drop any
         // cached token verifies so the new password takes effect immediately.
-        self.invalidate_token_cache();
+        self.inner.token_invalidate_all();
         self.inner.bump_generation();
         Ok(())
     }
@@ -319,43 +362,13 @@ impl SettingsCache {
         sync_config_values(&mut cache, config);
     }
 
-    /// Best-effort transparent upgrade: persist the freshly-hashed admin
-    /// password to Postgres **and** the in-memory cache in one go. The cache
-    /// update is authoritative for subsequent auth (the middleware reads the
-    /// cache, not the DB), so even if the DB write fails the process no longer
-    /// re-runs the 100k-iteration verify + UPDATE on every authenticated
-    /// request. DB failure is logged and ignored — this is a convenience, not
-    /// a correctness path.
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    pub async fn upgrade_password(&self, hashed: String) {
-        // Best-effort: a pool blip is folded into the query error (sqlx has
-        // no separate pool-get step), so both failure classes take the same
-        // warn path as before.
-        let val: serde_json::Value = serde_json::json!(hashed);
-        match raw::execute(
-            &self.inner.pool,
-            "UPDATE settings SET value = $1 WHERE key = $2",
-            |q| q.bind(&val).bind(KEY_ACCESS_ADMIN_PASSWORD),
-        )
-        .await
-        {
-            Ok(_) => tracing::info!("upgraded access.admin_password to a salted hash"),
-            Err(e) => {
-                tracing::warn!("failed to persist upgraded admin password (cached anyway): {e}")
-            }
-        }
-        // Cache the hash regardless of DB outcome so the upgrade is sticky.
-        let mut cache_guard = self
-            .inner
-            .cache
-            .write()
-            .expect("settings cache lock poisoned");
-        cache_guard.insert(KEY_ACCESS_ADMIN_PASSWORD.into(), serde_json::json!(hashed));
-        drop(cache_guard);
-        // The stored password just changed — cached verifies are stale now.
-        self.invalidate_token_cache();
-        self.inner.bump_generation();
+    /// The admin-auth service (token-verify KDF call sites with the TTL
+    /// cache + process-wide KDF cap, and the legacy-plaintext upgrade) —
+    /// extracted out of this struct (Arch M2, 2026-09 review). Constructing
+    /// a handle is an `Arc` clone of the shared inner state, so every handle
+    /// verifies against the same token cache and password value.
+    pub fn auth(&self) -> SettingsAuth {
+        SettingsAuth::new(self.inner.clone())
     }
 
     /// Get a single setting value.
@@ -377,8 +390,9 @@ impl SettingsCache {
 
     /// Keys whose stored value does not match its expected JSON type, each as
     /// `"key: reason"`. These settings silently run on their defaults —
-    /// surfaced by the authenticated `/diagnostic` route as `settings_mismatches` so a corrupted settings
-    /// row is not invisible. The record is seeded at each `reload()` (startup)
+    /// surfaced by the authenticated `/diagnostic` route as
+    /// `settings_mismatches` so a corrupted settings row is not invisible.
+    /// The record is seeded at each `reload()` (startup)
     /// and pruned per-key as a successful [`Self::update`] re-validates a row,
     /// so it tracks the current cache, not a frozen startup view. Empty when
     /// every value deserializes.
@@ -423,123 +437,6 @@ impl SettingsCache {
         for key in keys {
             mm.remove(*key);
         }
-    }
-
-    /// Fast path shared by [`Self::token_verify_cached`] and
-    /// [`Self::token_verify_cached_bg`]: an empty token is rejected and a
-    /// fresh positive/negative cache hit short-circuits (the check runs with
-    /// the cache lock held only for the lookup — a slow hash must not
-    /// serialize concurrent lookups). Only when neither hits is the stored
-    /// password returned so the caller can run the KDF (inline or on the
-    /// blocking pool). Keeping the rules in one place means a
-    /// cache-invalidation rule added later can't drift between variants.
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    fn token_verify_fast_path(&self, presented: &str) -> TokenVerifyFast {
-        if presented.is_empty() {
-            return TokenVerifyFast::Verdict(false);
-        }
-        let guard = self
-            .inner
-            .token_cache
-            .read()
-            .expect("token cache rwlock poisoned");
-        if guard.is_fresh(presented) {
-            return TokenVerifyFast::Verdict(true);
-        }
-        if guard.is_negative_fresh(presented) {
-            return TokenVerifyFast::Verdict(false);
-        }
-        TokenVerifyFast::RunKdf(
-            self.get_typed::<String>(KEY_ACCESS_ADMIN_PASSWORD)
-                .unwrap_or_default(),
-        )
-    }
-
-    /// Record a KDF result in the token cache and return it.
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    fn record_token_verify(&self, presented: &str, ok: bool) {
-        self.inner
-            .token_cache
-            .write()
-            .expect("token cache rwlock poisoned")
-            .record(presented, ok);
-    }
-
-    /// Verify `presented` against the stored `access.admin_password`, with a
-    /// short-TTL cache (M3) so the 100k-iteration hash runs at most once per
-    /// `TOKEN_CACHE_TTL` per distinct token (failed verifies are cached for
-    /// `TOKEN_NEGATIVE_TTL`, so a repeated wrong token skips the KDF).
-    ///
-    /// The stored password is read from the **raw** cache: `redact()` only
-    /// applies to `all_grouped_for` output, so the in-memory map always holds
-    /// the real (possibly `sha2:`-hashed) value. Both legacy plaintext and
-    /// hashed stored values are accepted via `verify_admin_password`.
-    ///
-    /// Invalidated by `update()` / `upgrade_password()` / `reload()`, so a
-    /// password change is picked up immediately (not after the TTL).
-    ///
-    /// Synchronous: the verify runs inline on the caller's thread. Use
-    /// [`Self::token_verify_cached_bg`] from an async context (the request
-    /// middleware) so the 100k-iteration hash doesn't block a runtime worker.
-    pub fn token_verify_cached(&self, presented: &str) -> bool {
-        match self.token_verify_fast_path(presented) {
-            TokenVerifyFast::Verdict(ok) => ok,
-            TokenVerifyFast::RunKdf(stored) => {
-                let ok = verify_admin_password(&stored, presented);
-                self.record_token_verify(presented, ok);
-                ok
-            }
-        }
-    }
-
-    /// Async wrapper around [`Self::token_verify_cached`] that runs the
-    /// 100k-iteration `verify_admin_password` on the blocking thread pool
-    /// (`spawn_blocking`) so a request handler never blocks a tokio worker
-    /// thread. Fast paths (empty token, fresh positive/negative cache hit)
-    /// resolve without any KDF. Used by the auth middleware and
-    /// `settings_authed`; `mcp` (a single verify at startup) and tests keep
-    /// the synchronous [`Self::token_verify_cached`].
-    // LINT-3 (2026-09 sweep): propagate a worker-task panic (JoinError) — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    pub async fn token_verify_cached_bg(&self, presented: &str) -> bool {
-        match self.token_verify_fast_path(presented) {
-            TokenVerifyFast::Verdict(ok) => ok,
-            TokenVerifyFast::RunKdf(stored) => {
-                // SEC (KDF DoS): bound the number of in-flight argon2id KDFs.
-                // On overload, deny and record the negative result so the
-                // flood re-hits the cache instead of re-queueing every request.
-                match tokio::time::timeout(KDF_ACQUIRE_TIMEOUT, KDF_SEM.acquire()).await {
-                    Ok(_permit) => {
-                        let presented_owned = presented.to_string();
-                        let ok = tokio::task::spawn_blocking(move || {
-                            verify_admin_password(&stored, &presented_owned)
-                        })
-                        .await
-                        .expect("blocking pool panicked");
-                        self.record_token_verify(presented, ok);
-                        ok
-                    }
-                    Err(_) => {
-                        self.record_token_verify(presented, false);
-                        false
-                    }
-                }
-            }
-        }
-    }
-
-    /// Drop all cached verified tokens. Called on any path that can change
-    /// the effective password (see [`Self::token_verify_cached`]).
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    fn invalidate_token_cache(&self) {
-        self.inner
-            .token_cache
-            .write()
-            .expect("token cache rwlock poisoned")
-            .clear();
     }
 
     /// Get all settings grouped by category, redacting topology values for
@@ -756,7 +653,7 @@ impl SettingsCache {
             // Defense in depth: `access.admin_password` is API-immutable, so a
             // settings write can't change the password — but if it ever could,
             // cached token verifies must not outlive it.
-            self.invalidate_token_cache();
+            self.inner.token_invalidate_all();
             self.inner.bump_generation();
             // M1: re-surface the cross-instance divergence for every
             // committed write (no-op in single-instance mode).
@@ -1879,9 +1776,9 @@ mod tests {
     #[test]
     fn token_verify_cached_hit_second_call() {
         let cache = cache_with_password("s3cret");
-        assert!(cache.token_verify_cached("s3cret"));
+        assert!(cache.auth().verify("s3cret"));
         // Second call: cache hit → true, and exactly one entry recorded.
-        assert!(cache.token_verify_cached("s3cret"));
+        assert!(cache.auth().verify("s3cret"));
         let guard = cache
             .inner
             .token_cache
@@ -1902,17 +1799,17 @@ mod tests {
     async fn token_verify_bg_matches_sync_on_fast_paths() {
         let cache = cache_with_password("s3cret");
         // Empty token: both reject without touching the cache.
-        assert!(!cache.token_verify_cached(""));
-        assert!(!cache.token_verify_cached_bg("").await);
+        assert!(!cache.auth().verify(""));
+        assert!(!cache.auth().verify_bg("").await);
         // Sync verify first (records a positive + a negative), then the bg
         // variant must serve the identical verdicts from the same cache.
-        assert!(cache.token_verify_cached("s3cret"));
-        assert!(!cache.token_verify_cached("wrong"));
-        assert!(cache.token_verify_cached_bg("s3cret").await);
-        assert!(!cache.token_verify_cached_bg("wrong").await);
+        assert!(cache.auth().verify("s3cret"));
+        assert!(!cache.auth().verify("wrong"));
+        assert!(cache.auth().verify_bg("s3cret").await);
+        assert!(!cache.auth().verify_bg("wrong").await);
         // Reverse direction: bg records, sync serves.
-        assert!(cache.token_verify_cached_bg("s3cret").await);
-        assert!(cache.token_verify_cached("s3cret"));
+        assert!(cache.auth().verify_bg("s3cret").await);
+        assert!(cache.auth().verify("s3cret"));
         let guard = cache
             .inner
             .token_cache
@@ -1929,7 +1826,7 @@ mod tests {
     #[test]
     fn token_verify_cached_wrong_token_negative_cached() {
         let cache = cache_with_password("s3cret");
-        assert!(!cache.token_verify_cached("wrong"));
+        assert!(!cache.auth().verify("wrong"));
         let guard = cache
             .inner
             .token_cache
@@ -1947,8 +1844,8 @@ mod tests {
         );
         drop(guard);
         // Repeat: still false, served from the negative cache (no second KDF).
-        assert!(!cache.token_verify_cached("wrong"));
-        assert!(!cache.token_verify_cached(""), "empty token never verifies");
+        assert!(!cache.auth().verify("wrong"));
+        assert!(!cache.auth().verify(""), "empty token never verifies");
     }
 
     #[test]
@@ -2002,7 +1899,7 @@ mod tests {
     #[test]
     fn token_cache_clear_drops_negative_map() {
         let cache = cache_with_password("s3cret");
-        assert!(!cache.token_verify_cached("wrong")); // records a negative
+        assert!(!cache.auth().verify("wrong")); // records a negative
         let guard = cache
             .inner
             .token_cache
@@ -2010,7 +1907,7 @@ mod tests {
             .expect("token cache rwlock poisoned");
         assert!(guard.negatives.contains_key("wrong"));
         drop(guard);
-        cache.invalidate_token_cache();
+        cache.inner.token_invalidate_all();
         let guard = cache
             .inner
             .token_cache
@@ -2036,7 +1933,7 @@ mod tests {
             );
         }
         // Expired → not a cache hit → re-verify (succeeds) and refresh.
-        assert!(cache.token_verify_cached("s3cret"));
+        assert!(cache.auth().verify("s3cret"));
         let guard = cache
             .inner
             .token_cache
@@ -2069,7 +1966,7 @@ mod tests {
     #[tokio::test]
     async fn upgrade_password_invalidates_token_cache() {
         let cache = cache_with_password("legacy");
-        assert!(cache.token_verify_cached("legacy"));
+        assert!(cache.auth().verify("legacy"));
         // NOTE: `VerifiedTokenCache` sits behind a non-reentrant
         // `std::sync::RwLock`. The guard MUST be dropped before any call
         // that re-locks it (the `upgrade_password` below invalidates the
@@ -2086,7 +1983,7 @@ mod tests {
         // upgrade_password (dead pool → DB write skipped, cache updated) must
         // drop the cached verify so the old token can't ride the TTL.
         let hashed = crate::settings::hash_admin_password("newpw");
-        cache.upgrade_password(hashed).await;
+        cache.auth().upgrade(hashed).await;
         {
             let guard = cache
                 .inner
@@ -2099,7 +1996,7 @@ mod tests {
             );
         }
         // The old plaintext no longer verifies against the hashed value.
-        assert!(!cache.token_verify_cached("legacy"));
+        assert!(!cache.auth().verify("legacy"));
     }
 
     // ── M1: multi-instance divergence warning ──────────────────────────────
@@ -2291,5 +2188,58 @@ mod tests {
             "warn must name the key: {text:?}"
         );
         assert!(text.contains("settings value ignored"), "got: {text:?}");
+    }
+
+    /// SEC (KDF DoS): the overload deny arm of `verify_bg` — when the
+    /// in-flight-KDF semaphore is exhausted (a burst of distinct tokens
+    /// holding every permit), a verify must be DENIED (never admitted)
+    /// and the denial must be recorded as a negative cache entry so a
+    /// token flood re-hits the cache instead of re-queueing KDFs. The
+    /// injected 1-permit semaphore + 50 ms timeout makes the arm
+    /// reachable without holding 16 real argon2id verifies for 10 s.
+    #[tokio::test]
+    async fn kdf_overload_denies_and_records_negative() {
+        use crate::settings::auth_service::SettingsAuth;
+
+        let mut values = default_settings();
+        values.insert(
+            KEY_ACCESS_ADMIN_PASSWORD.into(),
+            serde_json::json!("stored-secret"),
+        );
+        let cache = cache_with_locks(values, HashMap::new());
+
+        // Exhaust the only permit: every concurrent verify now times out
+        // at the acquire step, exactly like a distinct-token burst on the
+        // production 16-permit cap.
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = Arc::clone(&sem)
+            .try_acquire_owned()
+            .expect("take the single test permit");
+        let auth = SettingsAuth::new_for_test(
+            Arc::clone(&cache.inner),
+            Arc::clone(&sem),
+            Duration::from_millis(50),
+        );
+
+        assert!(
+            !auth.verify_bg("flood-token-1").await,
+            "overloaded KDF must deny — an unverified token is never admitted"
+        );
+        assert!(
+            cache.inner.token_is_negative_fresh("flood-token-1"),
+            "the denial must be cached negative so a flood re-hits the cache"
+        );
+
+        // Drop the flood: the cached negative survives the release and
+        // still short-circuits the verify (no KDF run, no acquire) for the
+        // TTL. (No `verify_bg` re-call here: the token differs from the
+        // stored password either way, so its result can't tell the negative
+        // fast path apart from a KDF run — `token_is_negative_fresh` is the
+        // direct evidence that the entry is what a verify will hit.)
+        drop(held);
+        assert!(
+            cache.inner.token_is_negative_fresh("flood-token-1"),
+            "the negative entry must survive the release for its TTL"
+        );
     }
 }

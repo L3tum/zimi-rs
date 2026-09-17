@@ -144,7 +144,8 @@ pub struct AddDownloadBody {
     responses(
         (status = 200, description = "Download queued", body = DownloadQueuedResponse),
         (status = 400, description = "Invalid URL", body = ErrorResponse),
-        (status = 409, description = "A download for this URL is already queued or in progress", body = ErrorResponse),
+        (status = 409, description = "A download for this URL is already queued or in \
+        progress", body = ErrorResponse),
         (status = 500, description = "Internal error", body = ErrorResponse)
     ),
     security(
@@ -228,7 +229,8 @@ pub(crate) fn default_download_name(url: &str) -> String {
     responses(
         (status = 200, description = "Download cancelled", body = OkIdResponse),
         (status = 404, description = "Download not found", body = ErrorResponse),
-        (status = 409, description = "Download is not cancellable in its current state", body = ErrorResponse),
+        (status = 409, description = "Download is not cancellable in its current \
+        state", body = ErrorResponse),
         (status = 500, description = "Internal error", body = ErrorResponse)
     ),
     security(

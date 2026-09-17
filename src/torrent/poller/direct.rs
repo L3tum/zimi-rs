@@ -208,7 +208,8 @@ enum FileStream {
 /// not throw away resume progress (PERF-11). If the reissue answers
 /// non-success, the `.part` is removed and the row error-marked (the
 /// fallback has already proven the resume unusable).
-#[allow(clippy::too_many_arguments)] // request context (url/client/part) + per-row state (cap/db/row id)
+// request context (url/client/part) + per-row state (cap/db/row id)
+#[allow(clippy::too_many_arguments)]
 async fn fresh_fallback(
     url: &str,
     client: &reqwest::Client,
@@ -274,7 +275,8 @@ async fn fresh_fallback(
 /// received means the body was cut short (skipped for a row observed
 /// `cancelled` mid-stream: the file is already gone and the row must not be
 /// error-marked).
-#[allow(clippy::too_many_arguments)] // request context (url/client/resp/part) + per-row state (resume/cap/db/row id)
+// request context (url/client/resp/part) + per-row state (resume/cap/db/row id)
+#[allow(clippy::too_many_arguments)]
 async fn stream_part(
     url: &str,
     client: &reqwest::Client,
@@ -354,8 +356,10 @@ async fn stream_part(
         FileStream::Append(f, from, total, resp) => (f, from, total, resp),
         FileStream::Fresh(f, total, resp) => (f, 0u64, total, resp),
     };
-    // Batch the per-chunk writes into syscalls; flushed on completion below.
-    let mut file = tokio::io::BufWriter::new(file);
+    // Batch the per-chunk writes into syscalls (1 MiB buffer — a multi-GB
+    // ZIM through the default 8 KiB buffer would be one write syscall per
+    // 8 KiB; ~100–500× fewer on a LAN); flushed on completion below.
+    let mut file = tokio::io::BufWriter::with_capacity(1 << 20, file);
 
     let mut stream = resp.bytes_stream();
     let mut window_bytes: u64 = 0;
@@ -527,7 +531,8 @@ pub(super) async fn direct_download(
         // row alone (no error mark, no verify/rename/index) — the file is
         // gone, so nothing is left to keep for resume.
         tracing::info!(
-            "direct download {id} cancelled during transfer — staged part removed, leaving row cancelled"
+            "direct download {id} cancelled during transfer — staged part removed, leaving row \
+            cancelled"
         );
         return Ok(());
     }

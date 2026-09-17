@@ -63,13 +63,35 @@ async fn drop_db(base_pool: &Pool, name: &str) {
 /// deliberate — a private database per test keeps the shared dev schema
 /// untouched, and the caller already holds the `DbExclusiveGuard`.
 pub async fn create_temp_db(base_pool: &Pool) -> Option<(Pool, String)> {
+    create_temp_db_with(base_pool, None).await
+}
+
+/// Variant with an explicit **C collation** (`LC_COLLATE 'C' LC_CTYPE 'C'`).
+/// Plan-shape tests that assert a *specific* index serve a `LIKE 'prefix%'`
+/// need it: a plain btree serves a prefix-LIKE range scan only under the C
+/// collation — under any locale collation (the common default for local dev
+/// clusters) the planner falls back to the trgm GIN or a seq scan and the
+/// index-specific assertion fails for collation reasons, not plan-shape
+/// reasons. `TEMPLATE template0` is required (template1's collation is
+/// incompatible with a new collation) and the encoding is pinned to UTF8
+/// independent of the server default.
+pub async fn create_temp_db_c_collated(base_pool: &Pool) -> Option<(Pool, String)> {
+    create_temp_db_with(base_pool, Some("C")).await
+}
+
+async fn create_temp_db_with(base_pool: &Pool, lc_collate: Option<&str>) -> Option<(Pool, String)> {
     sweep_stale_temp_dbs(base_pool).await;
     let name = temp_db_name();
+    let create_sql = match lc_collate {
+        None => format!("CREATE DATABASE {name}"),
+        Some(collate) => format!(
+            "CREATE DATABASE {name} TEMPLATE template0 ENCODING 'UTF8' \
+             LC_COLLATE '{collate}' LC_CTYPE '{collate}'"
+        ),
+    };
     // CREATE/DROP DATABASE cannot run inside a transaction; the plain pooled
     // statement is exactly that (sqlx opens no implicit BEGIN).
-    if let Err(e) =
-        zimservice::db::raw::execute(base_pool, &format!("CREATE DATABASE {name}"), |q| q).await
-    {
+    if let Err(e) = zimservice::db::raw::execute(base_pool, &create_sql, |q| q).await {
         drop_db(base_pool, &name).await;
         skip_midtest(&format!(
             "CREATE DATABASE {name} failed (user lacks CREATEDB?): {e}"
@@ -175,8 +197,25 @@ async fn sweep_stale_temp_dbs(base_pool: &Pool) {
 /// Close `pool` (releasing its connections), then drop the database
 /// best-effort on the shared server. `pub` for sibling temp-DB tests (see
 /// [`create_temp_db`]).
+///
+/// **Caller contract:** every connection checked out of `pool` must be
+/// dropped first — `pool.close()` acquires `max_connections` permits and
+/// deadlocks on a connection that is still checked out (sqlx waits for the
+/// permit the checked-out connection holds until it is released). The
+/// `pg_terminate_backend` sweep below is belt-and-braces for connections
+/// the pool did close but a half-open TCP left lingering server-side.
 pub async fn close_and_drop(base_pool: &Pool, pool: &Pool, name: &str) {
     pool.close().await;
+    // Belt-and-braces: kill any session still attached to the temp DB so
+    // the DROP cannot be refused ("database is being accessed by other
+    // users") — e.g. a connection whose close raced the drop on a slow
+    // network. Best-effort; `drop_db` stays the source of truth.
+    let _ = zimservice::db::raw::execute(
+        base_pool,
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1",
+        |q| q.bind(name),
+    )
+    .await;
     drop_db(base_pool, name).await;
 }
 
@@ -379,4 +418,88 @@ async fn smoke_concurrent_migrations_serialize_on_advisory_lock() {
 
     pool2.close().await;
     close_and_drop(&base_pool, &pool1, &name).await;
+}
+
+/// PONY (2026-09 review): the migration runner sends each migration file as
+/// ONE raw-string script (`raw::execute_script` → simple query protocol;
+/// Postgres splits the script server-side — the same mechanism
+/// `sqlx::migrate!` relies on). This test is the guard that was required
+/// before deleting the client-side `split_statements` lexer: it proves,
+/// through that exact path, that a two-statement script really executes
+/// BOTH statements (including one whose string literal contains a `;`), and
+/// that a failing second statement rolls the first back with the
+/// transaction.
+#[tokio::test]
+async fn smoke_two_statement_script_via_single_execute() {
+    use sqlx::Acquire;
+    let (base_pool, _db_gate) = match pool_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    let (pool, name) = match create_temp_db(&base_pool).await {
+        Some(t) => t,
+        None => return,
+    };
+
+    let mut client = pool.acquire().await.expect("connection");
+
+    // (1) Two statements in ONE raw-string execute — both must land.
+    let mut tx = client.begin().await.expect("begin");
+    zimservice::db::raw::execute_script(
+        &mut *tx,
+        "CREATE TABLE zimservice_itest_two_a (id INTEGER PRIMARY KEY); CREATE TABLE \
+        zimservice_itest_two_b (id INTEGER PRIMARY KEY, note TEXT DEFAULT 'has; a semicolon')",
+    )
+    .await
+    .expect("two-statement script must execute");
+    tx.commit().await.expect("commit");
+    for table in ["zimservice_itest_two_a", "zimservice_itest_two_b"] {
+        let exists: bool = zimservice::db::raw::fetch_scalar_optional(
+            &pool,
+            &format!("SELECT to_regclass('{table}') IS NOT NULL"),
+            |q| q,
+        )
+        .await
+        .expect("to_regclass")
+        .expect("regclass row");
+        assert!(
+            exists,
+            "both statements of the script must execute ({table} missing)"
+        );
+    }
+
+    // (2) A failing second statement must abort the whole script and roll
+    // back the first (the transaction is dropped uncommitted).
+    let mut tx = client.begin().await.expect("begin");
+    let err = zimservice::db::raw::execute_script(
+        &mut *tx,
+        "CREATE TABLE zimservice_itest_two_c (id INTEGER PRIMARY KEY); CREATE TABLE \
+        zimservice_itest_two_c (id INTEGER PRIMARY KEY)",
+    )
+    .await;
+    assert!(err.is_err(), "duplicate table name must fail the script");
+    drop(tx); // uncommitted → rollback
+              // Return the checked-out connection to the pool BEFORE close_and_drop:
+              // `pool.close()` acquires `max_connections` permits and would otherwise
+              // wait forever for this one (a checked-out connection is only released
+              // when the test function unwinds — which close_and_drop's wait blocks).
+    drop(client);
+    let exists: bool = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT to_regclass('zimservice_itest_two_c') IS NOT NULL",
+        |q| q,
+    )
+    .await
+    .expect("to_regclass")
+    .expect("regclass row");
+    assert!(
+        !exists,
+        "the first statement must roll back with the failed script"
+    );
+
+    // (3) End-to-end: the fresh-apply run above already exercised every real
+    // multi-statement migration through this same single-execute path
+    // (smoke_migration_drift_detection), so this file's coverage is the union
+    // of the synthetic two-statement cases and the committed corpus.
+    close_and_drop(&base_pool, &pool, &name).await;
 }

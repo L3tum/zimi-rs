@@ -13,8 +13,10 @@ use std::time::{Duration, Instant};
 /// cap is hit the entry with the oldest `first_failure` is evicted.
 #[derive(Default)]
 pub struct LockoutTracker {
-    /// (failure count, first_failure instant) per IP.
-    pub inner: std::sync::Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    /// (failure count, first_failure instant) per IP. `pub(crate)`: only
+    /// in-crate tests read it directly; production goes through the
+    /// capped-eviction API below.
+    pub(crate) inner: std::sync::Mutex<HashMap<IpAddr, (u32, Instant)>>,
 }
 
 impl LockoutTracker {

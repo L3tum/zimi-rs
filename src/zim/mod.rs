@@ -17,7 +17,8 @@ use crate::db::{pool::Pool, raw};
 use crate::error::{Error, Result};
 
 /// Max simultaneously-open ZIM handles. Each open ZIM holds one mmap fd, so this
-/// bounds fd usage. Oldest (by insertion order) is evicted when the cap is hit.
+/// bounds fd usage. Least-recently-used (min `last_access`) is evicted when
+/// the cap is hit — a true LRU, not insertion order.
 const MAX_OPEN_ZIMS: usize = 16;
 /// How long a cached handle's stat (mtime/size) is trusted before
 /// re-statting the file. Bounds a fresh download's visibility to this

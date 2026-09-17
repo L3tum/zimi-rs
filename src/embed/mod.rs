@@ -21,7 +21,7 @@
 
 mod auto_loop;
 mod client;
-mod column;
+pub mod column;
 mod pipeline;
 mod vector_index;
 

@@ -40,5 +40,7 @@ mod migrations;
 mod raw;
 mod search;
 mod serve;
+mod settings_auth;
 mod trgm_plan;
+mod vector_dim;
 mod zims;

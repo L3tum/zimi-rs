@@ -13,8 +13,9 @@ const WEB_CSP: &str =
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'";
 
 /// Shared security headers for the embedded Web UI (SEC L3): refuse framing
-/// (`X-Frame-Options: DENY`) and referrer leakage (`Referrer-Policy:
-/// no-referrer`), and the baseline CSP (see [`WEB_CSP`]).
+/// (`X-Frame-Options: DENY`), referrer leakage (`Referrer-Policy:
+/// no-referrer`), MIME sniffing (`X-Content-Type-Options: nosniff`, Sec
+/// L2/L3 2026-09), and the baseline CSP (see [`WEB_CSP`]).
 fn web_security_headers() -> Vec<(header::HeaderName, header::HeaderValue)> {
     vec![
         (
@@ -29,6 +30,10 @@ fn web_security_headers() -> Vec<(header::HeaderName, header::HeaderValue)> {
             header::REFERRER_POLICY,
             header::HeaderValue::from_static("no-referrer"),
         ),
+        (
+            header::X_CONTENT_TYPE_OPTIONS,
+            header::HeaderValue::from_static("nosniff"),
+        ),
     ]
 }
 
@@ -36,7 +41,8 @@ fn web_security_headers() -> Vec<(header::HeaderName, header::HeaderValue)> {
 /// kills script execution and framing; keeps inline styles + data-URI
 /// images/fonts so article rendering survives.
 pub const RAW_CONTENT_CSP: &str =
-    "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; frame-ancestors 'none'";
+    "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data: blob:; \
+    font-src data:; frame-ancestors 'none'";
 
 /// MIME types that browsers render as HTML documents (i.e. can execute
 /// scripts). Used to decide whether the sandbox CSP + `X-Frame-Options: DENY`
@@ -83,17 +89,31 @@ const ASSET_STAMP: &str = concat!("?v=", env!("CARGO_PKG_VERSION"));
 fn stamp_assets(page: &str) -> String {
     const ASSETS: [&str; 4] = ["/common.js", "/index.js", "/search.js", "/settings.js"];
     let mut out = page.to_string();
+    let mut stamped = 0usize;
     for asset in ASSETS {
-        out = out.replace(
-            &format!("src=\"{asset}\""),
-            &format!("src=\"{asset}{ASSET_STAMP}\""),
-        );
+        let from = format!("src=\"{asset}\"");
+        let to = format!("src=\"{asset}{ASSET_STAMP}\"");
+        if out.contains(&from) {
+            out = out.replace(&from, &to);
+            stamped += 1;
+        }
     }
     // The shared stylesheet is linked via `href=` (not `src=`); stamp it the
     // same way so cache-busting covers the CSS, not just the JS.
-    out = out.replace(
-        "href=\"/style.css\"",
-        &format!("href=\"/style.css{ASSET_STAMP}\""),
+    let css_from = "href=\"/style.css\"";
+    let css_to = format!("href=\"/style.css{ASSET_STAMP}\"");
+    if out.contains(css_from) {
+        out = out.replace(css_from, &css_to);
+        stamped += 1;
+    }
+    // (m2, 2026-09 review): the exact-string replace above is format-fragile
+    // — a renamed/reformatted asset reference would silently disable
+    // cache-busting. Every page embeds the stylesheet + common.js, so a
+    // page matching nothing has regressed; the per-page counts are pinned
+    // by the unit test below.
+    assert!(
+        stamped >= 2,
+        "stamp_assets: page matched no asset references — cache-busting silently disabled"
     );
     out
 }
@@ -202,6 +222,41 @@ pub async fn web_settings_js() -> Response {
 mod tests {
     use super::*;
 
+    // ── stamp_assets cache-busting (m2, 2026-09 review) ────────────────────
+
+    /// Pin the exact per-page reference set: if an asset reference is
+    /// renamed or reformatted in the HTML, stamping must break loudly here
+    /// instead of silently serving un-versioned URLs (the exact-string
+    /// replace in `stamp_assets` is format-fragile).
+    #[test]
+    fn stamp_assets_stamps_every_page_asset_exactly_once() {
+        let cases = [
+            (include_str!("../../../web/index.html"), 3), // style.css, common.js, index.js
+            (include_str!("../../../web/search.html"), 3), // style.css, common.js, search.js
+            (include_str!("../../../web/settings.html"), 3), // style.css, common.js, settings.js
+        ];
+        for (page, expected_refs) in cases {
+            let stamped = stamp_assets(page);
+            // No plain (unstamped) reference may survive stamping.
+            for asset in ["/common.js", "/index.js", "/search.js", "/settings.js"] {
+                assert!(
+                    !stamped.contains(&format!("src=\"{asset}\"")),
+                    "page still contains unstamped reference {asset:?}"
+                );
+            }
+            assert!(
+                !stamped.contains("href=\"/style.css\""),
+                "page still contains unstamped style.css reference"
+            );
+            // Each expected reference must be stamped exactly once.
+            let stamped_refs = stamped.matches(ASSET_STAMP).count();
+            assert_eq!(
+                stamped_refs, expected_refs,
+                "expected {expected_refs} stamped asset references, found {stamped_refs}"
+            );
+        }
+    }
+
     // ── Web security headers (SEC L3) ─────────────────────────────────────────
 
     fn assert_web_security_headers(resp: &axum::response::Response) {
@@ -226,6 +281,13 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("no-referrer"),
             "Referrer-Policy must be no-referrer"
+        );
+        assert_eq!(
+            headers
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff"),
+            "X-Content-Type-Options must be nosniff"
         );
     }
 

@@ -33,7 +33,13 @@ pub async fn probe_db(db: &db::Pool) -> bool {
     // (Architecture M1); the `"health:db_probe"` site label keeps its waits
     // attributable per-site, separate from search/suggest checkouts.
     match db::pool::acquire_timed(db, "health:db_probe").await {
-        Ok(mut pg) => sqlx::query("SELECT 1").execute(&mut *pg).await.is_ok(), // RAW-OK: `SELECT 1` liveness probe — the cheapest possible statement, run on a raw pooled connection (db::raw helpers are for query builders, not a one-word probe)
+        Ok(mut pg) => {
+            // `SELECT 1` liveness probe — the cheapest possible statement,
+            // run on a raw pooled connection (db::raw helpers are for query
+            // builders, not a one-word probe).
+            // RAW-OK: raw one-word probe; no db::raw helper exists for it.
+            sqlx::query("SELECT 1").execute(&mut *pg).await.is_ok()
+        }
         Err(_) => false,
     }
 }

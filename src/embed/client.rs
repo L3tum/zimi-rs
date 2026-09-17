@@ -191,7 +191,8 @@ fn check_embed_indices(sorted: &[EmbedData]) -> Result<()> {
     for (i, d) in sorted.iter().enumerate() {
         if d.index != i {
             return Err(Error::Embedding(format!(
-                "embedding API returned misaligned indices: position {i} has index {} (expected exactly 0..{})",
+                "embedding API returned misaligned indices: position {i} has index {} (expected \
+                exactly 0..{})",
                 d.index,
                 sorted.len()
             )));

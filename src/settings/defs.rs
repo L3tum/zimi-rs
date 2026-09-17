@@ -25,14 +25,14 @@
 //! The per-key policy flags (columns of [`SETTING_DEFS`], see
 //! [`SettingPolicy`]) control how each key behaves in the above flow:
 //!
-//! | Policy flag          | Meaning                                                                  | Enforcement                                                                                          |
-//! |----------------------|--------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
-//! | `env_locked`         | The key is env-backed and its env var was set at startup                 | Locked against API writes ("locked by environment variable"); the env value wins over the DB         |
-//! | `api_immutable`      | Seeded from the environment at startup, shown as locked in the UI        | Never changeable via the API                                                                          |
-//! | `config_only`        | Fixed by the environment at startup; no runtime effect if changed        | Stored for reference; rejected on API update (the server already bound / ZIM dir already opened)      |
-//! | `security_sensitive` | Gating auth / SSRF policy / secret-bearing integrations                  | Unauthenticated writes rejected (403 up front in `put_settings`)                                      |
-//! | `secret`             | Never returned with its real value in API responses                      | Set values become `"***"` (unset values pass through) — see [`redact`]                                 |
-//! | `topology`           | Redacted for unauthenticated callers (S6 topology leak guard)            | Unauthenticated reads see `"[redacted]"` in `all_grouped_for` output                                   |
+//! | Policy flag          | Meaning                            | Enforcement                   |
+//! | -------------------- | ---------------------------------- | ----------------------------- |
+//! | `env_locked`         | Env-backed key; env set at startup | API writes locked; env wins   |
+//! | `api_immutable`      | Seeded from env; locked in UI      | Never changeable via the API  |
+//! | `config_only`        | Fixed by env; no runtime effect    | Reference only; no updates    |
+//! | `security_sensitive` | Auth / SSRF / secret-bearing keys  | Unauth writes rejected (403)  |
+//! | `secret`             | Real value never in API output     | Set values become "***"       |
+//! | `topology`           | Redacted for unauth callers (S6)   | Unauth reads see "[redacted]" |
 
 use std::collections::HashMap;
 
@@ -205,9 +205,12 @@ pub const KEY_EMBEDDING_BATCH_SIZE: &str = "embedding.batch_size";
 pub const KEY_EMBEDDING_MAX_CONCURRENCY: &str = "embedding.max_concurrency";
 /// `embedding.timeout_secs` — per-request embedding timeout in seconds.
 pub const KEY_EMBEDDING_TIMEOUT_SECS: &str = "embedding.timeout_secs";
-/// `embedding.hnsw_threshold` — article count at/below which an HNSW index is used.
+/// `embedding.hnsw_threshold` — article count at/below which an HNSW index is
+/// used.
 pub const KEY_EMBEDDING_HNSW_THRESHOLD: &str = "embedding.hnsw_threshold";
-/// `embedding.ivfflat_threshold` — article count at/above which IVFFlat is preferred over HNSW (the index is still built at/above it — no seq-scan fallback).
+/// `embedding.ivfflat_threshold` — article count at/above which IVFFlat is
+/// preferred over HNSW (the index is still built at/above it — no seq-scan
+/// fallback).
 pub const KEY_EMBEDDING_IVFFLAT_THRESHOLD: &str = "embedding.ivfflat_threshold";
 
 // access.* — auth mode, rate limits, admin password, and read-gating.

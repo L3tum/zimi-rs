@@ -2,6 +2,37 @@
 //!
 //! Hand-rolled JSON-RPC 2.0 with newline-delimited JSON messages.
 //! No external MCP crate needed — the protocol is simple.
+//!
+//! **Conformance surface (pinned, protocol version "2025-03-26").** The
+//! pinned request/response vectors live in the `spec conformance` test
+//! section (`initialize_response_is_exactly_pinned`,
+//! `tools_list_pins_exact_tool_set_and_shape`,
+//! `tools_call_transcript_pins_success_and_error_shapes`,
+//! `unsupported_notification_is_ignored_and_loop_continues`,
+//! `oversized_line_gets_pinned_parse_error_and_closes_session`).
+//!
+//! **Deliberately unsupported** (silent spec-drift is the realistic failure
+//! mode of a hand-rolled server, so this list is the contract):
+//!
+//! | Capability / request shape | Behavior |
+//! - Transport other than stdio (HTTP+SSE, Streamable HTTP): not
+//!   implemented — stdio only, one client per process.
+//! - `resources`, `prompts`, `logging`, `completion` capabilities: not
+//!   advertised, not implemented — `capabilities` advertises `tools` only.
+//! - JSON-RPC batch requests (a JSON array line): rejected with `-32600`
+//!   Invalid Request (single messages only).
+//! - `notifications/cancelled` (in-flight cancellation): ignored (no
+//!   response — it is a notification); no cancellation is implemented.
+//! - Any other unknown notification (e.g. `notifications/foo`): ignored
+//!   (no response); the serve loop continues.
+//! - Unknown *method* on a request (with `id`): `-32601` Method not
+//!   found.
+//! - Line longer than 1 MiB (`MCP_MAX_LINE_BYTES`): `-32700` Parse
+//!   error, then the serve loop **stops** (untrusted peer — no further
+//!   draining).
+//! - `Mcp-Session-Id` / session management: not supported — stateless
+//!   per connection.
+//! - `ping`: supported (returns `{}`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -76,7 +107,8 @@ where
                 let err = json!({
                     "jsonrpc": "2.0",
                     "id": null,
-                    "error": { "code": -32700, "message": format!("Parse error: line exceeds {MCP_MAX_LINE_BYTES} bytes") }
+                    "error": { "code": -32700, "message": format!("Parse error: line exceeds \
+                    {MCP_MAX_LINE_BYTES} bytes") }
                 });
                 if let Err(e) = writer.write_all(format!("{err}\n").as_bytes()).await {
                     tracing::debug!("MCP stdio: failed to send parse-error reply: {e}");
@@ -130,7 +162,8 @@ where
             None => Some(json!({
                 "jsonrpc": "2.0",
                 "id": msg.get("id").cloned(),
-                "error": { "code": -32600, "message": "Invalid Request: expected a JSON-RPC 2.0 request or notification" },
+                "error": { "code": -32600, "message": "Invalid Request: expected a JSON-RPC 2.0 \
+                request or notification" },
             })),
         };
 
@@ -230,14 +263,19 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "search",
-            "description": "Search across all ZIM archives. Hybrid by default (full-text + fuzzy); set mode to use one engine only.",
+            "description": "Search across all ZIM archives. Hybrid by default (full-text + \
+            fuzzy); set mode to use one engine only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query" },
                     "zim": { "type": "string", "description": "Filter to specific ZIM" },
                     "language": { "type": "string", "description": "Filter by language" },
-                    "mode": { "type": "string", "description": "Engine: fts (full-text), trgm (fuzzy/prefix), vector (semantic), or hybrid (default)" },
+                    "mode": {
+                        "type": "string",
+                        "description": "Engine: fts (full-text), trgm (fuzzy/prefix), vector \
+                        (semantic), or hybrid (default)"
+                    },
                     "limit": { "type": "integer", "description": "Max results (default 10)" }
                 },
                 "required": ["query"]
@@ -251,7 +289,8 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "zim": { "type": "string", "description": "ZIM name" },
                     "path": { "type": "string", "description": "Article path" },
-                    "max_length": { "type": "integer", "description": "Max characters (default 8000)" }
+                    "max_length": { "type": "integer", "description": "Max characters (default \
+                    8000)" }
                 },
                 "required": ["zim", "path"]
             }
@@ -330,7 +369,8 @@ fn tool_definitions() -> Value {
             // returns a structured `{ "collections": [...] }` body), the MCP
             // envelope serializes that same payload as a JSON string in
             // `content[0].text` — parse it as JSON before use.
-            "description": "List user collections. Returns the collection list as a JSON string in content[0].text.",
+            "description": "List user collections. Returns the collection list as a JSON string \
+            in content[0].text.",
             "inputSchema": { "type": "object", "properties": {} }
         }
     ])
@@ -621,7 +661,9 @@ async fn tool_list_collections(state: &AppState) -> Value {
                 "name": r.name,
                 "label": r.label,
                 "is_favorite": r.is_favorite,
-                "zims": r.zim_ids.iter().filter_map(|id| id_to_name.get(id).cloned()).collect::<Vec<_>>(),
+                "zims": r.zim_ids.iter()
+                    .filter_map(|id| id_to_name.get(id).cloned())
+                    .collect::<Vec<_>>(),
                 "created_at": r.created_at.to_rfc3339(),
             })
         })
@@ -677,7 +719,8 @@ mod tests {
         let responses = run_session(
             &state,
             &[
-                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test","version":"0"}}}"#,
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVe\
+                rsion\":\"2025-03-26\",\"clientInfo\":{\"name\":\"test\",\"version\":\"0\"}}}",
                 r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
                 r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
                 r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#,
@@ -760,9 +803,12 @@ mod tests {
         let responses = run_session(
             &state,
             &[
-                r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#,
-                r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"search","arguments":{}}}"#,
-                r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"read","arguments":{"zim":"x"}}}"#,
+                "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\
+                \"nope\",\"arguments\":{}}}",
+                "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\
+                \"search\",\"arguments\":{}}}",
+                "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\
+                \"read\",\"arguments\":{\"zim\":\"x\"}}}",
             ],
         )
         .await;
@@ -795,7 +841,9 @@ mod tests {
         let responses = run_session(
             &state,
             &[
-                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"clientInfo":{"name":"spec-pinner","version":"1.0.0"}}}"#,
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVe\
+                rsion\":\"2025-03-26\",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"cli\
+                entInfo\":{\"name\":\"spec-pinner\",\"version\":\"1.0.0\"}}}",
             ],
         )
         .await;
@@ -876,12 +924,17 @@ mod tests {
         let responses = run_session(
             &state,
             &[
-                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"spec-pinner","version":"1.0.0"}}}"#,
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVe\
+                rsion\":\"2025-03-26\",\"clientInfo\":{\"name\":\"spec-pinner\",\"version\":\"1.0\
+                .0\"}}}",
                 r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_sources","arguments":{}}}"#,
-                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#,
+                "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"l\
+                ist_sources\",\"arguments\":{}}}",
+                "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"n\
+                ope\",\"arguments\":{}}}",
                 r#"{"jsonrpc":"2.0","id":5,"method":123,"params":{}}"#,
-                r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"list_sources","arguments":{}}}"#,
+                "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"list_sourc\
+                es\",\"arguments\":{}}}",
             ],
         )
         .await;
@@ -927,13 +980,67 @@ mod tests {
         );
     }
 
+    /// Unsupported notification: `notifications/cancelled` (in-flight
+    /// cancellation is deliberately not implemented — see the module docs
+    /// "deliberately unsupported" table) must be silently ignored (no
+    /// response — it is a notification) and the serve loop must keep serving
+    /// subsequent requests on the same connection.
+    #[tokio::test]
+    async fn unsupported_notification_is_ignored_and_loop_continues() {
+        let state = test_state();
+        let responses = run_session(
+            &state,
+            &[
+                "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\
+                 \"params\":{\"requestId\":7,\"reason\":\"user aborted\"}}",
+                r#"{"jsonrpc":"2.0","id":30,"method":"ping"}"#,
+            ],
+        )
+        .await;
+        // The notification gets no response; only the ping reply arrives.
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0],
+            json!({ "jsonrpc": "2.0", "id": 30, "result": {} })
+        );
+    }
+
+    /// Session-level vector for the 1 MiB line cap: an oversized line gets
+    /// the exact pinned `-32700` parse error, and the serve loop stops — a
+    /// request on the same connection after it gets no response.
+    #[tokio::test]
+    async fn oversized_line_gets_pinned_parse_error_and_closes_session() {
+        let state = test_state();
+        let big = "x".repeat(MCP_MAX_LINE_BYTES + 1);
+        let oversized = format!("{{\"a\":\"{big}\"}}");
+        let responses = run_session(
+            &state,
+            &[&oversized, r#"{"jsonrpc":"2.0","id":41,"method":"ping"}"#],
+        )
+        .await;
+        // Only the parse error — the session is dead after the oversized line.
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0],
+            json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": -32700,
+                    "message": "Parse error: line exceeds 1048576 bytes"
+                }
+            })
+        );
+    }
+
     #[tokio::test]
     async fn tool_runtime_failure_uses_is_error_envelope() {
         let state = test_state();
         let responses = run_session(
             &state,
             &[
-                r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"random","arguments":{}}}"#,
+                "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\
+                \"random\",\"arguments\":{}}}",
             ],
         )
         .await;

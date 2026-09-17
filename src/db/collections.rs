@@ -81,7 +81,8 @@ pub enum InsertOutcome {
 /// Insert a collection. A duplicate `name` hits the UNIQUE constraint and is
 /// surfaced as [`InsertOutcome::Duplicate`] (BUG-9: the handler maps it to a
 /// domain-specific 409, not the generic constraint-derived message).
-// LINT-3 (2026-09 sweep): `INSERT … RETURNING id` always yields a row — panic = DB contract violation.
+// LINT-3 (2026-09 sweep): `INSERT … RETURNING id` always yields a row —
+// panic = DB contract violation.
 #[allow(clippy::expect_used)]
 pub async fn insert_collection(
     pool: &Pool,
@@ -148,58 +149,77 @@ pub async fn update_collection(
     // zim_ids, is_favorite). The raw bind chain is positional and the four
     // field types differ, so the dispatch is one arm per provided-set
     // combination.
-    let updated = match (&fields.name, &fields.label, &fields.zim_ids, &fields.is_favorite) {
+    let updated = match (
+        &fields.name,
+        &fields.label,
+        &fields.zim_ids,
+        &fields.is_favorite,
+    ) {
         // Unreachable in practice (the handler 400s on an all-`None` body);
         // a benign fallback so we never build a malformed `UPDATE`.
         (None, None, None, None) => return Ok(UpdateOutcome::NotFound),
-        (Some(name), None, None, None) => raw::execute(
-            pool,
-            "UPDATE collections SET name = $2, updated_at = now() WHERE id = $1",
-            |q| q.bind(id).bind(name),
-        )
-        .await?,
-        (None, Some(label), None, None) => raw::execute(
-            pool,
-            "UPDATE collections SET label = $2, updated_at = now() WHERE id = $1",
-            |q| q.bind(id).bind(label),
-        )
-        .await?,
-        (None, None, Some(zim_ids), None) => raw::execute(
-            pool,
-            "UPDATE collections SET zim_ids = $2, updated_at = now() WHERE id = $1",
-            |q| q.bind(id).bind(zim_ids),
-        )
-        .await?,
-        (None, None, None, Some(is_favorite)) => raw::execute(
-            pool,
-            "UPDATE collections SET is_favorite = $2, updated_at = now() WHERE id = $1",
-            |q| q.bind(id).bind(is_favorite),
-        )
-        .await?,
-        (Some(name), Some(label), None, None) => raw::execute(
-            pool,
-            "UPDATE collections SET name = $2, label = $3, updated_at = now() WHERE id = $1",
-            |q| q.bind(id).bind(name).bind(label),
-        )
-        .await?,
-        (Some(name), None, Some(zim_ids), None) => raw::execute(
-            pool,
-            "UPDATE collections SET name = $2, zim_ids = $3, updated_at = now() WHERE id = $1",
-            |q| q.bind(id).bind(name).bind(zim_ids),
-        )
-        .await?,
+        (Some(name), None, None, None) => {
+            raw::execute(
+                pool,
+                "UPDATE collections SET name = $2, updated_at = now() WHERE id = $1",
+                |q| q.bind(id).bind(name),
+            )
+            .await?
+        }
+        (None, Some(label), None, None) => {
+            raw::execute(
+                pool,
+                "UPDATE collections SET label = $2, updated_at = now() WHERE id = $1",
+                |q| q.bind(id).bind(label),
+            )
+            .await?
+        }
+        (None, None, Some(zim_ids), None) => {
+            raw::execute(
+                pool,
+                "UPDATE collections SET zim_ids = $2, updated_at = now() WHERE id = $1",
+                |q| q.bind(id).bind(zim_ids),
+            )
+            .await?
+        }
+        (None, None, None, Some(is_favorite)) => {
+            raw::execute(
+                pool,
+                "UPDATE collections SET is_favorite = $2, updated_at = now() WHERE id = $1",
+                |q| q.bind(id).bind(is_favorite),
+            )
+            .await?
+        }
+        (Some(name), Some(label), None, None) => {
+            raw::execute(
+                pool,
+                "UPDATE collections SET name = $2, label = $3, updated_at = now() WHERE id = $1",
+                |q| q.bind(id).bind(name).bind(label),
+            )
+            .await?
+        }
+        (Some(name), None, Some(zim_ids), None) => {
+            raw::execute(
+                pool,
+                "UPDATE collections SET name = $2, zim_ids = $3, updated_at = now() WHERE id = $1",
+                |q| q.bind(id).bind(name).bind(zim_ids),
+            )
+            .await?
+        }
         (Some(name), None, None, Some(is_favorite)) => raw::execute(
             pool,
             "UPDATE collections SET name = $2, is_favorite = $3, updated_at = now() WHERE id = $1",
             |q| q.bind(id).bind(name).bind(is_favorite),
         )
         .await?,
-        (None, Some(label), Some(zim_ids), None) => raw::execute(
-            pool,
-            "UPDATE collections SET label = $2, zim_ids = $3, updated_at = now() WHERE id = $1",
-            |q| q.bind(id).bind(label).bind(zim_ids),
-        )
-        .await?,
+        (None, Some(label), Some(zim_ids), None) => {
+            raw::execute(
+                pool,
+                "UPDATE collections SET label = $2, zim_ids = $3, updated_at = now() WHERE id = $1",
+                |q| q.bind(id).bind(label).bind(zim_ids),
+            )
+            .await?
+        }
         (None, Some(label), None, Some(is_favorite)) => raw::execute(
             pool,
             "UPDATE collections SET label = $2, is_favorite = $3, updated_at = now() WHERE id = $1",
@@ -208,40 +228,56 @@ pub async fn update_collection(
         .await?,
         (None, None, Some(zim_ids), Some(is_favorite)) => raw::execute(
             pool,
-            "UPDATE collections SET zim_ids = $2, is_favorite = $3, updated_at = now() WHERE id = $1",
+            "UPDATE collections SET zim_ids = $2, is_favorite = $3, updated_at = now() WHERE id = \
+            $1",
             |q| q.bind(id).bind(zim_ids).bind(is_favorite),
         )
         .await?,
         (Some(name), Some(label), Some(zim_ids), None) => raw::execute(
             pool,
-            "UPDATE collections SET name = $2, label = $3, zim_ids = $4, updated_at = now() WHERE id = $1",
+            "UPDATE collections SET name = $2, label = $3, zim_ids = $4, updated_at = now() WHERE \
+            id = $1",
             |q| q.bind(id).bind(name).bind(label).bind(zim_ids),
         )
         .await?,
         (Some(name), Some(label), None, Some(is_favorite)) => raw::execute(
             pool,
-            "UPDATE collections SET name = $2, label = $3, is_favorite = $4, updated_at = now() WHERE id = $1",
+            "UPDATE collections SET name = $2, label = $3, is_favorite = $4, updated_at = now() \
+            WHERE id = $1",
             |q| q.bind(id).bind(name).bind(label).bind(is_favorite),
         )
         .await?,
         (Some(name), None, Some(zim_ids), Some(is_favorite)) => raw::execute(
             pool,
-            "UPDATE collections SET name = $2, zim_ids = $3, is_favorite = $4, updated_at = now() WHERE id = $1",
+            "UPDATE collections SET name = $2, zim_ids = $3, is_favorite = $4, updated_at = now() \
+            WHERE id = $1",
             |q| q.bind(id).bind(name).bind(zim_ids).bind(is_favorite),
         )
         .await?,
-        (None, Some(label), Some(zim_ids), Some(is_favorite)) => raw::execute(
-            pool,
-            "UPDATE collections SET label = $2, zim_ids = $3, is_favorite = $4, updated_at = now() WHERE id = $1",
-            |q| q.bind(id).bind(label).bind(zim_ids).bind(is_favorite),
-        )
-        .await?,
-        (Some(name), Some(label), Some(zim_ids), Some(is_favorite)) => raw::execute(
-            pool,
-            "UPDATE collections SET name = $2, label = $3, zim_ids = $4, is_favorite = $5, updated_at = now() WHERE id = $1",
-            |q| q.bind(id).bind(name).bind(label).bind(zim_ids).bind(is_favorite),
-        )
-        .await?,
+        (None, Some(label), Some(zim_ids), Some(is_favorite)) => {
+            raw::execute(
+                pool,
+                "UPDATE collections SET label = $2, zim_ids = $3, is_favorite = $4, updated_at = \
+            now() WHERE id = $1",
+                |q| q.bind(id).bind(label).bind(zim_ids).bind(is_favorite),
+            )
+            .await?
+        }
+        (Some(name), Some(label), Some(zim_ids), Some(is_favorite)) => {
+            raw::execute(
+                pool,
+                "UPDATE collections SET name = $2, label = $3, zim_ids = $4, is_favorite = $5, \
+            updated_at = now() WHERE id = $1",
+                |q| {
+                    q.bind(id)
+                        .bind(name)
+                        .bind(label)
+                        .bind(zim_ids)
+                        .bind(is_favorite)
+                },
+            )
+            .await?
+        }
     };
     Ok(if updated > 0 {
         UpdateOutcome::Updated

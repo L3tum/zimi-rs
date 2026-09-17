@@ -193,7 +193,8 @@ fn score_query(
 ) -> SqlQuery {
     let (zim, lang) = filters;
     let sql = format!(
-        "SELECT {SELECT_ARTICLE_COLS}, a.snippet{SELECT_ARTICLE_TAIL}, {weight} * {score_expr} as score FROM articles a JOIN zims z ON z.id = a.zim_id WHERE {where_clause}"
+        "SELECT {SELECT_ARTICLE_COLS}, a.snippet{SELECT_ARTICLE_TAIL}, {weight} * {score_expr} \
+         as score FROM articles a JOIN zims z ON z.id = a.zim_id WHERE {where_clause}"
     );
     let mut sq = SqlQuery { sql, params };
     push_filters(&mut sq, zim, lang, order_by, limit);
@@ -228,7 +229,8 @@ pub fn fts_sql(
     // `similarity(a.title_lower, $1)` is per-row, not a per-query constant, so
     // it cannot be hoisted at all.)
     let snippet_col = if highlight {
-        "coalesce(ts_headline('simple', a.content_preview, tsq.q, 'StartSel=<b>', 'StopSel=</b>', 'MaxFragments=1', 'MaxWords=30', 'MinWords=10'), a.snippet)"
+        "coalesce(ts_headline('simple', a.content_preview, tsq.q, 'StartSel=<b>', 'StopSel=</b>', \
+         'MaxFragments=1', 'MaxWords=30', 'MinWords=10'), a.snippet)"
     } else {
         "a.snippet"
     };
@@ -256,7 +258,12 @@ pub fn fts_sql(
 ///
 /// Raw SQL: the score is pg_trgm `similarity()`, which the `db::raw`
 /// helpers cannot express (the `LIKE` filter alone would be).
-pub(super) fn trgm_prefix_sql(
+///
+/// `pub` (not `pub(super)`): the query-plan regression gate in
+/// `tests/integration/trgm_plan.rs` EXPLAINs this exact arm SQL against a
+/// 100k-row temp DB — it must build the arm the same way `run` does, not
+/// re-transcribe the SQL by hand (drift would make the gate meaningless).
+pub fn trgm_prefix_sql(
     query_lower: &str,
     zim: Option<&str>,
     lang: Option<&str>,

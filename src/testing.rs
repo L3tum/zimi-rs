@@ -7,8 +7,9 @@
 //! bare `cargo test` spawns. `cargo test` runs the lib and integration
 //! binaries as parallel *processes*, so without the lockfile two processes
 //! could interleave their migrations + fixture writes against the same dev
-//! DB (e.g. two binaries seeding their fixture ZIMs at once). The lockfile is std-only (no `flock` crate) and
-//! portable: it claims a file via atomic `create_new` (`O_CREAT|O_EXCL` on
+//! DB (e.g. two binaries seeding their fixture ZIMs at once). The lockfile is
+//! std-only (no `flock` crate) and portable: it claims a file via atomic
+//! `create_new` (`O_CREAT|O_EXCL` on
 //! Unix, `CREATE_NEW` on Windows) and, on conflict, waits or steals it only
 //! if it is stale (mtime older than the timeout), which self-heals a lock
 //! left behind by a killed process. The `0o600` mode bits are applied on
@@ -25,7 +26,9 @@
 //! `DbExclusiveGuard::acquire()` **blocks** (rather than panicking) when
 //! another DB test — in this binary *or* another process — still holds the
 //! slot, so the suite is safe to run with the default parallel
-//! `--test-threads`.
+//! `--test-threads`. A same-pid holder past [`SAME_PID_HOLD_DEADLINE`] is
+//! wedged (a query on a half-open connection), and waiters then fail loud
+//! instead of hanging the suite silently (see the const's doc).
 //!
 //! Same-pid rule: the heartbeat makes the lockfile always fresh while a live
 //! holder holds it, so the staleness-based steal can no longer fire against
@@ -33,14 +36,18 @@
 //! after the timeout is the intended loud failure), but within one binary a
 //! holder in this very process (a parallel DB test in this binary holding
 //! the in-process slot) must not be treated as a foreign process: if the
-//! lockfile's recorded PID equals this process's PID, waiters keep polling
-//! without a deadline — the in-process flag is released by the holder's
-//! `Drop`, so this cannot deadlock anything that previously resolved. The guard deliberately does not hold a `MutexGuard`
+//! lockfile's recorded PID equals this process's PID, waiters keep polling,
+//! bounded by [`SAME_PID_HOLD_DEADLINE`] — the in-process flag is released
+//! by the holder's `Drop`, so a bounded wait cannot deadlock anything that
+//! previously resolved; a same-pid holder past the deadline is treated as
+//! wedged and waiters fail loud (see the const's doc). The
+//! guard deliberately does not hold a `MutexGuard`
 //! across `.await` (which would trip `clippy::await_holding_lock`): it only
 //! briefly holds the mutex to flip a process-level "held" flag. The
 //! cross-process `File` is an open descriptor, not a lock, so it is also safe
 //! to hold across `.await`.
-// LINT-3 (2026-09 sweep): test-support scaffolding — lazy dead-pool connect and fallback runtime build are intentional infallible panics; keeps the 19 expects unnoisy.
+// LINT-3 (2026-09 sweep): test-support scaffolding — lazy dead-pool connect
+// and fallback runtime build are intentional infallible panics; keeps the 19 expects unnoisy.
 #![allow(clippy::expect_used)]
 use std::sync::{Condvar, Mutex};
 
@@ -249,6 +256,17 @@ static DB_CV: Condvar = Condvar::new();
 /// sound only because a live holder keeps refreshing — see
 /// [`HEARTBEAT_INTERVAL`].
 const CROSS_PROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Hard deadline for a **same-pid** slot holder (the cross-process same-pid
+/// wait; the in-process wait is strictly behind it, so it is covered too).
+/// The suite's longest DB test (the 100k-row trgm plan gate) finishes in
+/// well under a minute, so a same-pid holder past this is wedged —
+/// typically an in-flight query on a half-open TCP connection whose peer
+/// vanished without a FIN (a read with nothing outstanding has no
+/// retransmit to fail, so it blocks forever). Without this bound the
+/// waiters poll forever and the whole suite hangs silently (2026-09: a
+/// remote-DB network flush wedged a run for 7+ hours); with it, waiters
+/// fail loud and the wedge is visible instead of invisible.
+const SAME_PID_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 /// Poll interval while waiting for another process to release the lock.
 const CROSS_PROCESS_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// How often a live holder refreshes the lockfile's mtime. Must stay well
@@ -296,14 +314,17 @@ fn cross_process_lock_path() -> std::path::PathBuf {
 /// never fire against it, and treating it as a foreign process would
 /// deadline-out (`DbExclusiveGuard::acquire` panics) exactly the case this
 /// module promises to block on. A same-pid holder is therefore waited out
-/// indefinitely (poll interval unchanged); its in-process flag is released
-/// by `Drop`, so this cannot deadlock a case that previously resolved. A
+/// up to [`SAME_PID_HOLD_DEADLINE`] (a same-pid holder that long is wedged,
+/// not merely slow — see that const's doc); its in-process flag is released
+/// by `Drop`, so the deadline cannot fire against a holder that would have
+/// resolved anyway. A
 /// different pid — or an unparseable/empty lockfile (treated as different
 /// pid) — keeps the deadline + steal behavior.
 fn acquire_cross_process(timeout: std::time::Duration) -> std::io::Result<std::fs::File> {
     use std::io::Write;
     let path = cross_process_lock_path();
     let deadline = std::time::Instant::now() + timeout;
+    let started = std::time::Instant::now();
     loop {
         // Builder methods take `&mut self`, so configure the options before
         // moving on; the `0o600` mode bits are Unix-only.
@@ -337,22 +358,36 @@ fn acquire_cross_process(timeout: std::time::Duration) -> std::io::Result<std::f
                 // Same-pid rule: if the holder is this process, it is a
                 // same-binary DB test holding the in-process slot (the
                 // heartbeat keeps its lockfile fresh, so the steal above
-                // cannot fire against it). Wait it out with no deadline
-                // instead of timing out; the in-process flag is released
-                // by the holder's Drop. A different pid — or an
-                // unparseable/empty file — keeps the deadline below.
+                // cannot fire against it). Wait it out — but only up to
+                // [`SAME_PID_HOLD_DEADLINE`]: a same-pid holder that long
+                // is wedged (typically a query on a half-open connection),
+                // and a loud failure beats an invisible suite hang.
                 let holder_pid = std::fs::read_to_string(&path)
                     .ok()
                     .and_then(|s| s.trim().parse::<u32>().ok());
                 let same_process_holder = holder_pid == Some(std::process::id());
-                if !same_process_holder && std::time::Instant::now() >= deadline {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
+                let wait_exceeded = if same_process_holder {
+                    started.elapsed() >= SAME_PID_HOLD_DEADLINE
+                } else {
+                    std::time::Instant::now() >= deadline
+                };
+                if wait_exceeded {
+                    let msg = if same_process_holder {
                         format!(
-                            "timed out waiting for the cross-process DB-test lock at {} \n (another `cargo test` process holds it). Run the binaries separately (e.g. `make test-integration`) or stop the other run.",
+                            "DB slot held for over {} minutes by a test in THIS process; \
+the holder is wedged (typically an in-flight query on a half-open TCP \
+connection whose peer vanished). Kill the test process and re-run.",
+                            SAME_PID_HOLD_DEADLINE.as_secs() / 60
+                        )
+                    } else {
+                        format!(
+                            "timed out waiting for the cross-process DB-test lock at {} \
+(another `cargo test` process holds it). Run the binaries separately (e.g. `make \
+test-integration`) or stop the other run.",
                             path.display()
-                        ),
-                    ));
+                        )
+                    };
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, msg));
                 }
                 std::thread::sleep(CROSS_PROCESS_POLL);
             }

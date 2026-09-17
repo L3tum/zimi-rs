@@ -126,7 +126,8 @@ pub fn has_zero_prefix_cidr(cidrs: &str) -> bool {
 /// fully-trusted peer inside the CIDR can still influence the leftmost
 /// entry — that is inherent to the operator's trust decision to list that
 /// CIDR as trusted.)
-// LINT-3 (2026-09 sweep): invariant panic (entries non-empty, checked above) — grandfathered expect_used.
+// LINT-3 (2026-09 sweep): invariant panic (entries non-empty, checked above) — grandfathered
+// expect_used.
 #[allow(clippy::expect_used)]
 pub(crate) fn client_ip_from_xff(
     cidrs: &str,

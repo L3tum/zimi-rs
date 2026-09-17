@@ -70,7 +70,8 @@ fn content_type_for(mt: &zim::MimeType) -> String {
     params(
         ("zim" = String, Query, description = "ZIM name"),
         ("path" = String, Query, description = "Article path within the ZIM"),
-        ("max_length" = Option<usize>, Query, description = "Truncate text at N chars (default 8000)")
+        ("max_length" = Option<usize>, Query, description = "Truncate text at N chars (default \
+        8000)")
     ),
     responses(
         (status = 200, description = "Article text", body = ReadResponse),
@@ -322,7 +323,8 @@ fn read_raw_entry_blocking(
         ("path" = String, Path, description = "Entry path within the ZIM (remaining path segments)")
     ),
     responses(
-        (status = 200, description = "Raw entry content with its MIME type (supports single-byte Range requests)"),
+        (status = 200, description = "Raw entry content with its MIME type (supports single-byte \
+        Range requests)"),
         (status = 206, description = "Partial content (satisfiable Range request)"),
         (status = 304, description = "Not Modified (If-None-Match revalidation)"),
         (status = 404, description = "ZIM or path not found", body = ErrorResponse),
@@ -514,7 +516,8 @@ pub struct ChunksQuery {
         ("zim" = String, Query, description = "ZIM name"),
         ("path" = String, Query, description = "Article path within the ZIM"),
         ("size" = Option<usize>, Query, description = "Chunk size in chars (default 1000)"),
-        ("overlap" = Option<usize>, Query, description = "Overlap between chunks in chars (default 200)")
+        ("overlap" = Option<usize>, Query, description = "Overlap between chunks in chars \
+        (default 200)")
     ),
     responses(
         (status = 200, description = "Overlapping text chunks for RAG", body = ChunksResponse),

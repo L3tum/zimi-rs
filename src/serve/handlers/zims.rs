@@ -32,6 +32,14 @@ pub struct HealthResponse {
     /// instance are invisible here until a restart. Monitors polling several
     /// instances can surface the mode from this field.
     pub multi_instance: bool,
+    /// True when this process started with `ZIMSERVICE_ALLOW_MULTI_DB=1`
+    /// (m-7 partial opt-out): the per-database advisory lock is best-effort
+    /// (a different-database deployment may share the zim_dir) while the
+    /// per-zim_dir PID lock stays enforced. The degraded single-instance
+    /// guarantee is visible here, not just in the startup log. Always
+    /// present (additive); mutually exclusive with `multi_instance` (the full
+    /// opt-out wins and suppresses both guards).
+    pub multi_db: bool,
     /// Branches with ≥ 3 consecutive failures (WI-5).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<String>,
@@ -254,6 +262,11 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
             // M1: process-level startup decision (env-var opt-out), so it is
             // read the same way `cmd_serve` reads it — no state field.
             multi_instance: crate::startup::multi_instance_allowed(),
+            // m-7: the partial opt-out is visible too (the full opt-out wins
+            // and reports `multi_instance` instead — mirroring `cmd_serve`'s
+            // `!allow_multi && config.allow_multi_db`).
+            multi_db: !crate::startup::multi_instance_allowed()
+                && crate::startup::multi_db_allowed(),
             degraded: state
                 .degradation
                 .degraded_snapshot()

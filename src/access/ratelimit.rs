@@ -183,9 +183,15 @@ fn scaled_limits(rps: u64, burst: u64) -> (u64, u64) {
 /// client). Checking costs one settings-cache read and a mutex lock per
 /// request; the limiter itself is only rebuilt on setting changes.
 /// `(rps, burst)` settings fingerprint paired with the limiter built for it.
-/// `(gen, (rps, burst), limiter)`: the settings generation at (re)build time,
-/// paired with the limits it was built for and the limiter itself.
-type LimiterSlot = (u64, (u64, u64), Arc<RateLimiter>);
+/// Struct (not the old nested `(u64, (u64, u64), Arc<…>)` tuple — the 2026-09
+/// review flagged the nested tuple): the settings generation at (re)build
+/// time, the limits it was built for, and the limiter itself.
+struct LimiterSlot {
+    gen: u64,
+    rps: u64,
+    burst: u64,
+    limiter: Arc<RateLimiter>,
+}
 
 /// Handle to the process-wide limiter: lazily builds it on first use and
 /// rebuilds it when the `access.rate_limit_*` settings change at runtime.
@@ -225,9 +231,9 @@ impl RateLimiterHandle {
         let mut guard = self.inner.lock().expect("rate limiter mutex poisoned");
         let cur_gen = settings.generation();
         match guard.as_ref() {
-            Some((slot_gen, _, limiter)) if *slot_gen == cur_gen => {
+            Some(slot) if slot.gen == cur_gen => {
                 // Fast path: generation unchanged → limits unchanged → no read.
-                limiter.clone()
+                slot.limiter.clone()
             }
             _ => {
                 let rps = settings
@@ -237,17 +243,20 @@ impl RateLimiterHandle {
                     .get_typed::<u64>(KEY_ACCESS_RATE_LIMIT_BURST)
                     .unwrap_or(200);
                 let limiter = match guard.as_ref() {
-                    Some((_, (cur_rps, cur_burst), old))
-                        if *cur_rps == rps && *cur_burst == burst =>
-                    {
+                    Some(slot) if slot.rps == rps && slot.burst == burst => {
                         // Limits unchanged (gen bumped, values same): keep the
                         // bucket, refresh the recorded generation below.
-                        old.clone()
+                        slot.limiter.clone()
                     }
-                    Some((_, _, old)) => Arc::new(RateLimiter::resized(old, rps, burst)),
+                    Some(slot) => Arc::new(RateLimiter::resized(&slot.limiter, rps, burst)),
                     None => Arc::new(RateLimiter::new(rps, burst)),
                 };
-                *guard = Some((cur_gen, (rps, burst), limiter.clone()));
+                *guard = Some(LimiterSlot {
+                    gen: cur_gen,
+                    rps,
+                    burst,
+                    limiter: limiter.clone(),
+                });
                 limiter
             }
         }

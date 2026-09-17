@@ -204,18 +204,57 @@ pub async fn auto_embed_loop(state: Arc<crate::AppState>, tick: Duration) {
                 }
             }
         }
+        // P3 (2026-09 review): pipelines for distinct ZIMs are disjoint row
+        // sets, so run them with bounded concurrency (2) instead of strictly
+        // sequentially — the initial backfill (many ZIMs, no vectors) is
+        // otherwise wall-clock-bound on the slowest single pipeline. Steady
+        // state (one ZIM left with work) still runs exactly one pipeline;
+        // the per-pipeline post-run index build funnels through the shared
+        // `build_probe` CAS + `index_building` flag, which already
+        // de-duplicates concurrent build attempts.
+        const EMBED_CONCURRENCY: usize = 2;
+        let mut set = tokio::task::JoinSet::new();
         for name in zims {
+            if set.len() >= EMBED_CONCURRENCY {
+                // Block on the oldest in-flight pipeline before starting the
+                // next one (bounded fan-out, FIFO-ish drain).
+                // LINT-3 (2026-09 sweep): checked invariant — the set is
+                // non-empty under the `set.len()` guard — grandfathered
+                // expect_used.
+                #[allow(clippy::expect_used)]
+                {
+                    let outcome = set
+                        .join_next()
+                        .await
+                        .expect("join_next before set is empty");
+                    match outcome {
+                        Ok((done, Err(e))) => {
+                            tracing::error!("auto-embed failed for '{done}': {e}")
+                        }
+                        Ok((done, Ok(()))) => {
+                            let _ = done;
+                        }
+                        Err(je) => tracing::error!("auto-embed task panicked: {je}"),
+                    }
+                }
+            }
             tracing::info!("auto-embedding ZIM '{name}'");
-            if let Err(e) = run_pipeline(
-                state.db.clone(),
-                state.settings.clone(),
-                &name,
-                &state.build_probe,
-                &state.index_building,
-            )
-            .await
-            {
-                tracing::error!("auto-embed failed for '{name}': {e}");
+            let db = state.db.clone();
+            let settings = state.settings.clone();
+            let build_probe = state.build_probe.clone();
+            let index_building = state.index_building.clone();
+            set.spawn(async move {
+                let r = run_pipeline(db, settings, &name, &build_probe, &index_building).await;
+                (name, r)
+            });
+        }
+        while let Some(outcome) = set.join_next().await {
+            match outcome {
+                Ok((done, Err(e))) => tracing::error!("auto-embed failed for '{done}': {e}"),
+                Ok((done, Ok(()))) => {
+                    let _ = done;
+                }
+                Err(je) => tracing::error!("auto-embed task panicked: {je}"),
             }
         }
     }
@@ -618,6 +657,42 @@ mod tests {
         }
     }
 
+    /// 2026-09 review round 2 (Tests): `settle_ticks` is probabilistic (5 ×
+    /// 25 ms wall clock), so a "disabled loop must not claim" negative
+    /// assertion could pass vacuously if the loop never ticked — a false
+    /// green. A disabled tick makes **no** I/O (the loop `continue`s right
+    /// after its 50 ms sleep + in-memory `embedding_enabled()` read), so the
+    /// proof is wall-clock, not DB-observable: a tokio task that has stayed
+    /// alive across ≥2 full `TEST_TICK` periods since spawn (or since the
+    /// settings write this test made) has necessarily executed its
+    /// check path at least once — the runtime polls it while this test
+    /// awaits its own timers/I-O. The liveness check also catches a
+    /// panicked/aborted loop, which would otherwise make the negative
+    /// assertions pass vacuously.
+    async fn prove_ticked(loop_task: &tokio::task::JoinHandle<()>) {
+        use std::time::Instant;
+
+        // ≥ 2 full TEST_TICK periods (200 ms for the 50 ms test tick) with
+        // 2× slack: the loop necessarily ran its check path ≥ once.
+        let deadline = Instant::now() + Duration::from_millis(TEST_TICK.as_millis() as u64 * 4);
+        loop {
+            if loop_task.is_finished() {
+                // JoinHandle (tokio 1.53) exposes no try-join, so the stored
+                // JoinError (abort or panic) isn't readable without
+                // consuming the handle — the liveness failure itself is the
+                // signal: a dead loop makes the negative assertions vacuous.
+                panic!(
+                    "loop task exited before the negative assertions — a \
+                       dead loop would make them pass vacuously"
+                );
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// (1) Recurring tick: the loop is not a one-shot — it keeps ticking on
     /// its cadence and re-evaluates its pre-conditions (`embedding_enabled`,
     /// `list_embeddable_zims`) every tick, so work that appears *after* the
@@ -717,6 +792,10 @@ mod tests {
         // Let the loop tick a few times while disabled: each tick re-reads
         // `embedding.enabled` and must skip — no claim, no HTTP.
         settle_ticks(&pool, 5).await;
+        // 2026-09 review round 2 (Tests): prove the loop actually ticked
+        // (alive across ≥2 ticks) before the negative assertions — and that
+        // it didn't die (a dead loop passes them vacuously).
+        prove_ticked(&loop_task).await;
         assert!(
             article_unclaimed(&pool, first).await.unwrap_or(false),
             "disabled loop must not claim the article"
@@ -772,6 +851,9 @@ mod tests {
         let second = seed_article(&pool, "A/phase-off2").await;
         // Let the loop tick a few times with the setting re-read as disabled.
         settle_ticks(&pool, 5).await;
+        // 2026-09 review round 2 (Tests): prove ≥1 tick after the re-disable
+        // (alive across ≥2 ticks) before the negative assertions.
+        prove_ticked(&loop_task).await;
         assert!(
             article_unclaimed(&pool, second).await.unwrap_or(false),
             "re-disabled loop must not claim new work"
@@ -874,7 +956,8 @@ mod tests {
         raw::execute(
             &pool,
             "WITH vec AS (
-                 SELECT '[' || (SELECT string_agg('0.1', ',') FROM generate_series(1, $2)) || ']' AS v
+                 SELECT '[' || (SELECT string_agg('0.1', ',') FROM generate_series(1, $2)) || ']'
+                 AS v
              )
              INSERT INTO articles (zim_id, path, title, content_preview, snippet,
                                    search_vector, embedding, embed_model)

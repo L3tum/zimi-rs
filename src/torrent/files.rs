@@ -112,7 +112,7 @@ fn remove_stale_tmps(dir: &Path, current_tmp: &Path) {
 /// Install a downloaded ZIM into `zim_dir`.
 ///
 /// - `strategy == "hardlink"`: hardlink when possible (same filesystem, no
-///   extra space used); falls back to a full copy across devices.
+///   extra space used); falls back to a buffered full copy across devices.
 /// - any other strategy (or "copy"): full copy.
 ///
 /// An existing file with the same name in `zim_dir` is replaced.
@@ -139,7 +139,7 @@ pub fn install_zim(src: &Path, zim_dir: &Path, strategy: &str) -> Result<PathBuf
         match std::fs::hard_link(src, &tmp) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-                match std::fs::copy(src, &tmp) {
+                match copy_file_buffered(src, &tmp) {
                     Ok(_) => Ok(()),
                     Err(e) => Err(Error::Io(e)),
                 }
@@ -147,7 +147,7 @@ pub fn install_zim(src: &Path, zim_dir: &Path, strategy: &str) -> Result<PathBuf
             Err(e) => Err(Error::Io(e)),
         }
     } else {
-        match std::fs::copy(src, &tmp) {
+        match copy_file_buffered(src, &tmp) {
             Ok(_) => Ok(()),
             Err(e) => Err(Error::Io(e)),
         }
@@ -162,6 +162,29 @@ pub fn install_zim(src: &Path, zim_dir: &Path, strategy: &str) -> Result<PathBuf
     Ok(dst)
 }
 
+/// Buffered file copy (1 MiB chunks). `std::fs::copy` uses a small (~8 KB)
+/// buffer — one-shot per download that is fine for the fixture copies in
+/// tests, but slow for multi-GB ZIMs (P4, 2026-09 review). Returns the
+/// number of bytes copied, matching `std::fs::copy`'s observable behavior
+/// (content only, no metadata, no sync).
+fn copy_file_buffered(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    use std::io::{Read, Write};
+    let mut f = std::fs::File::open(src)?;
+    let mut t = std::fs::File::create(dst)?;
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut copied = 0u64;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        t.write_all(&buf[..n])?;
+        copied += n as u64;
+    }
+    t.flush()?;
+    Ok(copied)
+}
+
 /// Locate the single `.zim` a completed torrent produced.
 ///
 /// qBittorrent reports `content_path` as the *first file* of the torrent:
@@ -173,7 +196,8 @@ pub fn install_zim(src: &Path, zim_dir: &Path, strategy: &str) -> Result<PathBuf
 ///   Zero → "no .zim found"; more than one → explicit rejection: a multi-
 ///   file torrent with several ZIMs is ambiguous and must not be silently
 ///   installed.
-// LINT-3 (2026-09 sweep): invariant panic (`found.len()==1` guarantees pop) — grandfathered expect_used.
+// LINT-3 (2026-09 sweep): invariant panic (`found.len()==1` guarantees pop) —
+// grandfathered expect_used.
 #[allow(clippy::expect_used)]
 pub fn locate_torrent_zim(path: &Path) -> Result<PathBuf> {
     if path.is_file() {

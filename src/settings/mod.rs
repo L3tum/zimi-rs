@@ -12,11 +12,13 @@
 //! snapshots), `cache` (`SettingsCache` itself).
 
 pub(crate) mod auth;
+mod auth_service;
 mod cache;
 mod defs;
 mod snapshots;
 
 pub use auth::{hash_admin_password, is_legacy_password, verify_admin_password};
+pub use auth_service::SettingsAuth;
 pub use cache::SettingsCache;
 pub use defs::{
     def, default_settings, is_security_sensitive, known_keys, require_reads_startup_default,

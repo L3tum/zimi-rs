@@ -20,7 +20,9 @@ use crate::embed::vector_index::{maybe_build_vector_index, VECTOR_INDEX_MIN_ROWS
 /// dimension fix (model or column) recovers them.
 pub(crate) fn dimension_mismatch_error(stored: u32, client: u32) -> Error {
     Error::Embedding(format!(
-        "embedding column is vector({stored}) but the configured model emits {client}-dim vectors; change the model back, or clear existing vectors (e.g. `UPDATE articles SET embedding = NULL`) and `ALTER TABLE articles ALTER COLUMN embedding TYPE vector({client})`"
+        "embedding column is vector({stored}) but the configured model emits {client}-dim \
+        vectors; change the model back, or clear existing vectors (e.g. `UPDATE articles SET \
+        embedding = NULL`) and `ALTER TABLE articles ALTER COLUMN embedding TYPE vector({client})`"
     ))
 }
 
@@ -60,7 +62,8 @@ pub(crate) fn bulk_update_sql(ids: &[i64]) -> Option<String> {
         .collect();
     let model_idx = ids.len() + 1;
     Some(format!(
-        "UPDATE articles a SET embedding = v.vec::vector, embed_model = ${model_idx}, embed_at = now() \
+        "UPDATE articles a SET embedding = v.vec::vector, \
+         embed_model = ${model_idx}, embed_at = now() \
          FROM (VALUES {}) AS v(id, vec) WHERE a.id = v.id",
         values.join(", ")
     ))
@@ -222,7 +225,8 @@ pub async fn run_pipeline(
                        AND embedding IS NULL \
                        AND (embed_at IS NULL OR embed_at < now() - interval '10 minutes') \
                      LIMIT $2) \
-                 RETURNING id, coalesce(snippet, '') || ' ' || coalesce(left(content_preview, 500), '')",
+                 RETURNING id, coalesce(snippet, '') || ' ' || coalesce(left(content_preview, \
+                 500), '')",
                 |q| q.bind(zim_name).bind(batch_size),
             )
             .await?

@@ -2,6 +2,8 @@
 //!
 //! Proves that the search arms against `articles` do NOT degrade to a
 //! sequential scan on a 100k-row corpus:
+//!   - the btree `LIKE 'q…%'` prefix arm — btree index on `title_lower`
+//!     (`idx_articles_title_prefix` from `migrations/001_initial.sql`),
 //!   - the trgm `LIKE '%…%'` contains arm — a trgm index on `title_lower`
 //!     (`idx_articles_title_trgm` GIN from `migrations/001_initial.sql`, or
 //!     `idx_articles_title_gist` GiST from `008_…_indexes.sql`; both operator
@@ -49,16 +51,19 @@
 //! Holds the `DbExclusiveGuard` for the shared-server `CREATE/DROP DATABASE`.
 
 use super::common::*;
-use super::migrations::{close_and_drop, create_temp_db};
-use zimservice::search::{fts_sql, trgm_contains_sql, trgm_similarity_sql, vector_sql, SqlQuery};
+use super::migrations::{close_and_drop, create_temp_db_c_collated};
+use zimservice::search::{
+    fts_sql, trgm_contains_sql, trgm_prefix_sql, trgm_similarity_sql, vector_sql, SqlQuery,
+};
 
 /// Corpus size. Deliberately 100k: below this the seq-scan-vs-index cost
 /// flip is unreliable and the gate proves little.
 const ROWS: usize = 100_000;
 
-/// 40 varied words; `quixotic` + `granite` are the probe phrase (the exact
-/// adjacent pair occurs in ~63 titles: `i ≡ 17 (mod 40)` for word 1 and
-/// `(i/40) ≡ 7 (mod 40)` for word 2 → one row per 1600).
+/// 40 varied words; `quixotic` + `granite` are the probe phrase. The exact
+/// adjacent pair occurs in 63 of the 100k titles: `i ≡ 17 (mod 40)` for word 1
+/// and `(i/40) ≡ 7 (mod 40)` for word 2 combine to `i ≡ 297 (mod 1600)`
+/// (297, 1697, … — 63 values below 100000).
 const WORDS: [&str; 40] = [
     "amber", "boulder", "canyon", "dune", "ember", "fjord", "glacier", "granite", "heath", "islet",
     "jungle", "lichen", "meadow", "niche", "oasis", "plateau", "quarry", "quixotic", "ridge",
@@ -170,22 +175,12 @@ async fn load_corpus(pool: &Pool) -> i32 {
         drop(client);
     }
 
-    // Production staging → articles upsert (tsvector computed in Postgres).
+    // Production staging → articles upsert (tsvector computed in Postgres)
+    // — the same `UPSERT_ARTICLES_FROM_STAGING_SQL` `bulk_insert` runs.
+    // (First pass: no conflicting rows, so only the INSERT arm fires here.)
     zimservice::db::raw::execute(
         pool,
-        "INSERT INTO articles (path, title, content_preview, snippet, search_vector,
-                               language, namespace, zim_id)
-         SELECT path, title, content_preview, snippet,
-                setweight(to_tsvector('simple', title), 'A')
-                || setweight(to_tsvector('simple', coalesce(content_preview, '')), 'B'),
-                language, namespace, zim_id
-         FROM articles_staging WHERE zim_id = $1
-         ON CONFLICT (zim_id, path) DO UPDATE SET
-             title = EXCLUDED.title,
-             content_preview = EXCLUDED.content_preview,
-             snippet = EXCLUDED.snippet,
-             search_vector = EXCLUDED.search_vector,
-             updated_at = now()",
+        zimservice::zim::index::UPSERT_ARTICLES_FROM_STAGING_SQL,
         |q| q.bind(zim_id),
     )
     .await
@@ -219,16 +214,17 @@ async fn load_corpus(pool: &Pool) -> i32 {
 }
 
 /// T-3: on a 100k-row `articles` corpus, every search arm must plan an
-/// index scan (GIN trgm for contains, GiST trgm for similarity, GIN
-/// tsvector for FTS, the partial ANN index for the vector top-k) — never a
-/// sequential scan of `articles`. Runs in a dedicated temp database.
+/// index scan (btree for the prefix range, GIN trgm for contains, GiST
+/// trgm for similarity, GIN tsvector for FTS, the partial ANN index for the
+/// vector top-k) — never a sequential scan of `articles`. Runs in a
+/// dedicated temp database.
 #[tokio::test]
 async fn smoke_search_arms_no_seq_scan_100k() {
     let (base_pool, _db_gate) = match pool_or_skip().await {
         Some(p) => p,
         None => return,
     };
-    let (pool, name) = match create_temp_db(&base_pool).await {
+    let (pool, name) = match create_temp_db_c_collated(&base_pool).await {
         Some(t) => t,
         None => return,
     };
@@ -238,10 +234,32 @@ async fn smoke_search_arms_no_seq_scan_100k() {
 
     load_corpus(&pool).await;
 
-    // The plan-shape assertions below are PG-16-specific: other Postgres
-    // versions may plan the same query differently (and can fail here).
+    // The plan-shape assertions below can shift across Postgres versions
+    // (cost-model changes plan the same query differently) — the gate is
+    // calibrated for CI's pgvector:pg16. The temp DB is created with an
+    // explicit **C collation** (see `create_temp_db_c_collated`): the btree
+    // prefix arm asserts below needs it — a plain btree serves `LIKE
+    // 'prefix%'` only under the C collation, and a locale-collated temp DB
+    // would fail this gate for collation reasons, not plan-shape reasons.
 
-    // (1) Contains arm — `title_lower LIKE '%quixotic granite%'`, served by
+    // (1) Prefix arm — `title_lower LIKE 'quixotic granite%'`, served by
+    // the btree index (idx_articles_title_prefix). The phrase occurs as a
+    // title *prefix* in exactly 63 of 100k titles (`i ≡ 297 (mod 1600)`),
+    // selective enough that the btree prefix range wins over a seq scan.
+    // (Tests m1, 2026-09 review: the gate was missing this arm.)
+    let prefix = trgm_prefix_sql(PROBE, None, None, 100, 1.0);
+    let plan = explain_plan(&pool, &prefix).await;
+    assert!(
+        !plan.contains("Seq Scan on articles"),
+        "trgm prefix arm must NOT degrade to a sequential scan on a \
+         100k-row corpus:\n{plan}"
+    );
+    assert!(
+        plan.contains("idx_articles_title_prefix"),
+        "trgm prefix arm should use the btree index on title_lower:\n{plan}"
+    );
+
+    // (2) Contains arm — `title_lower LIKE '%quixotic granite%'`, served by
     // the GIN trgm index (idx_articles_title_trgm).
     let contains = trgm_contains_sql(PROBE, None, None, 100, 1.0);
     let plan = explain_plan(&pool, &contains).await;
@@ -259,7 +277,7 @@ async fn smoke_search_arms_no_seq_scan_100k() {
         "trgm contains arm should use a trgm index on title_lower (GIN or GiST):\n{plan}"
     );
 
-    // (2) Similarity arm — `title_lower % … AND similarity(…) > 0.3`,
+    // (3) Similarity arm — `title_lower % … AND similarity(…) > 0.3`,
     // served by the GiST trgm index (idx_articles_title_gist).
     let similarity = trgm_similarity_sql(PROBE, 0.3, None, None, 100, 1.0);
     let plan = explain_plan(&pool, &similarity).await;
@@ -275,7 +293,7 @@ async fn smoke_search_arms_no_seq_scan_100k() {
         "trgm similarity arm should use a trgm index on title_lower (GIN or GiST):\n{plan}"
     );
 
-    // (3) FTS arm — `a.search_vector @@ websearch_to_tsquery('simple', $1)`
+    // (4) FTS arm — `a.search_vector @@ websearch_to_tsquery('simple', $1)`
     // (websearch: the probe's two words are ANDed, not a phrase), served
     // by the GIN tsvector index (idx_articles_fts). The pair occurs in
     // only a few hundred of 100k titles, so the index is overwhelmingly
@@ -293,7 +311,7 @@ async fn smoke_search_arms_no_seq_scan_100k() {
         "FTS arm should use the GIN tsvector index on search_vector:\n{plan}"
     );
 
-    // (4) Vector arm — `ORDER BY a.embedding <=> $1::vector LIMIT k`
+    // (5) Vector arm — `ORDER BY a.embedding <=> $1::vector LIMIT k`
     // top-k seek, served by the partial ANN index (idx_articles_embedding,
     // `WHERE embedding IS NOT NULL` — HNSW below the 1M-vector threshold,
     // see migrations/010). The probe is a 1536-dim one-hot literal, cast

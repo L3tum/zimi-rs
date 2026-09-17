@@ -168,6 +168,19 @@ jobs:
           DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
           cargo llvm-cov --lib --bins --test wiremock --test integration \
             --fail-under-lines "$(cat .github/coverage_floor.txt)"
+  # RUSTSEC audit (2026-09 review, Sec): fail CI on known-vulnerable
+  # dependencies. Binary-based action (no toolchain step) — reads
+  # `Cargo.lock` only. The lock file was inspected clean in the review; this
+  # pins that against future `cargo update` drift. Track the external `zim`
+  # 0.5 crate's robustness against malformed archives separately (most
+  # likely future code-execution-adjacent risk; RUSTSEC can't see it).
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
   # Docker image build gate: catch the toolchain (H1) and build-context
   # (H2) regressions that only surface during an actual image build.
   docker:

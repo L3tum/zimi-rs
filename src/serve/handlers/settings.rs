@@ -312,7 +312,8 @@ fn collection_from_row(
     get,
     path = "/collections",
     responses(
-        (status = 200, description = "User collections with resolved ZIM names", body = ListCollectionsResponse),
+        (status = 200, description = "User collections with resolved ZIM \
+        names", body = ListCollectionsResponse),
         (status = 500, description = "Internal error", body = ErrorResponse)
     )
 )]

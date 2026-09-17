@@ -14,8 +14,9 @@ type DownloadStatsRow = (
 );
 
 // ── T7: DB-backed MCP happy paths ─────────────────────────────────────────
-// One test per tool asserting the success envelope shape and a non-empty
-// result against the seeded fixture ZIM. Skipped when DB unreachable.
+// All nine tools driven against the seeded fixture ZIM, asserting the
+// success envelope shape and a non-empty result. Skipped when DB
+// unreachable.
 #[tokio::test]
 async fn mcp_tools_db_backed() {
     let (pool, _db_gate) = match pool_or_skip().await {
@@ -26,45 +27,106 @@ async fn mcp_tools_db_backed() {
 
     // Dedicated fixture ZIM so this test's inserts/deletes can't collide with
     // `smoke_search_suggest_random_on_seed`'s `__itest__` rows (suite runs
-    // single-threaded, but the fixtures must still be disjoint).
+    // single-threaded, but the fixtures must still be disjoint). The ZIM is a
+    // copy of the committed `tiny.zim` under a temp dir: `resync` populates
+    // the in-memory cache + zims row, so the ZIM-first read tools (`read`,
+    // `get_chunks`, `deep_search` auto-read) hit a REAL readable archive.
     const ZIM: &str = "__itest_mcp__";
+    const ZIM_DE: &str = "__itest_mcp_de__";
+    const COLL: &str = "__itest_mcp_coll__";
+    let tmp = std::env::temp_dir().join(format!("zimservice-mcp-itest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp fixture dir");
+    std::fs::copy(
+        std::path::Path::new(FIXTURES_DIR).join("tiny.zim"),
+        tmp.join(format!("{ZIM}.zim")),
+    )
+    .expect("copy fixture ZIM");
 
-    // Seed fixture ZIM + articles.
+    zimservice::db::raw::execute(&pool, "DELETE FROM collections WHERE name = $1", |q| {
+        q.bind(COLL)
+    })
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name IN ($1, $2)", |q| {
+        q.bind(ZIM).bind(ZIM_DE)
+    })
+    .await
+    .unwrap();
+
+    let zims = ZimManager::new(tmp.clone(), pool.clone());
+    zims.resync().await.expect("resync of the temp fixture dir");
+    assert!(
+        zims.get(ZIM).is_some(),
+        "resync must cache the fixture ZIM {ZIM}"
+    );
+
+    // Seed article rows (after the resync'd zims row exists). The first
+    // article uses the fixture archive's real entry path `main.html` so the
+    // ZIM-first read tools return live archive content; a (de-) ZIM shares
+    // Q-ID 42 with it for the cross-language tool.
     {
-        zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+        for (path, title, preview, vec_) in [
+            (
+                "main.html",
+                "Alpine",
+                "The Alps are mountains.",
+                "alpine peaks europe",
+            ),
+            (
+                "A/Baltic",
+                "Baltic Sea",
+                "The Baltic is a sea.",
+                "baltic sea",
+            ),
+            (
+                "A/Andes",
+                "Andes",
+                "The Andes are mountains in South America.",
+                "andes mountains south america",
+            ),
+        ] {
+            zimservice::db::raw::execute(
+                &pool,
+                "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) \
+                 VALUES ((SELECT id FROM zims WHERE name = $1), $2, $3, $4, to_tsvector('simple', \
+                 $5))",
+                |q| q.bind(ZIM).bind(path).bind(title).bind(preview).bind(vec_),
+            )
             .await
             .unwrap();
+        }
         zimservice::db::raw::execute(
             &pool,
-            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
-                               index_status, indexed_entries, article_count)
-             VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
-            |q| q.bind(ZIM),
+            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime, language,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'de', 'ready', 1, 1)",
+            |q| q.bind(ZIM_DE),
         )
         .await
         .unwrap();
-        // One statement per execute (sqlx has no multi-statement protocol
-        // call; `split_statements` replaces the old `batch_execute`).
-        for stmt in zimservice::db::raw::split_statements(&format!(
-            "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES
-             ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpine', 'Alpine',
-              'The Alps are mountains.', to_tsvector('simple','alpine peaks europe')),
-             ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Baltic', 'Baltic Sea',
-              'The Baltic is a sea.', to_tsvector('simple','baltic sea')),
-             ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Andes', 'Andes',
-              'The Andes are mountains in South America.',
-              to_tsvector('simple','andes mountains south america'))"
-        )) {
-            zimservice::db::raw::execute(&pool, &stmt, |q| q)
-                .await
-                .unwrap();
-        }
+        zimservice::db::raw::execute(
+            &pool,
+            "INSERT INTO qid_index (zim_id, path, qid) VALUES 
+             ((SELECT id FROM zims WHERE name = $1), 'main.html', 42), 
+             ((SELECT id FROM zims WHERE name = $2), 'A/Alpen', 42)",
+            |q| q.bind(ZIM).bind(ZIM_DE),
+        )
+        .await
+        .unwrap();
+        zimservice::db::raw::execute(
+            &pool,
+            "INSERT INTO collections (name, label, zim_ids, is_favorite) \
+             VALUES ($1, $2, ARRAY[(SELECT id FROM zims WHERE name = $3)], true)",
+            |q| q.bind(COLL).bind("MCP fixture collection").bind(ZIM),
+        )
+        .await
+        .unwrap();
     }
 
     let settings = SettingsCache::load(pool.clone(), HashMap::new(), HashMap::new())
         .await
         .expect("settings load");
-    let zims = ZimManager::new(std::path::PathBuf::from("/nonexistent-mcp"), pool.clone());
     let search = SearchEngine::new(
         pool.clone(),
         settings.clone(),
@@ -134,10 +196,103 @@ async fn mcp_tools_db_backed() {
         "list_sources payload is {{sources: [...]}}"
     );
 
+    // 5. read → live archive content (ZIM-first; no DB fallback involved).
+    let res = zimservice::testing::mcp_call_tool(
+        &state,
+        "read",
+        &serde_json::json!({"zim": ZIM, "path": "main.html"}),
+    )
+    .await
+    .expect("mcp read");
+    let text = res["content"][0]["text"].as_str().unwrap();
+    let body: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(body["path"], "main.html");
+    assert!(
+        body["content"]
+            .as_str()
+            .is_some_and(|s| !s.trim().is_empty()),
+        "read must return live archive text: {body}"
+    );
+
+    // 6. get_chunks → RAG-ready chunks of the same article.
+    let res = zimservice::testing::mcp_call_tool(
+        &state,
+        "get_chunks",
+        &serde_json::json!({"zim": ZIM, "path": "main.html", "size": 200, "overlap": 20}),
+    )
+    .await
+    .expect("mcp get_chunks");
+    let body: serde_json::Value =
+        serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(
+        body["chunk_count"].as_u64().is_some_and(|n| n >= 1),
+        "get_chunks must yield at least one chunk: {body}"
+    );
+    assert!(body["chunks"].is_array());
+
+    // 7. deep_search → search + auto-read of the top results.
+    let res = zimservice::testing::mcp_call_tool(
+        &state,
+        "deep_search",
+        &serde_json::json!({"query": "alpine", "zim": ZIM}),
+    )
+    .await
+    .expect("mcp deep_search");
+    let body: serde_json::Value =
+        serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(
+        body["count"].as_u64().is_some_and(|n| n >= 1),
+        "deep_search must return at least one article: {body}"
+    );
+    assert_eq!(body["articles"][0]["path"], "main.html");
+    assert!(
+        body["articles"][0]["content"]
+            .as_str()
+            .is_some_and(|s| !s.trim().is_empty()),
+        "deep_search must auto-read the top article: {body}"
+    );
+
+    // 8. article_languages → cross-language hits via the Q-ID index.
+    let res = zimservice::testing::mcp_call_tool(
+        &state,
+        "article_languages",
+        &serde_json::json!({"zim": ZIM, "path": "main.html"}),
+    )
+    .await
+    .expect("mcp article_languages");
+    let body: serde_json::Value =
+        serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["qid"], "Q42");
+    let langs = body["languages"].as_array().expect("languages array");
+    assert_eq!(langs.len(), 1, "exactly one other-language hit: {body}");
+    assert_eq!(langs[0]["zim"], ZIM_DE);
+    assert_eq!(langs[0]["path"], "A/Alpen");
+
+    // 9. list_collections → JSON-string envelope with the seeded collection.
+    let res =
+        zimservice::testing::mcp_call_tool(&state, "list_collections", &serde_json::json!({}))
+            .await
+            .expect("mcp list_collections");
+    let body: serde_json::Value =
+        serde_json::from_str(res["content"][0]["text"].as_str().unwrap()).unwrap();
+    let colls = body["collections"].as_array().expect("collections array");
+    assert!(
+        colls.iter().any(|c| c["name"] == COLL),
+        "list_collections must include the seeded collection: {body}"
+    );
+
     // Cleanup.
-    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
-        .await
-        .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM collections WHERE name = $1", |q| {
+        q.bind(COLL)
+    })
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name IN ($1, $2)", |q| {
+        q.bind(ZIM).bind(ZIM_DE)
+    })
+    .await
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 // ── T8: SettingsCache update success path ─────────────────────────────────
@@ -164,7 +319,8 @@ async fn put_settings_unauthenticated_response_redacts_topology() {
     .flatten();
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO settings (key, value) VALUES ('torrent.url', $1)\n             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        "INSERT INTO settings (key, value) VALUES ('torrent.url', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         |q| q.bind(serde_json::json!("http://qb-host:8080")),
     )
     .await
@@ -310,18 +466,35 @@ async fn random_article_respects_zim_filter() {
     for name in [ZIM_A, ZIM_B] {
         zimservice::db::raw::execute(
             &pool,
-            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                               index_status, indexed_entries, article_count)\n             VALUES ($1, $1, $1, 0, now(), 'ready', 5, 5)",
+            "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                               index_status, indexed_entries, article_count)
+             VALUES ($1, $1, $1, 0, now(), 'ready', 5, 5)",
             |q| q.bind(name),
         )
         .await
         .unwrap();
-        for stmt in zimservice::db::raw::split_statements(&format!(
-            "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a1', 'Rand {name} 1', 'x', to_tsvector('simple','rand')),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a2', 'Rand {name} 2', 'x', to_tsvector('simple','rand')),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a3', 'Rand {name} 3', 'x', to_tsvector('simple','rand')),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a4', 'Rand {name} 4', 'x', to_tsvector('simple','rand')),\n             ((SELECT id FROM zims WHERE name='{name}'), 'A/a5', 'Rand {name} 5', 'x', to_tsvector('simple','rand'))"
-        )) {
-            zimservice::db::raw::execute(&pool, &stmt, |q| q)
-                .await
-                .unwrap();
-        }
+        // Single no-bind execute: Postgres splits the script server-side
+        // (simple query protocol) — the same path the migration runner uses.
+        zimservice::db::raw::execute(
+            &pool,
+            &format!(
+                "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) \
+            VALUES
+             ((SELECT id FROM zims WHERE name='{name}'), 'A/a1', 'Rand {name} 1', 'x', \
+            to_tsvector('simple','rand')),
+             ((SELECT id FROM zims WHERE name='{name}'), 'A/a2', 'Rand {name} 2', 'x', \
+            to_tsvector('simple','rand')),
+             ((SELECT id FROM zims WHERE name='{name}'), 'A/a3', 'Rand {name} 3', 'x', \
+            to_tsvector('simple','rand')),
+             ((SELECT id FROM zims WHERE name='{name}'), 'A/a4', 'Rand {name} 4', 'x', \
+            to_tsvector('simple','rand')),
+             ((SELECT id FROM zims WHERE name='{name}'), 'A/a5', 'Rand {name} 5', 'x', \
+            to_tsvector('simple','rand'))"
+            ),
+            |q| q,
+        )
+        .await
+        .unwrap();
     }
     // Sanity: ZIM_B articles exist, so an unfiltered seek would find them.
     {
@@ -370,7 +543,9 @@ async fn random_article_respects_zim_filter() {
         };
         let exists: bool = zimservice::db::raw::fetch_scalar_optional(
             &pool,
-            "SELECT EXISTS (SELECT 1 FROM articles a\n                 JOIN zims z ON z.id = a.zim_id\n                 WHERE a.id = $1 AND z.name = $2)",
+            "SELECT EXISTS (SELECT 1 FROM articles a
+                 JOIN zims z ON z.id = a.zim_id
+                 WHERE a.id = $1 AND z.name = $2)",
             |q| q.bind(art.id).bind(art.zim.as_str()),
         )
         .await
@@ -419,7 +594,9 @@ async fn direct_zim_fragment() {
         .unwrap();
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 3, 3)",
         |q| q.bind(ZIM),
     )
     .await
@@ -507,7 +684,8 @@ async fn enqueue_rejects_same_name_active_row() {
         .unwrap();
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO downloads (name, url, status) VALUES ('itest_dup.zim', 'http://testhost:1/done.zim', 'complete')",
+        "INSERT INTO downloads (name, url, status) VALUES ('itest_dup.zim', \
+        'http://testhost:1/done.zim', 'complete')",
         |q| q,
     )
     .await
@@ -844,16 +1022,26 @@ async fn collections_crud() {
     };
     run_migrations(&pool).await.expect("migrations");
     const NAME: &str = "__itest_coll__";
+    const NAME2: &str = "__itest_coll2__";
     const LABEL: &str = "ITest Coll";
-    zimservice::db::raw::execute(&pool, "DELETE FROM collections WHERE name = $1", |q| {
-        q.bind(NAME)
+    const MEMBER: &str = "__itest_coll_member__";
+    zimservice::db::raw::execute(
+        &pool,
+        "DELETE FROM collections WHERE name IN ($1, $2)",
+        |q| q.bind(NAME).bind(NAME2),
+    )
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| {
+        q.bind(MEMBER)
     })
     .await
     .unwrap();
 
     let state = live_state(pool.clone()).await;
     use zimservice::serve::handlers::{
-        create_collection, delete_collection, list_collections, CreateCollectionBody,
+        create_collection, delete_collection, list_collections, update_collection,
+        CreateCollectionBody, UpdateCollectionBody,
     };
 
     // Create.
@@ -898,9 +1086,221 @@ async fn collections_crud() {
     assert!(
         matches!(
             dup,
-            zimservice::error::Error::Conflict(ref m) if m == "collection '__itest_coll__' already exists"
+            zimservice::error::Error::Conflict(ref m) if m == "collection '__itest_coll__' \
+            already exists"
         ),
         "expected a duplicate-name Conflict, got: {dup:?}"
+    );
+
+    // H1 (2026-09 review): PUT /collections/{id} — the DB layer dispatches
+    // over 16 combinations of 4 optional fields; exercise single-field and
+    // multi-field round-trips, duplicate-name 23505, unknown-id 404 and the
+    // empty-body 400 so a bind-order or SQL typo in any arm is visible.
+    const MEMBER_ZIM_SQL: &str = "INSERT INTO zims (name, display_title, file_path, file_size, \
+    file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)";
+
+    // Single-field: label only (name must be untouched).
+    let _ = update_collection(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id),
+        axum::Json(UpdateCollectionBody {
+            name: None,
+            label: Some("It L2".into()),
+            zim_names: None,
+            is_favorite: None,
+        }),
+    )
+    .await
+    .expect("put label only");
+    let c = get_collection(&state, id).await;
+    assert_eq!(c.label, "It L2", "label-only update sets label");
+    assert_eq!(c.name, NAME, "label-only update must not touch name");
+
+    // Single-field: is_favorite only.
+    let _ = update_collection(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id),
+        axum::Json(UpdateCollectionBody {
+            name: None,
+            label: None,
+            zim_names: None,
+            is_favorite: Some(true),
+        }),
+    )
+    .await
+    .expect("put favorite only");
+    assert!(
+        get_collection(&state, id).await.is_favorite,
+        "favorite-only update sets flag"
+    );
+    assert_eq!(
+        get_collection(&state, id).await.label,
+        "It L2",
+        "favorite-only keeps label"
+    );
+
+    // Single-field: zim_names only (member ZIM row seeded).
+    zimservice::db::raw::execute(&pool, MEMBER_ZIM_SQL, |q| q.bind(MEMBER))
+        .await
+        .unwrap();
+    // Mirror startup: the handler resolves zim names against the in-memory
+    // registry (not the DB), and `live_state`'s manager starts empty —
+    // reload it from the DB so the freshly seeded member is resolvable.
+    state
+        .zims
+        .load_from_db()
+        .await
+        .expect("load_from_db after seeding the member");
+    let _ = update_collection(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id),
+        axum::Json(UpdateCollectionBody {
+            name: None,
+            label: None,
+            zim_names: Some(vec![MEMBER.into()]),
+            is_favorite: None,
+        }),
+    )
+    .await
+    .expect("put zim_names only");
+    let c = get_collection(&state, id).await;
+    assert_eq!(
+        c.zim_names,
+        vec![MEMBER.to_string()],
+        "zim-only update replaces members"
+    );
+
+    // Single-field: name only.
+    let _ = update_collection(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id),
+        axum::Json(UpdateCollectionBody {
+            name: Some(NAME2.into()),
+            label: None,
+            zim_names: None,
+            is_favorite: None,
+        }),
+    )
+    .await
+    .expect("put name only");
+    let c = get_collection(&state, id).await;
+    assert_eq!(c.name, NAME2, "name-only update renames");
+    assert_eq!(c.label, "It L2", "name-only update keeps label");
+
+    // Multi-field: all four at once.
+    let _ = update_collection(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id),
+        axum::Json(UpdateCollectionBody {
+            name: Some(NAME.into()),
+            label: Some("It L4".into()),
+            zim_names: Some(vec![]),
+            is_favorite: Some(false),
+        }),
+    )
+    .await
+    .expect("put all four fields");
+    let c = get_collection(&state, id).await;
+    assert_eq!(c.name, NAME);
+    assert_eq!(c.label, "It L4");
+    assert!(c.zim_names.is_empty());
+    assert!(!c.is_favorite);
+
+    // Duplicate name → 23505 (mapped to 409 at the HTTP layer). Seed a
+    // second collection to collide with.
+    let (_, _created) = create_collection(
+        axum::extract::State(state.clone()),
+        axum::extract::Json(CreateCollectionBody {
+            name: NAME2.into(),
+            label: "Other".into(),
+            zim_names: vec![],
+            is_favorite: false,
+        }),
+    )
+    .await
+    .expect("create second collection");
+    let dup = update_collection(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id),
+        axum::Json(UpdateCollectionBody {
+            name: Some(NAME2.into()),
+            label: None,
+            zim_names: None,
+            is_favorite: None,
+        }),
+    )
+    .await
+    .expect_err("rename onto an existing name must fail");
+    let sqlx_err = match &dup {
+        zimservice::error::Error::Database(e) => e,
+        other => panic!("expected a Database(23505) error, got: {other:?}"),
+    };
+    let code = sqlx_err
+        .as_database_error()
+        .and_then(|d| d.code().map(|c| c.into_owned()));
+    assert_eq!(
+        code.as_deref(),
+        Some("23505"),
+        "duplicate name must hit the unique constraint"
+    );
+
+    // Unknown id → NotFound (404).
+    let nf = update_collection(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(999_999),
+        axum::Json(UpdateCollectionBody {
+            name: None,
+            label: Some("x".into()),
+            zim_names: None,
+            is_favorite: None,
+        }),
+    )
+    .await
+    .expect_err("unknown id must not succeed");
+    assert!(
+        matches!(nf, zimservice::error::Error::NotFound(ref m) if m.contains("999999")),
+        "expected a NotFound for the unknown id, got: {nf:?}"
+    );
+
+    // Empty body → 400 (nothing to update).
+    let empty = update_collection(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id),
+        axum::Json(UpdateCollectionBody {
+            name: None,
+            label: None,
+            zim_names: None,
+            is_favorite: None,
+        }),
+    )
+    .await
+    .expect_err("all-None body must 400");
+    assert!(
+        matches!(
+            empty,
+            zimservice::error::Error::InvalidInput(ref m) if m == "nothing to update"
+        ),
+        "expected 'nothing to update', got: {empty:?}"
+    );
+
+    // Unknown member ZIM → 400.
+    let badz = update_collection(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(id),
+        axum::Json(UpdateCollectionBody {
+            name: None,
+            label: None,
+            zim_names: Some(vec!["no-such-zim-xyz".into()]),
+            is_favorite: None,
+        }),
+    )
+    .await
+    .expect_err("unknown ZIM name must 400");
+    assert!(
+        matches!(badz, zimservice::error::Error::InvalidInput(_)),
+        "expected InvalidInput for the unknown ZIM, got: {badz:?}"
     );
 
     // Delete → absent.
@@ -915,6 +1315,18 @@ async fn collections_crud() {
         !list2.collections.iter().any(|c| c.id == id),
         "deleted collection should be absent"
     );
+}
+
+/// `collections_crud` helper: fetch one collection by id from the live list.
+async fn get_collection(state: &AppState, id: i32) -> zimservice::serve::handlers::Collection {
+    let resp = zimservice::serve::handlers::list_collections(axum::extract::State(state.clone()))
+        .await
+        .expect("list");
+    let zimservice::serve::handlers::ListCollectionsResponse { collections } = resp.0;
+    collections
+        .into_iter()
+        .find(|c| c.id == id)
+        .expect("collection row")
 }
 
 /// Per-ZIM settings writes: an unknown ZIM 404s (NotFound), a live ZIM
@@ -935,7 +1347,9 @@ async fn update_zim_settings_roundtrip_and_not_found() {
         .unwrap();
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,\n                           index_status, indexed_entries, article_count)\n         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
         |q| q.bind(NAME),
     )
     .await
@@ -1042,7 +1456,8 @@ async fn update_torrent_url_batch_enables_flag_in_same_save() {
     // Hermetic start: the cached flag is false.
     zimservice::db::raw::execute(
         &pool,
-        "INSERT INTO settings (key, value) VALUES ($1, $2)\n             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        "INSERT INTO settings (key, value) VALUES ($1, $2)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         |q| q.bind(FLAG).bind(serde_json::json!(false)),
     )
     .await

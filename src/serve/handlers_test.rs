@@ -75,6 +75,14 @@ mod tests {
             crate::startup::multi_instance_allowed(),
             "the /health flag must mirror the process-level opt-out"
         );
+        // m-7: the partial opt-out is visible too (the full opt-out wins and
+        // suppresses it — mirroring `cmd_serve`'s `!allow_multi &&
+        // config.allow_multi_db`).
+        assert_eq!(
+            v["multi_db"],
+            !crate::startup::multi_instance_allowed() && crate::startup::multi_db_allowed(),
+            "the /health multi_db flag must mirror the partial opt-out"
+        );
     }
 
     /// M-A: `/health` carries an additive `index` signal — `building` is
@@ -1466,7 +1474,13 @@ mod tests {
         assert_eq!(default_download_name("https://h/a.zim?q=1"), "a.zim");
         assert_eq!(default_download_name("https://h/a#frag"), "a"); // B9: fragment stripped
         assert_eq!(default_download_name("https://h/a?q=1#f"), "a"); // both stripped
-        assert_eq!(default_download_name("https://h/a?q=1#f/sub"), "sub"); // fragment in a later seg
+        assert_eq!(
+            default_download_name(
+                "https://h/a?q=1#f/sub\
+        "
+            ),
+            "sub"
+        ); // fragment in a later seg
         assert_eq!(default_download_name("https://h/"), ""); // empty last seg
     }
 

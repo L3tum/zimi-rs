@@ -65,7 +65,8 @@ struct Checkpoint {
 /// Q-ID extraction: matches wikidata.org/wiki/Q12345 or Q12345#identifiers
 static QID_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 
-// LINT-3 (2026-09 sweep): static regex pattern is valid by construction — grandfathered expect_used.
+// LINT-3 (2026-09 sweep): static regex pattern is valid by construction — grandfathered
+// expect_used.
 #[allow(clippy::expect_used)]
 fn get_qid_regex() -> &'static regex::Regex {
     QID_RE.get_or_init(|| {
@@ -349,7 +350,8 @@ pub(crate) fn is_wikipedia(
         || name_lc.contains("wiki_")
 }
 
-// LINT-3 (2026-09 sweep): `SELECT now()::text` always returns one row — panic = DB contract violation.
+// LINT-3 (2026-09 sweep): `SELECT now()::text` always returns one row —
+// panic = DB contract violation.
 #[allow(clippy::expect_used)]
 async fn index_body(
     _zims: &Arc<ZimManager>,
@@ -627,6 +629,25 @@ fn find_article_namespace(archive: &zim::Zim) -> Result<(zim::Namespace, std::op
     Err(Error::Zim("no article namespace found in ZIM".into()))
 }
 
+/// Head prefix of `html` for the deformat strip pass (H3, 2026-09 review):
+/// the whole string when it fits, else a char-boundary-safe slice of the
+/// first `STRIP_HEAD_BYTES`. Every consumer of the stripped text reads only
+/// the head (PREVIEW_CHARS preview, FTS title + preview, snippet fallback),
+/// so capping the input is output-equivalent for the consumed span while
+/// skipping the whole-document pass on multi-MB articles.
+const STRIP_HEAD_BYTES: usize = 256 * 1024;
+
+fn strip_head(html: &str) -> &str {
+    if html.len() <= STRIP_HEAD_BYTES {
+        return html;
+    }
+    let mut end = STRIP_HEAD_BYTES;
+    while !html.is_char_boundary(end) {
+        end -= 1;
+    }
+    &html[..end]
+}
+
 /// Extract a single entry: resolve redirects, decompress, extract text.
 fn extract_entry(
     archive: &zim::Zim,
@@ -689,8 +710,18 @@ fn extract_entry(
 
     // Extract text with deformat
     let html_str = String::from_utf8_lossy(&html_bytes);
+
+    // H3 (2026-09 review): cap the strip *input* to a head prefix. Every
+    // consumer of the stripped text reads only the document head (the
+    // PREVIEW_CHARS preview, FTS title + preview, the snippet fallback), so
+    // stripping the head prefix is output-equivalent for the consumed span —
+    // while skipping the whole-document deformat pass that dominated
+    // bulk-index CPU on large Wikipedia ZIMs. The full `html_str` is retained
+    // for the Q-ID windowed scan and for Readability snippets (which only run
+    // when the html is ≤ 200 KB, i.e. below the cap).
+    let strip_input = strip_head(&html_str);
     let text = deformat::html::strip_to_text_with_options(
-        &html_str,
+        strip_input,
         &deformat::html::StripOptions::wikipedia(),
     );
 
@@ -750,7 +781,8 @@ pub(crate) fn derive_title_from_path(url: &str) -> String {
 
 /// Collapse 3+ consecutive newlines to 2. The regex is compiled once and
 /// reused (it used to be recompiled per article).
-// LINT-3 (2026-09 sweep): static regex pattern is valid by construction — grandfathered expect_used.
+// LINT-3 (2026-09 sweep): static regex pattern is valid by construction — grandfathered
+// expect_used.
 #[allow(clippy::expect_used)]
 fn collapse_newlines(text: &str) -> String {
     static NEWLINE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
@@ -870,6 +902,48 @@ fn extract_qid(html: &str) -> Option<i64> {
 
 /// Bulk insert a batch of articles using COPY to staging → upsert to main.
 ///
+/// Phase 2 of the reindex: upsert staged articles into the main table.
+///
+/// **Invariant (2026-09 review, Perf #2 regression fix):** the `DO UPDATE`
+/// arm must **always** re-stamp `updated_at = now()` — even for rows whose
+/// content is byte-identical. `finalize_zim` prunes stale rows by
+/// `updated_at < index_started_at`, so any row the upsert skips is pruned at
+/// finalize: an `IS DISTINCT FROM` guard on the content columns (the first
+/// attempt) made a fresh reindex delete every unchanged article. The guard
+/// is therefore not on the `WHERE` clause; instead the expensive parts are
+/// skipped conditionally for unchanged rows:
+///
+/// - `search_vector` keeps the stored value when identical (`CASE`), so no
+///   tsvector column rewrite and no GIN index churn;
+/// - `title`/`content_preview`/`snippet` set to the same values leave the
+///   `title_lower` btree/trgm entries untouched (Postgres skips index
+///   maintenance for unchanged values);
+/// - the heap version bump (the `updated_at` re-stamp) remains — it is what
+///   the prune boundary reads.
+///
+/// `pub` so the reindex-prune integration tests run the *production*
+/// statement (a copied fixture cannot drift from this one).
+pub const UPSERT_ARTICLES_FROM_STAGING_SQL: &str = "\
+    INSERT INTO articles (path, title, content_preview, snippet, \
+    search_vector, language, namespace, zim_id)
+    SELECT
+        path, title, content_preview, snippet,
+        setweight(to_tsvector('simple', title), 'A')
+        || setweight(to_tsvector('simple', coalesce(content_preview, '')), 'B'),
+        language, namespace, zim_id
+    FROM articles_staging
+    WHERE zim_id = $1
+    ON CONFLICT (zim_id, path) DO UPDATE SET
+        title = EXCLUDED.title,
+        content_preview = EXCLUDED.content_preview,
+        snippet = EXCLUDED.snippet,
+        search_vector = CASE
+            WHEN articles.search_vector IS DISTINCT FROM EXCLUDED.search_vector
+            THEN EXCLUDED.search_vector
+            ELSE articles.search_vector
+        END,
+        updated_at = now()";
+
 /// Phase 1 stays a **COPY** (sqlx's `PgConnection::copy_in_raw`): a
 /// per-row `INSERT` would round-trip the whole 10k-row chunk as individual
 /// bound value sets and measurably lose the bulk-load throughput the
@@ -889,7 +963,8 @@ async fn bulk_insert(
     // Phase 1: COPY to staging table.
     // Build the whole chunk's payload in one buffer and send it in a single
     // `copy.send()` — one await per 10k-row chunk instead of one per row.
-    let copy_sql = "COPY articles_staging (path, title, content_preview, snippet, language, namespace, zim_id) FROM STDIN WITH (FORMAT text)";
+    let copy_sql = "COPY articles_staging (path, title, content_preview, snippet, language, \
+    namespace, zim_id) FROM STDIN WITH (FORMAT text)";
     let mut copy = client
         .copy_in_raw(copy_sql)
         .await
@@ -919,26 +994,13 @@ async fn bulk_insert(
 
     let _rows: u64 = copy.finish().await.map_err(Error::Database)?;
 
-    // Phase 2: Upsert from staging to main table
+    // Phase 2: Upsert from staging to main table (the SQL lives in
+    // `UPSERT_ARTICLES_FROM_STAGING_SQL` so the reindex-prune integration
+    // tests pin the production statement, not a copy).
     // tsvector is computed in Postgres (guaranteed correct for 'simple' config)
-    raw::execute(
-        &mut *client,
-        "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, namespace, zim_id)
-        SELECT
-            path, title, content_preview, snippet,
-            setweight(to_tsvector('simple', title), 'A')
-            || setweight(to_tsvector('simple', coalesce(content_preview, '')), 'B'),
-            language, namespace, zim_id
-        FROM articles_staging
-        WHERE zim_id = $1
-        ON CONFLICT (zim_id, path) DO UPDATE SET
-            title = EXCLUDED.title,
-            content_preview = EXCLUDED.content_preview,
-            snippet = EXCLUDED.snippet,
-            search_vector = EXCLUDED.search_vector,
-            updated_at = now()",
-        |q| q.bind(zim_id),
-    )
+    raw::execute(&mut *client, UPSERT_ARTICLES_FROM_STAGING_SQL, |q| {
+        q.bind(zim_id)
+    })
     .await?;
 
     // Phase 3: Q-ID batch insert (only if we have Q-IDs)
@@ -1208,7 +1270,8 @@ fn file_mtime_u64(path: &Path) -> u64 {
 mod tests {
     use super::{
         escape_copy_text_into, extract_qid, extract_qid_windowed, generate_snippet, is_wikipedia,
-        mark_index_error, parse_zim_date, truncate_at_sentence, QID_SCAN_BYTES,
+        mark_index_error, parse_zim_date, strip_head, truncate_at_sentence, PREVIEW_CHARS,
+        QID_SCAN_BYTES, STRIP_HEAD_BYTES,
     };
     use chrono::NaiveDate;
 
@@ -1305,9 +1368,12 @@ mod tests {
         // the HTML paragraph. `text` has only short lines, so if Readability
         // were skipped the fallback last-resort (first 200 chars of text) would
         // yield a different string.
-        let html = "<!DOCTYPE html><html><head><title>T</title></head><body><article>"
-            .to_string()
-            + "<p>The quick brown fox jumps over the lazy dog, and then it jumps over the lazy dog once more, and then it keeps jumping over the lazy dog until the lazy dog finally asks the quick brown fox to stop jumping over it, which the quick brown fox refuses to do, because the quick brown fox is simply too quick and the lazy dog is simply too lazy.</p>"
+        let html = "<!DOCTYPE html><html><head><title>T</title></head><body><article>".to_string()
+            + "<p>The quick brown fox jumps over the lazy dog, and then it jumps over the lazy \
+            dog once more, and then it keeps jumping over the lazy dog until the lazy dog finally \
+            asks the quick brown fox to stop jumping over it, which the quick brown fox refuses \
+            to do, because the quick brown fox is simply too quick and the lazy dog is simply too \
+            lazy.</p>"
             + "</article></body></html>";
         assert!(html.len() <= 200_000);
         let text = "short line\nanother short line\nlast short line";
@@ -1498,7 +1564,8 @@ mod tests {
             }
             crate::db::raw::execute(
                 &mut *conn,
-                "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime, index_status, indexed_entries, article_count)
+                "INSERT INTO zims (name, display_title, file_path, file_size, \
+                 file_mtime, index_status, indexed_entries, article_count)
                  VALUES ($1, $1, $1, 2048, now(), 'indexing', 1, 1)",
                 |q| q.bind(A),
             )
@@ -1506,7 +1573,8 @@ mod tests {
             .unwrap();
             crate::db::raw::execute(
                 &mut *conn,
-                "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime, index_status, indexed_entries, article_count)
+                "INSERT INTO zims (name, display_title, file_path, file_size, \
+                 file_mtime, index_status, indexed_entries, article_count)
                  VALUES ($1, $1, $1, 2048, now(), 'ready', 5, 5)",
                 |q| q.bind(B),
             )
@@ -1582,5 +1650,61 @@ mod tests {
             })
             .await;
         }
+    }
+
+    // H3 (2026-09 review): the strip-input cap must be char-boundary safe
+    // and must pass short documents through untouched.
+    #[test]
+    fn strip_head_is_char_boundary_safe() {
+        assert_eq!(strip_head("abc"), "abc");
+        // 3-byte chars (€) after a 3-byte prefix: boundaries sit at offsets
+        // ≡ 0 (mod 3); STRIP_HEAD_BYTES is ≡ 1 (mod 3), so the cap position
+        // itself is NOT a boundary and the back-off loop must run.
+        let html = format!("<p>{}</p>", "€".repeat(90_000));
+        assert!(html.len() > STRIP_HEAD_BYTES);
+        let head = strip_head(&html);
+        assert!(html.starts_with(head));
+        assert!(
+            head.len() < STRIP_HEAD_BYTES && STRIP_HEAD_BYTES - head.len() <= 3,
+            "back-off must stop at the nearest earlier boundary, got {}",
+            head.len()
+        );
+        // A doc exactly at the cap passes through whole.
+        let at_cap = "a".repeat(STRIP_HEAD_BYTES);
+        assert_eq!(strip_head(&at_cap), at_cap.as_str());
+    }
+
+    // H3 (2026-09 review): capping the strip input must be output-equivalent
+    // for the consumed head span (PREVIEW_CHARS), while dropping the tail.
+    #[test]
+    fn strip_head_cap_is_output_equivalent_for_consumed_prefix() {
+        let mut html = String::new();
+        html.push_str("<html><body>");
+        for i in 0..30 {
+            html.push_str(&format!("<p>Head paragraph {i} with some words.</p>"));
+        }
+        html.push_str(&format!("<p>{}</p>", "f".repeat(400 * 1024)));
+        html.push_str("<p>Tail paragraph TAILMARKER.</p></body></html>");
+        assert!(html.len() > STRIP_HEAD_BYTES);
+        // The tail marker sits beyond the cap by construction.
+        assert!(html.find("TAILMARKER").unwrap() > STRIP_HEAD_BYTES);
+
+        let opts = deformat::html::StripOptions::wikipedia();
+        let full = deformat::html::strip_to_text_with_options(&html, &opts);
+        let capped = deformat::html::strip_to_text_with_options(strip_head(&html), &opts);
+
+        // The consumed head span (the preview length) is byte-identical.
+        let n = PREVIEW_CHARS
+            .min(full.chars().count())
+            .min(capped.chars().count());
+        let full_head: String = full.chars().take(n).collect();
+        let capped_head: String = capped.chars().take(n).collect();
+        assert_eq!(
+            full_head, capped_head,
+            "consumed head prefix must be identical"
+        );
+        // The tail is dropped by the cap but present in the full strip.
+        assert!(!capped.contains("TAILMARKER"));
+        assert!(full.contains("TAILMARKER"));
     }
 }

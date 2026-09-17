@@ -34,7 +34,8 @@ pub struct DownloadRow {
     pub name: String,
     /// Source URL (ZIM archive or direct file).
     pub url: String,
-    /// Lifecycle status value (`queued` / `downloading` / …; see [`crate::db::downloads_lifecycle::DownloadStatus`]).
+    /// Lifecycle status value (`queued` / `downloading` / …;
+    /// see [`crate::db::downloads_lifecycle::DownloadStatus`]).
     pub status: String,
     /// Download progress in `0.0..=1.0` (qBittorrent convention).
     pub progress: f32,
@@ -69,7 +70,8 @@ pub struct DownloadRecord {
     pub url: String,
     /// Torrent hash, once known to the qBittorrent backend.
     pub hash: Option<String>,
-    /// Lifecycle status value (`queued` / `downloading` / …; see [`crate::db::downloads_lifecycle::DownloadStatus`]).
+    /// Lifecycle status value (`queued` / `downloading` / …;
+    /// see [`crate::db::downloads_lifecycle::DownloadStatus`]).
     pub status: String,
     /// Download progress in `0.0..=1.0` (qBittorrent convention).
     pub progress: f32,
@@ -277,7 +279,8 @@ pub enum InsertOutcome {
 /// The `url = $2 OR name = $1` pre-check is only fast feedback — the 003/011
 /// partial unique indexes are the authority, and the `23505` (unique
 /// violation) path below closes the concurrent-POST race.
-// LINT-3 (2026-09 sweep): `INSERT … RETURNING id` always yields a row — panic = DB contract violation.
+// LINT-3 (2026-09 sweep): `INSERT … RETURNING id` always yields a row —
+// panic = DB contract violation.
 #[allow(clippy::expect_used)]
 pub async fn insert_download(pool: &Pool, name: &str, url: &str) -> Result<InsertOutcome> {
     // The `(url = $1 OR name = $2)` pre-check is only fast feedback — the

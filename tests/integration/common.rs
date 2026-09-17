@@ -168,10 +168,13 @@ pub async fn seed_search_fixture(pool: &Pool) -> SearchEngine {
     .await
     .unwrap();
     {
-        // One statement per `raw::execute` (sqlx has no multi-statement
-        // protocol call; `split_statements` replaces the old `batch_execute`).
-        for stmt in zimservice::db::raw::split_statements(&format!(
-            "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES
+        // Single multi-row INSERT, no binds (extended protocol — only the
+        // raw-string `execute_script` path runs on the simple protocol and
+        // relies on server-side script splitting; see its doc).
+        zimservice::db::raw::execute(
+            pool,
+            &format!(
+                "INSERT INTO articles (zim_id, path, title, content_preview, search_vector) VALUES
              ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Alpine', 'Alpine',
               'The Alps are mountains.', to_tsvector('simple','alpine peaks europe')),
              ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Baltic', 'Baltic Sea',
@@ -179,11 +182,11 @@ pub async fn seed_search_fixture(pool: &Pool) -> SearchEngine {
              ((SELECT id FROM zims WHERE name='{ZIM}'), 'A/Andes', 'Andes',
               'The Andes are mountains in South America.',
               to_tsvector('simple','andes mountains south america'))"
-        )) {
-            zimservice::db::raw::execute(pool, &stmt, |q| q)
-                .await
-                .unwrap();
-        }
+            ),
+            |q| q,
+        )
+        .await
+        .unwrap();
     }
 
     let settings = SettingsCache::load(pool.clone(), HashMap::new(), HashMap::new())

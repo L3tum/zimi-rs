@@ -143,7 +143,8 @@ pub(crate) fn requeue_guard_step(
     if should_give_up(prev, msg, is_auth) {
         tracing::warn!(
             download_id = id,
-            "requeue guard: same error {msg:?} {REQUEUE_GIVE_UP_AFTER}x in a row — leaving row in error state"
+            "requeue guard: same error {msg:?} {REQUEUE_GIVE_UP_AFTER}x in a row — leaving row in \
+            error state"
         );
         // Retain the entry (never remove) so the give-up state survives
         // to the next pass; refresh `last_seen` so the lazy sweep reclaims it

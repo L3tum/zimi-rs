@@ -63,6 +63,12 @@ zimservice mcp            # Run MCP server on stdio
 zimservice embed -z name  # Generate embeddings
 ```
 
+Note: every subcommand that opens the database — including the read-only
+ones (`list`, `status`, `mcp`) — applies pending schema migrations first.
+"Read-only" means no *ZIM data* is mutated; schema DDL still runs (it is
+idempotent and advisory-locked), so a fresh database migrates on the first
+`zimservice status`.
+
 ## API
 
 | Endpoint | Method | Description |
@@ -403,6 +409,18 @@ defeat the per-IP lockout (M-3); over-broad (but not all-zero) CIDRs (≥ /8
 IPv4, ≥ /56 IPv6) still warn at startup. This is a config-only setting
 (restart required).
 
+> **⚠ Open mode behind a proxy defeats the loopback-only guarantee.** In
+> `access.mode=open` the server refuses any non-loopback bind, so the only way
+> a public reverse proxy can reach it is by port-forwarding the loopback bind
+> to the network. That exposes the **entire library with no password to gate
+> reads**, and — unlike password mode — there is no TLS warning to pair with
+> it. Since the 2026-09 review the server warns at startup whenever
+> `general.trusted_proxy_cidrs` is non-empty in open mode; if that warning
+> appears on a deployment you did not intend to expose, remove the proxy
+> (or the CIDR list). For genuinely network-facing deployments use
+> `access.mode=password` (with `AUTH_PASSWORD`) and terminate TLS at the
+> proxy.
+
 ### Index checkpoints
 
 Indexing checkpoints are transient JSON (ZIM name + resume counters) written to
@@ -482,7 +500,11 @@ one-time startup warning about this.
 ### Legacy databases / upgrades
 
 `serve` (and the other mutating subcommands) apply pending migrations from
-`migrations/` in order on startup. zimservice does **not** auto-upgrade a
+`migrations/` in order on startup. The read-only subcommands (`status`, `mcp`)
+apply pending migrations too — "read-only" means *no ZIM data mutation*, not
+*no DDL*: every startup run only ever applies pending **schema** DDL (under
+the same session advisory lock), never article/ZIM rows.
+zimservice does **not** auto-upgrade a
 *legacy* database whose `schema_migrations` table still uses the old
 `version INTEGER` column — on startup it detects that shape (the tracking
 table's leading column is `version` rather than `name`) and bails with an

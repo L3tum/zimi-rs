@@ -125,9 +125,7 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
 
     let state = startup::build_state(
         &config,
-        startup::StartupMode::Serve,
-        guard.as_ref().is_some_and(|g| g.advisory_lock_held()),
-        true,
+        startup::StartupRequest::serve(guard.as_ref().is_some_and(|g| g.advisory_lock_held())),
     )
     .await?;
 
@@ -343,7 +341,7 @@ async fn cmd_list(config: Config, sync: bool) -> anyhow::Result<()> {
 async fn cmd_status(config: Config) -> anyhow::Result<()> {
     // `status` reports the qBittorrent connection state in its output, so it
     // keeps the startup connect round-trip (`connect_torrent = true`).
-    let state = startup::build_state(&config, startup::StartupMode::ReadOnly, false, true).await?;
+    let state = startup::build_state(&config, startup::StartupRequest::status()).await?;
     let zims = state.zims.list();
     let total_articles: i64 = zims.iter().map(|z| z.indexed_entries as i64).sum();
 
@@ -386,9 +384,7 @@ async fn cmd_index(config: Config, zim: Option<String>, all: bool) -> anyhow::Re
     let mutating_guard = startup::acquire_mutating_guard(&config).await?;
     let state = startup::build_state(
         &config,
-        startup::StartupMode::Mutating,
-        mutating_guard.is_some(),
-        true,
+        startup::StartupRequest::mutating(mutating_guard.is_some()),
     )
     .await?;
 
@@ -401,7 +397,7 @@ async fn cmd_index(config: Config, zim: Option<String>, all: bool) -> anyhow::Re
 async fn cmd_mcp(config: Config) -> anyhow::Result<()> {
     // `connect_torrent = false` (ARCH minor #3): the stdio MCP session never
     // touches the qBittorrent client, so skip the startup login round-trip.
-    let state = startup::build_state(&config, startup::StartupMode::ReadOnly, false, false).await?;
+    let state = startup::build_state(&config, startup::StartupRequest::mcp()).await?;
     let state = Arc::new(state);
 
     // DEC-2: In password mode, require MCP_AUTH_PASSWORD env var and verify
@@ -434,9 +430,7 @@ async fn cmd_embed(config: Config, zim: Option<String>) -> anyhow::Result<()> {
     let mutating_guard = startup::acquire_mutating_guard(&config).await?;
     let state = startup::build_state(
         &config,
-        startup::StartupMode::Mutating,
-        mutating_guard.is_some(),
-        true,
+        startup::StartupRequest::mutating(mutating_guard.is_some()),
     )
     .await?;
 

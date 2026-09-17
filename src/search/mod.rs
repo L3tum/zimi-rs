@@ -25,10 +25,9 @@ pub use self::sql::SqlQuery;
 // re-transcribing it. The private `use` below still serves the in-module
 // call sites and unit tests.
 use self::sql::{
-    branch_fetch_limit, build_trgm_arms, trgm_prefix_sql, vector_fetch_limit, SEARCH_HARD_LIMIT,
-    SEARCH_HARD_OFFSET,
+    branch_fetch_limit, build_trgm_arms, vector_fetch_limit, SEARCH_HARD_LIMIT, SEARCH_HARD_OFFSET,
 };
-pub use self::sql::{fts_sql, trgm_contains_sql, trgm_similarity_sql, vector_sql};
+pub use self::sql::{fts_sql, trgm_contains_sql, trgm_prefix_sql, trgm_similarity_sql, vector_sql};
 
 /// PERF-2: the trigram *contains*/*similarity* arms need at least 3 chars to
 /// be index-useful (Postgres trigrams are built from 3-char windows), so gate
@@ -226,7 +225,10 @@ impl SearchEngine {
     where
         E: Executor<'e, Database = sqlx::Postgres>,
     {
-        sqlx::query("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'") // RAW-OK: catalog probe of pg_extension — no db::raw helper exists for catalog tables (sanctioned class per the db::raw doc)
+        // catalog probe of pg_extension — no db::raw helper exists for
+        // catalog tables (sanctioned class per the db::raw doc).
+        // RAW-OK: raw catalog probe; no db::raw helper exists for it.
+        sqlx::query("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
             .fetch_optional(executor)
             .await
             .is_ok()
@@ -873,7 +875,8 @@ fn vector_from_response(
     if vecs.is_empty() {
         degradation.record_failure("vector_embed");
         tracing::warn!(
-            "vector search disabled for this query: embed provider returned an empty embedding (no vectors in the response)"
+            "vector search disabled for this query: embed provider returned an empty embedding \
+            (no vectors in the response)"
         );
         return None;
     }
@@ -923,7 +926,8 @@ where
     // sqlx 0.9: runtime SQL must be wrapped in `AssertSqlSafe` (the `db::raw`
     // helpers are the central audit point; this hybrid branch query cannot go
     // through them, so it asserts itself).
-    let mut query = sqlx::query_as::<_, SearchRow>(sqlx::AssertSqlSafe(sq.sql.as_str())); // RAW-OK: runtime-built FTS/vector hybrid branch query (dynamic SQL + dynamic `$n` binds) — unexpressible via the db::raw helpers
+    // RAW-OK: dynamic hybrid SQL + $n binds — unexpressible via db::raw.
+    let mut query = sqlx::query_as::<_, SearchRow>(sqlx::AssertSqlSafe(sq.sql.as_str()));
     for p in &sq.params {
         query = query.bind(p);
     }

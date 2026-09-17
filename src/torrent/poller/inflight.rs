@@ -15,7 +15,8 @@ impl DownloadPoller {
     /// branch, hash rebind, fatal, `handle_complete`, `stats_changed` push
     /// into `changed`, missing-torrent grace expiry. Returns the collected
     /// `changed` rows (the flush is `flush_stats`).
-    // LINT-3 (2026-09 sweep): invariant panic (SeedingAction variant implies torrent present) — grandfathered expect_used.
+    // LINT-3 (2026-09 sweep): invariant panic (SeedingAction variant implies torrent present) —
+    // grandfathered expect_used.
     #[allow(clippy::expect_used)]
     pub(super) async fn process_inflight(
         &self,

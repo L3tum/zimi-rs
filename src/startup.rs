@@ -120,7 +120,70 @@ const ADVISORY_LOCK_MATCH: &str = "l.locktype = 'advisory' AND l.objsubid = 1 \
      AND l.objid = (hashtext('zimservice:instance')::bigint & 4294967295)::oid \
      AND a.pid <> pg_backend_pid()";
 
+/// The per-caller options that steer [`build_state`], bundled so the call
+/// chain doesn't accrete more positional booleans (m1, 2026-09 review).
+/// Use the named constructors — they encode the per-command contract:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupRequest {
+    /// The startup behavior (serve / mutating / read-only).
+    pub mode: StartupMode,
+    /// This process already owns the single-instance advisory lock
+    /// (`cmd_serve`'s lifetime guard, or a mutating command's guard) — the
+    /// lightweight `pg_locks` warning probe is skipped (our own lock
+    /// connection would otherwise register as "another instance").
+    pub advisory_lock_held: bool,
+    /// Whether to pay the qBittorrent login round-trip at startup
+    /// (ARCH minor #3): the stdio `mcp` session never touches the
+    /// qBittorrent client and skips it; everything else connects.
+    pub connect_torrent: bool,
+}
+
+impl StartupRequest {
+    /// `serve`: the `cmd_serve` guard was acquired before state was built
+    /// (M-1); the qBittorrent client is part of the served state.
+    pub fn serve(advisory_lock_held: bool) -> Self {
+        Self {
+            mode: StartupMode::Serve,
+            advisory_lock_held,
+            connect_torrent: true,
+        }
+    }
+
+    /// A mutating subcommand (`index`, `embed`) that holds
+    /// `acquire_mutating_guard` for the command's duration.
+    pub fn mutating(advisory_lock_held: bool) -> Self {
+        Self {
+            mode: StartupMode::Mutating,
+            advisory_lock_held,
+            connect_torrent: true,
+        }
+    }
+
+    /// `status`: read-only, but reports the qBittorrent connection state.
+    pub fn status() -> Self {
+        Self {
+            mode: StartupMode::ReadOnly,
+            advisory_lock_held: false,
+            connect_torrent: true,
+        }
+    }
+
+    /// `mcp`: read-only, and never touches the qBittorrent client
+    /// (ARCH minor #3), so it skips the startup login round-trip.
+    pub fn mcp() -> Self {
+        Self {
+            mode: StartupMode::ReadOnly,
+            advisory_lock_held: false,
+            connect_torrent: false,
+        }
+    }
+}
+
 /// Build the full application state (DB pool, settings, ZIM manager, etc.)
+///
+/// `req` bundles the startup behavior ([`StartupRequest::mode`]) with the
+/// per-caller options (`advisory_lock_held`, `connect_torrent`) — see the
+/// struct's constructors for the per-command contract.
 ///
 /// `mode` selects the startup behavior: [`StartupMode::Serve`] and
 /// [`StartupMode::Mutating`] reconcile the ZIM cache + DB with disk;
@@ -144,12 +207,13 @@ const ADVISORY_LOCK_MATCH: &str = "l.locktype = 'advisory' AND l.objsubid = 1 \
 /// `acquire_mutating_guard` (held for the command's duration) and pass
 /// `advisory_lock_held = true`; read-only subcommands do the lightweight
 /// `pg_locks` check for the warning only.
-pub async fn build_state(
-    config: &Config,
-    mode: StartupMode,
-    advisory_lock_held: bool,
-    connect_torrent: bool,
-) -> anyhow::Result<AppState> {
+pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result<AppState> {
+    let StartupRequest {
+        mode,
+        advisory_lock_held,
+        connect_torrent,
+    } = req;
+
     // Shared pool + migration + ZIM-manager bootstrap (also used by
     // `cmd_list` — ARCH M1, so the two startup paths cannot diverge).
     let (pool, zims) = bootstrap_pool_and_zims(config).await?;
@@ -187,14 +251,18 @@ pub async fn build_state(
         if held {
             if mode.resync() {
                 tracing::warn!(
-                    "Another zimservice instance appears to be running on this database (advisory lock \
-                     already held), and this subcommand mutates the shared database. The running \
-                     instance's in-memory caches (settings, ZIM manager, qBittorrent client) will be \
-                     STALE after this run until it is restarted — prefer restarting the server, or \
-                     run this command while no server is up."
+                    "Another zimservice instance appears to be running on this database \
+                     (advisory lock already held), and this subcommand mutates the shared \
+                     database. The running instance's in-memory caches (settings, ZIM \
+                     manager, qBittorrent client) will be STALE after this run until it \
+                     is restarted — prefer restarting the server, or run this command \
+                     while no server is up."
                 );
             } else {
-                tracing::warn!("Another zimservice instance appears to be running on this database (advisory lock already held).");
+                tracing::warn!(
+                    "Another zimservice instance appears to be running on this \
+                database (advisory lock already held)."
+                );
             }
         }
     }
@@ -289,7 +357,8 @@ pub async fn build_state(
                 .unwrap_or(false);
             if allow_private {
                 tracing::info!(
-                    "qBittorrent: private/LAN network access enabled via torrent.allow_private_networks"
+                    "qBittorrent: private/LAN network access enabled via \
+                    torrent.allow_private_networks"
                 );
             }
             if let Some(client) = connect_qbit(&url, &user, &pass, allow_private).await {
@@ -477,6 +546,15 @@ pub struct MutatingGuard {
 /// that need the live value must call this fn directly, not the cached copy.
 pub fn multi_instance_allowed() -> bool {
     matches!(std::env::var("ZIMSERVICE_ALLOW_MULTI_INSTANCE"), Ok(v) if v == "1")
+}
+
+/// m-7 partial opt-out: live reader of `ZIMSERVICE_ALLOW_MULTI_DB` (exact
+/// "1" — the same parse [`crate::config::Config::load`] applies). Like
+/// [`multi_instance_allowed`], a deliberate env reader kept outside `Config`
+/// so `/health` can surface the process's degraded single-instance guarantee
+/// without a state field.
+pub fn multi_db_allowed() -> bool {
+    matches!(std::env::var("ZIMSERVICE_ALLOW_MULTI_DB"), Ok(v) if v == "1")
 }
 
 /// H1: acquire a [`MutatingGuard`] for a mutating subcommand (`index`,
@@ -778,13 +856,16 @@ pub fn pid_is_alive(_pid: u32) -> bool {
 pub fn admin_password_startup_check(mode: &str, password: &str) -> Result<(), String> {
     if mode == crate::settings::ACCESS_MODE_PASSWORD && password.is_empty() {
         return Err(
-            "access.mode is \"password\" but access.admin_password is empty — set the AUTH_PASSWORD environment variable (or set access.mode back to \"open\" in the settings table)"
+            "access.mode is \"password\" but access.admin_password is empty — set the \
+            AUTH_PASSWORD environment variable (or set access.mode back to \"open\" in the \
+            settings table)"
                 .into(),
         );
     }
     if password == "CHANGE_ME" {
         return Err(
-            "access.admin_password is the placeholder \"CHANGE_ME\" — set a real password before starting"
+            "access.admin_password is the placeholder \"CHANGE_ME\" — set a real password before \
+            starting"
                 .into(),
         );
     }
@@ -920,9 +1001,10 @@ pub fn serve_policy_checks(
     // 4. /0 CIDR: refuse.
     if cidr::has_zero_prefix_cidr(trusted_proxy_cidrs) {
         return Err(
-            "general.trusted_proxy_cidrs contains a /0 CIDR (prefix length 0, e.g. 0.0.0.0/0 or ::/0): \
-             a /0 entry matches every address, so it would trust every X-Forwarded-For value \
-             and defeat the per-IP auth-failure lockout. Restrict the list to your actual proxy IPs."
+            "general.trusted_proxy_cidrs contains a /0 CIDR (prefix length 0, e.g. \
+             0.0.0.0/0 or ::/0): a /0 entry matches every address, so it would trust \
+             every X-Forwarded-For value and defeat the per-IP auth-failure lockout. \
+             Restrict the list to your actual proxy IPs."
                 .to_string(),
         );
     }
@@ -930,9 +1012,51 @@ pub fn serve_policy_checks(
     // 5. Over-broad CIDR: warn.
     if cidr::has_over_broad_cidr(trusted_proxy_cidrs) {
         warnings.push(StartupWarning {
-            message: "general.trusted_proxy_cidrs contains an over-broad CIDR (≥ /8 IPv4 or ≥ /56 IPv6): \
-             this allows X-Forwarded-For lockout bypass. Restrict to your actual proxy IPs."
+            message: "general.trusted_proxy_cidrs contains an over-broad CIDR \
+             (≥ /8 IPv4 or ≥ /56 IPv6): this allows X-Forwarded-For lockout bypass. \
+             Restrict to your actual proxy IPs."
                 .to_string(),
+            level: WarnLevel::Warn,
+        });
+    }
+
+    // 6. Open mode behind a proxy: warn (Sec M2, 2026-09 review). The TLS
+    // warning above only fires in password mode, so a public reverse proxy
+    // fronting a loopback open-mode instance gets NO startup warning at all —
+    // while silently defeating the loopback-only guarantee (open mode has no
+    // password to gate reads). Make the operator acknowledge the exposure.
+    if access_mode == settings::ACCESS_MODE_OPEN && !trusted_proxy_cidrs.trim().is_empty() {
+        warnings.push(StartupWarning {
+            message: "access.mode=open with general.trusted_proxy_cidrs set: if a public \
+                 reverse proxy fronts this loopback instance, the loopback-only \
+                 guarantee is defeated and the full library is exposed to network \
+                 peers with no password to gate reads. For network-facing \
+                 deployments use access.mode=password (with AUTH_PASSWORD) and \
+                 terminate TLS at the proxy — see the README 'Security' section."
+                .to_string(),
+            level: WarnLevel::Warn,
+        });
+    }
+
+    // 7. Password mode, non-loopback, behind a proxy: warn (2026-09 review
+    // round 2). The `?access_token=` query-string credential channel is
+    // last-resort: through a reverse proxy the token also passes proxy
+    // access logs, Referer headers, and browser history — outside the app's
+    // control. Prefer the Bearer Authorization header; treat `?access_token=`
+    // as last-resort.
+    if access_mode == settings::ACCESS_MODE_PASSWORD
+        && !is_loopback
+        && !trusted_proxy_cidrs.trim().is_empty()
+    {
+        warnings.push(StartupWarning {
+            message: format!(
+                "access.mode=password with non-loopback bind ({host}) and \
+                 general.trusted_proxy_cidrs set: the last-resort ?access_token= \
+                 query-string credential channel passes through the proxy (proxy \
+                 access logs, Referer headers, browser history are outside the \
+                 app's control). Prefer the Bearer Authorization header; keep \
+                 ?access_token= for clients that cannot set headers."
+            ),
             level: WarnLevel::Warn,
         });
     }
@@ -990,7 +1114,8 @@ mod tests {
     fn env_seeded_sha2_password_passes_through() {
         // (b) `sha2:`-prefixed values stay upgradable via the existing lazy
         // path — the startup transform must not touch them.
-        let legacy = "sha2:100000$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000";
+        let legacy = "sha2:100000$00000000000000000000000000000000$0000000000000000000000000000000\
+        000000000000000000000000000000000";
         let mut snap = HashMap::from([(KEY_ACCESS_ADMIN_PASSWORD.into(), legacy.to_string())]);
         hash_legacy_env_seeded_password(&mut snap);
         assert_eq!(
@@ -1038,7 +1163,8 @@ mod tests {
         // password mode + legacy plaintext → warn
         assert!(legacy_password_startup_warn("password", "plainpw"));
         // password mode + legacy sha2: hash → warn
-        let legacy = "sha2:100000$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000";
+        let legacy = "sha2:100000$00000000000000000000000000000000$0000000000000000000000000000000\
+        000000000000000000000000000000000";
         assert!(legacy_password_startup_warn("password", legacy));
         // password mode + current argon2id hash → no warn
         assert!(!legacy_password_startup_warn(
@@ -1631,7 +1757,8 @@ mod serve_shutdown_tests {
                 Err(join_err) => tracing::error!("background task '{name}' died: {join_err}"),
                 Ok(()) => {
                     tracing::error!(
-                        "background task '{name}' returned before shutdown \n                         (it must run for the lifetime of the server)"
+                        "background task '{name}' returned before shutdown 
+                         (it must run for the lifetime of the server)"
                     )
                 }
             }
@@ -1886,5 +2013,71 @@ mod serve_policy_checks_tests {
             .find(|w| w.message.contains("reads (GET/HEAD/OPTIONS) stay open"))
             .expect("open-reads warning present");
         assert_eq!(open_reads.level, WarnLevel::Info);
+    }
+
+    // Sec M2 (2026-09 review): open mode + proxy CIDRs must warn, because the
+    // TLS warning only exists for password mode.
+    #[test]
+    fn open_mode_with_proxy_cidrs_warns() {
+        let result = serve_policy_checks(
+            "127.0.0.1",
+            crate::settings::ACCESS_MODE_OPEN,
+            false,
+            "10.1.2.3/32",
+        )
+        .unwrap();
+        let proxy_warn = result
+            .iter()
+            .find(|w| {
+                w.message
+                    .contains("reverse proxy fronts this loopback instance")
+            })
+            .expect("proxy-fronted open-mode warning present");
+        assert_eq!(proxy_warn.level, WarnLevel::Warn);
+    }
+
+    #[test]
+    fn open_mode_without_proxy_cidrs_stays_silent() {
+        let result =
+            serve_policy_checks("127.0.0.1", crate::settings::ACCESS_MODE_OPEN, false, "   ")
+                .unwrap();
+        assert!(
+            result.is_empty(),
+            "blank proxy list must not trigger the proxy warning: {result:?}"
+        );
+    }
+
+    // 2026-09 review round 2: non-loopback password mode behind a proxy must
+    // warn about the ?access_token= query-string leak channel.
+    #[test]
+    fn password_mode_non_loopback_with_proxy_warns_access_token() {
+        let result = serve_policy_checks(
+            "0.0.0.0",
+            crate::settings::ACCESS_MODE_PASSWORD,
+            true,
+            "10.1.2.3/32",
+        )
+        .unwrap();
+        let warn = result
+            .iter()
+            .find(|w| w.message.contains("?access_token="))
+            .expect("access-token channel warning present");
+        assert_eq!(warn.level, WarnLevel::Warn);
+    }
+
+    #[test]
+    fn password_mode_loopback_with_proxy_stays_silent_on_access_token() {
+        // Loopback: the token never crosses the network, no warning.
+        let result = serve_policy_checks(
+            "127.0.0.1",
+            crate::settings::ACCESS_MODE_PASSWORD,
+            true,
+            "10.1.2.3/32",
+        )
+        .unwrap();
+        assert!(
+            !result.iter().any(|w| w.message.contains("?access_token=")),
+            "loopback bind must not warn about the query-string channel: {result:?}"
+        );
     }
 }

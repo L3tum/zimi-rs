@@ -126,18 +126,22 @@ pub struct SearchQuery {
     get,
     path = "/search",
     params(
-        ("q" = Option<String>, Query, description = "Search query (required unless 'query' is given)"),
+        ("q" = Option<String>, Query, description = "Search query (required unless 'query' is \
+        given)"),
         ("query" = Option<String>, Query, description = "Alias of 'q'"),
         ("zim" = Option<String>, Query, description = "Restrict to one ZIM by name"),
         ("language" = Option<String>, Query, description = "Restrict to one language code"),
-        ("mode" = Option<String>, Query, description = "Engine: fts, trgm (fuzzy/prefix), vector (semantic), or hybrid (default)"),
-        ("highlight" = Option<bool>, Query, description = "Wrap matched terms in snippet with <b> via ts_headline"),
+        ("mode" = Option<String>, Query, description = "Engine: fts, trgm (fuzzy/prefix), vector \
+        (semantic), or hybrid (default)"),
+        ("highlight" = Option<bool>, Query, description = "Wrap matched terms in snippet with <b> \
+        via ts_headline"),
         ("limit" = Option<usize>, Query, description = "Max results (default from settings)"),
         ("offset" = Option<usize>, Query, description = "Result offset for pagination")
     ),
     responses(
         (status = 200,
-            description = "Search results; `total` is the number of results in this page (after offset/limit), not a corpus-wide match count",
+            description = "Search results; `total` is the number of results in this page (after \
+            offset/limit), not a corpus-wide match count",
             body = SearchResponse),
         (status = 400, description = "Missing 'q' parameter", body = ErrorResponse),
         (status = 500, description = "Internal error", body = ErrorResponse)
@@ -221,7 +225,8 @@ pub struct SuggestQuery {
     get,
     path = "/suggest",
     params(
-        ("q" = Option<String>, Query, description = "Title prefix (required unless 'query' is given)"),
+        ("q" = Option<String>, Query, description = "Title prefix (required unless 'query' is \
+        given)"),
         ("query" = Option<String>, Query, description = "Alias of 'q'"),
         ("zim" = Option<String>, Query, description = "Restrict to one ZIM by name"),
         ("limit" = Option<usize>, Query, description = "Max suggestions (default 10, max 20)")
@@ -333,7 +338,8 @@ pub struct InterlangQuery {
         ("path" = String, Query, description = "Article path within the ZIM")
     ),
     responses(
-        (status = 200, description = "Cross-language links via Wikidata Q-ID (empty when the article has no Q-ID)", body = InterlanguageResponse),
+        (status = 200, description = "Cross-language links via Wikidata Q-ID (empty when the \
+        article has no Q-ID)", body = InterlanguageResponse),
         (status = 500, description = "Internal error", body = ErrorResponse)
     )
 )]

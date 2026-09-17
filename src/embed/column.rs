@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 /// pipeline's fail-fast dimension check reuses the same probe.
 ///
 /// pg_catalog probe (the generic helpers still serve it via db::raw).
-pub(crate) async fn stored_embedding_dimension(pool: &Pool) -> Result<Option<u32>> {
+pub async fn stored_embedding_dimension(pool: &Pool) -> Result<Option<u32>> {
     let typmod: Option<i32> = raw::fetch_scalar_optional(
         pool,
         "SELECT atttypmod FROM pg_attribute
@@ -51,7 +51,8 @@ pub async fn ensure_vector_dimension(pool: &Pool, dimension: u32) -> Result<()> 
     if stored > 0 {
         tracing::warn!(
             "articles.embedding is vector({current}) but configured dimension is {dimension}; \
-             {stored} existing vectors kept — run `zimservice embed` after clearing them if you want to switch models"
+             {stored} existing vectors kept — run `zimservice embed` after clearing them if you \
+             want to switch models"
         );
         return Ok(());
     }

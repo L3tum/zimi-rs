@@ -9,7 +9,8 @@
 //!    The intended fix is to move SQL into a named helper in `src/db/`.
 //!
 //! 2. **Direct `sqlx::query*` calls** outside `src/db/` need a
-//!    `// RAW-OK: <reason>` marker. Background layers (torrent, zim,
+//!    `// RAW-OK: <reason>` marker on the call line or the line directly
+//!    above it (call lines are often too long for a trailing comment). Background layers (torrent, zim,
 //!    search, embed, startup) call `db::raw::*` directly as the intended
 //!    path and are exempt from this rule.
 
@@ -17,7 +18,8 @@
 pub mod collections;
 /// Download-queue data access (ARCH M1 repository extraction).
 pub mod downloads;
-/// Download lifecycle state machine: status/hash/error/seed-stats transitions on the `downloads` table.
+/// Download lifecycle state machine: status/hash/error/seed-stats
+/// transitions on the `downloads` table.
 pub mod downloads_lifecycle;
 /// SQL migrations: a numbered, hash-tracked list applied in order at startup.
 pub mod migrate;
@@ -46,10 +48,15 @@ pub use pool::Pool;
 /// return it after chaining `.bind(...)` calls — `|q| q.bind(a).bind(b)`
 /// for bound parameters, `|q| q` when there are none.
 ///
-/// Batch DDL: iterate [`raw::split_statements`] and run each statement
-/// through [`raw::execute`] on the same executor — this is the replacement for the old
-/// `tokio_postgres` `batch_execute` (sqlx has no multi-statement
-/// protocol call).
+/// Multi-statement DDL: pass the whole script to ONE [`raw::execute_script`]
+/// — raw-string execution runs on the simple query protocol, and Postgres
+/// splits the script server-side (the same mechanism `sqlx::migrate!` uses
+/// for migration scripts; sqlx documents `raw_sql()` as the path that
+/// "accepts multiple queries separated by semicolons … never uses prepared
+/// statements"). This replaced the old client-side `split_statements`
+/// lexer (deleted, 2026-09 review: the premise "sqlx has no
+/// multi-statement protocol call" was false for the raw-string path);
+/// `tests/integration/migrations.rs` pins the behavior.
 pub mod raw {
     use crate::error::{Error, Result};
     use sqlx::postgres::{PgRow, Postgres};
@@ -159,273 +166,39 @@ pub mod raw {
         query.fetch_all(executor).await.map_err(Error::Database)
     }
 
-    /// Split a multi-statement SQL script at top-level `;` boundaries,
-    /// respecting single-quoted strings (`''` escapes; plain-string semantics
-    /// — a backslash has no escape meaning), dollar-quoted bodies (`$$ … $$`,
-    /// `$tag$ … $tag$` — e.g. `DO` blocks), line comments, and (nested)
-    /// block comments. Trailing/whitespace-only fragments are dropped.
+    /// Execute a multi-statement SQL script (no binds) as ONE simple-protocol
+    /// query — Postgres splits the script server-side.
     ///
-    /// Postgres E-strings (`E'…'`) are intentionally NOT supported: the sole
-    /// caller (migration DDL in `migrate.rs`) is forbidden from committing
-    /// `E'` literals by the `committed_migrations_contain_no_e_string_literals`
-    /// guard test, so a backslash inside a string is always a literal
-    /// backslash and the plain-string rule is the whole story.
-    pub fn split_statements(script: &str) -> Vec<String> {
-        let chars: Vec<char> = script.chars().collect();
-        let mut statements = Vec::new();
-        let mut current = String::new();
-        let mut i = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            if c == '\'' {
-                // Single-quoted string: copy verbatim, `''` is an escaped
-                // quote (plain-string semantics — a backslash is a literal
-                // backslash; E-strings are unsupported, see the fn doc).
-                current.push(c);
-                i += 1;
-                while i < chars.len() {
-                    current.push(chars[i]);
-                    if chars[i] == '\'' {
-                        if i + 1 < chars.len() && chars[i + 1] == '\'' {
-                            i += 1;
-                            current.push('\'');
-                        } else {
-                            i += 1;
-                            break;
-                        }
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            if c == '$' && is_dollar_quote_start(&chars, i) {
-                let tag = read_dollar_tag(&chars, i);
-                let tag_len = tag.chars().count();
-                current.push_str(&tag);
-                i += tag_len;
-                let end = find_dollar_tag(&chars, i, &tag);
-                if let Some(end) = end {
-                    current.push_str(&chars[i..end + tag_len].iter().collect::<String>());
-                    i = end + tag_len;
-                } else {
-                    // Unterminated: keep the rest as-is (Postgres will reject it).
-                    current.push_str(&chars[i..].iter().collect::<String>());
-                    i = chars.len();
-                }
-                continue;
-            }
-            if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
-                // Line comment: keep to end of line.
-                while i < chars.len() && chars[i] != '\n' {
-                    current.push(chars[i]);
-                    i += 1;
-                }
-                continue;
-            }
-            if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
-                // Block comment (Postgres allows nesting): copy verbatim.
-                let mut depth = 0usize;
-                while i < chars.len() {
-                    if chars[i] == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
-                        depth += 1;
-                        current.push_str("/*");
-                        i += 2;
-                        continue;
-                    }
-                    if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
-                        depth -= 1;
-                        current.push_str("*/");
-                        i += 2;
-                        if depth == 0 {
-                            break;
-                        }
-                        continue;
-                    }
-                    current.push(chars[i]);
-                    i += 1;
-                }
-                continue;
-            }
-            if c == ';' {
-                push_statement(&mut statements, &current);
-                current.clear();
-                i += 1;
-                continue;
-            }
-            current.push(c);
-            i += 1;
-        }
-        push_statement(&mut statements, &current);
-        statements
-    }
-
-    fn push_statement(statements: &mut Vec<String>, current: &str) {
-        let trimmed = current.trim();
-        if !trimmed.is_empty() {
-            statements.push(trimmed.to_string());
-        }
-    }
-
-    /// True when the `$` at `chars[i]` starts a dollar-quote tag
-    /// (`$$` or `$identifier$`).
-    fn is_dollar_quote_start(chars: &[char], i: usize) -> bool {
-        if i + 1 >= chars.len() {
-            return false;
-        }
-        if chars[i + 1] == '$' {
-            return true;
-        }
-        // $identifier$: letters/digits/underscore, must not start with a digit.
-        let mut j = i + 1;
-        let first = chars[j];
-        if !(first.is_ascii_alphabetic() || first == '_') {
-            return false;
-        }
-        j += 1;
-        while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
-            j += 1;
-        }
-        j < chars.len() && chars[j] == '$'
-    }
-
-    /// Read the dollar-quote tag (including both `$`s) starting at `chars[i]`.
-    fn read_dollar_tag(chars: &[char], i: usize) -> String {
-        if i + 1 < chars.len() && chars[i + 1] == '$' {
-            return "$$".to_string();
-        }
-        let mut j = i + 1;
-        while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
-            j += 1;
-        }
-        // j is at the closing `$` (guaranteed by is_dollar_quote_start).
-        chars[i..=j].iter().collect()
-    }
-
-    /// Index of the dollar-quote tag `tag` at/after position `i`, or `None`.
-    fn find_dollar_tag(chars: &[char], i: usize, tag: &str) -> Option<usize> {
-        let tag_len = tag.chars().count();
-        let mut j = i;
-        while j + tag_len <= chars.len() {
-            if chars[j..j + tag_len].iter().collect::<String>() == tag {
-                return Some(j);
-            }
-            j += 1;
-        }
-        None
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::unwrap_used, clippy::expect_used)]
-    mod tests {
-        use super::split_statements;
-
-        #[test]
-        fn plain_statements() {
-            assert_eq!(
-                split_statements("SELECT 1; SELECT 2"),
-                vec!["SELECT 1", "SELECT 2"]
-            );
-            // Trailing semicolons / whitespace-only fragments are dropped.
-            assert_eq!(split_statements("SELECT 1;\n\n  "), vec!["SELECT 1"]);
-            assert_eq!(split_statements("   "), Vec::<String>::new());
-        }
-
-        #[test]
-        fn single_quoted_strings_protect_semicolons() {
-            assert_eq!(
-                split_statements("SELECT ';'; SELECT 2"),
-                vec!["SELECT ';'", "SELECT 2"]
-            );
-            // `''` is an escaped quote, not end-of-literal.
-            assert_eq!(
-                split_statements("SELECT 'it''s; fine'; SELECT 2"),
-                vec!["SELECT 'it''s; fine'", "SELECT 2"]
-            );
-            // Plain strings keep literal-backslash semantics
-            // (standard_conforming_strings): `\'` is a backslash + the
-            // closing quote, so the `;` after it splits.
-            assert_eq!(
-                split_statements(r"SELECT 'a\'; SELECT 2"),
-                vec![r"SELECT 'a\'", "SELECT 2"]
-            );
-        }
-
-        #[test]
-        fn e_prefix_strings_use_plain_string_semantics() {
-            // The splitter intentionally does NOT support Postgres E-strings:
-            // an `E` before a quote is just an identifier character, so a
-            // backslash has no escape meaning. Exact split of the reported
-            // bug shape under plain semantics:
-            //
-            //   INSERT INTO te(a) VALUES ('x\'y'); SELECT 2
-            //
-            // the string is `'x\'` — the quote after the backslash closes it
-            // (a backslash is a literal character) — then `y` is a bare
-            // token, then `'` opens an UNTERMINATED string that swallows
-            // `); SELECT 2`. The whole input is one fragment, not two. This
-            // matches Postgres's own lexer (standard_conforming_strings=on
-            // is the default): the server parses `'x\'` identically and
-            // rejects the input as an unterminated quoted string — so the
-            // splitter no longer "helpfully" mis-parses the escape. (The
-            // old E-string mode treated `\'` as an escaped quote, closed the
-            // string at the quote after `y`, and reported a `;` boundary
-            // inside garbage — silently splitting input the server would
-            // reject anyway.) The `E'` corpus guard in migrate.rs keeps
-            // committed migrations out of this class entirely.
-            assert_eq!(
-                split_statements(r"INSERT INTO te(a) VALUES ('x\'y'); SELECT 2"),
-                vec![r"INSERT INTO te(a) VALUES ('x\'y'); SELECT 2"]
-            );
-            // An E-prefixed string with no backslash splits normally.
-            assert_eq!(
-                split_statements(r"SELECT E'abc'; SELECT 2"),
-                vec!["SELECT E'abc'", "SELECT 2"]
-            );
-            // The `''` escape still works: the doubled quote is a literal
-            // quote inside the string, not a close/reopen.
-            assert_eq!(
-                split_statements(r"SELECT 'it''s'; SELECT 2"),
-                vec![r"SELECT 'it''s'", "SELECT 2"]
-            );
-        }
-
-        #[test]
-        fn dollar_quoted_bodies_protect_semicolons() {
-            assert_eq!(
-                split_statements("DO $$ BEGIN RAISE NOTICE ';'; END $$; SELECT 2"),
-                vec!["DO $$ BEGIN RAISE NOTICE ';'; END $$", "SELECT 2"]
-            );
-            assert_eq!(
-                split_statements(
-                    "CREATE FUNCTION f() RETURNS text AS $fn$ SELECT ';' $fn$ LANGUAGE sql; SELECT 2"
-                ),
-                vec![
-                    "CREATE FUNCTION f() RETURNS text AS $fn$ SELECT ';' $fn$ LANGUAGE sql",
-                    "SELECT 2"
-                ]
-            );
-        }
-
-        #[test]
-        fn comments_protect_semicolons() {
-            // Quote + semicolon inside a line comment are inert; the
-            // comment text itself is kept verbatim in the statement.
-            assert_eq!(
-                split_statements("-- don't; split\nSELECT 1; SELECT 2"),
-                vec!["-- don't; split\nSELECT 1", "SELECT 2"]
-            );
-            // Block comments (nested, Postgres style) are copied verbatim
-            // and terminated — the pre-fix loop checked the outer loop's
-            // character instead of the current one, never recognized `*/`,
-            // and swallowed the rest of the script.
-            assert_eq!(
-                split_statements("SELECT 1; /* a /* b */ c */ SELECT 2"),
-                vec!["SELECT 1", "/* a /* b */ c */ SELECT 2"]
-            );
-            assert_eq!(
-                split_statements("SELECT 1; /**/ SELECT 2"),
-                vec!["SELECT 1", "/**/ SELECT 2"]
-            );
-        }
+    /// Protocol note (why this exists, 2026-09 review): a *no-bind*
+    /// [`execute`] still runs on the **extended** protocol — in sqlx
+    /// 0.9 the untyped `sqlx::query` carries an empty (but `Some`) argument
+    /// list, so it is parsed as a prepared statement, and Postgres rejects
+    /// multi-command prepared strings (`cannot insert multiple commands
+    /// into a prepared statement`). Only raw-string execution
+    /// (`AssertSqlSafe` + `Executor::execute` with `take_arguments() ==
+    /// None`) takes the simple query protocol — the same mechanism
+    /// `sqlx::migrate!` uses for migration scripts (sqlx documents its
+    /// `raw_sql()` as "accepts multiple queries separated by semicolons …
+    /// never uses prepared statements").
+    ///
+    /// The script is compile-time/fixture SQL only (the sole production
+    /// caller is the migration runner; `MIGRATIONS` is a `const`): there is
+    /// nothing to bind, and the single-argument `AssertSqlSafe` keeps this
+    /// on the crate's one injection-audit point. All statements run
+    /// atomically on the caller's executor (pass `&mut *tx` for the
+    /// migration transaction).
+    ///
+    /// Returns the row count of the script's **last** statement (the simple
+    /// protocol reports a single count per query) — callers that need
+    /// per-statement counts should split the script.
+    pub async fn execute_script<'q, 'c, E>(executor: E, sql: &'q str) -> Result<u64>
+    where
+        E: 'c + Executor<'c, Database = Postgres>,
+    {
+        Ok(executor
+            .execute(sqlx::AssertSqlSafe(sql))
+            .await
+            .map_err(Error::Database)?
+            .rows_affected())
     }
 }

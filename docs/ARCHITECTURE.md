@@ -84,9 +84,13 @@ hardlink-based file sharing, an OpenAI-compatible embedding pipeline, and an MCP
 
 - **`src/settings/`** — Postgres-backed runtime settings: `defs.rs` (setting
   table, seeds, security-sensitive classification), `cache.rs`
-  (`SettingsCache`: in-memory, env-locked writes, secret redaction, TTL-cached
-  token verification), `auth.rs` (argon2id hashing, legacy sha2/plaintext
-  verification), `snapshots.rs` (read snapshots for search/poller params).
+  (`SettingsCache`: in-memory, env-locked writes, secret redaction, typed
+  accessors), `auth.rs` (argon2id hashing, legacy sha2/plaintext
+  verification, verified-token cache), `auth_service.rs`
+  (`SettingsAuth`: the extracted admin-auth surface — TTL-cached token
+  verification with the process-wide KDF cap, and the legacy-plaintext
+  upgrade; reads the stored password through the shared cache),
+  `snapshots.rs` (read snapshots for search/poller params).
 
 - **`src/mcp/`** — MCP server over stdio: hand-rolled JSON-RPC 2.0,
   newline-delimited; tools: `search`, `read`, `suggest`, `list_sources`,
@@ -225,14 +229,17 @@ specific column types have no first-class sqlx types: `articles.search_vector`
 **Raw-SQL policy.** All SQL is raw, but it is confined: application SQL lives
 in `src/db/` (which owns the `db::raw` helpers and is therefore exempt from
 `scripts/check-raw-sql.sh`); any other direct `sqlx::query*` call site must
-carry a `// RAW-OK: <reason>` marker on the call line (session-level advisory
-locks, batch DDL — migration files are multi-statement; sqlx has no
-`batch_execute`, so statements are split and executed individually —, catalog
-probes (`pg_locks`, `pg_stat_activity`), the `COPY` bulk insert, and
-Postgres-specific operators — `websearch_to_tsquery`/tsvector, pg_trgm
-`similarity()`, pgvector distance operators, and `$n::vector` / `::tsvector`
-casts). The SQLSTATE/HTTP mapping in `Error` redacts DB details; 23505
-unique-violations are domain duplicates (409), not DB faults (503).
+carry a `// RAW-OK: <reason>` marker on the call line or the line directly
+above it (the lint's self-test pins both positions and the turbofish form; the
+"line directly above" form exists because call lines are often too long for a
+trailing comment within the 100-column budget). The sanctioned raw classes:
+session-level advisory locks, batch DDL — migration files are multi-statement,
+executed as one raw-string script split server-side (`db::raw::execute_script`)
+—, catalog probes (`pg_locks`, `pg_stat_activity`), the `COPY`
+bulk insert, and Postgres-specific operators — `websearch_to_tsquery`/tsvector,
+pg_trgm `similarity()`, pgvector distance operators, and `$n::vector` /
+`::tsvector` casts. The SQLSTATE/HTTP mapping in `Error` redacts DB details;
+23505 unique-violations are domain duplicates (409), not DB faults (503).
 
 **Migrations.** Numbered `.sql` files in `migrations/` (001–013; 005 is a
 void/retired number, never reused) are embedded
@@ -276,7 +283,15 @@ Explicitly declared out of scope:
   fails fast, not to enable it.
 - **Per-client rate limiting.** The token bucket is service-wide by design
   (single-operator model); one heavy client can 429 every other client
-  (`src/access/ratelimit.rs`, `README.md` "Threat model").
+  (`src/access/ratelimit.rs`, `README.md` "Threat model"). Trigger to revisit
+  (2026-09 review, Sec M1 × Perf): the moment the instance goes
+  network-facing with multiple independent clients, replace the single
+  service-wide bucket with per-IP buckets in a **bounded, evicted** map
+  (the map bound is the fairness ceiling — an unbounded per-IP state map is
+  itself the DoS vector the service-wide bucket avoids). Until then, the
+  loopback / few-client trade-off stands: one global bucket means one
+  aggressive authenticated client can self-DoS the others, and the 1 M
+  ceilings only stop operator misconfiguration.
 - **Persistent bounded-retry counts for the download requeue guard.** The
   give-up-after-N-consecutive-transient-failures policy is process-local
   (`DownloadPoller::last_error` / `requeue_passes`) and **resets on process

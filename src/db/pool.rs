@@ -7,7 +7,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgSslMode};
-use sqlx::ConnectOptions;
+use sqlx::{ConnectOptions, Connection};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -65,7 +65,8 @@ pub fn tls_mode_from_dsn(dsn: &str) -> Result<TlsMode> {
                     "disable" | "off" => Ok(TlsMode::None),
                     "require" | "verify-ca" | "verify-full" => Ok(TlsMode::Tls),
                     other => Err(Error::Config(format!(
-                        "Unsupported sslmode: '{other}'. Supported values: disable, require, verify-ca, verify-full"
+                        "Unsupported sslmode: '{other}'. Supported values: disable, require, \
+                        verify-ca, verify-full"
                     ))),
                 };
             }
@@ -186,20 +187,25 @@ pub fn driver_dsn(raw: &str) -> String {
     }
 }
 
-// Shared builder chain for both TLS modes so the timeout/runtime settings
-// can't drift between them.
-// (folded into `connect_options` — the options are built once and shared
-// between `create_pool` and `connect_dedicated`)
+/// Connection max lifetime (30 min): NAT and firewall devices silently
+/// drop idle TCP, so a connection held across such a drop fails with a bare
+/// network error on first reuse.
+const MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
+/// Hard cap on the per-acquire liveness ping (see `create_pool`'s
+/// `before_acquire` hook). A zombie peer (gone without a FIN) must not be
+/// able to hold an acquire past this.
+const ACQUIRE_PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Build the sqlx Postgres pool from [`Config`]: derives the TLS mode from
-/// the DSN scheme/`sslmode`, clamps the size via [`effective_pool_size`],
-/// and sets the lifetime/recycling options (10 s acquire timeout for fast
-/// 503s under exhaustion, 30 min max lifetime so NAT-dropped idle sockets
-/// are recycled).
-///
-/// TLS enforcement: `verify-full` enforces both chain and hostname validation;
-/// `require`/`verify-ca`/`+tls` enforce chain validation against the native
-/// root store.
+/// the DSN scheme/`sslmode` (see [`connect_options`] for the TLS semantics:
+/// `verify-full` enforces chain *and* hostname validation; `require` /
+/// `verify-ca` / `+tls` enforce chain validation against the native root
+/// store), clamps the size via [`effective_pool_size`], and sets the
+/// lifetime/recycling options (10 s acquire timeout for fast 503s under
+/// exhaustion, 30 min max lifetime so NAT-dropped idle sockets are recycled,
+/// and a **bounded** per-acquire liveness ping — see the `before_acquire`
+/// hook below — so a zombie peer can't wedge the pool).
 pub async fn create_pool(config: &Config) -> Result<Pool> {
     let tls_mode = tls_mode_from_dsn(&config.database_url)?;
 
@@ -213,7 +219,28 @@ pub async fn create_pool(config: &Config) -> Result<Pool> {
         // Recycle long-lived connections (ops hardening, Perf #8): NAT and
         // firewall devices silently drop idle TCP, so a connection held
         // across such a drop fails with a bare network error on first reuse.
-        .max_lifetime(Duration::from_secs(30 * 60))
+        .max_lifetime(MAX_LIFETIME)
+        // sqlx's default liveness check is an *unbounded* `ping()` before
+        // each acquire. That is the right check with the wrong bound: if a
+        // peer vanished without a FIN (NAT/firewall state flush, host
+        // reboot), the ping's read blocks forever and the acquire — and
+        // everything queued behind the pool — wedges indefinitely. The
+        // bounded hook below provides the same per-acquire check with a
+        // hard cap: a slow/zombie ping is an error, the pool hard-closes
+        // the connection and dials a fresh one (2026-09 review, ops
+        // hardening after a real remote-DB wedge).
+        .test_before_acquire(false)
+        .before_acquire(|conn, _meta| {
+            Box::pin(async move {
+                match tokio::time::timeout(ACQUIRE_PING_TIMEOUT, conn.ping()).await {
+                    Ok(res) => Ok(res.is_ok()),
+                    Err(_) => Err(sqlx::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("pool liveness ping exceeded {ACQUIRE_PING_TIMEOUT:?}"),
+                    ))),
+                }
+            })
+        })
         .connect_with(opts)
         .await
         .map_err(Error::Database)?;
@@ -267,8 +294,8 @@ impl CheckoutWaitStats {
 /// `search::SearchEngine::search`): a non-trivial `max`/`avg` checkout wait
 /// under sustained search QPS is the signal to move the search arms onto
 /// separate connections. One instance is the process-global aggregate
-/// ([`CHECKOUT_WAIT`]); [`record_checkout_wait`] additionally keeps one
-/// instance per call-site label in [`CHECKOUT_WAIT_BY_SITE`], so `/diagnostic`
+/// (`CHECKOUT_WAIT`); `record_checkout_wait` additionally keeps one
+/// instance per call-site label in `CHECKOUT_WAIT_BY_SITE`, so `/diagnostic`
 /// can attribute the wait to the checkout that caused it. Only **explicit**
 /// `pool.acquire()` sites are instrumented — via [`acquire_timed`] — because
 /// the implicit per-query acquires inside sqlx's `Executor` impl for `&Pool`
