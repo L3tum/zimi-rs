@@ -10,6 +10,8 @@ downloads/
 # Config (may contain secrets)
 config.toml
 .env
+# local dev DB connection (source it: `set -a; source dev-database.sh; set +a`)
+dev-database.sh
 
 # IDE
 .idea/
