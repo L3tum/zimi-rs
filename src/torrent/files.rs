@@ -585,4 +585,146 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    // ── verify_zim: malformed-input guard (TESTS-M1 × SEC M3b) ────────────
+    //
+    // The external `zim` 0.5 crate is the project's self-flagged top
+    // code-execution-adjacent risk (RUSTSEC-audit job in
+    // .github/workflows/ci.yml). These tests pin that every malformed input
+    // a poisoned swarm/OPDS feed could deliver is rejected with a clean
+    // `Error::Zim` — never a panic, never a silent "valid". The message
+    // substrings below are the *observed* rejections from zim 0.5.0, against
+    // its ZIM v6 little-endian 80-byte header layout:
+    //
+    //   0..4   magic u32         (0x044D495A, bytes "ZIM\x04")
+    //   4..6   version_major u16 (crate accepts only 5 or 6)
+    //   6..8   version_minor u16
+    //   8..24  uuid (16 bytes)
+    //   24..28 article_count u32
+    //   28..32 cluster_count u32
+    //   32..40 url_ptr_pos u64   (path/"central dir" pointer list)
+    //   40..48 title_ptr_pos u64 (deprecated)
+    //   48..56 cluster_ptr_pos u64
+    //   56..64 mime_list_pos u64 (crate requires exactly 80)
+    //   64..68 main_page u32
+    //   68..72 layout_page u32
+    //   72..80 checksum_pos u64  (crate requires file_len - 16)
+
+    #[test]
+    fn verify_zim_rejects_bad_magic_without_panic() {
+        // Poisoned first 4 bytes: not the ZIM magic. The real magic is
+        // derived from the fixture (not hardcoded) so the sanity check below
+        // stays honest if the format's magic ever changes.
+        let base = tmp("verify-badmagic");
+        let bytes = std::fs::read("tests/fixtures/tiny.zim").unwrap();
+        assert_ne!(&bytes[..4], b"XXXX", "fixture sanity: magic must differ");
+
+        let mut bad = b"XXXX".to_vec();
+        bad.extend(std::iter::repeat_n(0u8, 1024));
+        let path = base.join("badmagic.zim");
+        std::fs::write(&path, &bad).unwrap();
+
+        let err = verify_zim(&path).unwrap_err();
+        assert!(matches!(err, Error::Zim(_)), "got: {err}");
+        // Observed (zim 0.5.0): rejected at the magic check.
+        assert!(
+            err.to_string().contains("invalid magic number"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn verify_zim_rejects_zero_byte_file_without_panic() {
+        // A 0-byte `.zim`: an interrupted download that never grew. Mapping
+        // an empty file must not panic inside the crate.
+        let base = tmp("verify-empty");
+        let path = base.join("empty.zim");
+        std::fs::write(&path, b"").unwrap();
+
+        let err = verify_zim(&path).unwrap_err();
+        assert!(matches!(err, Error::Zim(_)), "got: {err}");
+        // Observed (zim 0.5.0 / memmap 0.7): mmap of a zero-length file
+        // fails, surfaced as a Parsing error — a clean rejection.
+        assert!(
+            err.to_string()
+                .contains("memory map must have a non-zero length"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn verify_zim_rejects_10_byte_and_half_truncation_without_panic() {
+        // Truncation at the two extremes a swarm can produce: almost nothing
+        // left (shorter than the 80-byte header), and ~50% (header intact,
+        // the rest of the archive gone — mid-central-dir cut).
+        let base = tmp("verify-trunc2");
+        let bytes = std::fs::read("tests/fixtures/tiny.zim").unwrap();
+        assert!(
+            bytes.len() > 100,
+            "fixture sanity: larger than the truncation points"
+        );
+
+        for (label, cut) in [("ten", 10usize), ("half", bytes.len() / 2)] {
+            let trunc = base.join(format!("{label}.zim"));
+            std::fs::write(&trunc, &bytes[..cut]).unwrap();
+
+            let err = verify_zim(&trunc).unwrap_err();
+            assert!(matches!(err, Error::Zim(_)), "{label}: got: {err}");
+            // Observed (zim 0.5.0): the 10-byte file is shorter than the
+            // 80-byte header; the half file keeps its header, so it fails
+            // the "checksumPos is 16 bytes before EOF" sanity check.
+            let msg = err.to_string();
+            if label == "ten" {
+                assert!(
+                    msg.contains("file is smaller than the header"),
+                    "got: {msg}"
+                );
+            } else {
+                assert!(
+                    msg.contains("checksumPos is not 16 bytes before the end"),
+                    "got: {msg}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn verify_zim_rejects_corrupted_header_fields() {
+        // Byte-level header corruption at full valid length (not
+        // truncation): fields no sane writer would emit.
+        let base = tmp("verify-corrupt");
+        let bytes = std::fs::read("tests/fixtures/tiny.zim").unwrap();
+
+        // (a) Zero out 4..8 (version_major + version_minor) → major 0.
+        let mut v = bytes.clone();
+        v[4..8].fill(0);
+        let p1 = base.join("badversion.zim");
+        std::fs::write(&p1, &v).unwrap();
+        let err = verify_zim(&p1).unwrap_err();
+        assert!(matches!(err, Error::Zim(_)), "got: {err}");
+        // Observed (zim 0.5.0): the crate accepts only major versions 5 or 6.
+        assert!(
+            err.to_string().contains("invalid major version: 0"),
+            "got: {err}"
+        );
+
+        // (b) Absurd central-dir ("path pointer list") offset: u64::MAX.
+        let mut c = bytes.clone();
+        c[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+        let p2 = base.join("badptrpos.zim");
+        std::fs::write(&p2, &c).unwrap();
+        let err = verify_zim(&p2).unwrap_err();
+        assert!(matches!(err, Error::Zim(_)), "got: {err}");
+        // Observed (zim 0.5.0): the pointer list cannot fit in the file.
+        assert!(
+            err.to_string()
+                .contains("path pointer list runs past the end of file"),
+            "got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

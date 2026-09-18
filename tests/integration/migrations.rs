@@ -171,15 +171,21 @@ async fn sweep_stale_temp_dbs(base_pool: &Pool) {
         if pid == 0 {
             continue; // `kill -0 0` targets the process group — never a pid
         }
-        // `kill -0` succeeds iff the pid is a live process we may signal.
-        // A live foreign-user pid answers EPERM (reads as "not alive"); in
-        // this environment the suite only ever runs as the dev-box/CI user,
-        // so the sweep's conservative failure mode is keeping a DB, not
-        // dropping one.
+        // `kill -0` exits 0 iff the pid is live AND signalable by us. A live
+        // FOREIGN-user pid exits non-zero with EPERM ("Operation not
+        // permitted" on stderr) — that pid is still a live process, so per
+        // the doc's conservative rule it is kept, not dropped. Any other
+        // failure (ESRCH: no such process, …) means the pid is gone → the
+        // DB is stale.
         let alive = std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
             .output()
-            .map(|o| o.status.success())
+            .map(|o| {
+                let eperm = String::from_utf8_lossy(&o.stderr)
+                    .to_lowercase()
+                    .contains("not permitted");
+                o.status.success() || eperm
+            })
             .unwrap_or(false);
         if alive {
             continue;

@@ -25,17 +25,18 @@ jobs:
       # there (move the SQL into a named src/db/ helper). POSIX sh, no
       # dependencies.
       - run: make raw-sql-lint
-      # JS syntax check for the embedded web UI (dependency-free, ~seconds).
-      # Strict because `make web-check` skips silently without node; CI always
-      # has node, so a missing-node must fail the gate, not pass it.
+      # web-check (JS syntax + CSS parse) and web-test both read
+      # node_modules: the CSS half parses with css-tree (the sanctioned
+      # parser dependency, mirroring jsdom), web-test boots a JSDOM
+      # document — so the install comes first. Strict because the targets
+      # skip silently without node/their dependency; CI always has node,
+      # so a missing node/css-tree/jsdom must fail the gate, not pass it.
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
+      - run: npm install --no-audit --no-fund
       - run: make web-check
         env:
           ZIMSERVICE_WEB_CHECK_STRICT: "1"
-      # web-test needs jsdom from node_modules (the smoke test boots a JSDOM
-      # document); web-check above is dependency-free and needs no install.
-      - run: npm install --no-audit --no-fund
       # Behavioral unit tests for web/common.js helpers (apiFetch admin-auth
       # flow, esc, formatters) — same strict policy: CI always has node.
       - run: make web-test

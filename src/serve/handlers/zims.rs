@@ -241,7 +241,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     let (zims_count, total_articles) = state.zims.summary();
     // Real liveness probes, memoized (2s TTL) so a burst of health checks
     // doesn't ping Postgres or qBittorrent unthrottled.
-    let db_connected = crate::health::probe_db(&state.db).await;
+    let db_connected = state.probes.probe_db(&state.db).await;
     let qbit_connected = state.probes.probe_qbit(&state.torrent.current()).await;
     // M-health-200: the status code mirrors DB liveness so a monitor can alert
     // on 503 (DB down). The body always reports the real probe results.

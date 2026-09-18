@@ -799,7 +799,7 @@ impl DownloadPoller {
                             "row no longer queued after add_torrent (cancel won the race) — \
                             removing just-added torrent"
                         );
-                        self.remove_just_added_torrent(q, &added).await;
+                        self.remove_just_added_torrent(q, &added, &p.category).await;
                         continue;
                     }
                     budget -= 1;
@@ -828,12 +828,17 @@ impl DownloadPoller {
     /// guard miss in the enqueue path: the torrent was just added to qB but
     /// the row is no longer `queued` (a cancel won the race). `add_torrent`
     /// returns the qB torrent name (not a hash), so re-fetch the list and
-    /// delete by the matched hash (case-insensitive name match — the same
-    /// convention as the in-flight name fallback). Best-effort: a failed
-    /// lookup/removal is logged; a leftover is at worst re-adopted by the
-    /// next reconcile.
-    async fn remove_just_added_torrent(&self, q: &Arc<QbitClient>, added_name: &str) {
-        let wanted = added_name.to_lowercase();
+    /// delete the first torrent [`is_just_added_candidate`] accepts — the
+    /// returned name **and** the category this add assigned
+    /// (`enqueue_category`) — so a pre-existing torrent that merely shares
+    /// the name is never deleted. Best-effort: a failed lookup/removal is
+    /// logged; a leftover is at worst re-adopted by the next reconcile.
+    async fn remove_just_added_torrent(
+        &self,
+        q: &Arc<QbitClient>,
+        added_name: &str,
+        enqueue_category: &str,
+    ) {
         let torrents = match q.get_torrents("all").await {
             Ok(t) => t,
             Err(e) => {
@@ -844,7 +849,10 @@ impl DownloadPoller {
                 return;
             }
         };
-        match torrents.iter().find(|t| t.name.to_lowercase() == wanted) {
+        match torrents
+            .iter()
+            .find(|t| is_just_added_candidate(t, added_name, enqueue_category))
+        {
             Some(t) => match q.delete(&t.hash, true).await {
                 Ok(()) => {
                     tracing::info!(
@@ -857,10 +865,39 @@ impl DownloadPoller {
                 }
             },
             None => tracing::warn!(
-                "compensating removal: no torrent matching {wanted:?} in qBittorrent (already \
-                gone?)"
+                "compensating removal: no torrent matching {added_name:?} (category \
+                {enqueue_category:?}) in qBittorrent (already gone?)"
             ),
         }
+    }
+}
+
+/// Decide whether a torrent in the re-fetched qB list is the one the enqueue
+/// loop just added (used by `remove_just_added_torrent`). Requires ALL of:
+/// - **name**: case-insensitive match against the name `add_torrent`
+///   returned (the same convention as the in-flight name fallback);
+/// - **category**: the enqueue call always assigns the configured category,
+///   so a candidate's `Some` category must equal `enqueue_category`
+///   case-insensitively, and a `None` category is rejected whenever
+///   `enqueue_category` is non-empty (our adds always carry the category).
+///   An empty `enqueue_category` (operator left `torrent.category` unset)
+///   falls back to the name-only match — a `Some` category still has to
+///   equal it, so a pre-existing categorized same-named torrent is kept.
+///
+/// Pure by design (no qB/DB access) so the matching rules are unit-testable.
+/// Note: `TorrentInfo` exposes no addition-date field, so no recency bound
+/// is possible — the name+category match is the full candidate test.
+fn is_just_added_candidate(
+    t: &super::TorrentInfo,
+    wanted_name: &str,
+    enqueue_category: &str,
+) -> bool {
+    if t.name.to_lowercase() != wanted_name.to_lowercase() {
+        return false;
+    }
+    match t.category.as_deref() {
+        Some(cat) => cat.to_lowercase() == enqueue_category.to_lowercase(),
+        None => enqueue_category.is_empty(),
     }
 }
 
@@ -900,7 +937,7 @@ pub(crate) fn seeding_row_action(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{Pool, REQUEUE_ERROR_PATTERN};
+    use super::{is_just_added_candidate, Pool, REQUEUE_ERROR_PATTERN};
     use crate::torrent::TorrentInfo;
 
     /// `(progress, speed_bps, eta_secs, ratio, up_speed_bps, num_seeds)`
@@ -979,6 +1016,96 @@ mod tests {
             assert!(tinfo("missingFiles", 0.9).is_fatal());
             assert!(!tinfo("downloading", 0.2).is_fatal());
             assert!(!tinfo("uploading", 1.0).is_fatal());
+        }
+    }
+
+    // ── is_just_added_candidate (BUGS-3): name+category candidate test ────
+
+    pub(crate) mod just_added {
+        use super::state::tinfo;
+        use super::*;
+
+        /// Base torrent, overridden field-by-field per case (state/progress
+        /// are irrelevant to the candidate test).
+        fn base() -> TorrentInfo {
+            tinfo("downloading", 0.0)
+        }
+
+        #[test]
+        fn name_and_category_match_is_candidate() {
+            let t = TorrentInfo {
+                name: "My.Zim".into(),
+                category: Some("Zim".into()),
+                ..base()
+            };
+            assert!(is_just_added_candidate(&t, "my.zim", "zim"));
+            // Case-insensitive in both directions.
+            let t = TorrentInfo {
+                name: "MY.ZIM".into(),
+                category: Some("ZIM".into()),
+                ..base()
+            };
+            assert!(is_just_added_candidate(&t, "my.zim", "zim"));
+        }
+
+        #[test]
+        fn same_name_wrong_category_is_not_candidate() {
+            // A pre-existing torrent that merely shares the name must
+            // survive: our add always carries the configured category.
+            let t = TorrentInfo {
+                name: "my.zim".into(),
+                category: Some("other".into()),
+                ..base()
+            };
+            assert!(!is_just_added_candidate(&t, "my.zim", "zim"));
+        }
+
+        #[test]
+        fn none_category_rejected_when_enqueue_category_set() {
+            // Our add always sets the category, so a same-named torrent
+            // without one is not the just-added one.
+            let t = TorrentInfo {
+                name: "my.zim".into(),
+                category: None,
+                ..base()
+            };
+            assert!(!is_just_added_candidate(&t, "my.zim", "zim"));
+        }
+
+        #[test]
+        fn empty_enqueue_category_falls_back_to_name() {
+            // Operator left `torrent.category` unset: our add assigns ""
+            // (qB default category), so a name-only match is acceptable.
+            let t = TorrentInfo {
+                name: "my.zim".into(),
+                category: None,
+                ..base()
+            };
+            assert!(is_just_added_candidate(&t, "MY.ZIM", ""));
+            // …but a pre-existing torrent that carries a different category
+            // is still not ours.
+            let t = TorrentInfo {
+                name: "my.zim".into(),
+                category: Some("other".into()),
+                ..base()
+            };
+            assert!(!is_just_added_candidate(&t, "my.zim", ""));
+        }
+
+        #[test]
+        fn name_mismatch_never_candidate() {
+            let t = TorrentInfo {
+                name: "other.zim".into(),
+                category: Some("ZIM".into()),
+                ..base()
+            };
+            assert!(!is_just_added_candidate(&t, "my.zim", "zim"));
+            let t = TorrentInfo {
+                name: "other.zim".into(),
+                category: None,
+                ..base()
+            };
+            assert!(!is_just_added_candidate(&t, "my.zim", "zim"));
         }
     }
 
@@ -3670,19 +3797,6 @@ mod tests {
                     "sql_zim_predicate({url:?}) = {sql_result}, expected {expected}"
                 );
             }
-        }
-    }
-
-    /// WI-10: print a summary of DB-gated lib-test skips at process exit.
-    /// Mirrors the pattern in `tests/integration.rs`.
-    #[dtor::dtor]
-    fn print_lib_skip_summary() {
-        let n = crate::testing::LIB_SKIPPED.load(std::sync::atomic::Ordering::Relaxed);
-        if n > 0 {
-            eprintln!(
-                "\n{n} lib test(s) SKIPPED (no database) — run with a \
-                reachable Postgres to exercise them"
-            );
         }
     }
 }

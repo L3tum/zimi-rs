@@ -1057,4 +1057,56 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── TESTS-M1 × SEC M3b: garbage isolation in the scan loop ─────────────
+
+    /// A garbage `.zim` sitting in the ZIM directory must not kill the
+    /// scan/reconcile loop.
+    ///
+    /// Observed behavior (pinned): the scan phase of resync
+    /// (`discovery::scan_snapshot_blocking`, run via `spawn_blocking` by both
+    /// `ZimManager::scan` and `resync`) is **stat-only** — it never parses
+    /// file contents, so a garbage file is *enumerated* and stubbed (status
+    /// `pending`), not skipped. The parse choke points for such a file are
+    /// the open paths: `ZimManager::open_zim` (serving, tested here) and
+    /// `index::open_zim_blocking` (indexing, tested in `index::tests`). Both
+    /// must fail with a clean `Error::Zim` rather than panic, and the failed
+    /// garbage open must not disturb the valid archive: it stays discovered
+    /// and openable afterwards.
+    #[tokio::test]
+    async fn scan_survives_garbage_zim_keeps_valid_discovered() {
+        let dir = temp_dir("garbage");
+        std::fs::copy("tests/fixtures/tiny.zim", dir.join("good.zim")).unwrap();
+        // Garbage: a zero-byte `.zim` (interrupted/poisoned swarm file).
+        std::fs::write(dir.join("bad.zim"), b"").unwrap();
+
+        let m = manager(&dir);
+        // The scan/reconcile entry point must complete without panic...
+        let names = m.scan().await.unwrap();
+        // ...enumerating BOTH files (stat-only: the garbage file is stubbed
+        // like any other and will be rejected later at open/index time — it
+        // is not skipped by the scan itself).
+        assert_eq!(
+            names,
+            vec!["bad".to_string(), "good".to_string()],
+            "got: {names:?}"
+        );
+        // The valid ZIM is discovered with its real size...
+        let good = m.get("good").unwrap();
+        assert_eq!(
+            good.file_size,
+            std::fs::metadata(dir.join("good.zim")).unwrap().len(),
+            "valid ZIM must be discovered with its real size"
+        );
+
+        // The parse choke point: the garbage file fails cleanly (Error::Zim),
+        // never panicking...
+        let res = m.open_zim("bad").await;
+        assert!(res.is_err(), "garbage .zim must not open");
+        let err = res.err().unwrap();
+        assert!(matches!(err, Error::Zim(_)), "got: {err}");
+        // ...and the valid ZIM stays openable afterwards (isolation).
+        assert!(m.open_zim("good").await.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

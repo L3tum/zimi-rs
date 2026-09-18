@@ -295,6 +295,25 @@ is reachable by any network peer. Open mode is rejected at startup on a
   content-integrity verification itself. See Download SSRF protection and
   ZIM content trust boundary for the operational checklist.
 
+#### Residual risks (accepted, 2026-09 review)
+
+- **ZIM content is the trust boundary.** A poisoned ZIM (from a torrent
+  swarm or OPDS feed) is served with its scripts intact; containment is the
+  browser CSP sandbox (`script-src 'none'` + `object-src 'none'`), not
+  content inspection. Hash-pinning or a separate origin for untrusted
+  sources is future work.
+- **`downloads.max_bytes` defaults to effectively unbounded** (1 EiB) — an
+  operator-settable cap; set it explicitly to bound disk exposure.
+- **`?access_token=` query-string auth** is limited to read-only verbs
+  (log-stripping is verified by test); prefer the `Authorization: Bearer`
+  header for scripts/curl (query tokens can leak in logs/shell history).
+- **`/health` is public by design** and discloses version, download/article
+  counts, and qBittorrent/DB liveness (for monitors) — treat it as not
+  confidential.
+- **Single shared password, no per-user accounts** (single-operator
+  design; no per-user audit trail). A legacy plaintext password in the DB
+  is transparently upgraded to a salted hash on first successful auth.
+
 ### MCP server authentication
 
 The MCP stdio server inherits the same access model. When `access.mode = "password"`,

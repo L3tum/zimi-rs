@@ -33,6 +33,7 @@
 //! to run against an existing dev database.
 
 mod common;
+mod constraints;
 mod embedding;
 mod health;
 mod invalid_index;
@@ -41,6 +42,7 @@ mod raw;
 mod search;
 mod serve;
 mod settings_auth;
+mod tls;
 mod trgm_plan;
 mod vector_dim;
 mod zims;

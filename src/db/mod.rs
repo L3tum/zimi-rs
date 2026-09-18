@@ -10,10 +10,13 @@
 //!
 //! 2. **Direct `sqlx::query*` calls** outside `src/db/` need a
 //!    `// RAW-OK: <reason>` marker on the call line or the line directly
-//!    above it (call lines are often too long for a trailing comment). Background layers (torrent, zim,
-//!    search, embed, startup) call `db::raw::*` directly as the intended
-//!    path and are exempt from this rule.
+//!    above it (call lines are often too long for a trailing comment).
+//!    Background layers (torrent, zim, search, embed, startup) call
+//!    `db::raw::*` directly as the intended path and are exempt from this rule.
 
+/// Explicit-ID lookups of a single article's indexed metadata (the non-random half
+/// of article fetching, split from `random_article`).
+pub mod articles;
 /// User-collection data access (ARCH M1 repository extraction).
 pub mod collections;
 /// Download-queue data access (ARCH M1 repository extraction).

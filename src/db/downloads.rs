@@ -263,6 +263,36 @@ pub async fn find_same_name_live_row(
     .await
 }
 
+/// The id of another *live* row (`queued`/`downloading`/`complete`/`seeding`)
+/// that owns the same `file_path`, excluding `exclude_id` — or `None`. The
+/// install/discard ownership guard keyed on the RESOLVED destination path:
+/// on the torrent path the install destination is the torrent's CONTENT file
+/// name (`zim_dir/{content_file_name}`), which can differ from the row's
+/// display name — so the name-based guard ([`find_same_name_live_row`]) can
+/// miss a collision that would overwrite (and the cancel-race discard could
+/// then delete) another live row's installed file. `exclude_id` tolerates the
+/// row being settled itself.
+pub async fn find_live_row_owns_path(
+    pool: &Pool,
+    path: &str,
+    exclude_id: i32,
+) -> Result<Option<i32>> {
+    raw::fetch_scalar_optional(
+        pool,
+        "SELECT id FROM downloads \
+         WHERE file_path = $1 AND id != $2 AND status IN ($3, $4, $5, $6) LIMIT 1",
+        |q| {
+            q.bind(path)
+                .bind(exclude_id)
+                .bind(crate::db::downloads_lifecycle::DownloadStatus::Queued.as_str())
+                .bind(crate::db::downloads_lifecycle::DownloadStatus::Downloading.as_str())
+                .bind(crate::db::downloads_lifecycle::DownloadStatus::Complete.as_str())
+                .bind(crate::db::downloads_lifecycle::DownloadStatus::Seeding.as_str())
+        },
+    )
+    .await
+}
+
 /// Outcome of [`insert_download`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertOutcome {

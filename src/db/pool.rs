@@ -198,7 +198,7 @@ const MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const ACQUIRE_PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Build the sqlx Postgres pool from [`Config`]: derives the TLS mode from
-/// the DSN scheme/`sslmode` (see [`connect_options`] for the TLS semantics:
+/// the DSN scheme/`sslmode` (see `connect_options` for the TLS semantics:
 /// `verify-full` enforces chain *and* hostname validation; `require` /
 /// `verify-ca` / `+tls` enforce chain validation against the native root
 /// store), clamps the size via [`effective_pool_size`], and sets the
@@ -805,5 +805,21 @@ mod tests {
             ssl_mode_for(TlsMode::None, "postgres://u:p@h/db?sslmode=disable"),
             PgSslMode::Disable
         ));
+    }
+
+    /// End-to-end verify-full promotion: the *driver-facing* `connect_options`
+    /// (not just the pure `ssl_mode_for` helper covered by
+    /// `ssl_mode_full_when_verify_full`) must pin `VerifyFull` on the
+    /// `PgConnectOptions` it returns — that pin is what overrides sqlx's
+    /// `prefer` URL default, so a regression here would silently downgrade
+    /// hostname verification for every `sslmode=verify-full` DSN.
+    #[test]
+    fn connect_options_pins_verify_full_from_dsn() {
+        let opts = connect_options(
+            "postgres://user:pass@localhost:5432/db?sslmode=verify-full",
+            TlsMode::Tls,
+        )
+        .unwrap();
+        assert!(matches!(opts.get_ssl_mode(), PgSslMode::VerifyFull));
     }
 }

@@ -1270,9 +1270,10 @@ fn file_mtime_u64(path: &Path) -> u64 {
 mod tests {
     use super::{
         escape_copy_text_into, extract_qid, extract_qid_windowed, generate_snippet, is_wikipedia,
-        mark_index_error, parse_zim_date, strip_head, truncate_at_sentence, PREVIEW_CHARS,
-        QID_SCAN_BYTES, STRIP_HEAD_BYTES,
+        mark_index_error, open_zim_blocking, parse_zim_date, strip_head, truncate_at_sentence,
+        PREVIEW_CHARS, QID_SCAN_BYTES, STRIP_HEAD_BYTES,
     };
+    use crate::error::Error;
     use chrono::NaiveDate;
 
     // ── is_wikipedia (WP3.4) ───────────────────────────────────────────────
@@ -1706,5 +1707,39 @@ mod tests {
         // The tail is dropped by the cap but present in the full strip.
         assert!(!capped.contains("TAILMARKER"));
         assert!(full.contains("TAILMARKER"));
+    }
+
+    // ── TESTS-M1 × SEC M3b: malformed-archive guard at the indexing open ──
+
+    /// The indexing pipeline's parse choke point (`open_zim_blocking` →
+    /// `zim::Zim::new`) must reject malformed archives with a clean
+    /// `Error::Zim` and never panic. The bulk `index_zims` pass relies on
+    /// per-ZIM failure isolation ("one corrupt archive must not abort the
+    /// rest of the batch"), which only holds if the parse itself cannot
+    /// panic or misreport success.
+    #[test]
+    fn open_zim_blocking_rejects_malformed_archives_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = std::fs::read("tests/fixtures/tiny.zim").unwrap();
+
+        let mut bad_magic = b"XXXX".to_vec();
+        bad_magic.extend(std::iter::repeat_n(0u8, 1024));
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("zero-byte", Vec::new()),
+            ("bad-magic", bad_magic),
+            ("truncated-10", bytes[..10].to_vec()),
+            ("truncated-half", bytes[..bytes.len() / 2].to_vec()),
+        ];
+        for (label, data) in cases {
+            let path = dir.path().join(format!("{label}.zim"));
+            std::fs::write(&path, &data).unwrap();
+            let res = open_zim_blocking(path, "Title".into(), "en".into());
+            assert!(res.is_err(), "{label}: malformed archive must not open");
+            let err = res.err().unwrap();
+            assert!(
+                matches!(err, Error::Zim(_)),
+                "{label}: expected Error::Zim, got: {err}"
+            );
+        }
     }
 }

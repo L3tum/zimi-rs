@@ -577,8 +577,7 @@ pub async fn get_snippet(
     Query(params): Query<SnippetQuery>,
 ) -> Result<Json<SnippetResponse>, crate::error::Error> {
     let row =
-        crate::db::random_article::fetch_article_snippet(&state.db, &params.zim, &params.path)
-            .await?;
+        crate::db::articles::fetch_article_snippet(&state.db, &params.zim, &params.path).await?;
 
     match row {
         Some((snippet, title, preview)) => Ok(Json(SnippetResponse {

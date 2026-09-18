@@ -85,17 +85,32 @@ pub async fn auth_middleware(
     // WI-14: when `general.trusted_proxy_cidrs` is set and the direct
     // connect IP is within a trusted CIDR, resolve the real client IP from
     // `X-Forwarded-For` for the lockout key (trusted-chain algorithm — see
-    // `client_ip_from_xff`).
+    // `client_ip_from_xff`). The header is read first and the settings
+    // lookup (cache read + `String` clone) happens only when the header is
+    // present — it is the expensive part, and the header is absent on most
+    // requests.
     let ip = ip.map(|ip| {
-        let cidrs_raw = state
-            .settings
-            .get_typed::<String>(KEY_GENERAL_TRUSTED_PROXY_CIDRS)
-            .unwrap_or_default();
         let xff = request
             .headers()
             .get("x-forwarded-for")
             .and_then(|h| h.to_str().ok());
-        client_ip_from_xff(&cidrs_raw, xff, ip)
+        match xff {
+            Some(x) => {
+                let cidrs_raw = state
+                    .settings
+                    .get_typed::<String>(KEY_GENERAL_TRUSTED_PROXY_CIDRS)
+                    .unwrap_or_default();
+                client_ip_from_xff(&cidrs_raw, Some(x), ip)
+            }
+            // `client_ip_from_xff(_cidrs, None, ip) == ip` for every input:
+            // no XFF value means no entries to walk, so the trusted-peer
+            // path falls back to the peer IP (and the untrusted-peer path
+            // returns it outright — see the `client_ip_from_xff` docs and
+            // its `xff_trusted_peer_empty_header_falls_back_to_peer` test).
+            // A missing header therefore skips the settings lookup with no
+            // behavior change.
+            None => ip,
+        }
     });
     let locked_remaining = ip.and_then(|ip| state.auth_lockout.lockout_remaining(&ip));
     if let Some(rem) = locked_remaining {

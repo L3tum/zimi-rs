@@ -4,6 +4,7 @@
 
 use crate::torrent::TorrentInfo;
 
+use super::direct::discard_if_unowned;
 use super::{
     client_from_option, direct_download, index, install_zim, kibs_to_bps, locate_torrent_zim,
     mark_error, verify_zim, Arc, DownloadPoller, Error, Path, QbitClient, Result,
@@ -24,6 +25,34 @@ impl DownloadPoller {
         p: &crate::settings::PollerParams,
         file_path: Option<String>,
     ) -> Result<()> {
+        // BUG-20: the claimed install may already be on disk. A requeued
+        // completion re-enters here with the file present (resync/final-
+        // UPDATE errors that match REQUEUE_ERROR_PATTERN are requeued;
+        // anything else already marks `error` and stops), so reuse it — the
+        // retry is O(1) instead of a multi-GB re-verify + copy.
+        let skipped_existing = file_path
+            .as_deref()
+            .map(|p| Path::new(p).exists())
+            .unwrap_or(false);
+        // BUGS-2: resolve the expected install destination up front (cheap —
+        // locate only, no verify). The install destination is the torrent's
+        // CONTENT file name — `zim_dir/{content_file_name}` — or the claimed
+        // `file_path` itself on the skip path. A locate failure yields
+        // `None` and defers to the install error path below (the guard runs
+        // only on success).
+        let expected_dst: Option<std::path::PathBuf> = if skipped_existing {
+            file_path.clone().map(std::path::PathBuf::from)
+        } else {
+            let content = t
+                .content_path
+                .as_deref()
+                .or(t.save_path.as_deref())
+                .unwrap_or("");
+            locate_torrent_zim(Path::new(content))
+                .ok()
+                .and_then(|zim_file| zim_file.file_name().map(|n| self.zims.zim_dir.join(n)))
+        };
+
         // Install-collision guard: dedup at enqueue only covers live rows, so
         // an older terminal row with the same name can already own
         // `zim_dir/{name}.zim` — an install on this row would overwrite it
@@ -43,6 +72,27 @@ impl DownloadPoller {
             mark_error(&self.db, id, &msg).await;
             return Ok(());
         }
+        // BUGS-2: the guard above keys on the row DISPLAY name, but the
+        // install destination is the CONTENT file name (`expected_dst`) — a
+        // differently-named row can still own that path. Guard on the
+        // resolved destination itself and refuse the install the same way —
+        // mark this row `error`, return WITHOUT touching the destination
+        // file. A query failure propagates (fail closed — same rationale as
+        // the same-name guard above).
+        if let Some(expected_dst) = &expected_dst {
+            if let Some(other) = crate::db::downloads::find_live_row_owns_path(
+                &self.db,
+                &expected_dst.display().to_string(),
+                id,
+            )
+            .await?
+            {
+                let msg = format!("install skipped: destination already owned by live row {other}");
+                tracing::info!("download {id}: {msg}");
+                mark_error(&self.db, id, &msg).await;
+                return Ok(());
+            }
+        }
         // Seeding: cap the ratio; the torrent stays in qBittorrent
         // (keep_completed means we simply never delete it).
         if let Some(q) = qbit.as_ref() {
@@ -53,15 +103,6 @@ impl DownloadPoller {
             }
         }
 
-        // BUG-20: the claimed install may already be on disk. A requeued
-        // completion re-enters here with the file present (resync/final-
-        // UPDATE errors that match REQUEUE_ERROR_PATTERN are requeued;
-        // anything else already marks `error` and stops), so reuse it — the
-        // retry is O(1) instead of a multi-GB re-verify + copy.
-        let skipped_existing = file_path
-            .as_deref()
-            .map(|p| Path::new(p).exists())
-            .unwrap_or(false);
         let dst: std::path::PathBuf = if skipped_existing {
             tracing::info!(
                 download_id = id,
@@ -137,8 +178,7 @@ impl DownloadPoller {
                 "download {id} was cancelled during install — discarding {}",
                 dst.display()
             );
-            let _ = std::fs::remove_file(&dst);
-            let _ = self.zims.resync().await;
+            discard_if_unowned(&self.db, &self.zims, id, &dst).await;
             return Ok(());
         }
 
@@ -452,6 +492,153 @@ mod tests {
         crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
             .await
             .unwrap();
+        crate::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| {
+            q.bind("utiny")
+        })
+        .await
+        .unwrap();
+    }
+
+    /// BUGS-2 (CI-DB): the destination-ownership guard — row A is `complete`
+    /// and owns `<zim_dir>/utiny.zim`; row B has a DIFFERENT display name,
+    /// but its torrent's CONTENT file is also named `utiny.zim`, so the
+    /// name-based same-name guard cannot see the collision. `handle_complete`
+    /// on B must refuse the install (B → `error`, message names the owning
+    /// row) and must leave A's file (inode + bytes) and A's row untouched.
+    #[tokio::test]
+    async fn handle_complete_refuses_install_when_destination_owned_by_other_live_row() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
+        let settings = download_settings();
+        let poller = super::super::DownloadPoller::new(
+            pool.clone(),
+            settings.clone(),
+            zims.clone(),
+            crate::torrent::QbitClientCache::new(),
+            None,
+            String::new(),
+            String::new(),
+        );
+        let p = poller.settings.poller_params_snapshot();
+
+        // Row A: `complete`, owns <zim_dir>/utiny.zim (the fixture is there).
+        let a_file = zims.zim_dir.join("utiny.zim");
+        std::fs::copy("tests/fixtures/tiny.zim", &a_file).expect("place A's file");
+        let a_id: i32 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "INSERT INTO downloads (name, url, status, file_path)
+                 VALUES ('bugs2-a', 'magnet:?xt=urn:btih:bugs2a', 'complete', $1) RETURNING id",
+            |q| q.bind(a_file.display().to_string()),
+        )
+        .await
+        .expect("insert complete row A")
+        .unwrap();
+
+        // Row B: different display name, `downloading`; its torrent content
+        // file is named utiny.zim — the SAME installed file A owns, a
+        // collision only the destination-keyed guard can see.
+        let content_dir = tmp.path().join("qb-content");
+        std::fs::create_dir_all(&content_dir).unwrap();
+        let content_file = content_dir.join("utiny.zim");
+        std::fs::copy("tests/fixtures/tiny.zim", &content_file).unwrap();
+        let b_id: i32 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "INSERT INTO downloads (name, url, status)
+                 VALUES ('bugs2-b', 'magnet:?xt=urn:btih:bugs2b', 'downloading') RETURNING id",
+            |q| q,
+        )
+        .await
+        .expect("insert downloading row B")
+        .unwrap();
+
+        let t = TorrentInfo {
+            hash: "bugs2b".into(),
+            name: "bugs2-b".into(),
+            progress: 1.0,
+            state: "uploading".into(),
+            dlspeed: 0,
+            upspeed: 0,
+            ratio: 0.0,
+            category: None,
+            save_path: Some(content_dir.to_string_lossy().into_owned()),
+            content_path: Some(content_file.to_string_lossy().into_owned()),
+            size: 0,
+            downloaded: 0,
+            num_seeds: 0,
+            err_str: None,
+        };
+
+        fn fingerprint(path: &std::path::Path) -> (u64, std::time::SystemTime, u64) {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata(path).expect("stat A's file");
+            (m.ino(), m.modified().expect("mtime"), m.len())
+        }
+        let before = fingerprint(&a_file);
+        let before_bytes = std::fs::read(&a_file).expect("read A's file");
+
+        poller
+            .handle_complete(b_id, "bugs2-b", &t, None, &p, None)
+            .await
+            .expect("handle_complete");
+
+        // B refused the install: `error` with the ownership message.
+        let (status, error): (String, Option<String>) = crate::db::raw::fetch_optional(
+            &pool,
+            "SELECT status, error FROM downloads WHERE id = $1",
+            |q| q.bind(b_id),
+        )
+        .await
+        .expect("read B")
+        .expect("row B present");
+        assert_eq!(status, "error", "B must be refused, not installed");
+        let msg = error.expect("B must carry the refusal message");
+        assert!(
+            msg.contains("owned by live row"),
+            "refusal must name the ownership guard: {msg}"
+        );
+        assert!(
+            msg.contains(&a_id.to_string()),
+            "refusal must name the owning row: {msg}"
+        );
+
+        // A's file is inode- and byte-identical; A's row is untouched.
+        assert_eq!(
+            before,
+            fingerprint(&a_file),
+            "A's file must be untouched (inode/mtime/size)"
+        );
+        assert_eq!(
+            std::fs::read(&a_file).expect("read A's file"),
+            before_bytes,
+            "A's bytes must be untouched"
+        );
+        let (a_status, a_fp): (String, Option<String>) = crate::db::raw::fetch_optional(
+            &pool,
+            "SELECT status, file_path FROM downloads WHERE id = $1",
+            |q| q.bind(a_id),
+        )
+        .await
+        .expect("read A")
+        .expect("row A present");
+        assert_eq!(a_status, "complete", "row A must stay complete");
+        assert_eq!(
+            a_fp,
+            Some(a_file.display().to_string()),
+            "row A's file_path must be intact"
+        );
+
+        // Cleanup (shared single-DB suite; articles cascade off zims).
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id IN ($1, $2)", |q| {
+            q.bind(a_id).bind(b_id)
+        })
+        .await
+        .unwrap();
         crate::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| {
             q.bind("utiny")
         })

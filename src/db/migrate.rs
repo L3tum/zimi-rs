@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 /// Numbering is historical: 005 was removed/superseded and is RESERVED/VOID
 /// — never add a `005_*.sql` (it would silently apply before 006). Do NOT
 /// renumber — migrations are tracked by filename + content hash. New
-/// migrations: 014, 015, …
+/// migrations: 015, 016, …
 const MIGRATIONS: &[(&str, &str)] = &[
     (
         "001_initial.sql",
@@ -62,6 +62,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "013_downloads_status_updated_index.sql",
         include_str!("../../migrations/013_downloads_status_updated_index.sql"),
+    ),
+    (
+        "014_drop_dead_schema.sql",
+        include_str!("../../migrations/014_drop_dead_schema.sql"),
     ),
 ];
 
@@ -333,9 +337,9 @@ mod tests {
     /// - every filename is `NNN_slug.sql` (exactly 3-digit numeric prefix,
     ///   non-empty slug) and all filenames are unique;
     /// - numeric prefixes strictly increase in the const's order;
-    /// - the set of numbers equals exactly {1,2,3,4,6,7,8,9,10,11,12,13} —
-    ///   pinning the current set and proving 5 is the ONLY missing number in
-    ///   1..=13, with the set size cross-checked against `MIGRATION_COUNT`.
+    /// - the set of numbers equals exactly {1,2,3,4,6,7,8,9,10,11,12,13,14}
+    ///   — pinning the current set and proving 5 is the ONLY missing number
+    ///   in 1..=14, with the set size cross-checked against `MIGRATION_COUNT`.
     #[test]
     fn migration_numbering_keeps_the_005_void_gap() {
         use std::collections::{BTreeSet, HashSet};
@@ -389,9 +393,9 @@ mod tests {
             );
         }
 
-        // The full set is exactly 1..=13 minus 5: pins the current migration
-        // set and proves the ONLY missing number in 1..=13 is the reserved 5.
-        let expected: BTreeSet<usize> = (1..=13).filter(|n| *n != 5).collect();
+        // The full set is exactly 1..=14 minus 5: pins the current migration
+        // set and proves the ONLY missing number in 1..=14 is the reserved 5.
+        let expected: BTreeSet<usize> = (1..=14).filter(|n| *n != 5).collect();
         let actual: BTreeSet<usize> = numbers.iter().copied().collect();
         assert_eq!(
             actual.len(),

@@ -119,6 +119,26 @@ pub fn dead_pool() -> crate::db::Pool {
 #[cfg(test)]
 pub static LIB_SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// WI-10: the lib suite's exit summary (process end), kept here next to
+/// the [`LIB_SKIPPED`] counter it summarizes (it lived in the poller's
+/// test module before the 2026-09 review move). Formatted as a two-line
+/// red banner — the same color/format idiom as the integration suite's
+/// `INTEGRATION SUITE SKIPPED` banner (tests/integration/common.rs) and
+/// the red WARNING the Makefile `test` target prints over it — so a
+/// vacuous `cargo test --lib` pass can't hide the skips. Prints on stderr,
+/// and only when at least one test was skipped.
+#[cfg(test)]
+#[dtor::dtor]
+fn print_lib_skip_summary() {
+    let n = LIB_SKIPPED.load(std::sync::atomic::Ordering::Relaxed);
+    if n > 0 {
+        eprintln!(
+            "\n\x1b[31m=== LIB TEST SUITE: {n} DB-gated test(s) SKIPPED (no Postgres) ===\x1b[0m"
+        );
+        eprintln!("\x1b[31mrun with a reachable Postgres to exercise them\x1b[0m");
+    }
+}
+
 /// The DB-gate skip/panic decision, shared by [`test_pool`], [`test_conn`],
 /// and any DB-gated test with custom pool options (e.g. `embed::auto_loop`):
 /// `ZIMSERVICE_REQUIRE_DB` set → a hard failure; unset → counted in

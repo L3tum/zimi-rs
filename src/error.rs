@@ -189,24 +189,29 @@ pub(crate) fn sqlstate_message(code: Option<&str>) -> &'static str {
 /// names use the `<table>_<column(s)>_key` convention, while pkeys and the
 /// hand-named partial uniques keep their declared names.
 ///
+/// `pub` (not `pub(crate)`) because the integration suite is a separate
+/// crate and pins this registry bidirectionally against the live database
+/// (`tests/integration/constraints.rs`): every registry name must exist in
+/// the DB, and every unique constraint/index in the DB must be registered.
+/// That machine check is what keeps the hand-maintained list from drifting
+/// — stale entries (dropped tables) and unregistered constraints both fail
+/// the test.
+///
 /// Add an entry here when a migration introduces a new unique constraint or
 /// index — without one, `duplicate_field` falls back to prefix-stripping and
 /// the client sees a raw constraint fragment instead of a field name.
-const CONSTRAINT_FIELDS: &[(&str, &str)] = &[
+pub const CONSTRAINT_FIELDS: &[(&str, &str)] = &[
     // zims (001)
     ("zims_pkey", "id"),
     ("zims_name_key", "name"),
     // articles (001)
     ("articles_pkey", "id"),
     ("articles_zim_id_path_key", "zim_id_path"),
-    // search_history (001)
-    ("search_history_pkey", "id"),
     // collections (001)
     ("collections_pkey", "id"),
     ("collections_name_key", "name"),
-    // qid_index / qid_cache (001) — composite pkeys on (zim_id, path)
+    // qid_index (001) — composite pkey on (zim_id, path)
     ("qid_index_pkey", "zim_id_path"),
-    ("qid_cache_pkey", "zim_id_path"),
     // settings (001)
     ("settings_pkey", "key"),
     // downloads (001, 003, 011)

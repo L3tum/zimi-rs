@@ -148,14 +148,31 @@ test-strict-ci:
 
 # JS syntax check for the embedded web UI (web/*.js — the pages carry no
 # inline <script> blocks; the `pages_have_no_inline_scripts` Rust unit test
-# guards that). Also syntax-checks the embedded CSS: web/style.css plus every
-# page's inline <style> block (web/check-css.mjs is a dependency-free parse
-# check). Requires node; skips with a warning when node is absent.
-# Set ZIMSERVICE_WEB_CHECK_STRICT=1 to fail without node.
+# guards that). Also syntax-checks the embedded CSS: web/style.css plus
+# every page's inline <style> block. web/check-css.mjs parses with
+# css-tree — the sanctioned CSS parser dependency (mirroring jsdom, the
+# sanctioned exception for web-test; it replaced the old hand-rolled
+# parser). Requires node; skips with a warning when node is absent. With
+# node but css-tree missing (no `npm install` yet) the CSS half warns +
+# skips while the JS half still runs. Set ZIMSERVICE_WEB_CHECK_STRICT=1 to
+# fail without node/css-tree. The node guard and the run stay chained on
+# ONE logical line (make runs each recipe line in its own shell, so an
+# `exit 0` on a separate guard line would not stop the check run — same
+# reason WEB_WRAP uses one-line chaining).
 web-check:
-	$(call WEB_WRAP,web-check,,web syntax checks,\
-	node --check web/common.js web/index.js web/search.js web/settings.js && \
-	node web/check-css.mjs web/style.css web/index.html web/search.html web/settings.html)
+	@if ! command -v node >/dev/null 2>&1; then \
+	  if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
+	    echo "web-check: node not found (strict mode)" >&2; exit 1; \
+	  fi; echo "web-check: node not found — skipping web syntax checks"; exit 0; \
+	else \
+	  node --check web/common.js web/index.js web/search.js web/settings.js && \
+	  { if ! node -e "require('css-tree')" >/dev/null 2>&1; then \
+	    if [ "$${ZIMSERVICE_WEB_CHECK_STRICT:-0}" = "1" ]; then \
+	      echo "web-check: css-tree not installed (run: npm install; strict mode)" >&2; exit 1; \
+	    fi; echo "web-check: css-tree not installed (run: npm install) — skipping CSS check"; exit 0; \
+	  fi; } && \
+	  node web/check-css.mjs web/style.css web/index.html web/search.html web/settings.html; \
+	fi
 
 # Behavioral unit tests for the web UI helpers + page scripts (node --test).
 # Single real-DOM harness: every suite (common/index/search/settings/smoke)

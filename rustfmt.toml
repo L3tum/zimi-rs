@@ -1,2 +1,6 @@
 edition = "2021"
 max_width = 100
+# Comment wrapping at 100 cols is a convention enforced by review, not
+# rustfmt: `wrap_comments` is nightly-only and this repo pins stable (1.96)
+# for the CI `cargo fmt --all -- --check` gate; the one-off wrap landed
+# 2026-09-18 keeps existing comments within 100 cols.

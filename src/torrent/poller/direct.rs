@@ -547,6 +547,39 @@ pub(super) async fn direct_download(
     finalize_direct_download(db, zims, id, part).await
 }
 
+/// Discard `dst` — the install destination a just-finalized download wrote
+/// — UNLESS another *live* row owns it (BUGS-1/BUGS-2). The cancel-race
+/// discard arms used to `remove_file` the destination unconditionally, but
+/// it can be the installed file of ANOTHER live row (a same-named
+/// re-download on the direct path, or a differently-named torrent whose
+/// content file collides on the torrent path) — deleting it destroys that
+/// row's file, and the trailing resync cascade-deletes its `zims` row +
+/// articles. `id` (this row) is excluded from the ownership check; a failed
+/// ownership check KEEPS the file (fail closed — a swallowed DB blip could
+/// delete the other row's file). The trailing resync reconciles cache + DB
+/// with whatever survived on disk (error ignored, as at the existing call
+/// sites).
+pub(super) async fn discard_if_unowned(db: &Pool, zims: &Arc<ZimManager>, id: i32, dst: &Path) {
+    match crate::db::downloads::find_live_row_owns_path(db, &dst.display().to_string(), id).await {
+        Ok(Some(other)) => {
+            tracing::warn!(
+                "download {id}: destination {} owned by live row {other}; keeping file",
+                dst.display()
+            );
+        }
+        Ok(None) => {
+            let _ = std::fs::remove_file(dst);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "download {id}: ownership check for {} failed: {e}; keeping file (fail closed)",
+                dst.display()
+            );
+        }
+    }
+    let _ = zims.resync().await;
+}
+
 /// Post-stream finalize for a direct download (TEST-5 seam, extracted from
 /// [`direct_download`]): the cancel re-check before verify, the libzim
 /// verify, the cancel check before rename, the atomic rename + resync, the
@@ -609,6 +642,25 @@ async fn finalize_direct_download(
         zims.zim_dir.join(part.file_stem().ok_or_else(|| {
             Error::InvalidInput(format!("bad part file name: {}", part.display()))
         })?);
+    // BUGS-1: destination-ownership guard before the rename: `dst` can be
+    // the installed file of ANOTHER live row (a same-named re-download —
+    // the 003/011 partial unique indexes only cover live rows, so a
+    // `complete` row can already own `dst`), and the `updated == 0` discard
+    // below would then have deleted it. In the direct path the dst stem is
+    // the row name, so this file_path-based check subsumes same-name
+    // collisions (no second guard needed). A query failure propagates (fail
+    // closed — a swallowed blip could rename over the other row's file).
+    if let Some(other) =
+        crate::db::downloads::find_live_row_owns_path(db, &dst.display().to_string(), id).await?
+    {
+        // mark_error's terminal-state guard means a concurrent cancel still wins.
+        let msg = format!("install skipped: destination already owned by live row {other}");
+        mark_error(db, id, &msg).await;
+        // Remove only our own staged file — never `dst`.
+        let _ = std::fs::remove_file(part);
+        tracing::info!("direct download {id}: {msg}");
+        return Ok(());
+    }
     std::fs::rename(part, &dst)?;
 
     zims.resync().await?;
@@ -623,8 +675,7 @@ async fn finalize_direct_download(
             "direct download {id} was cancelled during finalization — discarding {}",
             dst.display()
         );
-        let _ = std::fs::remove_file(&dst);
-        let _ = zims.resync().await;
+        discard_if_unowned(db, zims, id, &dst).await;
         return Ok(());
     }
 
@@ -1098,6 +1149,241 @@ mod tests {
         crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
             .await
             .unwrap();
+    }
+
+    /// BUGS-1 (CI-DB): the destination-ownership guard before the rename —
+    /// row A is `complete` and owns `<zim_dir>/x.zim` (the file is present);
+    /// row B (same name, different URL — allowed: the 003/011 partial unique
+    /// indexes only cover live rows) finalizes a staged part whose
+    /// destination is A's file. B must be refused (`error`, message names
+    /// the owning row): A's file untouched (inode/mtime/size), B's staged
+    /// part removed, `Ok(())`.
+    #[tokio::test]
+    async fn finalize_direct_download_refuses_install_when_destination_owned_by_other_live_row() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
+
+        // Row A: `complete`, owns <zim_dir>/x.zim (the fixture is there).
+        let a_file = zims.zim_dir.join("x.zim");
+        std::fs::copy("tests/fixtures/tiny.zim", &a_file).expect("place A's file");
+        let a_id: i32 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "INSERT INTO downloads (name, url, status, file_path)
+                 VALUES ('x', 'http://example.net/x.zim', 'complete', $1) RETURNING id",
+            |q| q.bind(a_file.display().to_string()),
+        )
+        .await
+        .expect("insert complete row A")
+        .unwrap();
+
+        // Row B: same name, different URL (allowed — the partial unique
+        // indexes only cover live rows), `downloading`.
+        let b_id: i32 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "INSERT INTO downloads (name, url, status)
+                 VALUES ('x', 'http://example.net/x-mirror.zim', 'downloading') RETURNING id",
+            |q| q,
+        )
+        .await
+        .expect("insert downloading row B")
+        .unwrap();
+
+        // B's staged part; its destination (the part's file stem) is x.zim
+        // — A's installed file. (Same naming shape as the installs test:
+        // row name `x`, part `x.zim.part`, dst `x.zim`.)
+        let part = zims.zim_dir.join("x.zim.part");
+        std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage x.zim.part");
+
+        fn fingerprint(path: &std::path::Path) -> (u64, std::time::SystemTime, u64) {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata(path).expect("stat A's file");
+            (m.ino(), m.modified().expect("mtime"), m.len())
+        }
+        let before = fingerprint(&a_file);
+
+        super::finalize_direct_download(&pool, &zims, b_id, &part)
+            .await
+            .expect("finalize must succeed (a refusal is Ok)");
+
+        // B refused: `error` with the ownership message; its staged part is
+        // gone; A's file and row are untouched.
+        let (status, error): (String, Option<String>) = crate::db::raw::fetch_optional(
+            &pool,
+            "SELECT status, error FROM downloads WHERE id = $1",
+            |q| q.bind(b_id),
+        )
+        .await
+        .expect("read B")
+        .expect("row B present");
+        assert_eq!(status, "error", "B must be refused, not installed");
+        let msg = error.expect("B must carry the refusal message");
+        assert!(
+            msg.contains("owned by live row"),
+            "refusal must name the ownership guard: {msg}"
+        );
+        assert!(
+            msg.contains(&a_id.to_string()),
+            "refusal must name the owning row: {msg}"
+        );
+        assert!(!part.exists(), "B's staged part must be removed");
+        assert_eq!(
+            before,
+            fingerprint(&a_file),
+            "A's file must be untouched (inode/mtime/size)"
+        );
+        let (a_status, a_fp): (String, Option<String>) = crate::db::raw::fetch_optional(
+            &pool,
+            "SELECT status, file_path FROM downloads WHERE id = $1",
+            |q| q.bind(a_id),
+        )
+        .await
+        .expect("read A")
+        .expect("row A present");
+        assert_eq!(a_status, "complete", "row A must stay complete");
+        assert_eq!(
+            a_fp,
+            Some(a_file.display().to_string()),
+            "row A's file_path must be intact"
+        );
+
+        // Cleanup (shared single-DB suite; articles cascade off zims).
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id IN ($1, $2)", |q| {
+            q.bind(a_id).bind(b_id)
+        })
+        .await
+        .unwrap();
+        crate::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind("x"))
+            .await
+            .unwrap();
+    }
+
+    /// BUGS-1/2 (CI-DB): `discard_if_unowned` with no other owner — the
+    /// file is removed, and the trailing resync reconciles the `zims`
+    /// table (the row for the removed file is dropped). The file is
+    /// pre-registered by an initial resync so the trailing resync has
+    /// something observable to reconcile away.
+    #[tokio::test]
+    async fn discard_if_unowned_removes_file_and_resyncs_when_unowned() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
+
+        // An unowned file, registered in `zims` (as a resync would have).
+        let file = zims.zim_dir.join("orphan.zim");
+        std::fs::copy("tests/fixtures/tiny.zim", &file).expect("place orphan file");
+        zims.resync().await.expect("initial resync");
+        let zims_rows: i64 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT count(*) FROM zims WHERE name = $1",
+            |q| q.bind("orphan"),
+        )
+        .await
+        .expect("zims count")
+        .unwrap();
+        assert_eq!(zims_rows, 1, "initial resync must register orphan.zim");
+
+        // No downloads rows at all — nothing owns the file (999_999 is a
+        // nonexistent id; exclude_id only ever excludes the caller).
+        super::discard_if_unowned(&pool, &zims, 999_999, &file).await;
+
+        assert!(!file.exists(), "unowned file must be removed");
+        let zims_rows: i64 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT count(*) FROM zims WHERE name = $1",
+            |q| q.bind("orphan"),
+        )
+        .await
+        .expect("zims count")
+        .unwrap();
+        assert_eq!(
+            zims_rows, 0,
+            "the trailing resync must drop the zims row of the removed file"
+        );
+    }
+
+    /// BUGS-1/2 (CI-DB): `discard_if_unowned` with an owner — row A is
+    /// `complete` with `file_path = dst`: the file survives (inode/mtime/
+    /// size + bytes) and A's row stays intact.
+    #[tokio::test]
+    async fn discard_if_unowned_keeps_file_owned_by_other_live_row() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
+
+        let file = zims.zim_dir.join("owned.zim");
+        std::fs::copy("tests/fixtures/tiny.zim", &file).expect("place owned file");
+        let a_id: i32 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "INSERT INTO downloads (name, url, status, file_path)
+                 VALUES ('owned', 'http://example.net/owned.zim', 'complete', $1) RETURNING id",
+            |q| q.bind(file.display().to_string()),
+        )
+        .await
+        .expect("insert complete row A")
+        .unwrap();
+
+        fn fingerprint(path: &std::path::Path) -> (u64, std::time::SystemTime, u64) {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata(path).expect("stat owned file");
+            (m.ino(), m.modified().expect("mtime"), m.len())
+        }
+        let before = fingerprint(&file);
+        let before_bytes = std::fs::read(&file).expect("read owned file");
+
+        super::discard_if_unowned(&pool, &zims, 999_999, &file).await;
+
+        assert_eq!(
+            before,
+            fingerprint(&file),
+            "owned file must survive (inode/mtime/size)"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("read owned file"),
+            before_bytes,
+            "owned bytes must survive"
+        );
+        let (a_status, a_fp): (String, Option<String>) = crate::db::raw::fetch_optional(
+            &pool,
+            "SELECT status, file_path FROM downloads WHERE id = $1",
+            |q| q.bind(a_id),
+        )
+        .await
+        .expect("read A")
+        .expect("row A present");
+        assert_eq!(a_status, "complete", "row A must stay complete");
+        assert_eq!(
+            a_fp,
+            Some(file.display().to_string()),
+            "row A's file_path must be intact"
+        );
+
+        // Cleanup (shared single-DB suite; articles cascade off zims).
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| {
+            q.bind(a_id)
+        })
+        .await
+        .unwrap();
+        crate::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| {
+            q.bind("owned")
+        })
+        .await
+        .unwrap();
     }
 
     // ── PERF-11: stream_part + resume_plan + content_range_total ─────────────
