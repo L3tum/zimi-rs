@@ -17,18 +17,23 @@
 //!
 //! A live holder keeps the staleness check honest: while the guard is held,
 //! a background heartbeat refreshes the lockfile's mtime every
-//! `HEARTBEAT_INTERVAL`. This is required, not optional — the steal
-//! threshold *doubles* as the waiter deadline, so without refreshing, a test
-//! that holds the slot for longer than the timeout (e.g. a slow migration)
-//! would look stale and have its slot stolen mid-run. With the heartbeat, an
-//! mtime older than the timeout genuinely means a dead holder.
+//! `HEARTBEAT_INTERVAL`. This is required, not optional — without
+//! refreshing, a test that holds the slot for longer than the staleness
+//! threshold (e.g. a slow migration) would look stale and have its slot
+//! stolen mid-run. With the heartbeat, an mtime older than the threshold
+//! genuinely means a dead holder. The staleness threshold is deliberately
+//! *not* the waiter deadline (those were conflated in one constant, which
+//! made a live but busy foreign binary — draining its whole DB-test queue
+//! in a couple of minutes — time out waiting processes after 2 minutes; see
+//! [`STALE_THRESHOLD`] vs [`HOLD_DEADLINE`]).
 //!
 //! `DbExclusiveGuard::acquire()` **blocks** (rather than panicking) when
 //! another DB test — in this binary *or* another process — still holds the
 //! slot, so the suite is safe to run with the default parallel
-//! `--test-threads`. A same-pid holder past [`SAME_PID_HOLD_DEADLINE`] is
-//! wedged (a query on a half-open connection), and waiters then fail loud
-//! instead of hanging the suite silently (see the const's doc).
+//! `--test-threads`. A holder (same or foreign pid) still holding the slot
+//! past [`HOLD_DEADLINE`] is wedged (a query on a half-open connection), and
+//! waiters then fail loud instead of hanging the suite silently (see the
+//! const's doc).
 //!
 //! Same-pid rule: the heartbeat makes the lockfile always fresh while a live
 //! holder holds it, so the staleness-based steal can no longer fire against
@@ -37,7 +42,7 @@
 //! holder in this very process (a parallel DB test in this binary holding
 //! the in-process slot) must not be treated as a foreign process: if the
 //! lockfile's recorded PID equals this process's PID, waiters keep polling,
-//! bounded by [`SAME_PID_HOLD_DEADLINE`] — the in-process flag is released
+//! bounded by [`HOLD_DEADLINE`] — the in-process flag is released
 //! by the holder's `Drop`, so a bounded wait cannot deadlock anything that
 //! previously resolved; a same-pid holder past the deadline is treated as
 //! wedged and waiters fail loud (see the const's doc). The
@@ -280,27 +285,34 @@ pub fn test_state() -> crate::AppState {
 static DB_LOCK: Mutex<bool> = Mutex::new(false);
 static DB_CV: Condvar = Condvar::new();
 
-/// How long a cross-process lock is considered live before it may be stolen
-/// (a killed process leaves its lockfile behind; after this it is stale).
-/// This also doubles as the *waiter* deadline, so mtime-only staleness is
-/// sound only because a live holder keeps refreshing — see
-/// [`HEARTBEAT_INTERVAL`].
-const CROSS_PROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-/// Hard deadline for a **same-pid** slot holder (the cross-process same-pid
-/// wait; the in-process wait is strictly behind it, so it is covered too).
-/// The suite's longest DB test (the 100k-row trgm plan gate) finishes in
-/// well under a minute, so a same-pid holder past this is wedged —
-/// typically an in-flight query on a half-open TCP connection whose peer
-/// vanished without a FIN (a read with nothing outstanding has no
-/// retransmit to fail, so it blocks forever). Without this bound the
-/// waiters poll forever and the whole suite hangs silently (2026-09: a
-/// remote-DB network flush wedged a run for 7+ hours); with it, waiters
-/// fail loud and the wedge is visible instead of invisible.
-const SAME_PID_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// How long a cross-process lockfile's mtime may be old before a waiter
+/// steals it as a **dead** holder (a killed process leaves its lockfile
+/// behind; after this it is stale). A live holder refreshes the mtime every
+/// [`HEARTBEAT_INTERVAL`], so a fresh mtime means the holder is alive and the
+/// steal never fires against it. This is the *staleness* threshold only — it
+/// is deliberately NOT the waiter deadline. (It used to double as both, which
+/// made a live but busy foreign binary — one draining its whole DB-test queue
+/// in a couple of minutes — look "dead" to a waiting process after 2 minutes
+/// and time the waiter out; see [`HOLD_DEADLINE`].)
+const STALE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(120);
+/// Hard deadline for **any** slot holder — same or foreign pid. A waiter that
+/// has not acquired the slot within this many seconds fails loud. Generous on
+/// purpose: the suite's longest single DB test (the 100k-row trgm plan gate)
+/// finishes in well under a minute, and even a busy *foreign* binary's entire
+/// DB-test queue drains in a few minutes, so a live holder never approaches
+/// this. It fires only when a holder is genuinely wedged — typically an
+/// in-flight query on a half-open TCP connection whose peer vanished without
+/// a FIN (a read with nothing outstanding has no retransmit to fail, so it
+/// blocks forever). Without this bound the waiters poll forever and the whole
+/// suite hangs silently (2026-09: a remote-DB network flush wedged a run for
+/// 7+ hours); with it, waiters fail loud and the wedge is visible instead of
+/// invisible. The in-process wait is strictly behind the cross-process wait,
+/// so this covers it too.
+const HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 /// Poll interval while waiting for another process to release the lock.
 const CROSS_PROCESS_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// How often a live holder refreshes the lockfile's mtime. Must stay well
-/// below [`CROSS_PROCESS_TIMEOUT`]: a slot held longer than the timeout must
+/// below [`STALE_THRESHOLD`]: a slot held longer than the threshold must
 /// still read as live, or waiters would steal it mid-test.
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long the heartbeat loop waits on its stop condvar between checks, so
@@ -331,7 +343,7 @@ fn cross_process_lock_path() -> std::path::PathBuf {
 
 /// Claim the cross-process DB-test lockfile, waiting for a live holder to
 /// release it and stealing a stale one (mtime older than
-/// [`CROSS_PROCESS_TIMEOUT`]). Returns the open `File`, which must be kept
+/// [`STALE_THRESHOLD`]). Returns the open `File`, which must be kept
 /// alive (and removed) for the slot's lifetime. Std-only and portable: the
 /// atomic `create_new` claim works on all platforms (the `0o600` mode bits
 /// are applied on Unix only, where they keep the lockfile owner-private).
@@ -344,7 +356,7 @@ fn cross_process_lock_path() -> std::path::PathBuf {
 /// never fire against it, and treating it as a foreign process would
 /// deadline-out (`DbExclusiveGuard::acquire` panics) exactly the case this
 /// module promises to block on. A same-pid holder is therefore waited out
-/// up to [`SAME_PID_HOLD_DEADLINE`] (a same-pid holder that long is wedged,
+/// up to [`HOLD_DEADLINE`] (a same-pid holder that long is wedged,
 /// not merely slow — see that const's doc); its in-process flag is released
 /// by `Drop`, so the deadline cannot fire against a holder that would have
 /// resolved anyway. A
@@ -379,7 +391,7 @@ fn acquire_cross_process(timeout: std::time::Duration) -> std::io::Result<std::f
                     if modified
                         .elapsed()
                         .ok()
-                        .is_some_and(|age| age > CROSS_PROCESS_TIMEOUT)
+                        .is_some_and(|age| age > STALE_THRESHOLD)
                     {
                         let _ = std::fs::remove_file(&path);
                         continue; // retry the claim
@@ -389,7 +401,7 @@ fn acquire_cross_process(timeout: std::time::Duration) -> std::io::Result<std::f
                 // same-binary DB test holding the in-process slot (the
                 // heartbeat keeps its lockfile fresh, so the steal above
                 // cannot fire against it). Wait it out — but only up to
-                // [`SAME_PID_HOLD_DEADLINE`]: a same-pid holder that long
+                // [`HOLD_DEADLINE`]: a same-pid holder that long
                 // is wedged (typically a query on a half-open connection),
                 // and a loud failure beats an invisible suite hang.
                 let holder_pid = std::fs::read_to_string(&path)
@@ -397,7 +409,7 @@ fn acquire_cross_process(timeout: std::time::Duration) -> std::io::Result<std::f
                     .and_then(|s| s.trim().parse::<u32>().ok());
                 let same_process_holder = holder_pid == Some(std::process::id());
                 let wait_exceeded = if same_process_holder {
-                    started.elapsed() >= SAME_PID_HOLD_DEADLINE
+                    started.elapsed() >= HOLD_DEADLINE
                 } else {
                     std::time::Instant::now() >= deadline
                 };
@@ -407,7 +419,7 @@ fn acquire_cross_process(timeout: std::time::Duration) -> std::io::Result<std::f
                             "DB slot held for over {} minutes by a test in THIS process; \
 the holder is wedged (typically an in-flight query on a half-open TCP \
 connection whose peer vanished). Kill the test process and re-run.",
-                            SAME_PID_HOLD_DEADLINE.as_secs() / 60
+                            HOLD_DEADLINE.as_secs() / 60
                         )
                     } else {
                         format!(
@@ -497,7 +509,7 @@ fn path_identity(path: &std::path::Path) -> Option<(u64, u64)> {
 
 /// The live cross-process lock: the open descriptor (removed on drop) plus
 /// the heartbeat that refreshes its mtime, so a holder holding the slot
-/// longer than [`CROSS_PROCESS_TIMEOUT`] is not stolen mid-test. A `File`
+/// longer than [`STALE_THRESHOLD`] is not stolen mid-test. A `File`
 /// is an open descriptor, not a lock, so it is fine to hold across `.await`.
 struct CrossProcessLock {
     /// Kept open for the slot's lifetime; taken (and closed) on drop. A
@@ -601,7 +613,7 @@ impl DbExclusiveGuard {
         // contention/timeout — fail loud (the footgun this lock exists to
         // catch).
         let cross_process = Some(CrossProcessLock::new(
-            acquire_cross_process(CROSS_PROCESS_TIMEOUT)
+            acquire_cross_process(HOLD_DEADLINE)
                 .unwrap_or_else(|e| panic!("DbExclusiveGuard: {e}")),
         ));
         let mut held = DB_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -703,7 +715,7 @@ mod tests {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let path = cross_process_lock_path();
         let _ = std::fs::remove_file(&path);
-        let file = acquire_cross_process(CROSS_PROCESS_TIMEOUT).expect("claim lockfile");
+        let file = acquire_cross_process(HOLD_DEADLINE).expect("claim lockfile");
         // Backdate the mtime so the assertion is robust to filesystem
         // timestamp granularity.
         let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
@@ -755,7 +767,7 @@ mod tests {
         // the timeout.
         let started = std::time::Instant::now();
         let claimed =
-            acquire_cross_process(CROSS_PROCESS_TIMEOUT).expect("stale lockfile must be stealable");
+            acquire_cross_process(HOLD_DEADLINE).expect("stale lockfile must be stealable");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "steal must happen immediately, not at the waiter deadline"
