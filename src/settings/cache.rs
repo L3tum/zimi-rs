@@ -1,5 +1,6 @@
 //! `SettingsCache`: the in-memory, Postgres-backed settings cache —
-//! load/reload, env-locked write validation, redaction, and the typed
+//! load/reload, env-locked write validation, redaction, the cross-process
+//! invalidation hooks (LISTEN/NOTIFY, `crate::db::notify`), and the typed
 //! accessors. The admin-auth surface (token-verify KDF call sites,
 //! legacy upgrade) lives in `auth_service` (`SettingsAuth`, Arch M2
 //! 2026-09 review).
@@ -16,10 +17,10 @@ use super::auth_service::SettingsAuth;
 use super::defs::{
     apply_env_snapshot, def, default_settings, default_value, is_security_sensitive, known_keys,
     normalize_embedding_endpoint, redact, sync_config_values, type_mismatch, ACCESS_MODE_OPEN,
-    KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_MODE, KEY_ACCESS_REQUIRE_AUTH_FOR_READS,
-    KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS, KEY_EMBEDDING_ENABLED, KEY_EMBEDDING_ENDPOINT,
-    KEY_TORRENT_ALLOW_PRIVATE_NETWORKS, KEY_TORRENT_ENABLED, KEY_TORRENT_MAX_ACTIVE,
-    KEY_TORRENT_OPDS_URL, KEY_TORRENT_URL,
+    KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_MODE, KEY_ACCESS_READ_ONLY_TOKEN,
+    KEY_ACCESS_REQUIRE_AUTH_FOR_READS, KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS, KEY_EMBEDDING_ENABLED,
+    KEY_EMBEDDING_ENDPOINT, KEY_TORRENT_ALLOW_PRIVATE_NETWORKS, KEY_TORRENT_ENABLED,
+    KEY_TORRENT_MAX_ACTIVE, KEY_TORRENT_OPDS_URL, KEY_TORRENT_URL,
 };
 
 /// In-memory settings cache backed by Postgres.
@@ -44,11 +45,18 @@ pub(crate) struct SettingsInner {
     ///
     /// **Locking discipline** (2026-09-04, ARCH minor #4): every std lock in
     /// this struct is a `std::sync::RwLock` (`cache`, `env_locked`,
-    /// `token_cache`) and is *never* held across an `.await`; the single
-    /// cross-await lock is the `tokio::sync::Mutex` `write_guard` (B1). All
-    /// `token_cache` sections are O(1) memory work — the KDF runs *after*
-    /// the guard is dropped, so a slow hash never serializes lookups.
+    /// `token_cache`, `ro_token_cache`) and is *never* held across an
+    /// `.await`; the single cross-await lock is the `tokio::sync::Mutex`
+    /// `write_guard` (B1). All `token_cache`/`ro_token_cache` sections are
+    /// O(1) memory work — the KDF runs *after* the guard is dropped, so a
+    /// slow hash never serializes lookups.
     token_cache: RwLock<VerifiedTokenCache>,
+    /// 2026-09-18 review (read-only API tokens): the read-only token gets its
+    /// OWN short-TTL verify cache, kept separate from `token_cache` so the
+    /// admin level's invalidation rules (and its test seams) stay exactly as
+    /// they were. Same TTLs/cap (shared `VerifiedTokenCache`); invalidated at
+    /// the same sites (`reload()` / `update()` / `upgrade_read_only`).
+    ro_token_cache: RwLock<VerifiedTokenCache>,
     /// Monotonic generation counter bumped after every cache mutation
     /// (reload/update/upgrade). Lets long-lived readers (the search
     /// snapshot, the poller — WI-44) detect "settings changed" without
@@ -124,6 +132,47 @@ impl SettingsInner {
             .clear();
     }
 
+    /// Drop all cached verified read-only tokens (same sites as
+    /// [`Self::token_invalidate_all`] — see `ro_token_cache`'s doc).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn ro_token_invalidate_all(&self) {
+        self.ro_token_cache
+            .write()
+            .expect("read-only token cache rwlock poisoned")
+            .clear();
+    }
+
+    /// True if `token` verified against the read-only token within the TTL.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn ro_token_is_fresh(&self, token: &str) -> bool {
+        self.ro_token_cache
+            .read()
+            .expect("read-only token cache rwlock poisoned")
+            .is_fresh(token)
+    }
+
+    /// True if `token` failed read-only verification within the negative TTL.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn ro_token_is_negative_fresh(&self, token: &str) -> bool {
+        self.ro_token_cache
+            .read()
+            .expect("read-only token cache rwlock poisoned")
+            .is_negative_fresh(token)
+    }
+
+    /// Record a KDF verdict for `token` against the read-only token.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn ro_token_record(&self, token: &str, ok: bool) {
+        self.ro_token_cache
+            .write()
+            .expect("read-only token cache rwlock poisoned")
+            .record(token, ok);
+    }
+
     /// The raw (unredacted) stored admin password, or empty when unset. The
     /// in-memory map always holds the real (possibly `sha2:`-hashed) value —
     /// `redact()` only applies to `all_grouped_for` output.
@@ -147,6 +196,52 @@ impl SettingsInner {
             .write()
             .expect("settings cache lock poisoned")
             .insert(KEY_ACCESS_ADMIN_PASSWORD.into(), serde_json::json!(hashed));
+    }
+
+    /// The raw (unredacted) stored read-only token, or empty when unset.
+    /// Mirrors [`Self::admin_password_raw`]: the in-memory map always holds
+    /// the real (possibly hashed) value — `redact()` only applies to
+    /// `all_grouped_for` output.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn read_only_token_raw(&self) -> String {
+        self.cache
+            .read()
+            .expect("settings cache lock poisoned")
+            .get(KEY_ACCESS_READ_ONLY_TOKEN)
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default()
+    }
+
+    /// Overwrite the cached read-only token (the legacy-upgrade path; the
+    /// sticky in-memory half of `SettingsAuth::upgrade_read_only`).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn read_only_token_set(&self, hashed: &str) {
+        self.cache
+            .write()
+            .expect("settings cache lock poisoned")
+            .insert(KEY_ACCESS_READ_ONLY_TOKEN.into(), serde_json::json!(hashed));
+    }
+
+    /// Test-only constructor: a full [`SettingsInner`] over an in-memory map
+    /// and a dead pool. 2026-09-18: also used by the `auth_service`
+    /// read-only-token tests, which live in a sibling module and cannot
+    /// name the private fields.
+    #[cfg(test)]
+    pub(crate) fn inner_for_test(values: HashMap<String, serde_json::Value>) -> Arc<SettingsInner> {
+        Arc::new(SettingsInner {
+            cache: RwLock::new(values),
+            env_locked: RwLock::new(HashMap::new()),
+            env_snapshot: HashMap::new(),
+            pool: crate::testing::dead_pool(),
+            token_cache: RwLock::new(VerifiedTokenCache::default()),
+            ro_token_cache: RwLock::new(VerifiedTokenCache::default()),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            write_guard: tokio::sync::Mutex::new(()),
+            type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
+            multi_instance: false,
+        })
     }
 
     /// The shared Postgres pool (the `SettingsAuth::upgrade` DB write goes
@@ -224,6 +319,7 @@ impl SettingsCache {
             env_snapshot,
             pool: pool.clone(),
             token_cache: RwLock::new(VerifiedTokenCache::default()),
+            ro_token_cache: RwLock::new(VerifiedTokenCache::default()),
             generation: std::sync::atomic::AtomicU64::new(0),
             write_guard: tokio::sync::Mutex::new(()),
             type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
@@ -253,6 +349,7 @@ impl SettingsCache {
                 env_snapshot,
                 pool,
                 token_cache: RwLock::new(VerifiedTokenCache::default()),
+                ro_token_cache: RwLock::new(VerifiedTokenCache::default()),
                 generation: std::sync::atomic::AtomicU64::new(0),
                 write_guard: tokio::sync::Mutex::new(()),
                 type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
@@ -266,12 +363,14 @@ impl SettingsCache {
     /// Reload all settings from Postgres. Seeds defaults for any missing keys.
     ///
     /// **B1 (concurrency)**: `reload()` atomically swaps the *whole* settings
-    /// map, but callers must not run it concurrently with [`Self::update`] —
-    /// the two are not lock-step serialized, so a concurrent `update()` could
-    /// be lost to the whole-map swap. In production `reload()` is only called
-    /// pre-traffic at startup (the sole caller is [`Self::load`]), so that
-    /// race is unreachable today; this note documents the requirement rather
-    /// than adding a lock.
+    /// map. It is serialized against [`Self::update`] by the same
+    /// `write_guard` (both hold it across their DB + cache phase), so a
+    /// concurrent `update()` can never be lost to the whole-map swap in
+    /// either direction: a reload that read the table before the update's
+    /// commit applies its swap before the update's cache insert (and vice
+    /// versa). Callers: [`Self::load`] (pre-traffic, at startup) and the
+    /// cross-process invalidation subscriber (below — a
+    /// `zimservice_settings` notification from a peer instance).
     // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
     #[allow(clippy::expect_used)]
     pub async fn reload(&self) -> Result<()> {
@@ -318,6 +417,13 @@ impl SettingsCache {
                 q
             })
             .await?;
+            // Cross-process invalidation (LISTEN/NOTIFY): the seed is a
+            // settings-table change (a first-run peer) — fire the channel as
+            // the last statement so the NOTIFY is delivered at commit (see
+            // `crate::db::notify`). A no-op seed (rows already present from
+            // a race) changed nothing; the notification then only triggers
+            // an idempotent peer reload.
+            raw::execute(&mut *tx, crate::db::notify::NOTIFY_SETTINGS_SQL, |q| q).await?;
             tx.commit().await.map_err(Error::Database)?;
         }
 
@@ -342,10 +448,42 @@ impl SettingsCache {
             .write()
             .expect("settings cache lock poisoned") = map;
         // A reload can change the stored password (env/config) — drop any
-        // cached token verifies so the new password takes effect immediately.
+        // cached token verifies so the new password takes effect immediately
+        // (both levels: a reload re-applies the READ_ONLY_TOKEN env var too).
         self.inner.token_invalidate_all();
+        self.inner.ro_token_invalidate_all();
         self.inner.bump_generation();
         Ok(())
+    }
+
+    /// Cross-process invalidation subscriber (serve mode): await the
+    /// `zimservice_settings` bumps from the [`crate::db::notify`] listener
+    /// and run a full [`Self::reload`] for each. One `tokio::spawn` task
+    /// owns `self` (an `Arc`-shared `SettingsCache` clone) for the listener's
+    /// lifetime; the watch channel coalesces a burst of notifications into
+    /// one reload, which is exactly the desired behavior — `reload()` is
+    /// idempotent and re-reads the whole map. The first bump is the
+    /// (re)connect-triggered resync (the missed-notification recovery).
+    ///
+    /// B1: the reload takes the same `write_guard` `update()` holds, so a
+    /// notification-driven reload can never be lost to (or clobber) a
+    /// concurrent write — the last cache phase to take the guard wins, and
+    /// its values are the most recent committed ones (a notification's
+    /// reload always re-reads the table after the firing transaction
+    /// committed, which the NOTIFY commit-ordering guarantees).
+    pub(crate) async fn run_invalidation_subscriber(
+        self,
+        mut rx: tokio::sync::watch::Receiver<u64>,
+    ) {
+        while rx.changed().await.is_ok() {
+            let bump = *rx.borrow_and_update();
+            match self.reload().await {
+                Ok(()) => tracing::debug!(bump, "cross-process settings invalidation: reloaded"),
+                Err(e) => {
+                    tracing::error!("cross-process settings invalidation: reload failed: {e}")
+                }
+            }
+        }
     }
 
     /// Refresh the `general.*` display keys from the process `Config` (the
@@ -516,7 +654,8 @@ impl SettingsCache {
             for (key, value) in updates {
                 if def(key).is_some_and(|d| d.policy.api_immutable) {
                     errors.push(format!(
-                        "{key}: not changeable via API — set ACCESS_MODE / AUTH_PASSWORD at startup"
+                        "{key}: not changeable via API — set it via environment at \
+                         startup (GET /settings names the locking variable)"
                     ));
                     continue;
                 }
@@ -630,6 +769,12 @@ impl SettingsCache {
                 )
                 .await?;
             }
+            // Cross-process invalidation (LISTEN/NOTIFY): fire the channel as
+            // the LAST statement of the transaction — Postgres delivers the
+            // NOTIFY only after the commit, so every peer (and our own
+            // listener) reloads exactly the committed values (see
+            // `crate::db::notify`).
+            raw::execute(&mut *tx, crate::db::notify::NOTIFY_SETTINGS_SQL, |q| q).await?;
             tx.commit().await.map_err(Error::Database)?;
 
             // 2) Update in-memory cache only after the commit (synchronous, no
@@ -652,8 +797,9 @@ impl SettingsCache {
             self.clear_type_mismatches(&keys);
             // Defense in depth: `access.admin_password` is API-immutable, so a
             // settings write can't change the password — but if it ever could,
-            // cached token verifies must not outlive it.
+            // cached token verifies must not outlive it (both levels).
             self.inner.token_invalidate_all();
+            self.inner.ro_token_invalidate_all();
             self.inner.bump_generation();
             // M1: re-surface the cross-instance divergence for every
             // committed write (no-op in single-instance mode).
@@ -665,17 +811,21 @@ impl SettingsCache {
 
     /// M1: re-surface the cross-instance settings divergence when this
     /// process runs with the multi-instance opt-out. The startup opt-out
-    /// warning is one-shot, but a committed change stays invisible to every
-    /// other instance until it restarts (there is no cross-instance
-    /// invalidation path), so [`Self::update`] calls this after **every**
+    /// warning is one-shot, but a committed change on one instance is
+    /// invisible to the other until it reloads — connected serve processes
+    /// now invalidate each other over `LISTEN`/`NOTIFY` (`crate::db::notify`),
+    /// so the residual gap is narrow: a *CLI* instance (or a process whose
+    /// listener is offline) stays stale until its own resync or restart.
+    /// [`Self::update`] therefore still calls this after **every**
     /// successful commit. No-op in single-instance mode. The `/health`
     /// `multi_instance` field exposes the mode to monitors in the meantime.
     fn warn_multi_instance_divergence(&self) {
         if self.inner.multi_instance {
             tracing::warn!(
                 "multi-instance mode (ZIMSERVICE_ALLOW_MULTI_INSTANCE=1): settings \
-                 written — other instances keep their cached copies until \
-                 restarted (no cross-instance invalidation)"
+                 written — connected serve peers reload via LISTEN/NOTIFY; CLI \
+                 instances and offline listeners stay stale until their own \
+                 resync or restart"
             );
         }
     }
@@ -895,6 +1045,7 @@ mod tests {
                 env_snapshot: HashMap::new(),
                 pool: dead_pool(),
                 token_cache: RwLock::new(VerifiedTokenCache::default()),
+                ro_token_cache: RwLock::new(VerifiedTokenCache::default()),
                 generation: std::sync::atomic::AtomicU64::new(0),
                 write_guard: tokio::sync::Mutex::new(()),
                 type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
@@ -2061,6 +2212,7 @@ mod tests {
                     env_snapshot: HashMap::new(),
                     pool: dead_pool(),
                     token_cache: RwLock::new(VerifiedTokenCache::default()),
+                    ro_token_cache: RwLock::new(VerifiedTokenCache::default()),
                     generation: std::sync::atomic::AtomicU64::new(0),
                     write_guard: tokio::sync::Mutex::new(()),
                     type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
@@ -2074,8 +2226,8 @@ mod tests {
             "multi-instance mode must warn — got: {text:?}"
         );
         assert!(
-            text.contains("restarted"),
-            "the warn must state the restart requirement — got: {text:?}"
+            text.contains("resync or restart"),
+            "the warn must state the CLI-staleness escape (own resync or restart) — got: {text:?}"
         );
 
         // Single-instance (flag explicitly off): no warn at all.

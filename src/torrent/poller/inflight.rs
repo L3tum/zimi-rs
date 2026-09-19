@@ -173,6 +173,12 @@ impl DownloadPoller {
                             );
                         }
                     } else if t.is_complete() {
+                        // SEC acceptance precondition: qB reached a
+                        // post-download state only after verifying every
+                        // piece against the info-hash — we trust that
+                        // verification (no client-side re-hash); the
+                        // info-hash was recorded above via `bind_hash`, and
+                        // `handle_complete` records the observed SHA-256.
                         if let Err(e) = self
                             .handle_complete(id, &name, t, qbit.clone(), p, file_path)
                             .await

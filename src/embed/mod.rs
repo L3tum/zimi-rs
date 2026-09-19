@@ -28,7 +28,7 @@ mod vector_index;
 pub use auto_loop::{auto_embed_loop, list_embeddable_zims};
 pub use client::{format_vector, EmbedClient, EmbedConfig};
 pub use column::ensure_vector_dimension;
-pub use pipeline::run_pipeline;
+pub use pipeline::{run_pipeline, CLAIM_EMBED_BATCH_SQL};
 pub use vector_index::{
     index_state, maybe_build_vector_index, vector_index_state, VectorIndexState,
     VECTOR_INDEX_MIN_ROWS,

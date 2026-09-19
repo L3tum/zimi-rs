@@ -146,7 +146,11 @@ fn ssl_mode_for(tls_mode: TlsMode, dsn: &str) -> PgSslMode {
 /// chain against it. `SslMode::VerifyFull` (used when the DSN specifies
 /// `sslmode=verify-full`) additionally validates the server certificate's
 /// hostname.
-fn connect_options(dsn: &str, tls_mode: TlsMode) -> Result<PgConnectOptions> {
+///
+/// `pub(crate)`: the `LISTEN`/`NOTIFY` listener (`db::notify`) builds its
+/// dedicated session with these exact options so the listener's TLS
+/// semantics can never drift from the application pool's.
+pub(crate) fn connect_options(dsn: &str, tls_mode: TlsMode) -> Result<PgConnectOptions> {
     let opts = PgConnectOptions::from_str(&normalize_sslmode(&driver_dsn(dsn)))
         .map_err(|e| Error::Internal(anyhow::anyhow!("db connect options: {e}")))?;
     Ok(opts.ssl_mode(ssl_mode_for(tls_mode, dsn)))
@@ -197,24 +201,28 @@ const MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
 /// able to hold an acquire past this.
 const ACQUIRE_PING_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Build the sqlx Postgres pool from [`Config`]: derives the TLS mode from
-/// the DSN scheme/`sslmode` (see `connect_options` for the TLS semantics:
-/// `verify-full` enforces chain *and* hostname validation; `require` /
-/// `verify-ca` / `+tls` enforce chain validation against the native root
-/// store), clamps the size via [`effective_pool_size`], and sets the
-/// lifetime/recycling options (10 s acquire timeout for fast 503s under
-/// exhaustion, 30 min max lifetime so NAT-dropped idle sockets are recycled,
-/// and a **bounded** per-acquire liveness ping — see the `before_acquire`
-/// hook below — so a zombie peer can't wedge the pool).
-pub async fn create_pool(config: &Config) -> Result<Pool> {
-    let tls_mode = tls_mode_from_dsn(&config.database_url)?;
+/// Build the sqlx Postgres pool for a DSN with the crate's standard
+/// lifecycle settings: the TLS mode derived from the DSN scheme/`sslmode`
+/// (see `connect_options` for the TLS semantics: `verify-full` enforces
+/// chain *and* hostname validation; `require` / `verify-ca` / `+tls`
+/// enforce chain validation against the native root store), the given
+/// max/min connection counts, and the lifetime/recycling options (10 s
+/// acquire timeout for fast 503s under exhaustion, 30 min max lifetime so
+/// NAT-dropped idle sockets are recycled, and a **bounded** per-acquire
+/// liveness ping — see the `before_acquire` hook below — so a zombie peer
+/// can't wedge the pool).
+///
+/// Every pool the process holds is built through this one helper, so the
+/// read-replica and background pools can never drift from the primary's
+/// lifecycle/TLS semantics.
+async fn build_pool(dsn: &str, max_connections: u32, min_connections: u32) -> Result<Pool> {
+    let tls_mode = tls_mode_from_dsn(dsn)?;
+    let opts = connect_options(dsn, tls_mode)?;
 
-    let opts = connect_options(&config.database_url, tls_mode)?;
-
-    let pool = PgPoolOptions::new()
-        .max_connections(effective_pool_size(config.db_pool_size))
-        .min_connections(1)
-        // Fast 503 under pool exhaustion instead of deadpool's 30 s default.
+    PgPoolOptions::new()
+        .max_connections(max_connections)
+        .min_connections(min_connections)
+        // Fast 503 under pool exhaustion instead of sqlx's 30 s default.
         .acquire_timeout(Duration::from_secs(10))
         // Recycle long-lived connections (ops hardening, Perf #8): NAT and
         // firewall devices silently drop idle TCP, so a connection held
@@ -243,10 +251,85 @@ pub async fn create_pool(config: &Config) -> Result<Pool> {
         })
         .connect_with(opts)
         .await
-        .map_err(Error::Database)?;
+        .map_err(Error::Database)
+}
 
+/// Create the primary Postgres connection pool from config, with automatic
+/// TLS negotiation based on the DATABASE_URL scheme and sslmode parameter.
+/// `effective_pool_size` clamps the size to at least 1 so a misconfigured
+/// `db_pool_size = 0` can never create an unbounded pool.
+///
+/// A hard ceiling (ARCH): without it, `DB_POOL_SIZE=999999` would open that
+/// many connections and exhaust Postgres's `max_connections` (default 100).
+/// Capping at 100 keeps one instance within Postgres's default budget while
+/// leaving headroom for real load; raise both together if you raise
+/// `max_connections` deliberately.
+///
+/// All writes and DDL go to this pool. Foreground reads use the read
+/// replica instead when `DATABASE_URL_READ` is set (see
+/// [`create_read_pool`]), and background work (auto-embed loop, vector-
+/// index builds) uses the dedicated [`create_bg_pool`] — neither ever
+/// touches writes.
+pub async fn create_pool(config: &Config) -> Result<Pool> {
+    let tls_mode = tls_mode_from_dsn(&config.database_url)?;
+    let pool = build_pool(
+        &config.database_url,
+        effective_pool_size(config.db_pool_size),
+        1,
+    )
+    .await?;
     tracing::info!("Database pool created (tls_mode={tls_mode:?})");
+    Ok(pool)
+}
 
+/// Create the optional read-replica pool from `DATABASE_URL_READ`
+/// ([`Config::read_database_url`]), or `Ok(None)` when the env var is
+/// absent — the documented single-pool default (current behavior).
+///
+/// When `Some`, the pool carries the same settings as the primary (size
+/// clamped by [`effective_pool_size`], same acquire timeout / max lifetime
+/// / bounded ping hook) and the same scheme/`sslmode` validation
+/// (`tls_mode_from_dsn` + `PgConnectOptions`), so a malformed read URL
+/// fails startup exactly like a malformed `DATABASE_URL`.
+pub async fn create_read_pool(config: &Config) -> Result<Option<Pool>> {
+    let Some(dsn) = config.read_database_url.as_deref() else {
+        return Ok(None);
+    };
+    let tls_mode = tls_mode_from_dsn(dsn)?;
+    let pool = build_pool(dsn, effective_pool_size(config.db_pool_size), 1).await?;
+    tracing::info!(
+        "Read-replica pool created from DATABASE_URL_READ (tls_mode={tls_mode:?}, size={})",
+        effective_pool_size(config.db_pool_size)
+    );
+    Ok(Some(pool))
+}
+
+/// Maximum connections of the dedicated background pool (PERF-10 /
+/// read-replica finding). Caps background work — the auto-embed loop and
+/// the vector-index builds — so a background burst can never starve
+/// foreground search/API checkouts on the shared primary pool. Deliberately
+/// small: at most one embed pipeline (batched `UPDATE`s) plus the rare
+/// index build run concurrently, and the 10 s acquire timeout bounds any
+/// wait the background work itself can pile up.
+pub const BG_POOL_MAX_CONNECTIONS: u32 = 4;
+
+/// Create the dedicated background pool on the **primary** URL, capped at
+/// [`BG_POOL_MAX_CONNECTIONS`]. Background work (the auto-embed loop,
+/// vector-index builds) checks out from this pool, never from the primary
+/// pool, so a background burst cannot consume foreground search/API
+/// checkouts (PERF-10: "one shared 20-connection pool for search +
+/// background work").
+///
+/// Same lifecycle settings as the primary (same DSN → same TLS mode, same
+/// 10 s acquire timeout / 30 min max lifetime / bounded ping), but
+/// `min_connections = 0`: the background pool opens no connections at all
+/// when no background work runs, so one-shot CLI commands and instances
+/// with embedding disabled pay nothing for the idle sockets.
+pub async fn create_bg_pool(config: &Config) -> Result<Pool> {
+    let pool = build_pool(&config.database_url, BG_POOL_MAX_CONNECTIONS, 0).await?;
+    tracing::info!(
+        "Background pool created on the primary URL (max_connections={BG_POOL_MAX_CONNECTIONS})"
+    );
     Ok(pool)
 }
 
@@ -435,6 +518,55 @@ mod tests {
     // Pool construction is now async and connection-backed, so the old
     // deadpool `build()` regression test no longer applies; the 10 s acquire
     // timeout is covered by the DB-gated tests.
+
+    // ── read-replica + background pool builders (PERF-10 / read-replica
+    //    finding) ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_read_pool_absent_env_returns_none() {
+        // Absent `DATABASE_URL_READ` = `None` = current single-pool
+        // behavior; no pool may be built (and no connection opened).
+        let config = Config {
+            read_database_url: None,
+            ..Config::default()
+        };
+        assert!(create_read_pool(&config)
+            .await
+            .expect("no pool to build")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn create_read_pool_malformed_sslmode_is_err() {
+        // Same scheme/sslmode validation as `DATABASE_URL`: an unsupported
+        // `sslmode` on the read URL must fail startup exactly like the
+        // primary URL does.
+        let config = Config {
+            read_database_url: Some("postgres://u:p@h/db?sslmode=weird".into()),
+            ..Config::default()
+        };
+        assert!(create_read_pool(&config).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_read_pool_unsupported_scheme_is_err() {
+        // The read URL goes through the same `PgConnectOptions::from_str`
+        // path as `DATABASE_URL`: a non-Postgres scheme is rejected before
+        // any socket is opened.
+        let config = Config {
+            read_database_url: Some("mysql://u:p@h/db".into()),
+            ..Config::default()
+        };
+        assert!(create_read_pool(&config).await.is_err());
+    }
+
+    #[test]
+    fn bg_pool_max_connections_caps_background_work() {
+        // The dedicated background pool is a small, named cap on the
+        // primary URL — a background burst (embed loop + index build) must
+        // never be able to starve foreground search/API checkouts.
+        assert_eq!(BG_POOL_MAX_CONNECTIONS, 4);
+    }
 
     // ── explicit checkout-wait metric (Architecture M1) ────────────────────
 

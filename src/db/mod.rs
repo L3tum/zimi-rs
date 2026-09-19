@@ -26,6 +26,10 @@ pub mod downloads;
 pub mod downloads_lifecycle;
 /// SQL migrations: a numbered, hash-tracked list applied in order at startup.
 pub mod migrate;
+/// Cross-process cache invalidation: `LISTEN`/`NOTIFY` on the two
+/// zimservice channels (settings + catalog), with the reconnect/resync
+/// recovery and the fail-closed supervisor.
+pub mod notify;
 /// Postgres connection pool configuration and TLS handling.
 pub mod pool;
 /// Wikidata Q-ID lookup for cross-language article discovery.

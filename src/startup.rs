@@ -218,6 +218,15 @@ pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result
     // `cmd_list` — ARCH M1, so the two startup paths cannot diverge).
     let (pool, zims) = bootstrap_pool_and_zims(config).await?;
 
+    // Read-replica pool (optional, `DATABASE_URL_READ` → `None` = current
+    // single-pool behavior) + dedicated background pool (primary URL,
+    // capped at `db::pool::BG_POOL_MAX_CONNECTIONS`) — built here so a
+    // misconfigured read URL fails startup through the same validation
+    // path as `DATABASE_URL`, before anything else uses the DB (PERF-10 /
+    // read-replica finding: one shared pool for search + background work).
+    let db_read = db::pool::create_read_pool(config).await?;
+    let db_bg = db::pool::create_bg_pool(config).await?;
+
     // Lightweight instance check (warn-only, non-acquiring): query `pg_locks`
     // to see if another session holds the advisory lock. This avoids the
     // S1 pitfall (taking the lock on a pooled connection that gets recycled).
@@ -318,9 +327,13 @@ pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result
     // `zims` manager itself came from `bootstrap_pool_and_zims` above.)
     populate_zims(&zims, mode.resync()).await?;
 
-    // Search engine
+    // Search engine — the arms / `suggest()` / the `ensure_trgm` slow path
+    // check out from the read replica when `DATABASE_URL_READ` is set, else
+    // from the primary pool (PERF-10: foreground search must not contend
+    // with background work on the shared pool).
     let degradation = crate::DegradationTracker::default();
-    let search = SearchEngine::new(pool.clone(), settings.clone(), degradation.clone());
+    let search_pool = db_read.clone().unwrap_or_else(|| pool.clone());
+    let search = SearchEngine::new(search_pool, settings.clone(), degradation.clone());
 
     // qBittorrent client (optional) — stored in a runtime cache (ARCH M3) so
     // a `PUT /settings` to `torrent.url` rebuilds the client within one poll
@@ -370,8 +383,31 @@ pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result
         }
     }
 
+    // Cross-process cache invalidation (LISTEN/NOTIFY, `db::notify`): the
+    // serve process keeps in-memory caches (settings, ZIM catalog) that a
+    // peer instance or a mutating CLI (under the multi-instance opt-out) can
+    // stale. Spawn the listener only for `serve` — the long-running process
+    // whose freshness matters; one-shot CLI subcommands (mutating / read-only
+    // / MCP) read the DB fresh and must not keep a background listener alive.
+    // The listener starts in `reconnecting` and never blocks or fails startup
+    // (a lost session degrades to the next local resync / restart and reports
+    // itself in `/diagnostic`). Spawned after `populate_zims` so the startup
+    // resync has already converged the caches and the listener's
+    // connect-resync is a no-op.
+    let notify = if mode == StartupMode::Serve {
+        Some(crate::db::notify::spawn_listener(
+            &config.database_url,
+            settings.clone(),
+            zims.clone(),
+        ))
+    } else {
+        None
+    };
+
     Ok(AppState {
         db: pool,
+        db_read,
+        db_bg,
         settings,
         zims,
         search,
@@ -382,6 +418,7 @@ pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result
         degradation,
         build_probe: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         index_building: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        notify,
     })
 }
 

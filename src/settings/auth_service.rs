@@ -14,7 +14,7 @@ use std::sync::{Arc, LazyLock};
 use crate::db::raw;
 use crate::settings::auth::verify_admin_password;
 use crate::settings::cache::SettingsInner;
-use crate::settings::defs::KEY_ACCESS_ADMIN_PASSWORD;
+use crate::settings::defs::{KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_READ_ONLY_TOKEN};
 
 /// SEC (KDF DoS): a 19.5 MiB argon2id verify is expensive in both memory and
 /// CPU, and the token negative cache bounds *distinct* tokens, not *concurrent*
@@ -217,7 +217,24 @@ impl SettingsAuth {
         )
         .await
         {
-            Ok(_) => tracing::info!("upgraded access.admin_password to a salted hash"),
+            Ok(_) => {
+                tracing::info!("upgraded access.admin_password to a salted hash");
+                // Cross-process invalidation (LISTEN/NOTIFY): the UPDATE above
+                // is a single autocommit statement, so it is committed by the
+                // time this runs — fire the channel as a best-effort
+                // follow-up; a notification failure only degrades peers to
+                // the pre-LISTEN staleness bounds (next local resync /
+                // restart). See `crate::db::notify`.
+                if let Err(e) = raw::execute(
+                    self.inner.pool(),
+                    crate::db::notify::NOTIFY_SETTINGS_SQL,
+                    |q| q,
+                )
+                .await
+                {
+                    tracing::warn!("failed to fire settings invalidation notification: {e}");
+                }
+            }
             Err(e) => {
                 tracing::warn!("failed to persist upgraded admin password (cached anyway): {e}")
             }
@@ -227,5 +244,220 @@ impl SettingsAuth {
         // The stored password just changed — cached verifies are stale now.
         self.inner.token_invalidate_all();
         self.inner.bump_generation();
+    }
+
+    /// Verify `presented` against the stored `access.read_only_token`, with
+    /// the same short-TTL cache discipline as [`Self::verify_bg`] but over
+    /// the *separate* read-only token cache (`ro_token_cache`). An unset
+    /// (empty) stored token rejects everything without running the KDF and
+    /// without polluting the cache — the common case, where only the admin
+    /// password exists, costs exactly one verification per distinct token.
+    ///
+    /// Mirrors [`Self::verify_bg`] because the stored value is hashed with
+    /// the identical mechanism (`verify_admin_password` accepts both legacy
+    /// plaintext and hashed values); nothing about the KDF differs between
+    /// the two secrets.
+    // LINT-3 (2026-09 sweep): propagate a worker-task panic (JoinError) —
+    // grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub async fn verify_read_only_bg(&self, presented: &str) -> bool {
+        if presented.is_empty() {
+            return false;
+        }
+        if self.inner.ro_token_is_fresh(presented) {
+            return true;
+        }
+        if self.inner.ro_token_is_negative_fresh(presented) {
+            return false;
+        }
+        let stored = self.inner.read_only_token_raw();
+        if stored.is_empty() {
+            // No read-only token configured: nothing can match. No cache
+            // entry (a later reload/env change takes effect immediately) and
+            // no KDF.
+            return false;
+        }
+        // SEC (KDF DoS): the read-only verify shares the process-wide
+        // in-flight-KDF cap with the admin verify — one attacker token that
+        // misses both levels costs at most two capped KDFs.
+        match tokio::time::timeout(self.kdf.acquire_timeout, self.kdf.sem.acquire()).await {
+            Ok(_permit) => {
+                let presented_owned = presented.to_string();
+                let ok = tokio::task::spawn_blocking(move || {
+                    verify_admin_password(&stored, &presented_owned)
+                })
+                .await
+                .expect("blocking pool panicked");
+                self.inner.ro_token_record(presented, ok);
+                ok
+            }
+            Err(_) => {
+                self.inner.ro_token_record(presented, false);
+                false
+            }
+        }
+    }
+
+    /// Best-effort transparent upgrade: persist the freshly-hashed read-only
+    /// token to Postgres **and** the in-memory cache in one go. Mirrors
+    /// [`Self::upgrade`] for `access.read_only_token` (same DB-failure
+    /// semantics: the cache update is authoritative for subsequent auth;
+    /// both token caches are invalidated because a stored-value change
+    /// makes every cached verdict stale).
+    pub async fn upgrade_read_only(&self, hashed: String) {
+        let val: serde_json::Value = serde_json::json!(hashed);
+        match raw::execute(
+            self.inner.pool(),
+            "UPDATE settings SET value = $1 WHERE key = $2",
+            |q| q.bind(&val).bind(KEY_ACCESS_READ_ONLY_TOKEN),
+        )
+        .await
+        {
+            Ok(_) => {
+                tracing::info!("upgraded access.read_only_token to a salted hash");
+                // Cross-process invalidation (LISTEN/NOTIFY): the UPDATE
+                // above is a single autocommit statement, so it is committed
+                // by the time this runs — best-effort, same as `upgrade`.
+                if let Err(e) = raw::execute(
+                    self.inner.pool(),
+                    crate::db::notify::NOTIFY_SETTINGS_SQL,
+                    |q| q,
+                )
+                .await
+                {
+                    tracing::warn!("failed to fire settings invalidation notification: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to persist upgraded read-only token (cached anyway): {e}")
+            }
+        }
+        // Cache the hash regardless of DB outcome so the upgrade is sticky.
+        self.inner.read_only_token_set(&hashed);
+        // Both stored values just changed — drop every cached verdict (admin
+        // and read-only) so nothing verifies against a stale value.
+        self.inner.token_invalidate_all();
+        self.inner.ro_token_invalidate_all();
+        self.inner.bump_generation();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::settings::{
+        default_settings, KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_READ_ONLY_TOKEN,
+    };
+    use std::collections::HashMap;
+
+    /// Build a DB-less settings cache (dead pool) from an in-memory map so
+    /// the read-only verify logic is exercised without a live Postgres.
+    fn cache_with(admin: &str, read_only: &str) -> crate::settings::SettingsCache {
+        let mut map = default_settings();
+        map.insert(
+            KEY_ACCESS_ADMIN_PASSWORD.to_string(),
+            serde_json::json!(admin),
+        );
+        map.insert(
+            KEY_ACCESS_READ_ONLY_TOKEN.to_string(),
+            serde_json::json!(read_only),
+        );
+        crate::settings::SettingsCache::new_with_map(
+            crate::testing::dead_pool(),
+            map,
+            HashMap::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn read_only_token_verifies_at_read_only_level_only() {
+        let s = cache_with("admin-pw", "ro-token");
+        let auth = s.auth();
+        // The read-only token matches the read-only level…
+        assert!(
+            auth.verify_read_only_bg("ro-token").await,
+            "the configured read-only token must verify at the read-only level"
+        );
+        // …but never at the admin level (it must not unlock full access).
+        assert!(
+            !auth.verify_bg("ro-token").await,
+            "the read-only token must NOT verify against the admin password"
+        );
+        // The admin password is not the read-only token.
+        assert!(
+            !auth.verify_read_only_bg("admin-pw").await,
+            "the admin password must not verify at the read-only level"
+        );
+        // A wrong token matches neither level.
+        assert!(!auth.verify_read_only_bg("nope").await);
+        assert!(!auth.verify_bg("nope").await);
+    }
+
+    #[tokio::test]
+    async fn empty_read_only_token_rejects_without_kdf() {
+        // No read-only token configured: nothing can match, and the verify
+        // must not even run the KDF (empty stored value short-circuits).
+        let s = cache_with("admin-pw", "");
+        let auth = s.auth();
+        assert!(
+            !auth.verify_read_only_bg("anything").await,
+            "an unset read-only token must reject every presented token"
+        );
+        assert!(
+            !auth.verify_read_only_bg("").await,
+            "an empty presented token must be rejected outright"
+        );
+        // The admin level is unaffected by the empty read-only token.
+        assert!(auth.verify_bg("admin-pw").await);
+    }
+
+    #[tokio::test]
+    async fn read_only_verify_caches_positive_and_negative() {
+        let s = cache_with("admin-pw", "ro-token");
+        let auth = s.auth();
+        // Prime the positive cache, then confirm the entry is fresh (the
+        // second call hits the cache, not the KDF — observable as the same
+        // verdict without re-running).
+        assert!(auth.verify_read_only_bg("ro-token").await);
+        assert!(
+            s.inner.ro_token_is_fresh("ro-token"),
+            "a successful read-only verify must be cached positive"
+        );
+        // A failed read-only verify is cached negative.
+        assert!(!auth.verify_read_only_bg("wrong").await);
+        assert!(
+            s.inner.ro_token_is_negative_fresh("wrong"),
+            "a failed read-only verify must be cached negative"
+        );
+        // The read-only cache is separate from the admin cache: a token
+        // cached at the read-only level is NOT fresh in the admin cache.
+        assert!(
+            !s.inner.token_is_fresh("ro-token"),
+            "the read-only token cache must not leak into the admin token cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_verify_respects_kdf_overload_deny() {
+        // With a zero-permit semaphore and a 1 ms acquire timeout, the
+        // in-flight-KDF overload arm denies (and records a negative) — the
+        // same fail-closed behavior as the admin verify. This proves the
+        // read-only path goes through the shared capped-KDF guard.
+        let mut map = default_settings();
+        map.insert(
+            KEY_ACCESS_READ_ONLY_TOKEN.to_string(),
+            serde_json::json!("ro-token"),
+        );
+        let inner = crate::settings::cache::SettingsInner::inner_for_test(map);
+        let auth = SettingsAuth::new_for_test(
+            inner,
+            Arc::new(tokio::sync::Semaphore::new(0)),
+            std::time::Duration::from_millis(1),
+        );
+        assert!(
+            !auth.verify_read_only_bg("ro-token").await,
+            "KDF overload must deny the read-only verify (fail-closed)"
+        );
     }
 }

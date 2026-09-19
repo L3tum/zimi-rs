@@ -304,8 +304,13 @@ pub async fn random_article(
     State(state): State<AppState>,
     Query(params): Query<RandomQuery>,
 ) -> Result<Json<RandomArticleResponse>, crate::error::Error> {
-    let article =
-        crate::db::random_article::fetch_random_article(&state.db, params.zim.as_deref()).await?;
+    // Foreground READ: routes to the read replica when `DATABASE_URL_READ`
+    // is set (PERF-10 / read-replica finding), else the primary pool.
+    let article = crate::db::random_article::fetch_random_article(
+        state.db_read_or_primary(),
+        params.zim.as_deref(),
+    )
+    .await?;
 
     Ok(Json(RandomArticleResponse {
         id: article.id,

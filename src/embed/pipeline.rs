@@ -69,6 +69,33 @@ pub(crate) fn bulk_update_sql(ids: &[i64]) -> Option<String> {
     ))
 }
 
+/// The atomic batch-claim statement of the embedding pipeline: stamp
+/// `embed_at = now()` on the next un-embedded batch for the ZIM, returning
+/// each row's `id` and the text to embed. Raw SQL: `UPDATE … WHERE id IN
+/// (SELECT … LIMIT) RETURNING <computed expr>` (the second RETURNING column
+/// is a `coalesce(…) || …` expression, not a plain column).
+///
+/// Deterministic FIFO (2026-09-18, PERF review item 3): the inner `SELECT`
+/// carries `ORDER BY id`, so batch membership is the OLDEST (lowest-id)
+/// un-embedded rows first, batch after batch, instead of the planner's
+/// arbitrary choice. Un-embedded rows accumulate since ingest, so id order
+/// ≈ insertion order; the deterministic order makes a failing batch
+/// reproducible (the same rows fail the same way on every retry) and keeps
+/// the W6.5 per-`id` poison counters stable across claim-window restarts.
+///
+/// `pub` (and re-exported from `crate::embed`) so the temp-DB regression
+/// test (`tests/integration/embed_claim_fifo.rs`) executes the exact
+/// production statement.
+pub const CLAIM_EMBED_BATCH_SQL: &str = "UPDATE articles SET embed_at = now() \
+ WHERE id IN (SELECT id FROM articles \
+     WHERE zim_id = (SELECT id FROM zims WHERE name = $1) \
+       AND embedding IS NULL \
+       AND (embed_at IS NULL OR embed_at < now() - interval '10 minutes') \
+     ORDER BY id \
+     LIMIT $2) \
+ RETURNING id, coalesce(snippet, '') || ' ' || coalesce(left(content_preview, \
+ 500), '')";
+
 // ─── W6.5: bounded re-claim of permanently-failing (poison) rows ─────────────
 //
 // A row whose embed batch keeps failing (e.g. the endpoint always 500s) stays
@@ -213,24 +240,13 @@ pub async fn run_pipeline(
         // window; successfully embedded rows have embedding IS NOT NULL and
         // are never re-claimed.
         //
-        // Raw SQL: `UPDATE … WHERE id IN (SELECT … LIMIT) RETURNING
-        // <computed expr>` (the RETURNING column is a `coalesce(…) || …`
-        // expression, not a plain column).
-        let mut rows: Vec<(i64, String)> = {
-            raw::fetch_all(
-                &pool,
-                "UPDATE articles SET embed_at = now() \
-                 WHERE id IN (SELECT id FROM articles \
-                     WHERE zim_id = (SELECT id FROM zims WHERE name = $1) \
-                       AND embedding IS NULL \
-                       AND (embed_at IS NULL OR embed_at < now() - interval '10 minutes') \
-                     LIMIT $2) \
-                 RETURNING id, coalesce(snippet, '') || ' ' || coalesce(left(content_preview, \
-                 500), '')",
-                |q| q.bind(zim_name).bind(batch_size),
-            )
-            .await?
-        };
+        // `CLAIM_EMBED_BATCH_SQL`: the inner `SELECT` is `ORDER BY id` —
+        // deterministic FIFO (the oldest rows are claimed first, batch after
+        // batch); see the const's doc for the 2026-09-18 decision.
+        let mut rows: Vec<(i64, String)> = raw::fetch_all(&pool, CLAIM_EMBED_BATCH_SQL, |q| {
+            q.bind(zim_name).bind(batch_size)
+        })
+        .await?;
 
         if rows.is_empty() {
             drop(permit);

@@ -37,8 +37,24 @@ impl DownloadPoller {
 }
 
 /// Queue OPDS auto-updates (TEST-5 seam, extracted from
-/// [`DownloadPoller::opds_check`]): skip an update whose URL already has a
-/// queued/in-flight/installed row (B10), insert the rest as `queued`.
+/// [`DownloadPoller::opds_check`]).
+///
+/// Version-key semantics (SEC content integrity): a URL is skipped only
+/// while a row for it is LIVE (`queued`/`downloading`). Terminal rows
+/// (`complete`/`seeding`) are history, not dedup — they skip only when they
+/// MATCH the catalog's CURRENT digest claim:
+/// - the catalog declares digest D: skip iff some terminal row recorded
+///   `sha256 = D` (this exact version is already installed). A different
+///   (or newly declared) digest is a NEW version, not a violation: the old
+///   row stays as history and a fresh `queued` row is inserted carrying the
+///   new claim, which the direct-download finalize path verifies against.
+/// - the catalog declares nothing (the current Kiwix catalog shape): the
+///   legacy status-based skip applies — any terminal row means the current
+///   file is the one we installed.
+///
+/// Each inserted row records `sha256 = <normalized catalog claim>` (NULL
+/// when the source declared nothing), so the settled row doubles as the
+/// provenance/version record for that URL.
 ///
 /// Loopback URLs never reach here — the SSRF gate in `opds_check`
 /// (`validate_download_url`) fires first.
@@ -47,33 +63,51 @@ async fn queue_opds_updates(db: &Pool, updates: &[OpdsUpdate]) -> Result<()> {
         return Ok(());
     }
     for u in updates {
-        // Second line of defense (B10): `find_updates` already dedups to
-        // one (newest) update per local ZIM; this per-URL guard prevents
-        // re-queueing while an older version of the same catalog is still
-        // queued/downloading, so the update lands cleanly on completion.
-        let pending: Option<i32> = crate::db::raw::fetch_scalar_optional(
+        // First line (B10): a LIVE row for this URL — queued or downloading
+        // — means the fetch is already in flight; never re-queue it.
+        let active: Option<i32> = crate::db::raw::fetch_scalar_optional(
             db,
             "SELECT id FROM downloads WHERE url = $1 \
-             AND status IN ($2, $3, $4, $5) LIMIT 1",
+             AND status IN ($2, $3) LIMIT 1",
             |q| {
                 q.bind(&u.download_url)
                     .bind(crate::torrent::DownloadStatus::Queued.as_str())
                     .bind(crate::torrent::DownloadStatus::Downloading.as_str())
+            },
+        )
+        .await?;
+        if active.is_some() {
+            continue;
+        }
+        // Second line (version key): does the terminal history for this URL
+        // already match the catalog's CURRENT claim?
+        let terminal: Vec<Option<String>> = crate::db::raw::fetch_scalar_all(
+            db,
+            "SELECT sha256 FROM downloads WHERE url = $1 \
+             AND status IN ($2, $3)",
+            |q| {
+                q.bind(&u.download_url)
                     .bind(crate::torrent::DownloadStatus::Complete.as_str())
                     .bind(crate::torrent::DownloadStatus::Seeding.as_str())
             },
         )
         .await?;
-        if pending.is_some() {
+        let claim: Option<String> = u.digest.as_ref().map(|d| d.value.clone());
+        let matches_current = match claim.as_deref() {
+            Some(c) => terminal.iter().any(|d| d.as_deref() == Some(c)),
+            None => !terminal.is_empty(),
+        };
+        if matches_current {
             continue;
         }
         match crate::db::raw::execute(
             db,
-            "INSERT INTO downloads (name, url, status) VALUES ($1, $2, $3)",
+            "INSERT INTO downloads (name, url, status, sha256) VALUES ($1, $2, $3, $4)",
             |q| {
                 q.bind(&u.catalog_name)
                     .bind(&u.download_url)
                     .bind(crate::torrent::DownloadStatus::Queued.as_str())
+                    .bind(&claim)
             },
         )
         .await
@@ -87,10 +121,11 @@ async fn queue_opds_updates(db: &Pool, updates: &[OpdsUpdate]) -> Result<()> {
             Err(e) => return Err(e),
         }
         tracing::info!(
-            "OPDS: queued auto-update for {} → {} ({})",
+            "OPDS: queued auto-update for {} → {} ({}) digest={}",
             u.local_name,
             u.catalog_name,
-            u.download_url
+            u.download_url,
+            claim.as_deref().unwrap_or("<none declared>")
         );
     }
     Ok(())
@@ -100,9 +135,17 @@ async fn queue_opds_updates(db: &Pool, updates: &[OpdsUpdate]) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{queue_opds_updates, DownloadPoller, OpdsUpdate};
-
     use crate::settings::{KEY_TORRENT_AUTO_UPDATE, KEY_TORRENT_OPDS_URL};
+    use crate::torrent::opds::ZimDigest;
     use crate::torrent::poller::test_pool;
+
+    /// A normalized 64-char lowercase hex claim for tests.
+    fn digest(s: &str) -> ZimDigest {
+        ZimDigest { value: s.into() }
+    }
+
+    /// A normalized 64-char lowercase hex claim for tests (64 × `a`).
+    const DIGEST_OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     /// TEST-5: wiremock binds 127.0.0.1 and netguard hard-blocks loopback,
     /// so a loopback OPDS URL must be rejected by the SSRF gate BEFORE any
@@ -176,12 +219,14 @@ mod tests {
                 catalog_name: "x2".into(),
                 title: None,
                 download_url: x.into(),
+                digest: None,
             },
             OpdsUpdate {
                 local_name: "y".into(),
                 catalog_name: "y2".into(),
                 title: None,
                 download_url: y.into(),
+                digest: None,
             },
         ];
         queue_opds_updates(&pool, &updates)
@@ -216,5 +261,237 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// Version-key (CI-DB): a `complete` row whose recorded digest EQUALS the
+    /// catalog's current claim means this exact version is already installed
+    /// → the URL is skipped (no re-queue, no duplicate row).
+    #[tokio::test]
+    async fn queue_opds_updates_skips_complete_row_matching_claim() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let x = "http://it.example/vk-match.zim";
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(x))
+            .await
+            .unwrap();
+        crate::db::raw::execute(
+            &pool,
+            "INSERT INTO downloads (name, url, status, sha256) VALUES ('vk-match', $1, 'complete', $2)",
+            |q| q.bind(x).bind(DIGEST_OLD),
+        )
+        .await
+        .unwrap();
+
+        queue_opds_updates(
+            &pool,
+            &[OpdsUpdate {
+                local_name: "m".into(),
+                catalog_name: "m2".into(),
+                title: None,
+                download_url: x.into(),
+                digest: Some(digest(DIGEST_OLD)),
+            }],
+        )
+        .await
+        .expect("queueing runs");
+
+        let count: i64 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT count(*) FROM downloads WHERE url = $1",
+            |q| q.bind(x),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 1, "matching digest ⇒ already installed ⇒ skip");
+
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(x))
+            .await
+            .unwrap();
+    }
+
+    /// Version-key (CI-DB): a `complete` row with a DIFFERENT digest than the
+    /// catalog's current claim is a NEW version, not a violation — a fresh
+    /// `queued` row is inserted carrying the NEW claim, and the old row stays
+    /// untouched as history.
+    #[tokio::test]
+    async fn queue_opds_updates_requeues_when_claim_changes() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let x = "http://it.example/vk-change.zim";
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(x))
+            .await
+            .unwrap();
+        crate::db::raw::execute(
+            &pool,
+            "INSERT INTO downloads (name, url, status, sha256) VALUES ('vk-change', $1, 'complete', $2)",
+            |q| q.bind(x).bind(DIGEST_OLD),
+        )
+        .await
+        .unwrap();
+
+        let new_claim = digest(&"b".repeat(64));
+        queue_opds_updates(
+            &pool,
+            &[OpdsUpdate {
+                local_name: "c".into(),
+                catalog_name: "c2".into(),
+                title: None,
+                download_url: x.into(),
+                digest: Some(new_claim.clone()),
+            }],
+        )
+        .await
+        .expect("queueing runs");
+
+        let count: i64 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT count(*) FROM downloads WHERE url = $1 AND status = 'queued'",
+            |q| q.bind(x),
+        )
+        .await
+        .expect("count new rows")
+        .unwrap();
+        let (new_status, new_sha): (String, Option<String>) = crate::db::raw::fetch_optional(
+            &pool,
+            "SELECT status, sha256 FROM downloads WHERE url = $1 AND status = 'queued'",
+            |q| q.bind(x),
+        )
+        .await
+        .expect("read new row")
+        .expect("a fresh queued row must exist for the new claim");
+        assert_eq!(count, 1);
+        assert_eq!(new_status, "queued");
+        assert_eq!(
+            new_sha.as_deref(),
+            Some(new_claim.value.as_str()),
+            "the new row must carry the catalog's current claim"
+        );
+        // The old completed row is preserved as history.
+        let old: Option<(String, Option<String>)> = crate::db::raw::fetch_optional(
+            &pool,
+            "SELECT status, sha256 FROM downloads \
+             WHERE url = $1 AND status = 'complete'",
+            |q| q.bind(x),
+        )
+        .await
+        .expect("read old row");
+        assert_eq!(old, Some(("complete".into(), Some(DIGEST_OLD.into()))));
+
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(x))
+            .await
+            .unwrap();
+    }
+
+    /// Version-key (CI-DB): a `complete` row with NO recorded claim (the URL
+    /// was fetched before the catalog started declaring digests) must be
+    /// re-queued once the catalog declares one — the claim was never
+    /// verified for that install.
+    #[tokio::test]
+    async fn queue_opds_updates_requeues_unclaimed_row_when_claim_appears() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let x = "http://it.example/vk-appear.zim";
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(x))
+            .await
+            .unwrap();
+        crate::db::raw::execute(
+            &pool,
+            "INSERT INTO downloads (name, url, status) VALUES ('vk-appear', $1, 'complete')",
+            |q| q.bind(x),
+        )
+        .await
+        .unwrap();
+
+        queue_opds_updates(
+            &pool,
+            &[OpdsUpdate {
+                local_name: "a".into(),
+                catalog_name: "a2".into(),
+                title: None,
+                download_url: x.into(),
+                digest: Some(digest(DIGEST_OLD)),
+            }],
+        )
+        .await
+        .expect("queueing runs");
+
+        let count: i64 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT count(*) FROM downloads WHERE url = $1 AND status = 'queued'",
+            |q| q.bind(x),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 1, "unclaimed history + new claim ⇒ re-queue");
+
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(x))
+            .await
+            .unwrap();
+    }
+
+    /// Version-key (CI-DB): when the catalog declares NOTHING (the current
+    /// Kiwix catalog shape), the legacy status-based dedup applies — a
+    /// `complete` row (claim or not) still skips the URL, preserving the
+    /// pre-digest behavior for digest-less sources.
+    #[tokio::test]
+    async fn queue_opds_updates_undeclared_claim_keeps_status_dedup() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let x = "http://it.example/vk-legacy.zim";
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(x))
+            .await
+            .unwrap();
+        crate::db::raw::execute(
+            &pool,
+            "INSERT INTO downloads (name, url, status) VALUES ('vk-legacy', $1, 'complete')",
+            |q| q.bind(x),
+        )
+        .await
+        .unwrap();
+
+        queue_opds_updates(
+            &pool,
+            &[OpdsUpdate {
+                local_name: "l".into(),
+                catalog_name: "l2".into(),
+                title: None,
+                download_url: x.into(),
+                digest: None,
+            }],
+        )
+        .await
+        .expect("queueing runs");
+
+        let count: i64 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT count(*) FROM downloads WHERE url = $1",
+            |q| q.bind(x),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 1, "digest-less catalog + complete row ⇒ legacy skip");
+
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE url = $1", |q| q.bind(x))
+            .await
+            .unwrap();
     }
 }

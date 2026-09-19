@@ -169,6 +169,11 @@ const FIELDS = {
     desc: 'Required when mode = password',
     type: 'password',
   },
+  'access.read_only_token': {
+    label: 'Read-only API token',
+    desc: 'Optional: grants read-only API access (search/suggest/content) only',
+    type: 'password',
+  },
   'access.rate_limit_rps': {
     label: 'Rate limit (req/s)',
     desc: 'Sustained requests per second allowed (token bucket refill rate)',

@@ -103,6 +103,13 @@ pub async fn list_embeddable_zims(pool: &Pool) -> Result<Vec<String>> {
 /// vectors, whenever embedding is enabled. Runs the full pipeline per ZIM,
 /// which is itself resumable (skips rows that already have vectors).
 ///
+/// All of the loop's DB work (the `list_embeddable_zims` probe, the
+/// vector-index state/probe checks, the spawned index build, and the
+/// pipelines) checks out from the dedicated background pool
+/// (`AppState::db_bg`, capped at `db::pool::BG_POOL_MAX_CONNECTIONS` on the
+/// primary URL — PERF-10), never from the shared foreground pool, so a
+/// background burst can never starve foreground search/API checkouts.
+///
 /// `tick` is the cadence between passes. Production passes 60 s; the loop
 /// tests pass a small value (e.g. 50 ms) so they run on a *real* clock and
 /// stay green on a remote (slow-RTT) DB — see the module's test note.
@@ -127,7 +134,9 @@ pub async fn auto_embed_loop(state: Arc<crate::AppState>, tick: Duration) {
         // P3: if there is nothing to embed, skip the `vector_index_state` DB
         // check entirely for this tick (and the pipeline below) — no embeddable
         // ZIM means no new vectors, so there is no point querying the index.
-        let Ok(zims) = list_embeddable_zims(&state.db).await else {
+        // Background work checks out from the dedicated background pool
+        // (`db_bg`, PERF-10), never the shared foreground pool.
+        let Ok(zims) = list_embeddable_zims(&state.db_bg).await else {
             continue;
         };
         if zims.is_empty() {
@@ -145,10 +154,10 @@ pub async fn auto_embed_loop(state: Arc<crate::AppState>, tick: Duration) {
             // the build threshold (so the embedded subset is too). This drops the
             // recurring 60 s full-table count from every tick except the rare
             // window where ≥ 10k rows exist with no index yet.
-            if index_build_worth_probing(&state.db).await {
+            if index_build_worth_probing(&state.db_bg).await {
                 // Probe failure fails closed (assume a valid index exists →
                 // don't build), as before.
-                let (count, st) = vector_index_state(&state.db)
+                let (count, st) = vector_index_state(&state.db_bg)
                     .await
                     .unwrap_or((0, VectorIndexState::Present));
                 // Read-only backoff check (pure atomic load, no CAS stamp):
@@ -163,7 +172,7 @@ pub async fn auto_embed_loop(state: Arc<crate::AppState>, tick: Duration) {
                     && should_spawn_build(st, count)
                     && in_flight.is_none()
                 {
-                    let db = state.db.clone();
+                    let db = state.db_bg.clone();
                     let settings = state.settings.clone();
                     let probe = state.build_probe.clone();
                     let index_building = state.index_building.clone();
@@ -239,7 +248,7 @@ pub async fn auto_embed_loop(state: Arc<crate::AppState>, tick: Duration) {
                 }
             }
             tracing::info!("auto-embedding ZIM '{name}'");
-            let db = state.db.clone();
+            let db = state.db_bg.clone();
             let settings = state.settings.clone();
             let build_probe = state.build_probe.clone();
             let index_building = state.index_building.clone();

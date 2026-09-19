@@ -14,7 +14,7 @@ use sqlx::Executor;
 
 use crate::db::pool::Pool;
 use crate::embed::{format_vector, EmbedClient, EmbedConfig};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::settings::{SearchParamsSnapshot, SettingsCache};
 
 use self::query_cache::QueryEmbedCache;
@@ -94,6 +94,12 @@ fn merge_suggest(
 /// Search engine that wraps Postgres FTS + trgm + optional vector (semantic) queries.
 #[derive(Clone)]
 pub struct SearchEngine {
+    /// Foreground read pool: the arms, `suggest()`, the `ensure_trgm` slow
+    /// path, and the vector ANN seek all check out from here.
+    /// `startup::build_state` wires it to the read replica when
+    /// `DATABASE_URL_READ` is set, else to the primary pool (PERF-10:
+    /// search must not contend with background work on the shared pool).
+    /// Test helpers pass a live or dead test pool directly.
     pool: Pool,
     settings: SettingsCache,
     /// Lazily-built embedding client, keyed by a settings fingerprint so it
@@ -382,6 +388,12 @@ impl SearchEngine {
     ///
     /// `highlight` wraps matched terms in the contextual snippet using Postgres
     /// `ts_headline` over `content_preview` (full content is not stored in DB).
+    ///
+    /// The selected arms run CONCURRENTLY — each text arm on its own pool
+    /// checkout, the vector arm (embed + ANN seek) in the same `tokio::join!`
+    /// (PERF-10 decision record above the join): merge/dedup semantics and
+    /// per-arm soft-fail are preserved exactly, and checkout pressure is
+    /// observable per arm via the /diagnostic checkout-wait metric.
     pub async fn search(&self, query: &str, p: &SearchParams<'_>) -> Result<Vec<SearchResult>> {
         let SearchParams {
             zim: zim_filter,
@@ -461,112 +473,178 @@ impl SearchEngine {
             debug_assert!(sq.placeholder_count() == sq.params.len());
         }
 
-        // ── Run the slow embed HTTP concurrently with every DB branch ──
-        // Total latency is max(embed, fts, trgm×3) + the vector ANN seek, not
-        // the sum. The pooled connection is acquired INSIDE the DB arm and
-        // dropped at the end of that arm (the arm returns only the rows), so a
-        // slow/failing embed API (up to its timeout, default 60 s) cannot hold
-        // a pool connection hostage: `tokio::join!` retains each arm's output
-        // until BOTH arms finish, so returning the client out of the join
-        // would keep it checked out for the entire embed round-trip. The
-        // vector ANN seek re-acquires a fresh connection afterward.
-        // H3: each phase holds exactly ONE pooled connection, and only for
-        // the fast sequential queries (a few ms each). A tokio-postgres
-        // client is single-in-flight-command, so the four DB arms run
-        // sequentially on it instead of each grabbing its own connection
-        // (4–5 of the pool's 20 per request).
-        // PERF-10 decision (2026-08-30): keep the arms sequential on ONE
-        // connection. A tokio-postgres client is single-in-flight-command;
-        // parallel arms would need 4–5 of the pool's 20 connections per request,
-        // which is not justified by the few-ms of sequential DB time (the slow
-        // arm is the embed HTTP, already concurrent via `join!`). Revisit
-        // trigger: sustained search QPS with visible pool saturation
-        // (non-trivial pool-checkout wait) — `/diagnostic`'s `checkout_wait`
-        // (max/avg since process start) is the measurement — then move the
-        // arms to separate connections (or pipelined queries in one
-        // transaction).
+        // ── Concurrency design (PERF-10 decision record) ───────────────────
+        // 2026-08-30 decision (superseded — kept for the audit trail): the
+        // arm queries ran SEQUENTIALLY on ONE pool checkout. A tokio-postgres
+        // client is single-in-flight-command, and parallel arms would need
+        // 4–5 of the pool's 20 connections per request, "not justified by
+        // the few-ms of sequential DB time" (the slow arm being the embed
+        // HTTP, already concurrent via `join!`).
+        //
+        // 2026-09-18 decision (this code): the documented revisit trigger
+        // fired — Postgres moved to a remote host, so every arm seek now pays
+        // a network RTT (the sub-10ms local-DB assumption is gone), and the
+        // per-search clone/checkout churn was measured. The selected arms
+        // therefore run CONCURRENTLY: each text arm takes its own pool
+        // checkout, and the vector arm (embed HTTP + ANN seek) joins them in
+        // the same `tokio::join!`. Total latency is now
+        // max(embed, fts, trgm×3, ann) — not the sum.
+        //
+        // Preserved exactly:
+        // - Arm SQL text (tests/integration/trgm_plan.rs EXPLAINs these
+        //   builders as the plan gate — unchanged).
+        // - Merge/scoring/dedup semantics: arms keep a FIXED position in the
+        //   merge (fts, [prefix⊕contains⊕similarity pre-deduped], vector) and
+        //   every arm SQL is `ORDER BY score DESC, a.id`, so per-arm order is
+        //   deterministic regardless of completion order; `merge_results`'s
+        //   stable sort then keeps equal-score rows in that fixed arm order.
+        // - Per-arm soft-fail: an arm QUERY failure degrades that arm to
+        //   empty (`run_sql_on`), and an ANN-checkout failure soft-fails too
+        //   (warn + empty) — an error in one arm never takes down the others.
+        // - The hard-fail corner: if at least one text arm is selected and
+        //   ALL selected text arms fail to CHECK OUT, the search errors, just
+        //   like the old sequential DB-arm checkout failure (a dead pool must
+        //   not surface as a silent empty result).
+        //
+        // Deliberate changes (small, documented):
+        // - A vector-ONLY search (mode "vector"/"semantic") against a dead
+        //   pool now returns empty instead of erroring: the old hard fail
+        //   came from an incidental no-op DB-arm checkout, not from any
+        //   arm's work, and the vector arm's ANN checkout soft-fails by
+        //   contract.
+        // - Checkout count: a full hybrid search briefly holds up to 4 text
+        //   checkouts + 1 ANN (the ANN only after its embed lands — the embed
+        //   itself still holds NO connection: H2, pinned by
+        //   `search_does_not_hold_pool_connection_during_embed`). The pool
+        //   default is 20 (`db_pool_size`, clamped [1,100]); every checkout
+        //   is recorded under its own label (`search_fts`, `search_trgm_*`,
+        //   `search_vector_ann`) in the /diagnostic checkout-wait metric, so
+        //   fan-out pressure is observable per site.
+        // - trgm probe cadence unchanged: one probe per search when the
+        //   in-process cache is cold (`ensure_trgm`, own checkout — taken
+        //   before the fan-out so the arms' selected state is known up
+        //   front), zero checkouts when warm, none when the trgm arms are
+        //   off for the mode/query length.
+        // PERF-13: the settings snapshot is built EXACTLY ONCE above
+        // (`search_params_snapshot` = ~13 Value clones + per-key JSON
+        // deserializes) and shared as an `Arc` across every arm — no arm
+        // re-derives settings, and the embed cache key and the client
+        // fingerprint both come from this one snapshot.
         let fingerprint = self.embed_fingerprint(&snap);
-        let embed_arm = VectorEmbedArm {
+        let ann_filtered = zim_filter.is_some() || lang_filter.is_some();
+        let vector_arm = VectorEmbedArm {
             engine: self,
+            snap: Arc::new(snap),
             fingerprint,
             query: query.to_string(),
             enabled: run_vector,
-            model: snap.embed_model.clone(),
-            dimension: snap.embed_dimension,
+            ann_zim: zim_filter,
+            ann_lang: lang_filter,
+            // Multiplier + cap interaction is documented on
+            // `vector_fetch_limit` (capped ANN top-k, see there for the
+            // filtered vector-only corner).
+            ann_limit: vector_fetch_limit(fetch_i32 as usize, ann_filtered),
+            ann_weight: vector_weight,
         };
-        let (query_vec, db_arm) = tokio::join!(embed_arm.run(), async {
-            // `acquire_timed`: the DB arm's checkout is the primary input
-            // to the /diagnostic checkout-wait metric (PERF-10 trigger).
-            let mut client = match crate::db::pool::acquire_timed(&self.pool, "search_db_arm").await
-            {
-                Ok(c) => c,
-                Err(e) => return Err(e.into()),
-            };
-            // Q0: full-text search
-            let fts = if let Some(sq) = &fts_sq {
-                run_sql_on(&mut *client, sq, "FTS", &self.degradation, "fts").await
-            } else {
-                Vec::new()
-            };
-            // WI-37: resolve the `pg_trgm` extension once (cached). A
-            // missing extension (or a pool blip) soft-disables all three
-            // trgm arms below; FTS always runs regardless. Probed on the
-            // arm's own connection (no second pool checkout — see
-            // `ensure_trgm_on`).
-            let trgm_ok = if run_trgm {
-                self.ensure_trgm_on(&mut *client).await
-            } else {
-                false
-            };
-            // Q1: prefix match — uses btree index on title_lower
-            let prefix = if let Some(sq) = sq_prefix.as_ref().filter(|_| trgm_ok) {
-                run_sql_on(
-                    &mut *client,
-                    sq,
-                    "trgm prefix query",
-                    &self.degradation,
-                    "trgm_prefix",
-                )
-                .await
-            } else {
-                Vec::new()
-            };
-            // Q2: contains match — uses GIN trgm index
-            let contains = if let Some(sq) = sq_contains.as_ref().filter(|_| trgm_ok) {
-                run_sql_on(
-                    &mut *client,
-                    sq,
-                    "trgm contains query",
-                    &self.degradation,
-                    "trgm_contains",
-                )
-                .await
-            } else {
-                Vec::new()
-            };
-            // Q3: similarity threshold — uses GiST trgm index
-            let similarity = if let Some(sq) = sq_similarity.as_ref().filter(|_| trgm_ok) {
-                run_sql_on(
-                    &mut *client,
-                    sq,
-                    "trgm similarity query",
-                    &self.degradation,
-                    "trgm_similarity",
-                )
-                .await
-            } else {
-                Vec::new()
-            };
-            // Drop the pooled connection at the end of the arm so it is
-            // returned to the pool the moment the fast queries finish —
-            // NOT held across the slow embed round-trip (see the comment
-            // above the join). `tokio::join!` retains this arm's output
-            // until the embed arm completes, so leaving `client` in the
-            // return value would keep it checked out for the whole embed.
-            drop(client);
-            Ok::<_, Error>((fts, prefix, contains, similarity))
-        },);
-        let (fts_rows, prefix_rows, contains_rows, similarity_rows) = db_arm?;
+        // WI-37: resolve the `pg_trgm` extension once (cached). A missing
+        // extension (or a pool blip) soft-disables all three trgm arms; FTS
+        // always runs regardless.
+        let trgm_ok = if run_trgm {
+            self.ensure_trgm().await
+        } else {
+            false
+        };
+
+        // Each text arm: own checkout → query → return-to-pool (H2: no
+        // connection is ever held across the embed). A CHECKOUT failure is
+        // returned to `search()` (which decides the hard-fail corner across
+        // the arm set); an arm QUERY failure soft-fails to empty inside
+        // `run_sql_on`, as before. `&str` labels are unique per arm for the
+        // /diagnostic checkout-wait metric (Architecture M1).
+        let pool = &self.pool;
+        let degradation = &self.degradation;
+        // Q0: full-text search
+        let fts_arm = async {
+            match fts_sq.as_ref() {
+                Some(sq) => run_text_arm(pool, sq, "FTS", "search_fts", "fts", degradation).await,
+                None => Ok(Vec::new()),
+            }
+        };
+        // Q1: prefix match — uses btree index on title_lower
+        let prefix_arm = async {
+            match sq_prefix.as_ref().filter(|_| trgm_ok) {
+                Some(sq) => {
+                    run_text_arm(
+                        pool,
+                        sq,
+                        "trgm prefix query",
+                        "search_trgm_prefix",
+                        "trgm_prefix",
+                        degradation,
+                    )
+                    .await
+                }
+                None => Ok(Vec::new()),
+            }
+        };
+        // Q2: contains match — uses GIN trgm index
+        let contains_arm = async {
+            match sq_contains.as_ref().filter(|_| trgm_ok) {
+                Some(sq) => {
+                    run_text_arm(
+                        pool,
+                        sq,
+                        "trgm contains query",
+                        "search_trgm_contains",
+                        "trgm_contains",
+                        degradation,
+                    )
+                    .await
+                }
+                None => Ok(Vec::new()),
+            }
+        };
+        // Q3: similarity threshold — uses GiST trgm index
+        let similarity_arm = async {
+            match sq_similarity.as_ref().filter(|_| trgm_ok) {
+                Some(sq) => {
+                    run_text_arm(
+                        pool,
+                        sq,
+                        "trgm similarity query",
+                        "search_trgm_similarity",
+                        "trgm_similarity",
+                        degradation,
+                    )
+                    .await
+                }
+                None => Ok(Vec::new()),
+            }
+        };
+
+        // The join: 4 text arms + the vector arm (embed → ANN seek) run
+        // concurrently. Only the text arms' CHECKOUT outcomes can error; the
+        // vector arm soft-fails inside and returns rows.
+        let (fts_r, prefix_r, contains_r, similarity_r, vector_results) = tokio::join!(
+            fts_arm,
+            prefix_arm,
+            contains_arm,
+            similarity_arm,
+            vector_arm.run(),
+        );
+
+        // Hard-fail corner (see the decision record above): at least one
+        // text arm selected AND every selected text arm failed to check out
+        // → the pool is dead/exhausted → the search errors, exactly like the
+        // old sequential DB-arm checkout failure. Any mix with ≥1 checkout
+        // that succeeded degrades the failed arms to empty (per-arm
+        // soft-fail); failed arms contribute their empty vec.
+        let [fts_rows, prefix_rows, contains_rows, similarity_rows] = join_text_arms([
+            (fts_sq.is_some(), fts_r),
+            (sq_prefix.is_some() && trgm_ok, prefix_r),
+            (sq_contains.is_some() && trgm_ok, contains_r),
+            (sq_similarity.is_some() && trgm_ok, similarity_r),
+        ])?;
 
         // ── Merge trgm branches: dedup by article id, first-wins by arm
         // order (Q1 prefix matches are generally the most relevant) — see
@@ -577,49 +655,6 @@ impl SearchEngine {
                 .chain(contains_rows)
                 .chain(similarity_rows),
         );
-
-        // ── Vector query (semantic) — runs after its embedding lands; the ANN
-        // seek is fast, so it adds little to the concurrent phase above. A
-        // failure degrades this branch only (no early return): FTS + trgm
-        // results are always kept. ──
-        let vector_results: Vec<SearchRow> = if let Some(vec_str) = query_vec {
-            let filtered = zim_filter.is_some() || lang_filter.is_some();
-            let sq = vector_sql(
-                &vec_str,
-                zim_filter,
-                lang_filter,
-                // Multiplier + cap interaction is documented on
-                // `vector_fetch_limit` (capped ANN top-k, see there for the
-                // filtered vector-only corner).
-                vector_fetch_limit(fetch_i32 as usize, filtered),
-                vector_weight,
-            );
-            debug_assert!(sq.placeholder_count() == sq.params.len());
-            // Re-acquire a (fresh, fast) connection for the ANN seek — the one
-            // from the concurrent phase above was already returned to the pool
-            // at the end of that arm. A pool-get failure degrades this branch
-            // only (no early return), matching the embed-failure path above.
-            // `acquire_timed`: explicit checkout behind the /diagnostic
-            // checkout-wait metric (Architecture M1).
-            match crate::db::pool::acquire_timed(&self.pool, "search_vector_ann").await {
-                Ok(mut client) => {
-                    run_sql_on(
-                        &mut *client,
-                        &sq,
-                        "vector search",
-                        &self.degradation,
-                        "vector_ann",
-                    )
-                    .await
-                }
-                Err(e) => {
-                    tracing::warn!("vector search disabled for this query: {e}");
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
 
         // ── Merge: dedup by `articles.id` (rows from the FTS/trgm/vector arms
         // are joined on id; equal-score ties keep the first arm's row) ──
@@ -735,10 +770,82 @@ impl SearchEngine {
     }
 }
 
+/// One concurrent text arm: check out a pool connection, run the arm SQL,
+/// return it to the pool the moment the query finishes (H2: no connection
+/// is ever held across the embed). A CHECKOUT failure is returned to
+/// `search()` (which decides the hard-fail corner across the arm set); an
+/// arm QUERY failure soft-fails to empty inside [`run_sql_on`], as before.
+async fn run_text_arm(
+    pool: &Pool,
+    sq: &SqlQuery,
+    what: &str,
+    site: &'static str,
+    branch: &'static str,
+    degradation: &crate::health::DegradationTracker,
+) -> std::result::Result<Vec<SearchRow>, sqlx::Error> {
+    // `acquire_timed`: explicit checkout behind the /diagnostic
+    // checkout-wait metric (Architecture M1), one label per arm.
+    let mut client = crate::db::pool::acquire_timed(pool, site).await?;
+    Ok(run_sql_on(&mut *client, sq, what, degradation, branch).await)
+}
+
+/// Decide the hard-fail corner of the concurrent text arms (PERF-10,
+/// 2026-09-18 decision) and hand back the rows. `arms` is the
+/// (selected, checkout+query result) state of each text arm, consumed in
+/// arm order (fts, prefix, contains, similarity).
+///
+/// Returns `Err(e)` — the first errored arm's checkout error, moved out
+/// (`sqlx::Error` is not `Clone`) — when the search must hard-fail: at
+/// least one arm is selected AND every selected arm failed to CHECK OUT
+/// (a dead/exhausted pool must never surface as a silent empty result; this
+/// preserves the old sequential DB-arm checkout failure). Otherwise
+/// `Ok(rows)`: one `Vec<SearchRow>` per arm in arm order, a failed arm
+/// contributing its soft-failed empty vec (per-arm soft-fail).
+///
+/// Pure over its inputs (no pool/DB access), so the corner is unit-pinned.
+fn join_text_arms(
+    arms: [(bool, std::result::Result<Vec<SearchRow>, sqlx::Error>); 4],
+) -> std::result::Result<[Vec<SearchRow>; 4], sqlx::Error> {
+    let mut selected_any = false;
+    let mut checked_out_any = false;
+    let mut first_err: Option<sqlx::Error> = None;
+    let mut rows = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for (i, (selected, res)) in arms.into_iter().enumerate() {
+        if !selected {
+            continue;
+        }
+        selected_any = true;
+        match res {
+            Ok(r) => {
+                checked_out_any = true;
+                rows[i] = r;
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    if selected_any && !checked_out_any {
+        // Invariant: ≥1 selected arm and none checked out ⇒ ≥1 selected arm
+        // errored ⇒ `first_err` was captured. Pinned by
+        // `checkout_hard_fail_when_every_selected_text_arm_fails`.
+        return match first_err {
+            Some(e) => Err(e),
+            None => unreachable!("hard-fail corner implies an errored selected arm"),
+        };
+    }
+    Ok(rows)
+}
+
 /// The vector (semantic) arm of [`SearchEngine::search`]: the embed HTTP
-/// call plus its `vector_embed` degradation recording, extracted from the
-/// join so `search()` reads uniformly as build branch queries → run branches
-/// (concurrently where designed) → merge.
+/// call plus the ANN seek, extracted from the join so `search()` reads
+/// uniformly as build branch queries → run branches (concurrently) → merge.
+///
+/// PERF-10 (2026-09-18): the arm now spans the whole vector branch —
+/// embed, then the ANN seek on its own pool checkout — and runs
+/// CONCURRENTLY with the text arms in the same `tokio::join!`.
 ///
 /// `run()` resolves the engine's cached embed client for this request's
 /// `fingerprint` (via `embed_client_with`, which rebuilds it only on a
@@ -749,31 +856,44 @@ impl SearchEngine {
 /// call (warned, degrades this branch only). An `Ok` response with **zero**
 /// embeddings (the provider answered `{"data": []}`) is likewise recorded as
 /// a `vector_embed` failure and returns `None` — see
-/// [`vector_from_response`].
+/// [`vector_from_response`]. Only on `Some` does the arm proceed to the ANN
+/// seek, which soft-fails to empty (warn + no rows) on a checkout failure —
+/// exactly the behavior the old post-join ANN seek had.
+///
+/// H2 (preserved): the EMBED itself holds no pool connection; the ANN seek
+/// checks out only after the embed has resolved, never across it.
 struct VectorEmbedArm<'a> {
     /// The engine whose cached embed client, settings (client-rebuild path),
     /// and degradation tracker the arm touches — nothing else.
     engine: &'a SearchEngine,
+    /// The search-wide settings snapshot (PERF-13: built once per `search()`
+    /// call and shared across every arm) — source of the cache key's
+    /// model/dimension and of the ANN filters/limit/weight.
+    snap: Arc<SearchParamsSnapshot>,
     /// Settings fingerprint computed once per request (`embed_fingerprint`).
     fingerprint: String,
     /// The query to embed (moved into the join — runs concurrently with the
-    /// DB arm).
+    /// text arms).
     query: String,
     /// Whether the vector branch runs at all (the mode + embedding-enabled
     /// gate computed in `search()`); `false` skips the embed HTTP entirely.
     enabled: bool,
-    /// Embedding model name (for the query cache key — a model change
-    /// changes the vector space).
-    model: String,
-    /// Embedding dimension (for the query cache key — a dimension change
-    /// changes the vector shape).
-    dimension: u32,
+    /// ANN seek filter: restrict to one ZIM name.
+    ann_zim: Option<&'a str>,
+    /// ANN seek filter: restrict to one language code.
+    ann_lang: Option<&'a str>,
+    /// ANN seek top-k (`vector_fetch_limit(fetch, filtered)` — the
+    /// multiplier + cap interaction is documented there).
+    ann_limit: i32,
+    /// ANN seek score weight (the snapshot's `vector_weight`).
+    ann_weight: f64,
 }
 
 impl<'a> VectorEmbedArm<'a> {
-    /// Run the embed arm: cached client → cache check → embed (3 s timeout)
-    /// → `format_vector`, with the `vector_embed` success/failure degradation
-    /// recording.
+    /// Run the whole vector arm: embed (cached client → cache check → 3
+    /// s-timeout HTTP → `vector_from_response`), then the ANN seek on a
+    /// fresh pool checkout. Returns the arm's rows — empty on any failure,
+    /// the per-arm soft-fail contract.
     ///
     /// Cache: a bounded FIFO of `(model, dimension, trimmed_query) → Vec<f32>`
     /// avoids the HTTP round-trip on repeated searches (the dominant p95 cost
@@ -783,7 +903,44 @@ impl<'a> VectorEmbedArm<'a> {
     /// embed API cannot stall interactive search; the vector branch degrades
     /// to empty and FTS+trgm still answer. The batch pipeline is unaffected
     /// (its client keeps the `embedding.timeout_secs` default of 60 s).
-    async fn run(self) -> Option<String> {
+    async fn run(self) -> Vec<SearchRow> {
+        let Some(vec_str) = self.embed_query().await else {
+            return Vec::new();
+        };
+        // ANN seek — own checkout, taken only AFTER the embed has resolved
+        // (H2). A checkout failure degrades this arm only (warn + empty),
+        // matching the old post-join ANN seek. `acquire_timed`: explicit
+        // checkout behind the /diagnostic checkout-wait metric (M1).
+        let sq = vector_sql(
+            &vec_str,
+            self.ann_zim,
+            self.ann_lang,
+            self.ann_limit,
+            self.ann_weight,
+        );
+        debug_assert!(sq.placeholder_count() == sq.params.len());
+        match crate::db::pool::acquire_timed(&self.engine.pool, "search_vector_ann").await {
+            Ok(mut client) => {
+                run_sql_on(
+                    &mut *client,
+                    &sq,
+                    "vector search",
+                    &self.engine.degradation,
+                    "vector_ann",
+                )
+                .await
+            }
+            Err(e) => {
+                tracing::warn!("vector search disabled for this query: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// The EMBED half of the arm (never touches the pool): cached client →
+    /// cache check → embed (3 s timeout) → `format_vector`, with the
+    /// `vector_embed` success/failure degradation recording.
+    async fn embed_query(&self) -> Option<String> {
         if !self.enabled {
             return None;
         }
@@ -793,7 +950,15 @@ impl<'a> VectorEmbedArm<'a> {
         };
         // Build the cache key: model|dimension|trimmed_query.
         // Case is preserved (embedding models are typically case-sensitive).
-        let cache_key = format!("{}|{}|{}", self.model, self.dimension, self.query.trim());
+        // PERF-13: model/dimension come from the shared search snapshot, so
+        // the cache key can't disagree with the fingerprint (computed from
+        // the same snapshot) across a concurrent settings write.
+        let cache_key = format!(
+            "{}|{}|{}",
+            self.snap.embed_model,
+            self.snap.embed_dimension,
+            self.query.trim()
+        );
         // Check the FIFO cache (short lock, no await while held).
         // LINT-3: intentional panic-on-poisoned-lock idiom.
         #[allow(clippy::expect_used)]
@@ -808,8 +973,8 @@ impl<'a> VectorEmbedArm<'a> {
         if let Some(vec) = cached {
             tracing::debug!(
                 "search embed cache hit (model={}, dim={}, query_len={})",
-                self.model,
-                self.dimension,
+                self.snap.embed_model,
+                self.snap.embed_dimension,
                 self.query.len()
             );
             return Some(format_vector(&vec));
@@ -1684,7 +1849,8 @@ mod tests {
     async fn timeout_degrades_slow_embed_to_elapsed() {
         // Verify the mechanism: a future that takes longer than
         // SEARCH_EMBED_TIMEOUT produces `Err(elapsed)` — which
-        // `VectorEmbedArm::run` maps to `None` (degraded vector branch).
+        // `VectorEmbedArm::embed_query` maps to `None` (degraded vector
+        // branch).
         let slow = tokio::time::sleep(Duration::from_secs(100));
         let result = tokio::time::timeout(SEARCH_EMBED_TIMEOUT, slow).await;
         assert!(
@@ -1734,5 +1900,47 @@ mod tests {
         assert_eq!(mk("nomic", 768, "  hello  "), mk("nomic", 768, "hello"));
         // Case is preserved (embedding models are case-sensitive).
         assert_ne!(mk("nomic", 768, "Hello"), mk("nomic", 768, "hello"));
+    }
+
+    // ── PERF-10 (2026-09-18): concurrent-arm checkout failure corner ──────
+
+    #[test]
+    fn checkout_hard_fail_when_every_selected_text_arm_fails() {
+        let ok = || Ok::<Vec<SearchRow>, sqlx::Error>(Vec::new());
+        let fail = || Err(sqlx::Error::Configuration("acquire timeout".into()));
+        // Every selected arm failed to check out → hard-fail with the
+        // checkout error (the old sequential DB-arm failure, preserved).
+        assert!(
+            join_text_arms([(true, fail()), (true, fail()), (false, ok()), (false, ok())]).is_err(),
+            "all selected arms failed → hard-fail"
+        );
+        // No arm selected (vector-only search) → never a hard-fail: the
+        // vector arm's ANN checkout soft-fails by contract.
+        assert!(
+            join_text_arms([
+                (false, fail()),
+                (false, fail()),
+                (false, fail()),
+                (false, fail())
+            ])
+            .is_ok(),
+            "no selected arm → no hard-fail"
+        );
+        // Mixed: at least one arm checked out → the failed arm degrades to
+        // empty (per-arm soft-fail), no hard-fail; rows keep arm order.
+        let rows = join_text_arms([(true, ok()), (true, fail()), (false, ok()), (false, ok())])
+            .expect("a checked-out arm → per-arm soft-fail, no hard-fail");
+        assert_eq!(rows.len(), 4, "one vec per arm, in arm order");
+        // All selected arms checked out → obviously fine.
+        assert!(join_text_arms([(true, ok()), (true, ok()), (false, ok()), (false, ok())]).is_ok());
+        // The first errored arm's error is the one surfaced.
+        let e1 = Err(sqlx::Error::Configuration("first".into()));
+        let e2 = Err(sqlx::Error::Configuration("second".into()));
+        let surfaced =
+            join_text_arms([(true, e1), (true, e2), (false, ok()), (false, ok())]).map(|_| "");
+        assert!(
+            matches!(&surfaced, Err(e) if e.to_string().contains("first")),
+            "first errored arm's error surfaces"
+        );
     }
 }

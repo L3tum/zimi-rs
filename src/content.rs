@@ -209,7 +209,10 @@ pub(crate) async fn read_article_payload(
                     JOIN zims z ON z.id = a.zim_id WHERE z.name = $1 AND a.path = $2")
                     .bind(zim_name)
                     .bind(path)
-                    .fetch_optional(&state.db)
+                    // Foreground READ: routes to the read replica when
+                    // `DATABASE_URL_READ` is set (PERF-10 / read-replica
+                    // finding), else the primary pool.
+                    .fetch_optional(state.db_read_or_primary())
                     .await
                     .map_err(crate::error::Error::Database)?;
             match db_row {

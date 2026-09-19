@@ -116,6 +116,7 @@ managed via the web UI at `/settings.html` — they change without a restart.
 | `PORT` | `8899` | HTTP listen port |
 | `LOG_LEVEL` | `info` | `tracing` level (or `RUST_LOG`) |
 | `AUTH_PASSWORD` | (none) | Sets the admin password; locks `access.admin_password` |
+| `READ_ONLY_TOKEN` | (none) | Optional **read-only** API token; locks `access.read_only_token`. When set, it authenticates a restricted caller that can hit only the RAG-read allowlist (`/search`, `/suggest`, `/read`, `/snippet`, `/random`, `/chunks`, `/interlanguage`, `/w/…`, `/list`, `/health`, `/openapi.json`) — settings, diagnostics, collections, downloads, the web UI, and every mutating verb are 403 for it. See [Read-only API token](#read-only-api-token) |
 | `ACCESS_MODE` | (none) | Sets `access.mode` (`open` or `password`) |
 | `REQUIRE_AUTH_FOR_READS` | (none) | Sets `access.require_auth_for_reads`. Without it, the startup default is bind-based: `true` on a non-loopback `HOST` (reads gated), `false` on loopback (reads open) |
 | `QBITTORRENT_URL` | (disabled) | qBittorrent WebUI URL; its presence enables torrent support |
@@ -126,7 +127,7 @@ managed via the web UI at `/settings.html` — they change without a restart.
 | `EMBEDDING_MODEL` | (none) | Seeds `embedding.model` |
 | `EMBEDDING_DIM` | (none) | Seeds `embedding.dimension` |
 
-`AUTH_PASSWORD`, `ACCESS_MODE`, `REQUIRE_AUTH_FOR_READS`, and the `EMBEDDING_*` vars seed the
+`AUTH_PASSWORD`, `READ_ONLY_TOKEN`, `ACCESS_MODE`, `REQUIRE_AUTH_FOR_READS`, and the `EMBEDDING_*` vars seed the
 corresponding settings at startup (the env value wins) and lock them in the UI.
 
 `DATABASE_URL` accepts `postgres+tls://` / `postgresql+tls://` and the `sslmode`
@@ -200,6 +201,24 @@ removed and a settings table still holding a non-`$argon2id$` value will fail
 closed. Check your instance with `SELECT value FROM settings WHERE key =
 'access.admin_password' AND value NOT LIKE '$argon2id$%'`.
 
+**Read-only API token (optional, scoped).** `READ_ONLY_TOKEN` (seeded into the
+`access.read_only_token` setting at startup, env-locked, secret-redacted, and
+transparently upgraded to an argon2id hash on first successful use) grants a
+second, *scoped* credential for RAG clients. A request whose `Authorization:
+Bearer` token matches it authenticates, but is then restricted to the read-only
+allowlist — `GET`/`HEAD`/`OPTIONS` on `/search`, `/suggest`, `/read`,
+`/snippet`, `/random`, `/chunks`, `/interlanguage`, `/w/…`, `/list`, `/health`,
+and `/openapi.json`. Everything else — `/settings` (secrets), `/diagnostic`
+(topology), `/collections`, `/downloads`, the web-UI routes, the MCP server,
+and **every mutating verb** — returns **403** for the token (the credential is
+valid; the scope is not). An unknown token is **401** (no match). The admin
+password keeps full access, and the two caches are separate (a token verified
+at the read-only level is never fresh in the admin cache, and vice versa).
+When no read-only token is configured the second verification is skipped
+entirely (no KDF, no cache entry), so a single-admin-password deployment is
+unchanged. The read-only token does **not** authenticate the MCP server, which
+still requires the admin password (see MCP server authentication).
+
 **`GET /downloads`** redacts credentials from torrent URLs, but `file_path` reveals
 server-local paths (where downloaded files land) — expected for the operator-facing
 file-status UI, relevant if the API is exposed beyond the operator.
@@ -270,12 +289,17 @@ is reachable by any network peer. Open mode is rejected at startup on a
   admin) can read them in full. This is a documented, accepted trade-off —
   the settings table and its backups must be treated as sensitive in both
   access modes (see Access control).
-- **ZIM content is validated structurally, not by integrity or provenance**
+- **ZIM content is validated structurally, and against source-declared digests
+  when present — not against a fixed digest or signature**
   (Security M-1/M-2) — a malicious swarm peer, torrent, or mirror can serve
-  a ZIM that is structurally valid and therefore accepted, indexed, and
-  served as if it were the real archive; there is no cryptographic signature
-  check and OPDS catalogs carry no hashes. Two independent trust boundaries
-  apply:
+  a ZIM that is structurally valid; OPDS catalogs carry no hashes in the
+  current live shape, so such a ZIM is accepted, indexed, and served as if
+  it were the real archive. When a source *does* declare a digest (the OPDS
+  acquire link's `hash`/`digest` attribute) a mismatch is refused
+  fail-closed, and a later different-bytes publish of the same identity is
+  flagged as drift, never auto-rejected (digests are version-keyed — see
+  Content integrity). There is no cryptographic signature check. Two
+  independent trust boundaries apply:
   - **Source trust** — the download source (OPDS feed URL, torrent tracker,
     user-supplied URL) is the trust boundary, exactly as with a browser
     download. Prefer pinned, known-good sources (https OPDS endpoints, hash-
@@ -291,9 +315,10 @@ is reachable by any network peer. Open mode is rejected at startup on a
     network-positioned attacker can substitute the bytes entirely. Prefer
     https endpoints wherever the source offers them.
   Mitigations (known-good OPDS endpoint, per-ZIM SHA-256 + size pinning,
-  https-only sources) are **advisory by design** — the server performs no
-  content-integrity verification itself. See Download SSRF protection and
-  ZIM content trust boundary for the operational checklist.
+  https-only sources) are **advisory by design** — the digest mechanism binds
+  only what the source itself declares (version-keyed, see Content
+  integrity), it does not pin a fixed digest. See Download SSRF protection
+  and ZIM content trust boundary for the operational checklist.
 
 #### Residual risks (accepted, 2026-09 review)
 
@@ -302,8 +327,11 @@ is reachable by any network peer. Open mode is rejected at startup on a
   browser CSP sandbox (`script-src 'none'` + `object-src 'none'`), not
   content inspection. Hash-pinning or a separate origin for untrusted
   sources is future work.
-- **`downloads.max_bytes` defaults to effectively unbounded** (1 EiB) — an
-  operator-settable cap; set it explicitly to bound disk exposure.
+- **`downloads.max_bytes` defaults to 512 GiB** — an operator-settable cap, far
+  above any real ZIM (English Wikipedia ≈ 111 GiB) while bounding a single
+  download's disk blast radius (the 2026-09 review flagged the previous
+  effectively-unbounded 1 EiB default as a disk-exhaustion DoS vector). Raising
+  it further is an explicit, authenticated `PUT /settings` decision.
 - **`?access_token=` query-string auth** is limited to read-only verbs
   (log-stripping is verified by test); prefer the `Authorization: Bearer`
   header for scripts/curl (query tokens can leak in logs/shell history).
@@ -392,19 +420,48 @@ checked. Your trust boundary is the **source** (OPDS feed URL, torrent
 tracker), not the file itself. For high-trust deployments, pin torrents by
 hash and/or verify the OPDS feed over TLS with a known-good endpoint — and
 pin the downloaded artifacts themselves by **size + SHA-256** (a pinned list
-checked out-of-band, per the Download SSRF section) since the server performs
-no content-integrity verification of its own.
+checked out-of-band, per the Download SSRF section) — or, when the source
+declares digests, rely on the fail-closed declared-digest check (see Content
+integrity) since the server performs no *fixed-digest* verification of its
+own.
 
 ### Content integrity
 
-zimservice trusts the **source** of a ZIM or mirror, not file integrity: it
-does not verify checksums or hashes of downloaded or torrent-acquired ZIMs.
-LAN mirrors are plaintext HTTP and torrent swarm peers are untrusted, so a
-network-positioned or malicious peer can serve different bytes. The impact is
-bounded to defacement or malicious *content* — the sandboxed render path
-(see Served content) blocks script execution, so there is no RCE/XSS from
-served ZIM entries. High-trust operators should use hash-pinned torrents and
-pinned TLS mirrors.
+zimservice trusts the **source** of a ZIM or mirror — the OPDS feed URL or
+the torrent info-hash — not the bytes in flight: LAN mirrors are plaintext
+HTTP and torrent swarm peers are untrusted, so a network-positioned or
+malicious peer can serve different bytes. What the server does about it:
+
+- **Structural verification (always).** `verify_zim` parses the finished
+  file (ZIM central directory) before it is installed; a corrupt or
+  truncated file is refused, quarantined (staged `.part` removed), and the
+  download row is marked `error`. This is format validity, not provenance.
+- **Declared-digest verification (fail-closed, when declared).** When the
+  source declares a SHA-256 for the artifact — the `hash` or `digest`
+  attribute on an OPDS acquire link — it is checked against the measured
+  digest of the downloaded bytes at install time. A mismatch is a hard
+  refusal: the file is quarantined, the download row is `error` naming
+  **both** digests, and nothing is installed. Torrent content is pinned by
+  the BitTorrent info-hash itself (piece-checked by qBittorrent), so it is
+  never re-verified against a digest claim — the same way an `xt=urn:btih:`
+  magnet pins its payload.
+- **Digests are version-keyed, never pinned.** The recorded digest is the
+  one the source is **currently** publishing for that identity (source URL /
+  info-hash), not a fixed digest: a publisher republishing the same URL with
+  new content is a new version, not a violation. A later install of the same
+  identity whose bytes differ from the identity's previously observed digest
+  is **flagged** (`digest_drift`, surfaced on `/diagnostic` and the library
+  page) but never auto-rejected — that is a human judgment call. First
+  observations are never flagged, and the current Kiwix catalog shape
+  declares no digests at all, in which case the structural check is the only
+  gate.
+
+The impact of a source that *does* serve different bytes is bounded to
+defacement or malicious *content* — the sandboxed render path (see Served
+content) blocks script execution, so there is no RCE/XSS from served ZIM
+entries. High-trust operators should additionally pin torrents by hash and
+use pinned TLS mirrors, since the digest mechanism only binds what the
+source itself declares.
 
 ### TLS termination
 

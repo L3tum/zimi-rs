@@ -59,7 +59,7 @@ struct CachedZim {
 }
 
 /// One `zims` row as decoded by [`ZimManager::load_from_db`]. A named struct
-/// (decoded by column name) rather than a tuple: the SELECT lists 17
+/// (decoded by column name) rather than a tuple: the SELECT lists 20
 /// columns, past sqlx's 16-tuple `FromRow` cap, and this sqlx build has the
 /// `derive` feature off.
 struct ZimRow {
@@ -80,6 +80,9 @@ struct ZimRow {
     index_progress: f32,
     indexed_entries: i64,
     embed_enabled: bool,
+    content_sha256: Option<String>,
+    publisher_sha256: Option<String>,
+    digest_drift: bool,
 }
 
 impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ZimRow {
@@ -103,6 +106,9 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for ZimRow {
             index_progress: row.try_get("index_progress")?,
             indexed_entries: row.try_get("indexed_entries")?,
             embed_enabled: row.try_get("embed_enabled")?,
+            content_sha256: row.try_get("content_sha256")?,
+            publisher_sha256: row.try_get("publisher_sha256")?,
+            digest_drift: row.try_get("digest_drift")?,
         })
     }
 }
@@ -173,6 +179,24 @@ pub struct ZimMeta {
     pub indexed_entries: u64,
     /// Whether the embedding index is enabled for this ZIM.
     pub embed_enabled: bool,
+    /// Measured SHA-256 (64 lowercase hex) of the installed file, when known
+    /// — set by the install paths (direct finalize, torrent completion)
+    /// after the bytes are in place. `None` for pre-feature installs or for a
+    /// just-replaced file until it is re-hashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+    /// Publisher-declared SHA-256 verified against the installed bytes at
+    /// install time (`None` when the source declared nothing — structural
+    /// check only; the current Kiwix catalog shape). Equals
+    /// [`content_sha256`](Self::content_sha256) whenever present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher_sha256: Option<String>,
+    /// Drift flag: a later download of the SAME identity (source URL /
+    /// torrent info-hash) yielded bytes differing from the identity's
+    /// previously observed digest. Flag, never reject — surfaced in
+    /// /diagnostic for a human judgment call.
+    #[serde(default)]
+    pub digest_drift: bool,
 }
 
 impl ZimMeta {
@@ -197,6 +221,9 @@ impl ZimMeta {
             index_progress: 0.0,
             indexed_entries: 0,
             embed_enabled: true,
+            content_sha256: None,
+            publisher_sha256: None,
+            digest_drift: false,
         }
     }
 }
@@ -351,8 +378,9 @@ impl ZimManager {
             "INSERT INTO zims (
                 name, display_title, description, language, creator, publisher, date,
                 entry_count, article_count, file_path, file_size, category,
-                index_status, index_progress, indexed_entries, embed_enabled, file_mtime
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now())
+                index_status, index_progress, indexed_entries, embed_enabled, file_mtime,
+                content_sha256, publisher_sha256, digest_drift
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now(),$17,$18,$19)
             ON CONFLICT (name) DO UPDATE SET
                 display_title = $2,
                 description = $3,
@@ -370,6 +398,9 @@ impl ZimManager {
                 indexed_entries = $15,
                 embed_enabled = $16,
                 file_mtime = now(),
+                content_sha256 = $17,
+                publisher_sha256 = $18,
+                digest_drift = $19,
                 updated_at = now()
             RETURNING id",
             |q| {
@@ -389,6 +420,9 @@ impl ZimManager {
                     .bind(meta.index_progress)
                     .bind(indexed_entries)
                     .bind(meta.embed_enabled)
+                    .bind(&meta.content_sha256)
+                    .bind(&meta.publisher_sha256)
+                    .bind(meta.digest_drift)
             },
         )
         .await?;
@@ -404,6 +438,77 @@ impl ZimManager {
         }
 
         Ok(())
+    }
+
+    /// Record the integrity record for this ZIM's cache entry and DB row:
+    /// the measured SHA-256 of the installed bytes, the publisher claim that
+    /// was verified against them, and the drift decision for this identity
+    /// (see [`ZimMeta::digest_drift`]).
+    ///
+    /// Both install paths (direct finalize, torrent completion) call this
+    /// after verify + install + resync: the digest was just measured on the
+    /// installed bytes, so the library row now carries the provenance the
+    /// diagnostic surface reads and the next same-identity install compares
+    /// against.
+    ///
+    /// `publisher = None` means "this source declared nothing" — the
+    /// PREVIOUS verified claim (from an earlier claimed install of the same
+    /// ZIM) is kept, not clobbered: provenance accumulates. Only a fresh
+    /// claim replaces it. No-op (DB row aside) when the name is unknown —
+    /// a resync race that already replaced the entry.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub async fn set_content_sha256(
+        &self,
+        name: &str,
+        sha256: &str,
+        publisher: Option<&str>,
+        drift: bool,
+    ) -> Result<()> {
+        {
+            let mut cache = self.cache.write().expect("zim cache lock poisoned");
+            if let Some(m) = cache.get_mut(name) {
+                m.content_sha256 = Some(sha256.to_string());
+                if let Some(p) = publisher {
+                    m.publisher_sha256 = Some(p.to_string());
+                }
+                m.digest_drift = drift;
+            }
+        }
+        // COALESCE: a claim-less install keeps the previously verified claim
+        // (provenance accumulates across install paths).
+        raw::execute(
+            &self.db,
+            "UPDATE zims SET content_sha256 = $1, \
+             publisher_sha256 = COALESCE($2, publisher_sha256), \
+             digest_drift = $3, updated_at = now() WHERE name = $4",
+            |q| q.bind(sha256).bind(publisher).bind(drift).bind(name),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Read-side counterpart of [`Self::set_content_sha256`]: the integrity
+    /// snapshot for the authenticated `/diagnostic` endpoint — every ZIM row
+    /// that carries an integrity record, as
+    /// `(name, content_sha256, publisher_sha256, digest_drift)`, in name
+    /// order. Rows with no integrity record at all (pre-feature installs)
+    /// do not appear.
+    ///
+    /// The SQL lives here (the ZIM data layer), not in the handler: the
+    /// raw-SQL boundary lint forbids the presentation layer from owning
+    /// SQL, and this is the one place the integrity columns are read back.
+    pub async fn integrity_snapshot_rows(
+        &self,
+    ) -> Result<Vec<(String, Option<String>, Option<String>, bool)>> {
+        raw::fetch_all(
+            &self.db,
+            "SELECT name, content_sha256, publisher_sha256, digest_drift FROM zims \
+             WHERE content_sha256 IS NOT NULL OR publisher_sha256 IS NOT NULL \
+               OR digest_drift ORDER BY name",
+            |q| q,
+        )
+        .await
     }
 
     /// Open a ZIM file for reading, reusing a cached handle when the file is unchanged.
@@ -523,7 +628,8 @@ impl ZimManager {
             &self.db,
             "SELECT id, name, display_title, description, language, creator, publisher, date, \
              entry_count, article_count, file_path, file_size, category, index_status, \
-             index_progress, indexed_entries, embed_enabled \
+             index_progress, indexed_entries, embed_enabled, content_sha256, \
+             publisher_sha256, digest_drift \
              FROM zims ORDER BY name",
             |q| q,
         )
@@ -552,6 +658,9 @@ impl ZimManager {
                 index_progress: m.index_progress as f64,
                 indexed_entries: count_u64(m.indexed_entries),
                 embed_enabled: m.embed_enabled,
+                content_sha256: m.content_sha256,
+                publisher_sha256: m.publisher_sha256,
+                digest_drift: m.digest_drift,
             };
             cache.insert(m.name, meta);
         }
@@ -608,6 +717,14 @@ impl ZimManager {
                     {
                         meta.index_status = "pending".into();
                         meta.index_progress = 0.0;
+                    }
+                    // A replaced file's old digest describes the old bytes —
+                    // drop it until the file is re-verified (the install
+                    // path re-records it as the last word; the drift flag is
+                    // identity-scoped and likewise re-decided there).
+                    if size_changed {
+                        meta.content_sha256 = None;
+                        meta.publisher_sha256 = None;
                     }
                     cache.insert(name.clone(), meta);
                     changed.push(name.clone());
@@ -730,6 +847,23 @@ impl ZimManager {
                 self.persist_to_db(&meta).await?;
                 tracing::info!("resync: {kind} ZIM {name}");
                 report.push(format!("{name} ({kind})"));
+            }
+        }
+
+        // Cross-process invalidation (LISTEN/NOTIFY): this resync persisted
+        // catalog membership changes to the shared `zims` table (the DELETE /
+        // upsert statements above are autocommit — all durable by now), so
+        // fire the channel ONCE as a best-effort follow-up; peers rescan the
+        // shared directory and converge via their own `resync()`. A converged
+        // peer resync early-outs (no on-disk change) and fires nothing, so
+        // the notification cannot ping-pong. A failed notification only
+        // degrades peers to the next local resync / restart (see
+        // `crate::db::notify`).
+        if !report.is_empty() {
+            if let Err(e) =
+                raw::execute(&self.db, crate::db::notify::NOTIFY_CATALOG_SQL, |q| q).await
+            {
+                tracing::warn!("failed to fire catalog invalidation notification: {e}");
             }
         }
 

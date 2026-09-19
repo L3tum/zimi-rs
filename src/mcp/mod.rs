@@ -542,11 +542,18 @@ fn tool_list_sources(state: &AppState) -> Value {
 
 async fn tool_random(state: &AppState, args: &Value) -> Result<Value, (i32, String)> {
     let zim = args.get("zim").and_then(|z| z.as_str()).map(str::to_string);
-    let article =
-        match crate::db::random_article::fetch_random_article(&state.db, zim.as_deref()).await {
-            Ok(a) => a,
-            Err(e) => return Ok(tool_error(e.to_string())),
-        };
+    let article = match crate::db::random_article::fetch_random_article(
+        // Foreground READ: routes to the read replica when
+        // `DATABASE_URL_READ` is set (PERF-10 / read-replica finding),
+        // else the primary pool.
+        state.db_read_or_primary(),
+        zim.as_deref(),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => return Ok(tool_error(e.to_string())),
+    };
     Ok(tool_result(&json!({
         "path": article.path,
         "title": article.title,

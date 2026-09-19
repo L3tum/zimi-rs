@@ -580,10 +580,43 @@ pub(super) async fn discard_if_unowned(db: &Pool, zims: &Arc<ZimManager>, id: i3
     let _ = zims.resync().await;
 }
 
+/// Streaming SHA-256 of a file → 64 lowercase hex characters. Streaming is
+/// the whole point (versus `std::fs::read`): a multi-GB ZIM must not be
+/// buffered to hash it. `pub(super)` so the torrent completion path (sibling
+/// module) records its observed digest with the identical primitive.
+pub(super) fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut h = sha2::Sha256::new();
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    let mut s = String::with_capacity(64);
+    for b in h.finalize() {
+        s.push_str(&format!("{b:02x}"));
+    }
+    Ok(s)
+}
+
 /// Post-stream finalize for a direct download (TEST-5 seam, extracted from
 /// [`direct_download`]): the cancel re-check before verify, the libzim
 /// verify, the cancel check before rename, the atomic rename + resync, the
 /// guarded `status = 'downloading'` row update, and the auto-index.
+///
+/// Content integrity (SEC): when the row carries a catalog digest claim
+/// (set by the OPDS queue from the feed's `hash`/`digest` attributes), the
+/// staged bytes' measured SHA-256 must equal it before anything is
+/// published — a mismatch (a mirror serving another revision, a truncated
+/// or corrupted body) marks the row `error` and discards the staged file.
+/// The measured digest is stored on the settled row either way (provenance;
+/// for claim-less rows it becomes the version-key the queue guard later
+/// compares a newly declared claim against).
 ///
 /// Cancel policy (RECONCILE with PERF-11 resume): a CANCEL always removes the
 /// staged file — at all four cancel-observation sites (the in-stream loop —
@@ -613,14 +646,52 @@ async fn finalize_direct_download(
         }
     }
 
-    // Verify before publishing — a corrupt file must not clobber the library.
-    // The central-dir parse is blocking (multi-GB) — keep it off the single
-    // poller task so all download polling stays responsive.
+    // The row's publisher-digest claim (set when the OPDS queue enqueued
+    // it; None for sources that declared nothing — the current Kiwix
+    // catalog shape). Read here, at finalize, so the check keys off the
+    // row's own claim.
+    let claim = crate::db::downloads_lifecycle::claim_digest(db, id).await?;
+
+    // Verify before publishing — a corrupt file must not clobber the
+    // library. Both the SHA-256 stream and the central-dir parse are
+    // blocking (multi-GB) — keep them off the single poller task so all
+    // download polling stays responsive.
     let part_owned = part.to_path_buf();
-    let verify_res = tokio::task::spawn_blocking(move || verify_zim(&part_owned))
-        .await
-        .map_err(|e| Error::Internal(anyhow::anyhow!("verify task failed: {e}")))?;
-    verify_res?;
+    // Clone for the closure — the outer scope keeps `claim` for the
+    // provenance record after the check.
+    let claim_check = claim.clone();
+    let check_res = tokio::task::spawn_blocking(move || -> Result<(String, Option<String>)> {
+        let digest = sha256_file(&part_owned)?;
+        // The publisher's claim, when present, is the content-integrity
+        // check: a mismatch means the bytes are not what the catalog says
+        // they are — refuse without the expensive central-dir parse.
+        if let Some(c) = &claim_check {
+            if !digest.eq_ignore_ascii_case(c) {
+                return Ok((digest, Some(c.clone())));
+            }
+        }
+        verify_zim(&part_owned)?;
+        Ok((digest, None))
+    })
+    .await
+    .map_err(|e| Error::Internal(anyhow::anyhow!("verify task failed: {e}")))?;
+    let (digest, mismatch) = check_res?;
+    if let Some(c) = mismatch {
+        let err = Error::ZimDigestMismatch(format!("file is {digest}, catalog declared {c}"));
+        // mark_error's terminal-state guard means a concurrent cancel still
+        // wins (same route as the destination-ownership refusal above).
+        mark_error(db, id, &err.to_string()).await;
+        let _ = std::fs::remove_file(part);
+        // warn! (not info!): an integrity failure is the security-relevant
+        // event of the download path — a mirror serving wrong bytes for the
+        // claimed digest deserves operator attention.
+        tracing::warn!(
+            "direct download {id}: {} — discarding {}",
+            err,
+            part.display()
+        );
+        return Ok(());
+    }
 
     // Re-read the row BEFORE publishing: if the download was cancelled while
     // in flight, don't install it — discard the staged file and leave the DB
@@ -667,9 +738,16 @@ async fn finalize_direct_download(
 
     // `AND status = 'downloading'`: a cancel landing between the pre-rename
     // check and this UPDATE must still win — never clobber a terminal state
-    // (the guard lives in `finalize_direct`).
-    let updated =
-        crate::db::downloads_lifecycle::finalize_direct(db, id, &dst.display().to_string()).await?;
+    // (the guard lives in `finalize_direct`). `digest` is the measured
+    // SHA-256 of the installed bytes — equal to the claim when one was
+    // present, provenance for the rest.
+    let updated = crate::db::downloads_lifecycle::finalize_direct(
+        db,
+        id,
+        &dst.display().to_string(),
+        Some(&digest),
+    )
+    .await?;
     if updated == 0 {
         tracing::info!(
             "direct download {id} was cancelled during finalization — discarding {}",
@@ -687,6 +765,61 @@ async fn finalize_direct_download(
         .unwrap_or("")
         .to_string();
     if !name.is_empty() {
+        // Drift detection (SEC): a NEW download of the SAME identity (the
+        // row's source URL) whose measured bytes differ from what that URL
+        // previously served is flagged, not rejected — a publisher
+        // republishing the same URL is a human judgment call (the fetch-time
+        // claim mismatch is what auto-rejects). First observation (or a NULL
+        // legacy record) is never drift; a new URL is a new identity.
+        let url: Option<String> = match crate::db::raw::fetch_scalar_optional(
+            db,
+            "SELECT url FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        {
+            Ok(u) => u,
+            // Fail-open: a blip degrades to "no drift flagged", the
+            // same state as missing history.
+            Err(e) => {
+                tracing::warn!("drift check for download {id} failed: {e}");
+                None
+            }
+        };
+        let drift = match url.as_deref() {
+            Some(url) => {
+                match crate::db::downloads_lifecycle::prior_observed_digest_by_url(db, id, url)
+                    .await
+                {
+                    Ok(Some(prev))
+                        if crate::db::downloads_lifecycle::drift_decision(Some(&prev), &digest) =>
+                    {
+                        tracing::warn!(
+                            "ZIM {name} digest DRIFT: source {url} previously served {prev}, \
+                             now serves {digest} — flagged (not rejected)"
+                        );
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(e) => {
+                        // Best-effort: a blip degrades to "no drift flagged",
+                        // the same state as missing history.
+                        tracing::warn!("drift check for download {id} failed: {e}");
+                        false
+                    }
+                }
+            }
+            None => false,
+        };
+        // Provenance: record the integrity record on the library row (best
+        // effort — the install itself is already settled; a failure here
+        // degrades to "digest unknown", it never un-installs the file).
+        if let Err(e) = zims
+            .set_content_sha256(&name, &digest, claim.as_deref(), drift)
+            .await
+        {
+            tracing::error!("recording content digest for {name} failed: {e}");
+        }
         if let Err(e) = index::index_zims(zims, db, Some(&name)).await {
             tracing::error!("auto-index of {name} failed: {e}");
         }
@@ -700,6 +833,7 @@ async fn finalize_direct_download(
 mod tests {
     use super::super::tests::download::test_pool;
     use super::{build_download_client, ClientProfile};
+    use crate::db::pool::Pool;
     use crate::netguard::{follow_pinned_get, PinnedResponse};
     use crate::testing::dead_pool;
 
@@ -1010,6 +1144,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
 
+        // Pre-clean (re-runnability): a failed run leaves a live row on the
+        // shared suite DB that would hit the partial unique index.
+        crate::db::raw::execute(
+            &pool,
+            "DELETE FROM downloads WHERE url = 'http://example.net/utiny.zim'",
+            |q| q,
+        )
+        .await
+        .unwrap();
         let id: i32 = crate::db::raw::fetch_scalar_optional(
             &pool,
             "INSERT INTO downloads (name, url, status)
@@ -1083,6 +1226,392 @@ mod tests {
         .unwrap();
     }
 
+    /// SEC (CI-DB): a row carrying a catalog digest claim that MATCHES the
+    /// staged bytes installs normally, and the settled row records the
+    /// measured digest (= the claim).
+    #[tokio::test]
+    async fn finalize_direct_download_verifies_matching_claim() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
+
+        let claim = super::sha256_file(std::path::Path::new("tests/fixtures/tiny.zim"))
+            .expect("hash fixture");
+        // Pre-clean (re-runnability): a failed run leaves a live row on the
+        // shared suite DB that would hit the partial unique index.
+        crate::db::raw::execute(
+            &pool,
+            "DELETE FROM downloads WHERE url = 'http://example.net/udigest.zim'",
+            |q| q,
+        )
+        .await
+        .unwrap();
+        let id: i32 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "INSERT INTO downloads (name, url, status, sha256)
+                 VALUES ('udigest', 'http://example.net/udigest.zim', 'downloading', $1) RETURNING id",
+            |q| q.bind(&claim),
+        )
+        .await
+        .expect("insert downloading row with claim")
+        .unwrap();
+        let part = tmp.path().join("udigest.zim.part");
+        std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage part");
+
+        super::finalize_direct_download(&pool, &zims, id, &part)
+            .await
+            .expect("finalize must succeed");
+
+        let (status, sha): (String, Option<String>) = crate::db::raw::fetch_optional(
+            &pool,
+            "SELECT status, sha256 FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .expect("read row")
+        .expect("row exists");
+        assert_eq!(status, "complete");
+        assert_eq!(
+            sha,
+            Some(claim),
+            "settled row must carry the measured digest (== claim)"
+        );
+        assert!(
+            zims.zim_dir.join("udigest.zim").exists(),
+            "must be installed"
+        );
+
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
+            .await
+            .unwrap();
+        crate::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| {
+            q.bind("udigest")
+        })
+        .await
+        .unwrap();
+    }
+
+    /// SEC (CI-DB): a row whose catalog digest claim MISMATCHES the staged
+    /// bytes must be refused — `error` row naming the mismatch WITH BOTH
+    /// DIGESTS (the measured file hash and the catalog claim), staged part
+    /// removed, the pre-existing destination file byte-identical (quarantine
+    /// never touches it), `Ok(())` (the row carries the reason; the poller
+    /// moves on).
+    #[tokio::test]
+    async fn finalize_direct_download_refuses_claim_mismatch() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
+
+        let bad_claim = "0".repeat(64);
+        // Pre-clean (re-runnability): a failed run leaves a live row on the
+        // shared suite DB that would hit the partial unique index.
+        crate::db::raw::execute(
+            &pool,
+            "DELETE FROM downloads WHERE url = 'http://example.net/ubad.zim'",
+            |q| q,
+        )
+        .await
+        .unwrap();
+        let id: i32 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "INSERT INTO downloads (name, url, status, sha256)
+                 VALUES ('ubad', 'http://example.net/ubad.zim', 'downloading', $1) RETURNING id",
+            |q| q.bind(&bad_claim),
+        )
+        .await
+        .expect("insert downloading row with bad claim")
+        .unwrap();
+        let part = tmp.path().join("ubad.zim.part");
+        std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage part");
+        // Sentinel pre-placed at the install destination: the refusal path
+        // must not touch it (a regression that renamed over it — or the
+        // `updated == 0`-style discard that deleted it — is the exact bug
+        // class this guard exists for).
+        let dst = zims.zim_dir.join("ubad.zim");
+        std::fs::write(&dst, b"sentinel").expect("pre-place sentinel at dst");
+        let sentinel = std::fs::read(&dst).expect("read sentinel");
+        let measured = super::sha256_file(&part).expect("hash staged part");
+
+        super::finalize_direct_download(&pool, &zims, id, &part)
+            .await
+            .expect("refusal is Ok (the row carries the reason)");
+
+        let (status, err): (String, Option<String>) = crate::db::raw::fetch_optional(
+            &pool,
+            "SELECT status, error FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .expect("read row")
+        .expect("row exists");
+        assert_eq!(status, "error", "mismatch must error the row");
+        let err = err.expect("error message must be recorded");
+        assert!(
+            err.contains("digest mismatch"),
+            "error message must name the digest mismatch, got: {err}"
+        );
+        assert!(
+            err.contains(&measured),
+            "error message must carry the MEASURED digest, got: {err}"
+        );
+        assert!(
+            err.contains(&bad_claim),
+            "error message must carry the DECLARED claim, got: {err}"
+        );
+        assert!(!part.exists(), "staged part must be removed (quarantined)");
+        assert_eq!(
+            std::fs::read(&dst).expect("read sentinel after"),
+            sentinel,
+            "refusal must leave the pre-existing destination byte-identical"
+        );
+
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(dst);
+    }
+
+    /// SEC (CI-DB): a claim-less row (the current Kiwix catalog shape — the
+    /// source declared nothing) still installs, and the settled row records
+    /// the MEASURED digest — the provenance the queue guard's version-key
+    /// compares a later-declared claim against.
+    #[tokio::test]
+    async fn finalize_direct_download_stores_measured_digest_when_undeclared() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
+
+        let measured = super::sha256_file(std::path::Path::new("tests/fixtures/tiny.zim"))
+            .expect("hash fixture");
+        // Pre-clean (re-runnability): a failed run leaves a live row on the
+        // shared suite DB that would hit the partial unique index.
+        crate::db::raw::execute(
+            &pool,
+            "DELETE FROM downloads WHERE url = 'http://example.net/uclaimless.zim'",
+            |q| q,
+        )
+        .await
+        .unwrap();
+        let id: i32 = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "INSERT INTO downloads (name, url, status)
+                 VALUES ('uclaimless', 'http://example.net/uclaimless.zim', 'downloading') RETURNING id",
+            |q| q,
+        )
+        .await
+        .expect("insert downloading row without claim")
+        .unwrap();
+        let part = tmp.path().join("uclaimless.zim.part");
+        std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage part");
+
+        super::finalize_direct_download(&pool, &zims, id, &part)
+            .await
+            .expect("finalize must succeed");
+
+        let (status, sha): (String, Option<String>) = crate::db::raw::fetch_optional(
+            &pool,
+            "SELECT status, sha256 FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .expect("read row")
+        .expect("row exists");
+        assert_eq!(status, "complete");
+        assert_eq!(
+            sha,
+            Some(measured),
+            "a claim-less install must still record the measured digest"
+        );
+
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
+            .await
+            .unwrap();
+        crate::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| {
+            q.bind("uclaimless")
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Test helper (drift truth table): seed a settled downloads row — an
+    /// earlier published version of `url` (`sha` = its observed digest,
+    /// `None` for a NULL-legacy pre-feature row).
+    async fn seed_settled_row(pool: &Pool, name: &str, url: &str, sha: Option<&str>) -> i32 {
+        crate::db::raw::fetch_scalar_optional(
+            pool,
+            "INSERT INTO downloads (name, url, status, sha256)
+                 VALUES ($1, $2, 'complete', $3) RETURNING id",
+            |q| q.bind(name).bind(url).bind(sha),
+        )
+        .await
+        .expect("seed settled row")
+        .unwrap()
+    }
+
+    /// Test helper (drift truth table): insert a `downloading` row for
+    /// `name` with claim `claim` (its url is derived from the name), stage
+    /// the fixture as its `.part`, run the real finalize, and return the id.
+    async fn finalize_fixture_case(
+        pool: &Pool,
+        zims: &std::sync::Arc<crate::zim::ZimManager>,
+        dir: &std::path::Path,
+        name: &str,
+        claim: &str,
+    ) -> i32 {
+        let id: i32 = crate::db::raw::fetch_scalar_optional(
+            pool,
+            "INSERT INTO downloads (name, url, status, sha256)
+                 VALUES ($1, $2, 'downloading', $3) RETURNING id",
+            |q| {
+                q.bind(name)
+                    .bind(format!("http://example.net/{name}.zim"))
+                    .bind(claim)
+            },
+        )
+        .await
+        .expect("insert downloading row")
+        .unwrap();
+        let part = dir.join(format!("{name}.zim.part"));
+        std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage part");
+        super::finalize_direct_download(pool, zims, id, &part)
+            .await
+            .expect("finalize must succeed");
+        id
+    }
+
+    /// Test helper (drift truth table): read a ZIM's integrity record.
+    async fn zims_integrity(pool: &Pool, name: &str) -> (Option<String>, Option<String>, bool) {
+        crate::db::raw::fetch_optional(
+            pool,
+            "SELECT content_sha256, publisher_sha256, digest_drift FROM zims WHERE name = $1",
+            |q| q.bind(name),
+        )
+        .await
+        .expect("read zims row")
+        .expect("zims row must exist")
+    }
+
+    /// SEC (CI-DB): the drift truth table end-to-end through the real
+    /// finalize path — same identity (source URL) with a new digest is
+    /// FLAGGED (never rejected); a new identity is not; a NULL legacy
+    /// record is not; a first observation is not.
+    #[tokio::test]
+    async fn finalize_direct_download_drift_truth_table() {
+        let Some((pool, _db_gate)) = test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
+
+        let d1 = super::sha256_file(std::path::Path::new("tests/fixtures/tiny.zim"))
+            .expect("hash fixture");
+        let old = "2".repeat(64); // the identity's previously published digest
+
+        // Seed the identity's previous settled row (an earlier version of
+        // the same URL) + a NULL-legacy settled row (pre-feature history).
+        // Pre-clean (re-runnability): a failed run leaves a live row on the
+        // shared suite DB that would hit the partial unique index.
+        crate::db::raw::execute(
+            &pool,
+            "DELETE FROM downloads WHERE name IN ('udrift', 'udrift2', 'udrift3', 'udrift4', 'udrift-old', 'udrift-legacy')",
+            |q| q,
+        )
+        .await
+        .unwrap();
+        let seed_u = seed_settled_row(
+            &pool,
+            "udrift-old",
+            "http://example.net/udrift.zim",
+            Some(&old),
+        )
+        .await;
+        let seed_x = seed_settled_row(
+            &pool,
+            "udrift-legacy",
+            "http://example.net/udrift3.zim",
+            None,
+        )
+        .await;
+
+        // One finalize per scenario (same bytes throughout — the identity,
+        // not the bytes, is what the table varies):
+        let case_a = finalize_fixture_case(&pool, &zims, tmp.path(), "udrift", &d1).await; // same URL as the seeded old row
+        let case_b = finalize_fixture_case(&pool, &zims, tmp.path(), "udrift2", &d1).await; // new identity
+        let case_c = finalize_fixture_case(&pool, &zims, tmp.path(), "udrift3", &d1).await; // same URL as the NULL-legacy row
+        let case_d = finalize_fixture_case(&pool, &zims, tmp.path(), "udrift4", &d1).await; // first observation
+
+        // Same identity, new digest → FLAGGED (not rejected: the row is
+        // complete, the file installed, the verified publisher recorded).
+        let (content, publisher, drift) = zims_integrity(&pool, "udrift").await;
+        assert!(
+            drift,
+            "same URL, different digest than the previous version → drift"
+        );
+        assert_eq!(content.as_deref(), Some(d1.as_str()));
+        assert_eq!(
+            publisher.as_deref(),
+            Some(d1.as_str()),
+            "claim verified → recorded"
+        );
+        let sha: Option<String> = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT sha256 FROM downloads WHERE id = $1",
+            |q| q.bind(case_a),
+        )
+        .await
+        .expect("read row")
+        .unwrap();
+        assert_eq!(
+            sha.as_deref(),
+            Some(d1.as_str()),
+            "settled row carries the measured digest"
+        );
+
+        // New identity → no drift (even though the digest differs from
+        // another identity's observation).
+        let (_, _, drift) = zims_integrity(&pool, "udrift2").await;
+        assert!(!drift, "a new URL is a new identity — never drift");
+
+        // NULL legacy record → no drift (nothing comparable).
+        let (_, _, drift) = zims_integrity(&pool, "udrift3").await;
+        assert!(!drift, "a NULL legacy record is never drift");
+
+        // First observation for the identity → no drift.
+        let (_, _, drift) = zims_integrity(&pool, "udrift4").await;
+        assert!(!drift, "first observation is never drift");
+
+        // Cleanup (shared single-DB suite; articles cascade off zims).
+        for id in [seed_u, seed_x, case_a, case_b, case_c, case_d] {
+            crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
+                .await
+                .unwrap();
+        }
+        for name in ["udrift", "udrift2", "udrift3", "udrift4"] {
+            crate::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(name))
+                .await
+                .unwrap();
+        }
+    }
+
     /// TEST-5 (CI-DB): the cancel-race proof — the row flipped to `cancelled`
     /// before finalize must discard the staged part: nothing installed, row
     /// stays `cancelled` with no `file_path`, `Ok(())`.
@@ -1097,6 +1626,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
 
+        // Pre-clean (re-runnability): a failed run leaves a live row on the
+        // shared suite DB that would hit the partial unique index.
+        crate::db::raw::execute(
+            &pool,
+            "DELETE FROM downloads WHERE url = 'http://example.net/utiny.zim'",
+            |q| q,
+        )
+        .await
+        .unwrap();
         let id: i32 = crate::db::raw::fetch_scalar_optional(
             &pool,
             "INSERT INTO downloads (name, url, status)
@@ -1172,6 +1710,11 @@ mod tests {
         // Row A: `complete`, owns <zim_dir>/x.zim (the fixture is there).
         let a_file = zims.zim_dir.join("x.zim");
         std::fs::copy("tests/fixtures/tiny.zim", &a_file).expect("place A's file");
+        // Pre-clean (re-runnability): a failed run leaves a live row on the
+        // shared suite DB that would hit the partial unique index.
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE name = 'x'", |q| q)
+            .await
+            .unwrap();
         let a_id: i32 = crate::db::raw::fetch_scalar_optional(
             &pool,
             "INSERT INTO downloads (name, url, status, file_path)
@@ -1328,6 +1871,11 @@ mod tests {
 
         let file = zims.zim_dir.join("owned.zim");
         std::fs::copy("tests/fixtures/tiny.zim", &file).expect("place owned file");
+        // Pre-clean (re-runnability): a failed run leaves a live row on the
+        // shared suite DB that would hit the partial unique index.
+        crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE name = 'owned'", |q| q)
+            .await
+            .unwrap();
         let a_id: i32 = crate::db::raw::fetch_scalar_optional(
             &pool,
             "INSERT INTO downloads (name, url, status, file_path)

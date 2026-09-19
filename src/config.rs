@@ -8,10 +8,11 @@ use std::path::PathBuf;
 
 use crate::error::{Error, Result};
 use crate::settings::{
-    KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_MODE, KEY_ACCESS_REQUIRE_AUTH_FOR_READS,
-    KEY_EMBEDDING_API_KEY, KEY_EMBEDDING_DIMENSION, KEY_EMBEDDING_ENDPOINT, KEY_EMBEDDING_MODEL,
-    KEY_GENERAL_HOST, KEY_GENERAL_PORT, KEY_GENERAL_TRUSTED_PROXY_CIDRS, KEY_GENERAL_ZIM_DIR,
-    KEY_TORRENT_PASSWORD, KEY_TORRENT_URL, KEY_TORRENT_USERNAME,
+    KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_MODE, KEY_ACCESS_READ_ONLY_TOKEN,
+    KEY_ACCESS_REQUIRE_AUTH_FOR_READS, KEY_EMBEDDING_API_KEY, KEY_EMBEDDING_DIMENSION,
+    KEY_EMBEDDING_ENDPOINT, KEY_EMBEDDING_MODEL, KEY_GENERAL_HOST, KEY_GENERAL_PORT,
+    KEY_GENERAL_TRUSTED_PROXY_CIDRS, KEY_GENERAL_ZIM_DIR, KEY_TORRENT_PASSWORD, KEY_TORRENT_URL,
+    KEY_TORRENT_USERNAME,
 };
 
 /// Application configuration, loaded from env + compiled-in defaults.
@@ -26,8 +27,25 @@ use crate::settings::{
 pub struct Config {
     /// Directory scanned for `.zim` archives (`ZIM_DIR`, default `/zims`).
     pub zim_dir: PathBuf,
-    /// Postgres connection string (`DATABASE_URL`).
+    /// Postgres connection string (`DATABASE_URL`). All writes and DDL
+    /// always go to this pool, regardless of
+    /// [`Config::read_database_url`].
     pub database_url: String,
+    /// Optional read-replica Postgres connection string
+    /// (`DATABASE_URL_READ`); `None` when the env var is absent, which is
+    /// the documented single-pool default (current behavior). Same
+    /// scheme/`sslmode` validation as `DATABASE_URL` (both are parsed by
+    /// the same `PgConnectOptions` path in [`crate::db::pool`], so a
+    /// malformed read URL fails startup exactly like a malformed primary
+    /// URL). When set, foreground READ checkouts — search arms, `suggest`,
+    /// the `ensure_trgm` slow path, `/snippet`, `/random`, the article-read
+    /// DB fallback, and the `/health` db probe — route to the pool built
+    /// from this URL; the primary pool stays authoritative for all writes.
+    /// When the replica is unreachable the read paths fail (503) rather
+    /// than failing over silently — `/diagnostic` (`pool_read`) is the
+    /// operator's pre-503 signal, and unsetting the var reverts to
+    /// single-pool.
+    pub read_database_url: Option<String>,
     /// Postgres connection pool size (`DB_POOL_SIZE`, default 20).
     pub db_pool_size: u32,
     /// HTTP bind address (`HOST`, default `127.0.0.1`).
@@ -62,6 +80,7 @@ impl Default for Config {
         Self {
             zim_dir: PathBuf::from("/zims"),
             database_url: "postgres://localhost:5432/zimservice".into(),
+            read_database_url: None,
             db_pool_size: 20,
             host: "127.0.0.1".into(),
             port: 8899,
@@ -85,7 +104,7 @@ impl Default for Config {
 /// `settings::SETTING_DEFS` (static eligibility only); `database.url` is the
 /// documented 1-entry exception — it is process config, not a settings-table
 /// row, so it has no `SETTING_DEFS` row and stays here.
-const ENV_SETTING_KEYS: [(&str, &str, bool); 15] = [
+const ENV_SETTING_KEYS: [(&str, &str, bool); 16] = [
     (KEY_GENERAL_ZIM_DIR, "ZIM_DIR", false),
     (KEY_GENERAL_PORT, "PORT", false),
     (KEY_GENERAL_HOST, "HOST", false),
@@ -100,6 +119,7 @@ const ENV_SETTING_KEYS: [(&str, &str, bool); 15] = [
     (KEY_EMBEDDING_DIMENSION, "EMBEDDING_DIM", true),
     (KEY_ACCESS_MODE, "ACCESS_MODE", true),
     (KEY_ACCESS_ADMIN_PASSWORD, "AUTH_PASSWORD", true),
+    (KEY_ACCESS_READ_ONLY_TOKEN, "READ_ONLY_TOKEN", true),
     (
         KEY_ACCESS_REQUIRE_AUTH_FOR_READS,
         "REQUIRE_AUTH_FOR_READS",
@@ -130,6 +150,13 @@ impl Config {
         }
         if let Some(v) = get("DATABASE_URL") {
             self.database_url = v;
+        }
+        // Optional read replica: absent = `None` = current single-pool
+        // behavior. No validation here — the read pool builder in
+        // `db::pool` runs the same scheme/sslmode checks as `DATABASE_URL`
+        // at startup (both go through `PgConnectOptions::from_str`).
+        if let Some(v) = get("DATABASE_URL_READ") {
+            self.read_database_url = Some(v);
         }
         if let Some(v) = get("DB_POOL_SIZE") {
             self.db_pool_size = v
@@ -304,7 +331,7 @@ mod tests {
         // The getter, not the process env, drives the result.
         assert_eq!(locked.len(), 2);
 
-        // env_settings_snapshot returns only the eight reload keys, non-empty only.
+        // env_settings_snapshot returns only the nine reload keys, non-empty only.
         let snap = c.env_settings_snapshot(&get);
         assert!(!snap.contains_key(KEY_ACCESS_MODE));
         assert!(!snap.contains_key(KEY_ACCESS_ADMIN_PASSWORD));
@@ -346,6 +373,28 @@ mod tests {
         c2.apply_env(&env_from(&[]))
             .expect("apply_env should succeed");
         assert!(c2.mcp_auth_password.is_none(), "absent env must stay None");
+    }
+
+    #[test]
+    fn read_database_url_env_present_and_absent() {
+        let mut c = Config::default();
+        c.apply_env(&env_from(&[(
+            "DATABASE_URL_READ",
+            "postgres://replica:5432/zimservice",
+        )]))
+        .expect("apply_env should succeed");
+        assert_eq!(
+            c.read_database_url.as_deref(),
+            Some("postgres://replica:5432/zimservice"),
+            "set DATABASE_URL_READ must select the read replica"
+        );
+        let mut c2 = Config::default();
+        c2.apply_env(&env_from(&[]))
+            .expect("apply_env should succeed");
+        assert!(
+            c2.read_database_url.is_none(),
+            "absent env must stay None (single-pool default)"
+        );
     }
 
     #[test]

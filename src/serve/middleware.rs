@@ -1,15 +1,19 @@
-//! HTTP middleware: shared-password auth, `access_token` sanitisation, and
-//! the global rate-limiting middleware.
+//! HTTP middleware: two-level credential auth (admin password + optional
+//! read-only token), `access_token` sanitisation, and the global
+//! rate-limiting middleware.
 //!
 //! `auth_required` gates mutating endpoints (and, behind a flag, reads);
 //! `is_authorized` matches a Bearer header and/or `access_token` query param
-//! in constant time; `sanitize_uri_for_logs` strips the token so it never
-//! lands in logs; `rate_limit` enforces the global token-bucket limiter from
-//! `crate::access::ratelimit` (exempting the `/health` probe). The policy
-//! objects themselves — the limiter, the per-IP auth-failure lockout, and the
-//! trusted-proxy CIDR / `X-Forwarded-For` client-IP resolution — live in
-//! `crate::access` (M-B); this module only *applies* them as HTTP middleware
-//! and request gates.
+//! in constant time; a token verifies as **Full** against the admin password
+//! or, failing that, as **ReadOnly** against the optional
+//! `access.read_only_token` (2026-09-18 review — read-only tokens grant only
+//! the RAG-read allowlist, [`read_only_allowed`]); `sanitize_uri_for_logs`
+//! strips the token so it never lands in logs; `rate_limit` enforces the
+//! global token-bucket limiter from `crate::access::ratelimit` (exempting
+//! the `/health` probe). The policy objects themselves — the limiter, the
+//! per-IP auth-failure lockout, and the trusted-proxy CIDR / `X-Forwarded-For`
+//! client-IP resolution — live in `crate::access` (M-B); this module only
+//! *applies* them as HTTP middleware and request gates.
 use axum::extract::{FromRequestParts, State};
 use axum::http::{header, Request, StatusCode};
 use axum::middleware::Next;
@@ -17,7 +21,9 @@ use axum::response::{IntoResponse, Json, Response};
 
 use crate::access::cidr::client_ip_from_xff;
 use crate::access::ratelimit::ms_to_retry_after_secs;
-use crate::settings::{KEY_ACCESS_ADMIN_PASSWORD, KEY_GENERAL_TRUSTED_PROXY_CIDRS};
+use crate::settings::{
+    KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_READ_ONLY_TOKEN, KEY_GENERAL_TRUSTED_PROXY_CIDRS,
+};
 use crate::AppState;
 
 /// Simple shared-password auth.
@@ -142,32 +148,85 @@ pub async fn auth_middleware(
         None
     };
     let presented = bearer_token(authorization).or(q.as_deref());
-    let ok = match presented.filter(|t| !t.is_empty()) {
-        Some(t) => state.settings.auth().verify_bg(t).await,
-        None => false,
+
+    // 2026-09-18 review (read-only API tokens): two credential levels. The
+    // admin password verifies first; a match is Full access (today's
+    // behavior, including the transparent legacy upgrade). Failing that, the
+    // optional `access.read_only_token` is verified — a match grants only
+    // the RAG-read allowlist. When no read-only token is configured the
+    // second verify is skipped entirely (no KDF, no cache entry), so a
+    // single-admin-password deployment costs exactly what it did before.
+    let read_only_password = state
+        .settings
+        .get_typed::<String>(KEY_ACCESS_READ_ONLY_TOKEN)
+        .unwrap_or_default();
+    let outcome = match presented.filter(|t| !t.is_empty()) {
+        Some(t) => {
+            if state.settings.auth().verify_bg(t).await {
+                AuthOutcome::Full
+            } else if !read_only_password.is_empty()
+                && state.settings.auth().verify_read_only_bg(t).await
+            {
+                AuthOutcome::ReadOnly
+            } else {
+                AuthOutcome::None
+            }
+        }
+        None => AuthOutcome::None,
     };
 
-    if ok {
-        if let Some(ip) = &ip {
-            state.auth_lockout.record_success(ip);
+    match outcome {
+        AuthOutcome::Full => {
+            if let Some(ip) = &ip {
+                state.auth_lockout.record_success(ip);
+            }
+            // Transparent upgrade: a legacy plaintext value that just verified is
+            // re-stored as a salted hash. The middleware reads the password from
+            // the cache, so `SettingsAuth::upgrade` updates cache + DB together —
+            // without the cache update, every authenticated request would re-run
+            // the 100k-iteration verify + UPDATE until restart. (upgrade also
+            // invalidates the token cache, so this legacy value is not
+            // re-verified as plaintext after the upgrade.)
+            if crate::settings::is_legacy_password(&password) {
+                let hashed = crate::settings::hash_admin_password(&password);
+                state.settings.auth().upgrade(hashed).await;
+            }
+            return Ok(next.run(request).await);
         }
-        // Transparent upgrade: a legacy plaintext value that just verified is
-        // re-stored as a salted hash. The middleware reads the password from
-        // the cache, so `SettingsAuth::upgrade` updates cache + DB together —
-        // without the cache update, every authenticated request would re-run
-        // the 100k-iteration verify + UPDATE until restart. (upgrade also
-        // invalidates the token cache, so this legacy value is not
-        // re-verified as plaintext after the upgrade.)
-        if crate::settings::is_legacy_password(&password) {
-            let hashed = crate::settings::hash_admin_password(&password);
-            state.settings.auth().upgrade(hashed).await;
+        AuthOutcome::ReadOnly => {
+            // A valid read-only credential is not an auth failure for
+            // lockout accounting, whatever the scope decision below is.
+            if let Some(ip) = &ip {
+                state.auth_lockout.record_success(ip);
+            }
+            // Transparent upgrade (mirrors the Full arm above): a legacy
+            // plaintext read-only token that just verified is re-stored as a
+            // salted hash; the cache update is what stops the re-verify
+            // loop, and `upgrade_read_only` invalidates both token caches.
+            if crate::settings::is_legacy_password(&read_only_password) {
+                let hashed = crate::settings::hash_admin_password(&read_only_password);
+                state.settings.auth().upgrade_read_only(hashed).await;
+            }
+            if read_only_allowed(request.method().as_str(), path) {
+                return Ok(next.run(request).await);
+            }
+            // 403 (not 401): the credential is valid, the scope is not.
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "read-only token",
+                    "hint": "this endpoint requires the admin credential (Authorization: Bearer <admin-password>)"
+                })),
+            )
+                .into_response());
         }
-        return Ok(next.run(request).await);
+        AuthOutcome::None => {
+            if let Some(ip) = &ip {
+                state.auth_lockout.record_failure(ip);
+            }
+        }
     }
 
-    if let Some(ip) = &ip {
-        state.auth_lockout.record_failure(ip);
-    }
     // SEC-M3: the 401 hint only advertises the query-string form on read
     // verbs; mutating verbs must use the Bearer header.
     let hint = if is_read_verb(request.method().as_str()) {
@@ -231,6 +290,53 @@ pub async fn rate_limit(
 /// must use the `Authorization: Bearer` header.
 fn is_read_verb(method: &str) -> bool {
     matches!(method, "GET" | "HEAD" | "OPTIONS")
+}
+
+/// The credential level a presented token verified to (2026-09-18 review,
+/// read-only API tokens). `Full` = the admin password (today's full access);
+/// `ReadOnly` = the optional `access.read_only_token` (the RAG-read
+/// allowlist only); `None` = nothing presented, or no match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthOutcome {
+    Full,
+    ReadOnly,
+    None,
+}
+
+/// Whether a request is within the read-only token's allowlist — the single
+/// source of truth for the read-only scope (2026-09-18 review). The token
+/// grants the RAG-read surface and nothing else; adding a route here widens
+/// the read-only blast radius and should be a deliberate decision.
+///
+/// Read verbs only (GET/HEAD/OPTIONS — the query-string form is
+/// read-verb-only anyway, SEC-M3). Allowed routes:
+/// - `/health` (and future `/health/…` subpaths — the shared probe
+///   exemption) — status;
+/// - `/search`, `/suggest`, `/read`, `/snippet`, `/random`, `/chunks`,
+///   `/interlanguage` — the search/content surface a RAG client consumes;
+/// - `/w/…` — raw ZIM content (article assets);
+/// - `/list` — the ZIM catalog (a RAG client must know what is available);
+/// - `/openapi.json` — the public API description.
+///
+/// Deliberately excluded: `/diagnostic` (operator topology), `/settings`
+/// (can carry secrets), `/collections` and `/downloads` (operator state),
+/// the web-UI pages, and every mutating verb.
+pub(crate) fn read_only_allowed(method: &str, path: &str) -> bool {
+    is_read_verb(method)
+        && (is_health_path(path)
+            || matches!(
+                path,
+                "/search"
+                    | "/suggest"
+                    | "/read"
+                    | "/snippet"
+                    | "/random"
+                    | "/chunks"
+                    | "/interlanguage"
+                    | "/list"
+                    | "/openapi.json"
+            )
+            || path.starts_with("/w/"))
 }
 
 /// Whether a request must present the shared password.
@@ -537,6 +643,72 @@ mod tests {
         for m in ["POST", "PUT", "PATCH", "DELETE"] {
             assert!(!is_read_verb(m), "{m} is mutating");
         }
+    }
+
+    // ── read_only_allowed (2026-09-18 read-only API tokens) ─────────────
+
+    #[test]
+    fn read_only_allowlist_read_verbs_only() {
+        for path in [
+            "/search",
+            "/suggest",
+            "/read",
+            "/snippet",
+            "/random",
+            "/chunks",
+            "/interlanguage",
+            "/list",
+            "/openapi.json",
+            "/health",
+            "/w/foo/bar.zim",
+        ] {
+            for m in ["GET", "HEAD", "OPTIONS"] {
+                assert!(read_only_allowed(m, path), "{m} {path} must be allowed");
+            }
+            for m in ["POST", "PUT", "PATCH", "DELETE"] {
+                assert!(
+                    !read_only_allowed(m, path),
+                    "{m} {path} must be denied (mutating verb)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_denies_operator_and_ui_routes() {
+        for path in [
+            "/diagnostic",
+            "/settings",
+            "/settings/zim/x",
+            "/downloads",
+            "/downloads/1",
+            "/collections",
+            "/collections/1",
+            "/",
+            "/search.html",
+            "/settings.html",
+            "/index.js",
+            "/style.css",
+            "/common.js",
+        ] {
+            assert!(!read_only_allowed("GET", path), "GET {path} must be denied");
+        }
+    }
+
+    #[test]
+    fn read_only_path_matching_is_exact_for_roots() {
+        // Exact-match roots: no look-alike prefix or suffix passes.
+        assert!(!read_only_allowed("GET", "/searchx"));
+        assert!(!read_only_allowed("GET", "/search/"));
+        assert!(!read_only_allowed("GET", "/listx"));
+        assert!(!read_only_allowed("GET", "/openapi.jsonx"));
+        // `/w` without the slash segment is not a raw-content route, but any
+        // `/w/…` path is.
+        assert!(!read_only_allowed("GET", "/w"));
+        assert!(read_only_allowed("GET", "/w/a/b"));
+        // Health subpaths ride the shared probe exemption.
+        assert!(read_only_allowed("GET", "/health/x"));
+        assert!(!read_only_allowed("GET", "/healthx"));
     }
 
     #[test]

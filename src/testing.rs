@@ -229,6 +229,12 @@ pub fn state_from_parts(
         crate::health::DegradationTracker::default(),
     );
     crate::AppState {
+        // Tests never enable a read replica (`db_read: None` → the primary
+        // pool is the read path), and the dedicated background pool is the
+        // same pool as the foreground one — the `auto_embed_loop` tests
+        // exercise background work against the live test pool.
+        db_read: None,
+        db_bg: pool.clone(),
         db: pool,
         settings,
         zims,
@@ -240,6 +246,10 @@ pub fn state_from_parts(
         degradation: crate::health::DegradationTracker::default(),
         build_probe: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         index_building: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Tests never run the cross-process invalidation listener (it is a
+        // serve-only, long-lived concern — the DB-gated tests in `db::notify`
+        // exercise it directly via `spawn_listener_as`).
+        notify: None,
     }
 }
 

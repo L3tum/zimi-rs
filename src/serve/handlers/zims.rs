@@ -123,6 +123,47 @@ pub struct VectorIndexDiagnostic {
     pub degraded: Option<String>,
 }
 
+/// One per-ZIM integrity row of `GET /diagnostic` →
+/// `content_integrity.zims` (full digests; the web UI shows a prefix + "…").
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ZimIntegrityRow {
+    /// ZIM name.
+    pub name: String,
+    /// Observed SHA-256 of the installed bytes (64 lowercase hex). Absent
+    /// when the install predates integrity recording.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+    /// Publisher-declared SHA-256 verified against the installed bytes at
+    /// install time. Present only when the source declared one (the current
+    /// Kiwix catalog shape declares none) — always equal to
+    /// `content_sha256` when both are present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher_sha256: Option<String>,
+    /// Drift: a later install of the SAME identity (source URL / torrent
+    /// info-hash) produced bytes differing from the identity's previously
+    /// observed digest. Flag, never auto-rejected — the operator's judgment
+    /// call (a publisher republishing the same URL).
+    pub digest_drift: bool,
+}
+
+/// `GET /diagnostic` → `content_integrity`: per-ZIM content-integrity
+/// record (SEC). Which ZIMs have an observed digest, which were verified
+/// against a publisher claim, and which are drifted (same identity served
+/// different bytes at a later install — flagged, never auto-rejected). Rows
+/// with no integrity record at all (pre-feature installs) do not appear.
+/// Omitted entirely when the probe fails (DB unreachable — `/health`'s
+/// `db_connected` already reports that).
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ContentIntegrityDiagnostic {
+    /// ZIM rows carrying at least one integrity field (observed digest,
+    /// verified publisher claim, or drift flag), sorted by name.
+    pub zims: Vec<ZimIntegrityRow>,
+    /// Rows with a verified publisher claim (`publisher_sha256 IS NOT NULL`).
+    pub publisher_verified: i64,
+    /// Rows currently flagged drifted.
+    pub drift: i64,
+}
+
 /// `GET /diagnostic` → `checkout_wait`: explicit `pool.acquire()` wait times
 /// since process start (Architecture M1). The number behind the "the shared
 /// 20-connection pool is the main scalability limiter" revisit decision (the
@@ -185,6 +226,38 @@ fn checkout_wait_snapshot() -> CheckoutWait {
     }
 }
 
+/// Probe the per-ZIM content-integrity record for `GET /diagnostic` (SEC):
+/// observed SHA-256, verified publisher claim, and the drift flag. Rows
+/// with no integrity record at all (pre-feature installs) do not appear.
+/// Called only by the authenticated, operator-pulled `/diagnostic` handler —
+/// one scan over the integrity columns is fine there.
+async fn content_integrity_snapshot(
+    zims: &crate::zim::ZimManager,
+) -> crate::error::Result<ContentIntegrityDiagnostic> {
+    // The SQL lives in the ZIM data layer (raw-SQL boundary: handlers must
+    // not own SQL). One indexed scan over the integrity columns, operator-
+    // pulled and authenticated.
+    let rows = zims.integrity_snapshot_rows().await?;
+    let zims = rows
+        .into_iter()
+        .map(
+            |(name, content_sha256, publisher_sha256, digest_drift)| ZimIntegrityRow {
+                name,
+                content_sha256,
+                publisher_sha256,
+                digest_drift,
+            },
+        )
+        .collect::<Vec<_>>();
+    let drift = zims.iter().filter(|z| z.digest_drift).count() as i64;
+    let publisher_verified = zims.iter().filter(|z| z.publisher_sha256.is_some()).count() as i64;
+    Ok(ContentIntegrityDiagnostic {
+        zims,
+        publisher_verified,
+        drift,
+    })
+}
+
 /// `GET /diagnostic` response: operator-facing introspection that `/health`
 /// intentionally does not carry (it is an unauthenticated, rate-limit-exempt
 /// LB probe, so it must not disclose which settings rows are corrupt).
@@ -197,10 +270,25 @@ pub struct DiagnosticResponse {
     /// needs the signal. Empty (omitted) when every value deserializes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub settings_mismatches: Vec<String>,
-    /// Shared Postgres pool saturation snapshot (Architecture M1): the
+    /// Primary Postgres pool saturation snapshot (Architecture M1): the
     /// pre-503 signal for a long query (e.g. a reindex `COPY`) holding the
     /// pool at its ceiling. Always present (additive).
     pub pool: PoolHealth,
+    /// Read-replica pool saturation snapshot — present only when a read
+    /// replica is configured (`DATABASE_URL_READ`). Foreground reads
+    /// (search, suggest, snippet, random, the article-read DB fallback,
+    /// the `/health` db probe) check out from this pool when it is set, so
+    /// replica saturation is the pre-503 signal for the read path (mirrors
+    /// `pool` for the primary). Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_read: Option<PoolHealth>,
+    /// Dedicated background pool saturation snapshot (PERF-10): the pool on
+    /// the primary URL capped at `db::pool::BG_POOL_MAX_CONNECTIONS` that
+    /// the auto-embed loop and the vector-index builds check out from —
+    /// a saturated background pool is the pre-stall signal for background
+    /// work (it can no longer consume foreground checkouts). Always present
+    /// (additive).
+    pub pool_bg: PoolHealth,
     /// Partial vector-index degradation state (Architecture M1): the
     /// embedded row count, the `idx_articles_embedding` catalog state, and —
     /// when no valid index exists over ≥ 10k embedded rows — an explicit
@@ -215,6 +303,18 @@ pub struct DiagnosticResponse {
     /// Query-embedding FIFO cache entry count (operator signal for cache
     /// effectiveness). Always present (additive).
     pub query_embed_cache_entries: usize,
+    /// Per-ZIM content-integrity record (SEC): observed SHA-256, verified
+    /// publisher claim (when declared), and the drift flag. Omitted when
+    /// the probe fails (DB unreachable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_integrity: Option<ContentIntegrityDiagnostic>,
+    /// Cross-process invalidation-listener liveness (LISTEN/NOTIFY,
+    /// `db::notify`): session state + notification/resync counters. Omitted
+    /// when no listener is running (non-serve processes, and a serve whose
+    /// startup could not reach the database — a `reconnecting` session is
+    /// reported by the field's own `state`, an *absent* listener is omitted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify: Option<crate::db::notify::NotifyStatusSnapshot>,
 }
 
 /// `GET /list` response: all ZIM archives with metadata.
@@ -241,7 +341,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     let (zims_count, total_articles) = state.zims.summary();
     // Real liveness probes, memoized (2s TTL) so a burst of health checks
     // doesn't ping Postgres or qBittorrent unthrottled.
-    let db_connected = state.probes.probe_db(&state.db).await;
+    let db_connected = state.probes.probe_db(state.db_read_or_primary()).await;
     let qbit_connected = state.probes.probe_qbit(&state.torrent.current()).await;
     // M-health-200: the status code mirrors DB liveness so a monitor can alert
     // on 503 (DB down). The body always reports the real probe results.
@@ -328,6 +428,13 @@ pub async fn diagnostic(
             pool.max_size
         );
     }
+    // PERF-10 / read-replica finding: report the other two pools' saturation
+    // too (reporting only — a saturated background pool cannot starve the
+    // foreground pools, and replica saturation is a read-path signal, not a
+    // write-path 503). `pool_read` is present only when `DATABASE_URL_READ`
+    // is set.
+    let pool_read = state.db_read.as_ref().map(pool_health);
+    let pool_bg = pool_health(&state.db_bg);
     // Architecture M1 (vector index): surface the degradation state — no
     // valid index at scale means every vector search is a brute-force
     // sequential cosine scan. One extra `COUNT(*)` + catalog probe is fine
@@ -347,13 +454,29 @@ pub async fn diagnostic(
     };
     // Architecture M1 (checkout wait): pure atomic reads — no connection.
     let checkout_wait = checkout_wait_snapshot();
+    // SEC (content integrity): per-ZIM observed/publisher digests + the
+    // drift flag. Operator-pulled and authenticated — one indexed scan over
+    // the integrity columns is fine here. On probe failure the field is
+    // omitted (the DB is unreachable — `/health`'s `db_connected` already
+    // reports that).
+    let content_integrity = match content_integrity_snapshot(&state.zims).await {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!("content integrity diagnostic probe failed: {e}");
+            None
+        }
+    };
     Ok(Json(DiagnosticResponse {
         version: env!("CARGO_PKG_VERSION").into(),
         settings_mismatches: state.settings.type_mismatches(),
         pool,
+        pool_read,
+        pool_bg,
         vector_index,
         checkout_wait,
         query_embed_cache_entries: state.search.query_embed_cache_len(),
+        content_integrity,
+        notify: state.notify_status(),
     }))
 }
 

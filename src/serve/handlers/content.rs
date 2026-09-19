@@ -576,8 +576,14 @@ pub async fn get_snippet(
     State(state): State<AppState>,
     Query(params): Query<SnippetQuery>,
 ) -> Result<Json<SnippetResponse>, crate::error::Error> {
-    let row =
-        crate::db::articles::fetch_article_snippet(&state.db, &params.zim, &params.path).await?;
+    // Foreground READ: routes to the read replica when `DATABASE_URL_READ`
+    // is set (PERF-10 / read-replica finding), else the primary pool.
+    let row = crate::db::articles::fetch_article_snippet(
+        state.db_read_or_primary(),
+        &params.zim,
+        &params.path,
+    )
+    .await?;
 
     match row {
         Some((snippet, title, preview)) => Ok(Json(SnippetResponse {

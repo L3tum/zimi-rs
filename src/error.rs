@@ -32,6 +32,15 @@ pub enum Error {
     #[error("ZIM error: {0}")]
     Zim(String),
 
+    /// Content-integrity failure (SEC): the fetched bytes' measured SHA-256
+    /// does not match the publisher's declared digest (the catalog claim
+    /// recorded on the `downloads` row at enqueue). The staged file is
+    /// quarantined (removed) and the row marked `error` BEFORE this variant
+    /// surfaces, so it maps to a redacted 500 — both digests stay in the
+    /// row's `error` text and the operator log, never in the client reply.
+    #[error("content digest mismatch: {0}")]
+    ZimDigestMismatch(String),
+
     /// Configuration error with a human-readable detail (500, redacted).
     #[error("config error: {0}")]
     Config(String),

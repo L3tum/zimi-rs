@@ -47,15 +47,19 @@ pub const EMBED_DEFAULT_HNSW_THRESHOLD: i64 = 1_000_000;
 /// there is no seq-scan fallback.
 pub const EMBED_DEFAULT_IVFFLAT_THRESHOLD: i64 = 10_000_000;
 
-/// Default `downloads.max_bytes` — 1 EiB, i.e. effectively unbounded.
+/// Default `downloads.max_bytes` — 512 GiB.
 ///
-/// Full ZIMs can be huge (the English Wikipedia is ~120 GB ≈ 111 GiB), so the
-/// old 20 GiB default would have blocked legitimate archives and the old
-/// 100 GiB ceiling would have blocked them too. The cap is now an
-/// operator-set upper bound with **no** built-in ceiling (WP3.11); this
-/// default simply means "don't stop a normal download". Only a floor of 1 is
-/// enforced so a stored `0` can't disable the cap entirely.
-pub const DEFAULT_MAX_BYTES: u64 = 1 << 60; // 1 EiB
+/// Full ZIMs can be huge (the English Wikipedia is ~120 GB ≈ 111 GiB), so
+/// the old 20 GiB / 100 GiB defaults would have blocked legitimate archives
+/// (WP3.11 raised the default to 1 EiB = effectively unbounded). The
+/// 2026-09-18 security review flagged an effectively-unbounded download cap
+/// as a disk-exhaustion DoS vector: a misconfigured (or malicious, with an
+/// admin token) single download could fill the volume. 512 GiB is far above
+/// any real ZIM while capping the blast radius; the operator can still raise
+/// it via `PUT /settings` (admin token) if a future archive ever needs it.
+/// Only a floor of 1 is enforced so a stored `0` can't disable the cap
+/// entirely.
+pub const DEFAULT_MAX_BYTES: u64 = 512 * 1024 * 1024 * 1024; // 512 GiB
 
 /// Canonical `access.mode` values — compare against these, not string literals.
 pub const ACCESS_MODE_OPEN: &str = "open";
@@ -222,6 +226,15 @@ pub const KEY_ACCESS_RATE_LIMIT_RPS: &str = "access.rate_limit_rps";
 pub const KEY_ACCESS_RATE_LIMIT_BURST: &str = "access.rate_limit_burst";
 /// `access.admin_password` — admin password (secret, redacted in responses).
 pub const KEY_ACCESS_ADMIN_PASSWORD: &str = "access.admin_password";
+/// `access.read_only_token` — optional read-only API token (secret, redacted
+/// in responses). When set, it authenticates a restricted caller that can hit
+/// only the RAG-read allowlist (search/suggest/content/health); everything
+/// else — settings, diagnostics, MCP, all mutating verbs — is 403/401 for it.
+/// Mirrors `access.admin_password` in policy: env-seeded
+/// (`READ_ONLY_TOKEN`), env-locked, API-immutable, and transparently
+/// upgraded to a salted hash on first successful use (2026-09-18 review,
+/// "read-only API tokens" operator decision).
+pub const KEY_ACCESS_READ_ONLY_TOKEN: &str = "access.read_only_token";
 /// `access.require_auth_for_reads` — require auth for read endpoints too.
 pub const KEY_ACCESS_REQUIRE_AUTH_FOR_READS: &str = "access.require_auth_for_reads";
 
@@ -233,7 +246,7 @@ pub const KEY_ACCESS_REQUIRE_AUTH_FOR_READS: &str = "access.require_auth_for_rea
 /// `LazyLock` (not `const`) because float defaults (`0.6`, `2.0`, …) can't be
 /// built by the `json!` macro in const context; the table is still built once
 /// and shared by reference — the single source of truth for settings policy.
-pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::LazyLock::new(|| {
+pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 44]> = std::sync::LazyLock::new(|| {
     [
         SettingDef {
             key: KEY_GENERAL_ZIM_DIR,
@@ -592,6 +605,22 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             },
         },
         SettingDef {
+            key: KEY_ACCESS_READ_ONLY_TOKEN,
+            default: serde_json::json!(""),
+            json_type: JsonType::Str,
+            // Mirrors `access.admin_password` exactly: env-seeded + env-
+            // locked + secret + API-immutable. (No `security_sensitive` —
+            // like admin_password, the `api_immutable` arm rejects writes
+            // first, and the update-path test pins that invariant for every
+            // sensitive key.)
+            policy: SettingPolicy {
+                env_locked: true,
+                secret: true,
+                api_immutable: true,
+                ..Default::default()
+            },
+        },
+        SettingDef {
             key: KEY_ACCESS_REQUIRE_AUTH_FOR_READS,
             default: serde_json::json!(false),
             json_type: JsonType::Bool,
@@ -888,6 +917,78 @@ mod tests {
         for key in seeds.keys() {
             assert!(keys.contains(key.as_str()), "un-tabled seed key {key:?}");
         }
+    }
+
+    /// 2026-09-18 review (open mode): pin the EXACT set of settings keys an
+    /// unauthenticated (open-mode) caller may write. `SettingsCache::update`
+    /// rejects, in order: `api_immutable`, `config_only`, unknown keys, type
+    /// mismatches, then `!authenticated && is_security_sensitive` — so the
+    /// open-mode-writable surface is precisely the keys that are none of the
+    /// first, last, or both. This test makes that surface explicit: a future
+    /// key added without a conscious decision (sensitive or not) fails here.
+    #[test]
+    fn open_mode_writable_surface_is_pinned() {
+        // The intended open-mode-writable surface as of 2026-09-18: search
+        // tuning, torrent behaviour, embedding tuning, and read-gating.
+        // Deliberately excluded: every `general.*` key (`config_only` — env
+        // at startup, restart required), `access.mode` (api_immutable), and
+        // every `security_sensitive` key (credentials, SSRF policy, secret-
+        // bearing integrations).
+        const EXPECTED_OPEN_WRITABLE: &[&str] = &[
+            "access.require_auth_for_reads",
+            "embedding.hnsw_threshold",
+            "embedding.ivfflat_threshold",
+            "embedding.max_concurrency",
+            "search.default_limit",
+            "search.fts_weight",
+            "search.max_limit",
+            "search.trgm_threshold",
+            "search.trgm_weight",
+            "search.vector_weight",
+            "torrent.category",
+            "torrent.enabled",
+            "torrent.file_strategy",
+            "torrent.keep_completed",
+            "torrent.max_active",
+            "torrent.poll_secs",
+            "torrent.seed_ratio",
+        ];
+        let mut open_writable: Vec<&str> = Vec::new();
+        for d in SETTING_DEFS.iter() {
+            if !d.policy.api_immutable && !d.policy.config_only && !d.policy.security_sensitive {
+                open_writable.push(d.key);
+            }
+        }
+        open_writable.sort_unstable();
+        let mut expected: Vec<&str> = EXPECTED_OPEN_WRITABLE.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            open_writable, expected,
+            "open-mode-writable settings surface drifted — extend the \"
+             \"expected list deliberately (and document the risk) if this is intended"
+        );
+        // Defense in depth: the open-writable surface must never contain a
+        // secret key or a key whose name reads like a credential.
+        for key in &open_writable {
+            let d = def(key).expect("tabled key");
+            assert!(!d.policy.secret, "{key} is secret yet open-writable");
+            assert!(
+                !key.contains("password") && !key.contains("token") && !key.contains("api_key"),
+                "{key} reads like a credential yet is open-writable"
+            );
+        }
+    }
+
+    /// 2026-09-18 review (unbounded `downloads.max_bytes` DoS vector): the
+    /// effectively-unbounded 1 EiB default is now capped at 512 GiB — far
+    /// above any real ZIM (English Wikipedia ≈ 111 GiB) while bounding a
+    /// single download's disk blast radius. Raising it further remains an
+    /// explicit, authenticated operator decision via `PUT /settings`.
+    #[test]
+    fn downloads_max_bytes_default_is_bounded() {
+        assert_eq!(DEFAULT_MAX_BYTES, 512 * 1024 * 1024 * 1024);
+        let d = def(KEY_DOWNLOADS_MAX_BYTES).expect("key tabled");
+        assert_eq!(d.default, serde_json::json!(DEFAULT_MAX_BYTES));
     }
 
     /// FIELDS drift guard (Ponytail SIMPLIFY #2 / ARCH #2): the web UI's

@@ -32,10 +32,13 @@
 //! legacy refusal, `migrations.rs`) run in temp DBs they drop — so it is safe
 //! to run against an existing dev database.
 
+mod auth_tokens;
 mod common;
 mod constraints;
+mod embed_claim_fifo;
 mod embedding;
 mod health;
+mod integrity;
 mod invalid_index;
 mod migrations;
 mod raw;

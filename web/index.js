@@ -59,6 +59,14 @@ function renderZims() {
       `<span class="badge">${esc(z.language)}</span>`
       + ` ${z.category ? `<span class="badge">${esc(z.category)}</span>` : ''}`
       + ` ${z.date ? `<span class="badge">${esc(z.date)}</span>` : ''}`;
+    // Content-integrity record (SEC): short observed SHA-256 (full hash in
+    // the tooltip), a "publisher verified" badge when the source declared a
+    // claim and it matched, and a drift warning when the same identity
+    // served different bytes at a later install (flag, not rejection).
+    const integrityBadges =
+      `${z.content_sha256 ? `<span class="badge" title="content SHA-256: ${esc(z.content_sha256)}">sha ${esc(z.content_sha256.slice(0, 12))}…</span>` : ''}`
+      + ` ${z.publisher_sha256 ? '<span class="badge badge-green" title="publisher-declared SHA-256 verified against the installed bytes">publisher verified</span>' : ''}`
+      + ` ${z.digest_drift ? '<span class="badge badge-warn" title="same source served different bytes at a later install — inspect before relying on this ZIM">digest drift</span>' : ''}`;
     const embedBadge = z.embed_enabled
       ? '<span class="badge badge-green">embedding on</span>'
       : '';
@@ -67,6 +75,7 @@ function renderZims() {
       <h3>${esc(z.display_title)}</h3>
       <div class="meta">
         <div>${metaBadges}</div>
+        <div>${integrityBadges}</div>
         <div>${fmtNum(z.entry_count)} entries · ${fmtBytes(z.file_size)}</div>
         <div>${fmtNum(z.indexed_entries)} indexed · ${pct}%</div>
         ${bar}

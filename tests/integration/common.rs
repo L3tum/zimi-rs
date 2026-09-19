@@ -220,9 +220,11 @@ pub async fn insert_download(
 // ── B5.7: DB-backed handler happy paths ────────────────────────────────
 
 /// Assemble a full `AppState` from the four parts that vary per test
-/// (pool, settings, ZIM manager, search engine). The five remaining
-/// infrastructure fields are always fresh defaults — this is the single
-/// spelling of that boilerplate in the test suite.
+/// (pool, settings, ZIM manager, search engine). The remaining
+/// infrastructure fields are always fresh defaults (the invalidation
+/// listener is `None` — serve-only; the DB-gated tests in `db::notify`
+/// exercise it directly) — this is the single spelling of that
+/// boilerplate in the test suite.
 pub fn assemble_state(
     db: Pool,
     settings: SettingsCache,
@@ -230,6 +232,11 @@ pub fn assemble_state(
     search: SearchEngine,
 ) -> AppState {
     AppState {
+        // Tests never enable a read replica (`None` → primary pool is the
+        // read path); the dedicated background pool is the same pool as the
+        // foreground one (background work runs against the live test pool).
+        db_read: None,
+        db_bg: db.clone(),
         db,
         settings,
         zims,
@@ -241,6 +248,7 @@ pub fn assemble_state(
         degradation: zimservice::health::DegradationTracker::default(),
         build_probe: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         index_building: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        notify: None,
     }
 }
 

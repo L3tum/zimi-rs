@@ -109,6 +109,18 @@ impl TorrentInfo {
     /// Only *post-download* states count: `pausedDL` (paused mid-download) is
     /// deliberately excluded so a torrent paused before it actually finished
     /// is never installed as complete.
+    ///
+    /// **Acceptance precondition (SEC trust boundary):** this predicate is
+    /// the gate between "qBittorrent says the torrent is done" and "install
+    /// the file into the library" (`handle_complete`). It accepts only
+    /// post-download states, which qBittorrent reaches only AFTER it has
+    /// verified every downloaded piece against the torrent's **info-hash**
+    /// — including the re-check it runs on startup (`checking`, which
+    /// deliberately does NOT count here). The system therefore trusts qB
+    /// piece-verification and does not re-hash torrent content client-side;
+    /// the info-hash is recorded on the `downloads` row (`bind_hash`) as the
+    /// content-identity provenance, and the observed file SHA-256 is recorded
+    /// at completion for drift detection.
     pub fn is_complete(&self) -> bool {
         self.progress >= 0.999
             && matches!(
@@ -549,6 +561,34 @@ mod tests {
         }
         // High progress alone is not enough — the state must be post-download.
         assert!(!info("downloading", 0.9999).is_complete());
+    }
+
+    /// SEC (acceptance precondition): the states that must NOT count are
+    /// exactly those where qBittorrent has not FINISHED verifying the file
+    /// against the info-hash — `checking` is the critical one (qB re-verifies
+    /// pieces after a restart / on-demand; the on-disk file may be corrupt
+    /// until it finishes), and `allocating` / `moving` are pre- or mid-file
+    /// preparation. Asserting the predicate itself (not a copy of the state
+    /// set) pins the trust boundary: we install only what qB has
+    /// hash-verified.
+    #[test]
+    fn is_complete_rejects_verification_in_progress_states() {
+        assert!(
+            !info("checking", 1.0).is_complete(),
+            "checking at full progress: qB is STILL verifying pieces — never install"
+        );
+        assert!(
+            !info("allocating", 1.0).is_complete(),
+            "allocating: file being prepared"
+        );
+        assert!(
+            !info("moving", 1.0).is_complete(),
+            "moving: file in transit"
+        );
+        assert!(
+            !info("checking", 0.5).is_complete(),
+            "checking at partial progress is doubly incomplete"
+        );
     }
 
     #[test]

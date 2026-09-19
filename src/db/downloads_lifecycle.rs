@@ -295,18 +295,125 @@ pub async fn requeue_stale_errors(pool: &Pool, ids: &[i32]) -> Result<u64> {
 
 /// `downloading → complete` (direct-download finalize). The `AND status =
 /// 'downloading'` guard means a cancel landing between the pre-rename check and
-/// this update still wins — never clobber a terminal state. Returns the row
+/// this update still wins — never clobber a terminal state. `sha256` is the
+/// MEASURED digest of the installed bytes (see the finalize path): when the
+/// row carried a catalog claim, the bytes already matched it (a mismatch
+/// never reaches this point), so storing the measured value both records the
+/// provenance and — for claim-less rows — makes the settled row carry the
+/// digest the queue guard's version-key compares against. Returns the row
 /// count (0 = cancelled mid-finalize; the caller discards the staged file).
-pub async fn finalize_direct(pool: &Pool, id: i32, dst: &str) -> Result<u64> {
+pub async fn finalize_direct(pool: &Pool, id: i32, dst: &str, sha256: Option<&str>) -> Result<u64> {
     raw::execute(
         pool,
-        "UPDATE downloads SET status = $1, progress = 1.0, file_path = $2, updated_at = now() \
-         WHERE id = $3 AND status = $4",
+        "UPDATE downloads SET status = $1, progress = 1.0, file_path = $2, sha256 = $3, \
+         updated_at = now() WHERE id = $4 AND status = $5",
         |q| {
             q.bind(DownloadStatus::Complete.as_str())
                 .bind(dst)
+                .bind(sha256)
                 .bind(id)
                 .bind(DownloadStatus::Downloading.as_str())
+        },
+    )
+    .await
+}
+
+/// Read a row's catalog digest claim (the `sha256` value recorded when the
+/// OPDS queue enqueued it; `None` when the source declared nothing). For
+/// rows that never settled from this path it is the raw claim; after a
+/// direct finalize it is the measured digest (which equals the claim when
+/// one was present).
+pub async fn claim_digest(pool: &Pool, id: i32) -> Result<Option<String>> {
+    // The column is nullable (no claim) — decode as `Option<String>` so a
+    // NULL decodes to `None` instead of a decode error (a claim-less row is
+    // the current Kiwix catalog shape, not an edge case).
+    let claim: Option<Option<String>> =
+        raw::fetch_scalar_optional(pool, "SELECT sha256 FROM downloads WHERE id = $1", |q| {
+            q.bind(id)
+        })
+        .await?;
+    Ok(claim.flatten())
+}
+
+/// The previously observed digest for the SAME identity (SEC drift
+/// detection): the most recent settled (`complete`/`seeding`) row for the
+/// same source URL, excluding this row, that recorded a digest. `None`
+/// means this URL has no integrity history (first observation — or a NULL
+/// legacy record — drift cannot be detected), so the install path must not
+/// flag it. Distinct URLs are distinct identities and never compare.
+pub async fn prior_observed_digest_by_url(
+    pool: &Pool,
+    id: i32,
+    url: &str,
+) -> Result<Option<String>> {
+    raw::fetch_scalar_optional(
+        pool,
+        // `id DESC` tie-breaks equal `updated_at` (same-millisecond settles
+        // — a re-queued version of the same identity always gets a larger
+        // id, so it is the newer observation).
+        "SELECT sha256 FROM downloads \
+         WHERE url = $1 AND id <> $2 AND sha256 IS NOT NULL \
+         AND status IN ($3, $4) ORDER BY updated_at DESC, id DESC LIMIT 1",
+        |q| {
+            q.bind(url)
+                .bind(id)
+                .bind(DownloadStatus::Complete.as_str())
+                .bind(DownloadStatus::Seeding.as_str())
+        },
+    )
+    .await
+}
+
+/// The previously observed digest for the SAME identity on the torrent
+/// path: keyed by torrent info-hash (the torrent's content identity) with
+/// the same semantics as [`prior_observed_digest_by_url`].
+pub async fn prior_observed_digest_by_hash(
+    pool: &Pool,
+    id: i32,
+    hash: &str,
+) -> Result<Option<String>> {
+    raw::fetch_scalar_optional(
+        pool,
+        // `id DESC` tie-break — see `prior_observed_digest_by_url`.
+        "SELECT sha256 FROM downloads \
+         WHERE hash = $1 AND id <> $2 AND sha256 IS NOT NULL \
+         AND status IN ($3, $4) ORDER BY updated_at DESC, id DESC LIMIT 1",
+        |q| {
+            q.bind(hash)
+                .bind(id)
+                .bind(DownloadStatus::Complete.as_str())
+                .bind(DownloadStatus::Seeding.as_str())
+        },
+    )
+    .await
+}
+
+/// The drift decision itself (SEC, pure — both install paths call this so
+/// the rule lives in one place): a later download of the SAME identity
+/// yields drift iff a previous observed digest exists AND differs from the
+/// current one. `None` previous observation (first observation for the
+/// identity, or a NULL legacy record) is NEVER drift — there is nothing to
+/// compare against. Comparison is case-insensitive (the CHECK constraints
+/// pin lowercase, but a hand-edited row must not flip the flag).
+pub fn drift_decision(prev: Option<&str>, current: &str) -> bool {
+    matches!(prev, Some(p) if !p.eq_ignore_ascii_case(current))
+}
+
+/// Record the observed SHA-256 of the installed bytes on a SETTLED torrent
+/// row (the provenance record + drift baseline; `mark_complete` does not
+/// write digests, so this runs after it). Status-guarded on the settled
+/// statuses so a racing settle/cancel wins over a late write. Returns the
+/// row count (0 = the row left the settled states — a no-op, harmless).
+pub async fn record_observed_digest(pool: &Pool, id: i32, sha256: &str) -> Result<u64> {
+    raw::execute(
+        pool,
+        "UPDATE downloads SET sha256 = $1, updated_at = now() \
+         WHERE id = $2 AND status IN ($3, $4)",
+        |q| {
+            q.bind(sha256)
+                .bind(id)
+                .bind(DownloadStatus::Complete.as_str())
+                .bind(DownloadStatus::Seeding.as_str())
         },
     )
     .await
@@ -759,6 +866,34 @@ mod tests {
             no_longer_downloading("complete"),
             Some("complete".into()),
             "complete → bail"
+        );
+    }
+
+    /// SEC drift decision truth table: drift requires BOTH a previous
+    /// observed digest AND a difference from the current one. `None`
+    /// previous (first observation / NULL legacy) is never drift; an equal
+    /// digest (any case) is never drift; a different one is.
+    #[test]
+    fn drift_decision_truth_table() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        // First observation (no history) — never drift.
+        assert!(
+            !drift_decision(None, &a),
+            "no previous observation → no drift"
+        );
+        // Same digest — no drift (case-insensitive: a hand-edited uppercase
+        // row must not flip the flag).
+        assert!(!drift_decision(Some(&a), &a), "equal digest → no drift");
+        assert!(
+            !drift_decision(Some(&a.to_uppercase()), &a),
+            "case-insensitive equality → no drift"
+        );
+        // Different digest — drift.
+        assert!(drift_decision(Some(&b), &a), "different digest → drift");
+        assert!(
+            drift_decision(Some(&b.to_uppercase()), &a),
+            "different digest (uppercase stored) → drift"
         );
     }
 }

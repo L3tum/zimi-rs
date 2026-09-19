@@ -62,7 +62,7 @@ $(if $2,&& { if [ ! -x node_modules/.bin/eslint ]; then \
 && $4 && echo "$1: OK"
 endef
 
-.PHONY: all help check fmt fmt-check clippy raw-sql-lint test test-fast test-integration test-strict test-strict-ci build release install uninstall doc run clean web-check web-fmt web-test web-lint
+.PHONY: all help check fmt fmt-check clippy raw-sql-lint test test-fast test-integration test-strict test-strict-ci bench build release install uninstall doc run clean web-check web-fmt web-test web-lint
 
 # Quick pre-commit checks
 check:
@@ -145,6 +145,19 @@ test-strict:
 test-strict-ci:
 	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --lib --bins --test wiremock && \
 	    DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration)
+
+# Criterion perf micro-benches (search + retrieval) against an EXISTING dev
+# Postgres. Unlike test-integration this does NOT boot the compose
+# container: it reuses whatever DATABASE_URL points at (default $(DEV_DSN);
+# override: `make bench DATABASE_URL=postgres://...`). Each bench target
+# seeds a dedicated `bench_fixture` ZIM (10,000 deterministic articles +
+# real embeddings) into that DB on every run — idempotent (drop + recreate,
+# so re-runs measure identical data) — and removes it on exit. Unreachable
+# DB ⇒ each target prints a skip banner and exits 0 (the same vacuous-run
+# policy as `make test` with no database). Not part of `all`: a run takes
+# several minutes and mutates the shared dev DB (see benches/common/mod.rs).
+bench:
+	@DATABASE_URL="$$${DATABASE_URL:-$(DEV_DSN)}" $(CARGO) bench
 
 # JS syntax check for the embedded web UI (web/*.js — the pages carry no
 # inline <script> blocks; the `pages_have_no_inline_scripts` Rust unit test
@@ -246,6 +259,8 @@ help:
 	@echo "  make test-integration  Boot compose Postgres, run DB integration tests"
 	@echo "  make test-strict      Strict mode: DB required (missing DB is a hard failure)"
 	@echo "  make test-strict-ci    Mirrors the CI test job: strict DB, lib+bins+wiremock+integration"
+	@echo "  make bench            Criterion perf micro-benches (search + retrieval) against the"
+	@echo "                        dev DB (DATABASE_URL, default $(DEV_DSN))"
 	@echo "  make web-check    JS syntax + CSS syntax check of the embedded web UI (needs node; skips if absent)"
 	@echo "  make web-test     Behavioral unit tests for web UI helpers + page scripts (node --test, jsdom real-DOM harness)"
 	@echo "  make web-fmt      eslint --fix for the web UI (JS half of make fmt; needs npm install; skips if absent)"

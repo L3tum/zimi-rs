@@ -91,6 +91,8 @@ impl utoipa::Modify for AddSecuritySchemes {
         crate::serve::handlers::DiagnosticResponse,
         crate::serve::handlers::PoolHealth,
         crate::serve::handlers::VectorIndexDiagnostic,
+        crate::serve::handlers::ContentIntegrityDiagnostic,
+        crate::serve::handlers::ZimIntegrityRow,
         crate::serve::handlers::CheckoutWait,
         crate::embed::VectorIndexState,
         crate::serve::handlers::HealthResponse,
@@ -215,7 +217,13 @@ mod tests {
         // Architecture M1 (vector index + checkout wait): the nested
         // /diagnostic schemas — including the re-exported embed enum that
         // `VectorIndexDiagnostic.index` references — must all resolve.
-        for schema in ["VectorIndexDiagnostic", "CheckoutWait", "VectorIndexState"] {
+        for schema in [
+            "VectorIndexDiagnostic",
+            "CheckoutWait",
+            "VectorIndexState",
+            "ContentIntegrityDiagnostic",
+            "ZimIntegrityRow",
+        ] {
             assert!(
                 components.schemas.contains_key(schema),
                 "the /diagnostic {schema} schema must be registered"

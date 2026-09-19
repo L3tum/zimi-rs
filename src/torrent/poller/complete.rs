@@ -187,6 +187,102 @@ impl DownloadPoller {
             self.zims.zim_dir.display()
         );
 
+        // Content provenance (SEC): record the OBSERVED SHA-256 of the
+        // installed file. The torrent's content identity is its BitTorrent
+        // info-hash — qBittorrent verified every piece against it before the
+        // torrent could reach a post-download state (the acceptance
+        // precondition; see `TorrentInfo::is_complete`), so this is a
+        // provenance record + drift baseline, not a re-verification (and
+        // never a rejection). Hashing is blocking (multi-GB) — off the
+        // single poller task. The skip path (BUG-20 reuse) hashes only for
+        // legacy rows with no recorded digest yet; the fresh path always
+        // records (a pre-settlement row digest, when present, is the catalog
+        // claim — noted on mismatch, then replaced by the observed value).
+        let row_digest = crate::db::downloads_lifecycle::claim_digest(&self.db, id).await?;
+        let needs_digest = if skipped_existing {
+            row_digest.is_none()
+        } else {
+            true
+        };
+        if needs_digest {
+            let digest_path = dst.clone();
+            let hash = t.hash.clone();
+            let digest_res =
+                tokio::task::spawn_blocking(move || super::direct::sha256_file(&digest_path))
+                    .await
+                    .map_err(|e| Error::Internal(anyhow::anyhow!("digest task failed: {e}")))?;
+            match digest_res {
+                Ok(digest) => {
+                    // A catalog-driven torrent row (rare — the live catalog
+                    // declares no digests) may carry a claim: note, don't
+                    // reject (the info-hash is the content gate here).
+                    if let Some(c) = &row_digest {
+                        if !c.eq_ignore_ascii_case(&digest) {
+                            tracing::warn!(
+                                "download {id}: catalog claim {c} differs from observed \
+                                 digest {digest} (torrent path — info-hash-pinned, noted \
+                                 not rejected)"
+                            );
+                        }
+                    }
+                    // Provenance on the settled row (status-guarded; a
+                    // racing settle/cancel wins — a no-op then, harmless).
+                    let _ = crate::db::downloads_lifecycle::record_observed_digest(
+                        &self.db, id, &digest,
+                    )
+                    .await;
+                    // Drift (SEC): same info-hash, different bytes than the
+                    // previously observed digest for this torrent. Flag,
+                    // never reject — a re-torrent of the same name is a
+                    // human judgment call. Best-effort: a blip degrades to
+                    // "no drift flagged", the same state as missing history.
+                    let drift = match crate::db::downloads_lifecycle::prior_observed_digest_by_hash(
+                        &self.db, id, &hash,
+                    )
+                    .await
+                    {
+                        Ok(Some(prev))
+                            if crate::db::downloads_lifecycle::drift_decision(
+                                Some(&prev),
+                                &digest,
+                            ) =>
+                        {
+                            tracing::warn!(
+                                "torrent {hash} digest DRIFT: previously observed {prev}, \
+                                 now {digest} — flagged (not rejected)"
+                            );
+                            true
+                        }
+                        Ok(_) => false,
+                        Err(e) => {
+                            tracing::warn!("drift check for download {id} failed: {e}");
+                            false
+                        }
+                    };
+                    let zname = dst
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !zname.is_empty() {
+                        if let Err(e) = self
+                            .zims
+                            .set_content_sha256(&zname, &digest, None, drift)
+                            .await
+                        {
+                            tracing::error!("recording content digest for {zname} failed: {e}");
+                        }
+                    }
+                }
+                // Best-effort provenance: a hashing failure degrades to
+                // "digest unknown" (the next settlement retries), it never
+                // fails an already-settled install.
+                Err(e) => {
+                    tracing::warn!("observed-digest hashing for download {id} failed: {e}");
+                }
+            }
+        }
+
         // If we don't keep completed torrents, drop them from qBittorrent now
         // that the file is safely in the ZIM dir.
         if !p.keep_completed {
@@ -298,6 +394,15 @@ mod tests {
         let content_file = content_dir.join("utiny.zim");
         std::fs::copy("tests/fixtures/tiny.zim", &content_file).unwrap();
 
+        // Pre-clean (re-runnability): a failed run leaves a live row on the
+        // shared suite DB that would hit the partial unique index.
+        crate::db::raw::execute(
+            &pool,
+            "DELETE FROM downloads WHERE url = 'magnet:?xt=urn:btih:it'",
+            |q| q,
+        )
+        .await
+        .unwrap();
         let id: i32 = crate::db::raw::fetch_scalar_optional(
             &pool,
             "INSERT INTO downloads (name, url, status)
@@ -367,6 +472,45 @@ mod tests {
             "file installed into zim_dir, got {fp}"
         );
 
+        // SEC provenance (torrent path): the settled row and the ZIM row
+        // carry the MEASURED digest of the installed bytes. Torrents are
+        // pinned by the info-hash (the magnet), so no publisher column is
+        // set and there is nothing to compare against — no drift flag.
+        let measured =
+            crate::torrent::poller::direct::sha256_file(installed).expect("hash installed");
+        let sha: Option<String> = crate::db::raw::fetch_scalar_optional(
+            &pool,
+            "SELECT sha256 FROM downloads WHERE id = $1",
+            |q| q.bind(id),
+        )
+        .await
+        .expect("read row")
+        .unwrap();
+        assert_eq!(
+            sha.as_deref(),
+            Some(measured.as_str()),
+            "settled torrent row must carry the measured digest"
+        );
+        let (content, publisher, drift): (Option<String>, Option<String>, bool) =
+            crate::db::raw::fetch_optional(
+                &pool,
+                "SELECT content_sha256, publisher_sha256, digest_drift FROM zims WHERE name = $1",
+                |q| q.bind("utiny"),
+            )
+            .await
+            .expect("read zims row")
+            .expect("zims row must exist");
+        assert_eq!(
+            content.as_deref(),
+            Some(measured.as_str()),
+            "zims row carries the observed digest"
+        );
+        assert!(
+            publisher.is_none(),
+            "torrent installs record no publisher column (info-hash pinned)"
+        );
+        assert!(!drift, "first observation is never drift");
+
         // Cleanup (shared single-DB suite; articles cascade off zims).
         crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
             .await
@@ -412,6 +556,16 @@ mod tests {
         // no-rename assertion observes a regression to the re-verify path.
         let installed = zims.zim_dir.join("utiny.zim");
         std::fs::copy("tests/fixtures/tiny.zim", &installed).expect("pre-place utiny.zim");
+
+        // Pre-clean (re-runnability): a failed run leaves a live row on the
+        // shared suite DB that would hit the partial unique index.
+        crate::db::raw::execute(
+            &pool,
+            "DELETE FROM downloads WHERE url = 'magnet:?xt=urn:btih:it'",
+            |q| q,
+        )
+        .await
+        .unwrap();
 
         let id: i32 = crate::db::raw::fetch_scalar_optional(
             &pool,
@@ -530,6 +684,16 @@ mod tests {
         // Row A: `complete`, owns <zim_dir>/utiny.zim (the fixture is there).
         let a_file = zims.zim_dir.join("utiny.zim");
         std::fs::copy("tests/fixtures/tiny.zim", &a_file).expect("place A's file");
+        // Pre-clean (re-runnability): a failed run leaves a live row on the
+        // shared suite DB that would hit the partial unique index.
+        crate::db::raw::execute(
+            &pool,
+            "DELETE FROM downloads WHERE name IN ('bugs2-a', 'bugs2-b')",
+            |q| q,
+        )
+        .await
+        .unwrap();
+
         let a_id: i32 = crate::db::raw::fetch_scalar_optional(
             &pool,
             "INSERT INTO downloads (name, url, status, file_path)
