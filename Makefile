@@ -167,13 +167,22 @@ bench:
 # needed direction (POSIX sh + cp only, so it runs on the dev box and in CI
 # alike). 'week0' was captured 2026-09-21 on the dev box against the shared
 # dev DB (dev-database.sh), 10k-row fixture, release build (LTO).
-# Caveat: the baseline is machine/DB-specific — a regression detector for
-# THIS setup, not an absolute performance contract, and deliberately NOT what
-# CI compares against (a different CPU plus loopback Postgres would make
-# every CI run a false "regression"). CI's bench job uploads its own
-# criterion data as an artifact instead (see .github/workflows/bench.yml).
+# Caveat: the baseline is machine/DB-specific — captured on the dev box
+# against the shared dev DB. It is a regression detector for THIS setup, not
+# an absolute performance contract. CI compares against the same committed
+# baseline too (see .github/workflows/bench.yml), but the runner's CPU and
+# loopback Postgres differ from this one, so CI deltas carry a roughly
+# constant hardware offset — read week-over-week drift there, not the
+# absolute delta.
+#
+# Both targets invoke each bench target EXPLICITLY (`--bench retrieval` /
+# `--bench search`), never bare `cargo bench -- ...`: a bare run also selects
+# the lib/bin targets, whose libtest harness rejects criterion's flags
+# ("Unrecognized option") and fails the whole run before any benchmark
+# executes.
 bench-baseline:
-	@DATABASE_URL="$$${DATABASE_URL:-$(DEV_DSN)}" $(CARGO) bench -- --save-baseline week0
+	@DATABASE_URL="$$${DATABASE_URL:-$(DEV_DSN)}" $(CARGO) bench --bench retrieval -- --save-baseline week0
+	@DATABASE_URL="$$${DATABASE_URL:-$(DEV_DSN)}" $(CARGO) bench --bench search -- --save-baseline week0
 	@for d in target/criterion/*/week0; do \
 	  [ -d "$$d" ] || continue; \
 	  g="$${d#target/criterion/}"; \
@@ -185,7 +194,7 @@ bench-baseline:
 # 'week0' baseline (mean/median shift, confidence interval, p-value, noise
 # verdict). First syncs criterion/ into target/criterion/ so it works right
 # after `make clean` without re-measuring; fails loudly if the tracked
-# baseline is absent.
+# baseline is absent. Per-target invocations — see the comment above.
 bench-compare:
 	@ls criterion/*/week0/estimates.json >/dev/null 2>&1 || { \
 	  echo "no tracked baseline in criterion/ — run make bench-baseline first" >&2; exit 1; \
@@ -194,7 +203,8 @@ bench-compare:
 	  g="$${d#criterion/}"; \
 	  mkdir -p "target/criterion/$$g" && cp -r "$$d/." "target/criterion/$$g/"; \
 	done
-	@DATABASE_URL="$$${DATABASE_URL:-$(DEV_DSN)}" $(CARGO) bench -- --baseline week0
+	@DATABASE_URL="$$${DATABASE_URL:-$(DEV_DSN)}" $(CARGO) bench --bench retrieval -- --baseline week0
+	@DATABASE_URL="$$${DATABASE_URL:-$(DEV_DSN)}" $(CARGO) bench --bench search -- --baseline week0
 
 # JS syntax check for the embedded web UI (web/*.js — the pages carry no
 # inline <script> blocks; the `pages_have_no_inline_scripts` Rust unit test

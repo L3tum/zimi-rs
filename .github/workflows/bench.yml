@@ -17,11 +17,18 @@
 # every PR, which is where timing regressions must be caught early.
 #
 # Each run uploads its full criterion data as the `criterion-data` artifact
-# (persistent, per-run versioned record). Deliberately NOT compared against
-# the tracked local baseline (criterion/*/week0/): different CPU plus a
-# loopback Postgres service would make every runner run a false
-# "regression". If a runner-specific baseline is wanted, extract one from
-# an artifact after a manual `workflow_dispatch` run.
+# (persistent, per-run versioned record).
+#
+# Baseline comparison: every run compares each benchmark against the
+# COMMITTED baseline (criterion/<group>/week0/). It was captured on the dev
+# box against the shared dev DB, and the runner differs (CPU + loopback
+# Postgres), so the reported deltas include a roughly CONSTANT hardware
+# offset — read week-over-week DRIFT in the deltas (a sudden extra shift is
+# the signal), not the absolute delta vs the dev box. The comparison is
+# informational: the job still only hard-fails on a vacuous (DB-skip) run.
+# When bench code or the fixture changes, refresh with `make bench-baseline`
+# and commit criterion/ — comparing stale fixture data is worse than no
+# comparison.
 on:
   # Mondays 06:23 UTC (off-peak, not on the round hour).
   schedule:
@@ -46,11 +53,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.0
-      - run: |
+      - name: Run benches against the committed week0 baseline
+        run: |
           set -o pipefail
           out=$(mktemp); trap "rm -f $out" EXIT
+          # Sync the committed baseline (criterion/<group>/week0/) into
+          # criterion's home (target/criterion) — criterion reads baselines
+          # from its home directory, not the repo path. Same sync as
+          # `make bench-compare` (POSIX sh + cp).
+          for d in criterion/*/week0; do
+            g="${d#criterion/}"
+            mkdir -p "target/criterion/$g"
+            cp -r "$d/." "target/criterion/$g/"
+          done
+          # One explicit target per invocation (NOT bare `cargo bench`):
+          # a bare run also selects the lib/bin targets, whose libtest
+          # harness would reject criterion's --baseline flag and fail the
+          # job before any benchmark runs.
+          echo "::notice::comparing against the committed week0 baseline (dev-box capture) — read week-over-week drift in the deltas, not the absolute hardware offset"
           DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
-            cargo bench 2>&1 | tee "$out"
+            cargo bench --bench retrieval -- --baseline week0 2>&1 | tee "$out"
+          DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
+            cargo bench --bench search -- --baseline week0 2>&1 | tee -a "$out"
           # The benches' loud-skip policy (benches/{search,retrieval}.rs)
           # prints `BENCH SKIPPED (<name>): no reachable Postgres` and exits
           # 0 — mirror the `test` job's treatment of a vacuous run: fail
