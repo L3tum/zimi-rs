@@ -159,22 +159,41 @@ test-strict-ci:
 bench:
 	@DATABASE_URL="$$${DATABASE_URL:-$(DEV_DSN)}" $(CARGO) bench
 
-# Named criterion baseline for local regression detection. The data lives in
-# target/criterion/<group>/week0/ — UNTRACKED, wiped by `make clean` and by
-# moving machines; re-save with `make bench-baseline` after any meaningful
-# environment change. 'week0' was captured 2026-09-21 on the dev box against
-# the shared dev DB (dev-database.sh), 10k-row fixture, release build (LTO).
-# Caveat: the baseline is machine/DB-specific — it is a regression detector
-# for THIS setup, not an absolute performance contract (CI's bench job is
-# the trend detector for GitHub runners; see .github/workflows/bench.yml).
+# Named criterion baseline for local regression detection, PERSISTENT: the
+# tracked copy lives in criterion/<group>/week0/ (a mirror of criterion's own
+# layout under target/criterion — 4 JSON files per benchmark, ~36 KB total).
+# Runs always use target/ as criterion's home, so each run's new/+change/
+# +report/ noise stays gitignored; these targets sync the tracked copy in the
+# needed direction (POSIX sh + cp only, so it runs on the dev box and in CI
+# alike). 'week0' was captured 2026-09-21 on the dev box against the shared
+# dev DB (dev-database.sh), 10k-row fixture, release build (LTO).
+# Caveat: the baseline is machine/DB-specific — a regression detector for
+# THIS setup, not an absolute performance contract, and deliberately NOT what
+# CI compares against (a different CPU plus loopback Postgres would make
+# every CI run a false "regression"). CI's bench job uploads its own
+# criterion data as an artifact instead (see .github/workflows/bench.yml).
 bench-baseline:
 	@DATABASE_URL="$$${DATABASE_URL:-$(DEV_DSN)}" $(CARGO) bench -- --save-baseline week0
+	@for d in target/criterion/*/week0; do \
+	  [ -d "$$d" ] || continue; \
+	  g="$${d#target/criterion/}"; \
+	  mkdir -p "criterion/$$g" && cp -r "$$d/." "criterion/$$g/"; \
+	done
+	@echo "week0 refreshed in criterion/ (tracked) — commit it: git add criterion"
 
-# Run the bench suite and report each benchmark's change vs the 'week0'
-# baseline (mean/median shift, confidence interval, p-value, noise verdict).
-# Fails the target only if a benchmark is missing its baseline data — run
-# `make bench-baseline` first if target/ was cleaned.
+# Run the bench suite and report each benchmark's change vs the tracked
+# 'week0' baseline (mean/median shift, confidence interval, p-value, noise
+# verdict). First syncs criterion/ into target/criterion/ so it works right
+# after `make clean` without re-measuring; fails loudly if the tracked
+# baseline is absent.
 bench-compare:
+	@ls criterion/*/week0/estimates.json >/dev/null 2>&1 || { \
+	  echo "no tracked baseline in criterion/ — run make bench-baseline first" >&2; exit 1; \
+	}
+	@for d in criterion/*/week0; do \
+	  g="$${d#criterion/}"; \
+	  mkdir -p "target/criterion/$$g" && cp -r "$$d/." "target/criterion/$$g/"; \
+	done
 	@DATABASE_URL="$$${DATABASE_URL:-$(DEV_DSN)}" $(CARGO) bench -- --baseline week0
 
 # JS syntax check for the embedded web UI (web/*.js — the pages carry no
@@ -279,9 +298,9 @@ help:
 	@echo "  make test-strict-ci    Mirrors the CI test job: strict DB, lib+bins+wiremock+integration"
 	@echo "  make bench            Criterion perf micro-benches (search + retrieval) against the"
 	@echo "                        dev DB (DATABASE_URL, default $(DEV_DSN))"
-	@echo "  make bench-baseline   Re-measure and save the 'week0' criterion baseline (untracked,"
-	@echo "                        target/criterion; wiped by make clean)"
-	@echo "  make bench-compare    Run benches and report per-benchmark change vs the 'week0' baseline"
+	@echo "  make bench-baseline   Re-measure and refresh the tracked 'week0' criterion baseline"
+	@echo "                        (criterion/ in the repo — commit the diff afterwards)"
+	@echo "  make bench-compare    Run benches and report per-benchmark change vs the tracked 'week0' baseline (criterion/)"
 	@echo "  make web-check    JS syntax + CSS syntax check of the embedded web UI (needs node; skips if absent)"
 	@echo "  make web-test     Behavioral unit tests for web UI helpers + page scripts (node --test, jsdom real-DOM harness)"
 	@echo "  make web-fmt      eslint --fix for the web UI (JS half of make fmt; needs npm install; skips if absent)"

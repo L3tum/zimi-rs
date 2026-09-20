@@ -15,6 +15,13 @@
 # blocking would be a policy decision, not a config tweak — and the
 # `trgm_plan` EXPLAIN gate in ci.yml already pins search plan SHAPE on
 # every PR, which is where timing regressions must be caught early.
+#
+# Each run uploads its full criterion data as the `criterion-data` artifact
+# (persistent, per-run versioned record). Deliberately NOT compared against
+# the tracked local baseline (criterion/*/week0/): different CPU plus a
+# loopback Postgres service would make every runner run a false
+# "regression". If a runner-specific baseline is wanted, extract one from
+# an artifact after a manual `workflow_dispatch` run.
 on:
   # Mondays 06:23 UTC (off-peak, not on the round hour).
   schedule:
@@ -53,3 +60,13 @@ jobs:
             echo "::error::bench skipped vacuously — the Postgres service must be reachable for this job"
             exit 1
           fi
+      # `if: always()` so the data is kept even when the run failed (that is
+      # exactly when it is most useful). The artifact is versioned per run;
+      # it is the persistent record the trend comparison is read from.
+      - name: Upload criterion data (persistent per-run record)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-data
+          path: target/criterion
+          if-no-files-found: warn
