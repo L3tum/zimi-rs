@@ -10,9 +10,9 @@ use crate::error::{Error, Result};
 use crate::settings::{
     KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_MODE, KEY_ACCESS_READ_ONLY_TOKEN,
     KEY_ACCESS_REQUIRE_AUTH_FOR_READS, KEY_EMBEDDING_API_KEY, KEY_EMBEDDING_DIMENSION,
-    KEY_EMBEDDING_ENDPOINT, KEY_EMBEDDING_MODEL, KEY_GENERAL_HOST, KEY_GENERAL_PORT,
-    KEY_GENERAL_TRUSTED_PROXY_CIDRS, KEY_GENERAL_ZIM_DIR, KEY_TORRENT_PASSWORD, KEY_TORRENT_URL,
-    KEY_TORRENT_USERNAME,
+    KEY_EMBEDDING_ENDPOINT, KEY_EMBEDDING_MODEL, KEY_GENERAL_CORS_ORIGINS, KEY_GENERAL_HOST,
+    KEY_GENERAL_PORT, KEY_GENERAL_TRUSTED_PROXY_CIDRS, KEY_GENERAL_ZIM_DIR, KEY_TORRENT_PASSWORD,
+    KEY_TORRENT_URL, KEY_TORRENT_USERNAME,
 };
 
 /// Application configuration, loaded from env + compiled-in defaults.
@@ -100,15 +100,16 @@ impl Default for Config {
 /// `env_settings_snapshot` (the in-snapshot keys with non-empty values) derive
 /// from this single table (L5), so the two can't drift.
 ///
-/// The 13 settings-table rows set `policy.env_locked = true` in
+/// The 14 settings-table rows set `policy.env_locked = true` in
 /// `settings::SETTING_DEFS` (static eligibility only); `database.url` is the
 /// documented 1-entry exception — it is process config, not a settings-table
 /// row, so it has no `SETTING_DEFS` row and stays here.
-const ENV_SETTING_KEYS: [(&str, &str, bool); 16] = [
+const ENV_SETTING_KEYS: [(&str, &str, bool); 17] = [
     (KEY_GENERAL_ZIM_DIR, "ZIM_DIR", false),
     (KEY_GENERAL_PORT, "PORT", false),
     (KEY_GENERAL_HOST, "HOST", false),
     (KEY_GENERAL_TRUSTED_PROXY_CIDRS, "TRUSTED_PROXY_CIDRS", true),
+    (KEY_GENERAL_CORS_ORIGINS, "CORS_ORIGINS", true),
     ("database.url", "DATABASE_URL", false),
     (KEY_TORRENT_URL, "QBITTORRENT_URL", false),
     (KEY_TORRENT_USERNAME, "QBITTORRENT_USER", false),
@@ -331,7 +332,7 @@ mod tests {
         // The getter, not the process env, drives the result.
         assert_eq!(locked.len(), 2);
 
-        // env_settings_snapshot returns only the nine reload keys, non-empty only.
+        // env_settings_snapshot returns only the ten reload keys, non-empty only.
         let snap = c.env_settings_snapshot(&get);
         assert!(!snap.contains_key(KEY_ACCESS_MODE));
         assert!(!snap.contains_key(KEY_ACCESS_ADMIN_PASSWORD));

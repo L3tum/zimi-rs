@@ -275,6 +275,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // m6 (2026-09 review): hold the same cross-process DB slot the
+    // integration tests use, so a concurrent `cargo test` against the same
+    // dev DB is serialized against the fixture seed / bulk COPY instead of
+    // interleaving with it. (The NoDb skip above already returned, so the
+    // DB is reachable and the acquire is meaningful.)
+    let _db_slot = zimservice::testing::DbExclusiveGuard::acquire();
     println!(
         "fixture: {} seeded ({} rows, embed_dim={})",
         common::FIXTURE_ZIM,

@@ -13,8 +13,8 @@ use crate::error::{Error, Result};
 /// Numbering is historical: 005 was removed/superseded and is RESERVED/VOID
 /// — never add a `005_*.sql` (it would silently apply before 006). Do NOT
 /// renumber — migrations are tracked by filename + content hash. New
-/// migrations: 015, 016, …
-const MIGRATIONS: &[(&str, &str)] = &[
+/// migrations: 017, 018, …
+pub(crate) const MIGRATIONS: &[(&str, &str)] = &[
     (
         "001_initial.sql",
         include_str!("../../migrations/001_initial.sql"),
@@ -70,6 +70,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "015_zim_content_digest.sql",
         include_str!("../../migrations/015_zim_content_digest.sql"),
+    ),
+    (
+        "016_drop_ivfflat_threshold_setting.sql",
+        include_str!("../../migrations/016_drop_ivfflat_threshold_setting.sql"),
     ),
 ];
 
@@ -397,9 +401,9 @@ mod tests {
             );
         }
 
-        // The full set is exactly 1..=15 minus 5: pins the current migration
-        // set and proves the ONLY missing number in 1..=15 is the reserved 5.
-        let expected: BTreeSet<usize> = (1..=15).filter(|n| *n != 5).collect();
+        // The full set is exactly 1..=16 minus 5: pins the current migration
+        // set and proves the ONLY missing number in 1..=16 is the reserved 5.
+        let expected: BTreeSet<usize> = (1..=16).filter(|n| *n != 5).collect();
         let actual: BTreeSet<usize> = numbers.iter().copied().collect();
         assert_eq!(
             actual.len(),

@@ -93,3 +93,35 @@ ZIMSERVICE_REQUIRE_DB=1 cargo test
 on the local server, so only a superuser can create it. In a reset/provision
 script that recreates the role, use `ALTER ROLE zimservice SUPERUSER;` (or
 `CREATE ROLE zimservice LOGIN SUPERUSER PASSWORD 'zimservice';`).
+
+## Gotcha: trailing whitespace is load-bearing — never bulk-strip it
+
+Several multi-line Rust string literals use the `\` line-continuation form
+with a **trailing space before the backslash** (e.g. `startup.rs`,
+`src/torrent/poller/*.rs`): `"...text \"` — that space is part of the
+continuation's emitted text. A bulk "strip trailing whitespace" pass (editor
+setting, `sed -i 's/ $//'`, formatter) will **silently corrupt** SQL and log
+strings by deleting spaces inside the literal. `cargo fmt` does not touch it
+and eslint does not flag the web side — this is intentional, not sloppiness.
+If a diff removes a space before a `\` continuation, restore it.
+
+## Gates: what must be green before pushing
+
+The CI gate is the contract; the local mirror is `make test-strict-ci`
+(strict DB: `ZIMSERVICE_REQUIRE_DB=1` — a missing Postgres is a hard failure,
+never a vacuous pass) plus the non-DB jobs. **Pre-push policy:
+`make all` (fmt + clippy + `make test`) AND `make test-strict-ci`** — a
+`cargo test` run without a reachable DB passes vacuously by design (loud
+WARNING banner, DB-gated tests skip), so the strict mirror is the gate that
+means something. Web-side: `web/lint` (eslint, `ZIMSERVICE_WEB_CHECK_STRICT=1`)
+and the rustdoc gate (`RUSTDOCFLAGS="-D warnings" cargo doc`) are red on
+intra-doc link breakage and >100-col `max-len` lines in `web/*.js` — both
+have burned a green-local/red-CI merge before; run them, don't skip them.
+
+**Performance gate policy:** CI has no timing ratchet (the `trgm_plan`
+EXPLAIN gate pins plan SHAPE only, and plan-shape gates demonstrably don't
+catch everything — see the retracted 2026-09 perf F1). The weekly non-blocking
+`bench` job (`cargo bench` on the 10k fixture) is the trend detector: a
+sustained regression in its output is a signal to investigate, not an
+automatic block. If a hot path changes, run `cargo bench` locally and compare
+before pushing.

@@ -101,7 +101,7 @@ function routingFetch(routes) {
 // `extra_cat` is a category outside CAT_ORDER.
 const SETTINGS = {
   general: {
-    zim_dir: { value: '/d&ata/zims' },
+    zim_dir: { value: '/d&ata/zims', locked: true, locked_by: 'environment (not runtime)' },
     port: { value: 4567 },
   },
   search: {
@@ -153,19 +153,22 @@ test('load: renders sections in CAT_ORDER with unknown category last', async (t)
   assert.ok(doc.getElementById('zimRows').innerHTML.includes('No ZIMs in the library.'));
 });
 
-test('inputFor: label, desc, restart tag, and text input for zim_dir', async (t) => {
+test('inputFor: zim_dir renders label, desc, disabled text input (no restart tag)', async (t) => {
   const { fetchStub } = routingFetch(settingsRoutes());
   const { doc, close } = loadSettings({ fetch: fetchStub });
   t.after(close);
   await tick();
   const html = doc.getElementById('sections').innerHTML;
   assert.ok(html.includes('<div class="flabel">ZIM directory</div>'));
-  const desc = '<div class="desc">Directory scanned for .zim files (watched for changes)</div>';
+  const desc =
+    '<div class="desc">Directory scanned for .zim files (watched for changes)</div>';
   assert.ok(html.includes(desc));
-  assert.ok(html.includes('⚠ restart'), 'restart tag for general.zim_dir');
+  assert.ok(html.includes('🔒 environment (not runtime)'), 'env-lock tag for config_only');
+  assert.ok(!html.includes('⚠ restart'), 'no restart tag remains');
   assert.ok(html.includes('data-field="general.zim_dir"'));
   const inp = doc.querySelector('[data-key="general.zim_dir"]');
   assert.equal(inp.type, 'text');
+  assert.ok(inp.disabled, 'config_only field renders disabled');
 });
 
 test('inputFor: numeric values → number input (float gets step="any")', async (t) => {

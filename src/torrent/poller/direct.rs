@@ -246,6 +246,17 @@ async fn fresh_fallback(
     Ok(FileStream::Fresh(f, resp2.content_length(), resp2))
 }
 
+/// In-loop progress-update window: a `downloads` row gets its
+/// `progress`/`download_speed` refreshed at most once per this interval
+/// (less DB churn, the speed sample covers this window).
+const PROGRESS_WINDOW: Duration = Duration::from_secs(2);
+
+/// In-loop cancel-check window: `stream_part` re-reads the `downloads`
+/// row at most once per this interval to detect a mid-stream CANCEL / error
+/// (the test `stream_part_cancel_mid_stream_removes_part_no_error` derives
+/// its body-hold delay from this — keep them coupled).
+const CANCEL_CHECK_WINDOW: Duration = Duration::from_secs(5);
+
 /// Stream an in-flight HTTP body into `part`, with Range resume support
 /// (PERF-11). `resp` is the terminal (non-redirect) response of the manual
 /// redirect chain and `url`/`client` the pinned final hop that produced it
@@ -268,9 +279,9 @@ async fn fresh_fallback(
 /// - Anything else → `mark_error` + `Err`.
 ///
 /// In-loop: over-cap check (against `received`, which includes the resumed
-/// prefix), 2 s progress updates, ~5 s cancel check — a CANCEL removes the
-/// staged `.part` there (see [`observe_cancel`]) so the post-loop guard can
-/// not strand it.
+/// prefix), `PROGRESS_WINDOW` progress updates, `CANCEL_CHECK_WINDOW` cancel
+/// check — a CANCEL removes the staged `.part` there (see [`observe_cancel`])
+/// so the post-loop guard can not strand it.
 /// Post-loop: truncation guard — a declared total that was not fully
 /// received means the body was cut short (skipped for a row observed
 /// `cancelled` mid-stream: the file is already gone and the row must not be
@@ -385,7 +396,7 @@ async fn stream_part(
         received += chunk_bytes;
         window_bytes += chunk_bytes;
 
-        if window_start.elapsed() >= Duration::from_secs(2) {
+        if window_start.elapsed() >= PROGRESS_WINDOW {
             let pct = match total {
                 // u64 → f64 has no `From` impl (lossless widening; `as`).
                 Some(t) if t > 0 => (received as f64 / t as f64).min(1.0) as f32,
@@ -398,11 +409,12 @@ async fn stream_part(
             crate::db::downloads_lifecycle::refresh_progress(db, id, pct, speed).await?;
         }
 
-        // Periodic cancel check (every ~5 s): if the row is no longer
+        // Periodic cancel check (every `CANCEL_CHECK_WINDOW`): if the row is
+        // no longer
         // 'downloading' (cancelled, errored, etc.), abort the stream. A
         // CANCEL removes the staged `.part` inside `observe_cancel` (a plain
         // break would leave it behind — see that fn).
-        if last_cancel_check.elapsed() >= Duration::from_secs(5) {
+        if last_cancel_check.elapsed() >= CANCEL_CHECK_WINDOW {
             last_cancel_check = Instant::now();
             if let Some(status) = observe_cancel(db, id, part).await {
                 tracing::info!("direct download {id} aborted: status changed to '{status}'");
@@ -1254,7 +1266,8 @@ mod tests {
         let id: i32 = crate::db::raw::fetch_scalar_optional(
             &pool,
             "INSERT INTO downloads (name, url, status, sha256)
-                 VALUES ('udigest', 'http://example.net/udigest.zim', 'downloading', $1) RETURNING id",
+                 VALUES ('udigest', 'http://example.net/udigest.zim',
+                     'downloading', $1) RETURNING id",
             |q| q.bind(&claim),
         )
         .await
@@ -1411,7 +1424,8 @@ mod tests {
         let id: i32 = crate::db::raw::fetch_scalar_optional(
             &pool,
             "INSERT INTO downloads (name, url, status)
-                 VALUES ('uclaimless', 'http://example.net/uclaimless.zim', 'downloading') RETURNING id",
+                 VALUES ('uclaimless', 'http://example.net/uclaimless.zim',
+                     'downloading') RETURNING id",
             |q| q,
         )
         .await
@@ -1532,7 +1546,9 @@ mod tests {
         // shared suite DB that would hit the partial unique index.
         crate::db::raw::execute(
             &pool,
-            "DELETE FROM downloads WHERE name IN ('udrift', 'udrift2', 'udrift3', 'udrift4', 'udrift-old', 'udrift-legacy')",
+            "DELETE FROM downloads WHERE name IN
+                 ('udrift', 'udrift2', 'udrift3', 'udrift4', 'udrift-old',
+                     'udrift-legacy')",
             |q| q,
         )
         .await
@@ -1554,10 +1570,14 @@ mod tests {
 
         // One finalize per scenario (same bytes throughout — the identity,
         // not the bytes, is what the table varies):
-        let case_a = finalize_fixture_case(&pool, &zims, tmp.path(), "udrift", &d1).await; // same URL as the seeded old row
-        let case_b = finalize_fixture_case(&pool, &zims, tmp.path(), "udrift2", &d1).await; // new identity
-        let case_c = finalize_fixture_case(&pool, &zims, tmp.path(), "udrift3", &d1).await; // same URL as the NULL-legacy row
-        let case_d = finalize_fixture_case(&pool, &zims, tmp.path(), "udrift4", &d1).await; // first observation
+        // same URL as the seeded old row:
+        let case_a = finalize_fixture_case(&pool, &zims, tmp.path(), "udrift", &d1).await;
+        // new identity:
+        let case_b = finalize_fixture_case(&pool, &zims, tmp.path(), "udrift2", &d1).await;
+        // same URL as the NULL-legacy row:
+        let case_c = finalize_fixture_case(&pool, &zims, tmp.path(), "udrift3", &d1).await;
+        // first observation:
+        let case_d = finalize_fixture_case(&pool, &zims, tmp.path(), "udrift4", &d1).await;
 
         // Same identity, new digest → FLAGGED (not rejected: the row is
         // complete, the file installed, the verified publisher recorded).
@@ -2639,7 +2659,11 @@ mod tests {
             .expect("migrations");
 
         // Headers now, `SENT` body bytes after `BODY_DELAY_SECS`, then close.
-        const BODY_DELAY_SECS: u64 = 7;
+        // Derived from `CANCEL_CHECK_WINDOW`: the first chunk must arrive
+        // AFTER the in-loop cancel check has run (the row flips 2 s in), so
+        // the delay is window + 2 s — a production window change moves the
+        // test with it instead of silently passing.
+        const BODY_DELAY_SECS: u64 = super::CANCEL_CHECK_WINDOW.as_secs() + 2;
         const DECLARED: u64 = 1000;
         const SENT: usize = 64;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2689,7 +2713,7 @@ mod tests {
 
         // The cancel lands 2 s in: the request has been in flight since
         // t≈0, the first chunk (hence the in-loop cancel check) arrives at
-        // t≈7 s — well past the 5 s window and well after the flip.
+        // t≈`BODY_DELAY_SECS` — past `CANCEL_CHECK_WINDOW` and after the flip.
         let flip_pool = pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;

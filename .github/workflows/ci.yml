@@ -183,12 +183,51 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
   # Docker image build gate: catch the toolchain (H1) and build-context
-  # (H2) regressions that only surface during an actual image build.
+  # (H2) regressions that only surface during an actual image build, plus
+  # (m3, 2026-09 review) an e2e run of the built image: boot it against a
+  # real Postgres and require `/health` to go green — the build-only job
+  # could not catch a runtime regression (env wiring, migration failure,
+  # bind/auth startup refusal) that compiles fine.
   docker:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
+        env:
+          POSTGRES_USER: zimservice
+          POSTGRES_PASSWORD: zimservice
+          POSTGRES_DB: zimservice
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U zimservice"
+          --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t zimservice:ci .
+      # e2e: `--network host` lets the container reach the `postgres`
+      # service hostname the runner resolves (a default-bridge container
+      # could not). `HOST=0.0.0.0` + `ACCESS_MODE=password` is the only
+      # startup combination allowed on a non-loopback bind (open mode is
+      # refused at boot — the Threat model); `/health` stays open, which is
+      # what we poll. `ZIMSERVICE_REQUIRE_DB=1` turns a misrouted
+      # DATABASE_URL into a hard boot failure instead of a limp serve.
+      - run: |
+          docker run -d --name zimservice-e2e --network host \
+            -e DATABASE_URL=postgres://zimservice:zimservice@postgres:5432/zimservice \
+            -e ZIMSERVICE_REQUIRE_DB=1 \
+            -e HOST=0.0.0.0 \
+            -e ACCESS_MODE=password \
+            -e AUTH_PASSWORD=e2e-ci-password \
+            zimservice:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8899/health >/dev/null 2>&1; then
+              echo "e2e: /health is green"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs zimservice-e2e
+          exit 1
   # Cross-platform smoke: the crate builds and its DB-less unit tests pass on
   # macOS and Windows (DB-gated tests skip — no Postgres service here). Catches
   # platform-specific compile/link issues a Linux-only CI would miss.

@@ -72,6 +72,17 @@ impl EmbedConfig {
     }
 }
 
+/// Max bytes of a single embeddings response body (the wire budget for
+/// `resp` in `EmbedClient::embed`). Every other external read in this crate
+/// is size-capped (256 KB article reads, 64 MB downloads, 10 MiB OPDS, 1 MB
+/// MCP); the embeddings response was the one unbounded `.json()`. A
+/// well-formed response is `batch_size × dimension × ~12` JSON bytes
+/// (default 64 × 768 ≈ 600 KB; the max dimension 4096 × max batch 64 ≈ 3.2
+/// MiB), so 16 MiB bounds the honest case by ~5× while still catching a
+/// rogue endpoint (the operator-configured, DNS-pinned target of this
+/// client) serving a pathological payload.
+const MAX_EMBED_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// OpenAI-compatible embeddings client.
 #[derive(Clone)]
 pub struct EmbedClient {
@@ -139,13 +150,35 @@ impl EmbedClient {
                 req = req.bearer_auth(&self.config.api_key);
             }
 
-            let resp: EmbedResponse = req
-                .send()
-                .await
-                .map_err(Error::Http)?
-                .json()
-                .await
-                .map_err(Error::Http)?;
+            let resp: EmbedResponse = {
+                let resp = req.send().await.map_err(Error::Http)?;
+                // Non-2xx → `Error::Http` carrying the status (the pre-cap
+                // `.json()` behaved this way via reqwest's decode path).
+                let resp = resp.error_for_status().map_err(Error::Http)?;
+                // Size budget: a `Content-Length` over the cap is rejected
+                // before reading (the common case — providers send it);
+                // the post-read check below covers chunked/lying bodies.
+                let over_cl = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .is_some_and(|cl| cl > MAX_EMBED_RESPONSE_BYTES);
+                if over_cl {
+                    return Err(Error::Embedding(format!(
+                        "embedding endpoint response exceeds the {MAX_EMBED_RESPONSE_BYTES}-byte \
+                         body budget (Content-Length)"
+                    )));
+                }
+                let body = resp.bytes().await.map_err(Error::Http)?;
+                if (body.len() as u64) > MAX_EMBED_RESPONSE_BYTES {
+                    return Err(Error::Embedding(format!(
+                        "embedding endpoint response is {} bytes (budget {MAX_EMBED_RESPONSE_BYTES})",
+                        body.len()
+                    )));
+                }
+                serde_json::from_slice(&body)?
+            };
 
             // Sort by index to maintain order
             let mut data = resp.data;
@@ -301,6 +334,118 @@ mod tests {
     }
 
     // ── check_embed_indices ─────────────────────────────────────────────────
+
+    /// A config pointed at a local (loopback-allowed) endpoint with the
+    /// smallest honest shape.
+    fn budget_config(endpoint: &str) -> EmbedConfig {
+        EmbedConfig {
+            endpoint: endpoint.into(),
+            api_key: String::new(),
+            model: EMBED_DEFAULT_MODEL.into(),
+            dimension: 2,
+            batch_size: 1,
+            max_concurrency: 1,
+            timeout_secs: 5,
+        }
+    }
+
+    // ── response-size budget (P1: the one unbounded `.json()`) ────────
+
+    #[tokio::test]
+    async fn embed_rejects_oversized_response_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // Just over the 16 MiB budget (560k entries × ~30 JSON bytes).
+        let big = format!(
+            "{{\"data\":[{}]}}",
+            vec!["{\"index\":0,\"embedding\":[0.0]}"; 560_000].join(",")
+        );
+        assert!((big.len() as u64) > MAX_EMBED_RESPONSE_BYTES);
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(big, "application/json"))
+            .mount(&server)
+            .await;
+        let client = EmbedClient::new(budget_config(&server.uri()), None).unwrap();
+        let err = client.embed(&["x".into()]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("budget"),
+            "oversized body must be rejected as a size-budget error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn embed_rejects_oversized_chunked_response() {
+        // Chunked (no `Content-Length`): the pre-read gate cannot see the
+        // size, so the post-read byte check is the only gate. wiremock 0.6
+        // always serves a `Full` body with `Content-Length`, so this speaks
+        // hand-rolled chunked HTTP over raw TCP (the idiom
+        // `stream_part_cancel_mid_stream_removes_part_no_error` uses for
+        // wiremock-inexpressible behavior).
+        let body = format!(
+            "{{\"data\":[{}]}}",
+            vec!["{\"index\":0,\"embedding\":[0.0]}"; 560_000].join(",")
+        );
+        assert!((body.len() as u64) > MAX_EMBED_RESPONSE_BYTES);
+        // One chunk frame: `<hex len>\r\n<body>\r\n0\r\n\r\n`.
+        let frame = format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            // Read the request head (everything up to the blank line).
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).await.expect("read head");
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = sock
+                .write_all(
+                    // Byte-exact response head (single literal: adjacent
+                    // literals do not concatenate across lines).
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await;
+            let _ = sock.write_all(frame.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        let client = EmbedClient::new(budget_config(&format!("http://{addr}/v1")), None).unwrap();
+        let err = client.embed(&["x".into()]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("budget"),
+            "oversized chunked body must be rejected by the post-read check: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn embed_accepts_sized_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "index": 0, "embedding": [0.1, 0.2] }]
+            })))
+            .mount(&server)
+            .await;
+        let client = EmbedClient::new(budget_config(&server.uri()), None).unwrap();
+        let vecs = client.embed(&["x".into()]).await.unwrap();
+        assert_eq!(vecs, vec![vec![0.1, 0.2]]);
+    }
 
     fn embed_data(indices: &[usize]) -> Vec<EmbedData> {
         indices

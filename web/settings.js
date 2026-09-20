@@ -10,30 +10,27 @@ const ZIM_FLASH_DURATION_MS = 1600;
 const ANCHOR_FLASH_DELAY_MS = 60;
 
 // Field metadata: label, description, input type. `int`/`float`/`password`/
-// `select` default to text. `restart` marks settings read only at startup.
+// `select` default to text. `config_only` settings render disabled with a 🔒
+// "environment (not runtime)" tag (the server marks them `locked`).
 const FIELDS = {
   'general.zim_dir': {
     label: 'ZIM directory',
     desc: 'Directory scanned for .zim files (watched for changes)',
-    restart: true,
   },
-  'general.host': { label: 'Bind host', restart: true },
-  'general.port': { label: 'Port', type: 'int', restart: true },
+  'general.host': { label: 'Bind host' },
+  'general.port': { label: 'Port', type: 'int' },
   'general.log_level': {
     label: 'Log level',
     type: 'select',
     options: ['trace', 'debug', 'info', 'warn', 'error'],
-    restart: true,
   },
   'general.cors_origins': {
     label: 'CORS origins',
     desc: 'Comma-separated allowed origins (applied at startup)',
-    restart: true,
   },
   'general.trusted_proxy_cidrs': {
     label: 'Trusted proxy CIDRs',
     desc: 'Comma-separated reverse-proxy source CIDRs (applied at startup)',
-    restart: true,
   },
 
   'downloads.max_bytes': {
@@ -138,12 +135,7 @@ const FIELDS = {
   'embedding.batch_size':       { label: 'Batch size', type: 'int' },
   'embedding.hnsw_threshold': {
     label: 'HNSW below (rows)',
-    desc: 'Use HNSW index when row count is below this',
-    type: 'int',
-  },
-  'embedding.ivfflat_threshold': {
-    label: 'IVFFlat above (rows)',
-    desc: 'Use IVFFlat index above this (less RAM)',
+    desc: 'Use HNSW index when row count is below this (IVFFlat above)',
     type: 'int',
   },
   'embedding.max_concurrency': {
@@ -262,9 +254,6 @@ function render() {
         const title = `Set via ${esc(info.locked_by || 'environment variable')}`;
         tags.push(`<span class="tag lock" title="${title}">🔒 ${esc(lockedBy)}</span>`);
       }
-      const restartTag = '<span class="tag restart"'
-        + ' title="Read at startup — restart zimservice to apply">⚠ restart</span>';
-      if (meta.restart) tags.push(restartTag);
       return `<div class="field" data-field="${esc(fullKey)}">
         <div>
           <div class="flabel">${esc(meta.label || key)}</div>

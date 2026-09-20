@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::content::{
     chunk_text, clamp_chunk_params, find_entry, read_article_payload, read_zim_text,
-    ChunksResponse, ReadResponse,
+    ChunksResponse, ReadResponse, DEFAULT_READ_MAX_LENGTH,
 };
 use crate::serve::openapi::ErrorResponse;
 use crate::AppState;
@@ -83,9 +83,10 @@ pub async fn read_article(
     State(state): State<AppState>,
     Query(params): Query<ReadQuery>,
 ) -> Result<Json<ReadResponse>, crate::error::Error> {
-    // The 8000-char default is intentionally uncapped client-side (callers may
-    // request more for RAG); the underlying raw read is already bounded at 256 KB.
-    let max_len = params.max_length.unwrap_or(8000);
+    // The 8000-char default is intentionally uncapped client-side (callers
+    // may request more for RAG); the underlying raw read is already bounded
+    // at 256 KB (see `DEFAULT_READ_MAX_LENGTH` / `clamp_read_max_length`).
+    let max_len = params.max_length.unwrap_or(DEFAULT_READ_MAX_LENGTH);
     let payload = read_article_payload(&state, &params.zim, &params.path, max_len).await?;
     Ok(Json(payload))
 }

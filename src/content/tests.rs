@@ -174,6 +174,29 @@ fn truncate_preview_zero_max_len() {
     assert_eq!(content.chars().count(), 1);
 }
 
+#[test]
+fn default_read_max_length_caps_a_long_article() {
+    // P2 (2026-09 review): pin the `/read` default intent — 8000 chars is a
+    // client convenience, not a ceiling: a larger client-requested cap is
+    // allowed up to the 256 KB raw-read bound.
+    let text = "x".repeat(DEFAULT_READ_MAX_LENGTH + 100);
+    let (content, full_len) = truncate_preview(&text, DEFAULT_READ_MAX_LENGTH);
+    assert_eq!(full_len, DEFAULT_READ_MAX_LENGTH + 100);
+    assert_eq!(
+        content.chars().count(),
+        DEFAULT_READ_MAX_LENGTH + 1, // `…` suffix when cut
+    );
+    assert!(content.ends_with('…'));
+    // The default is a convenience, not a ceiling: a larger client-requested
+    // cap is honored as long as it stays under the raw-read bound…
+    assert_eq!(
+        clamp_read_max_length(DEFAULT_READ_MAX_LENGTH * 10),
+        DEFAULT_READ_MAX_LENGTH * 10
+    );
+    // …and is clamped to the 256 KB bound above it.
+    assert_eq!(clamp_read_max_length(MAX_READ_BYTES * 2), MAX_READ_BYTES);
+}
+
 // ── Raw-read cap + lossy decode (BUG-11 / BUG-12) ────────────────────────
 
 #[test]

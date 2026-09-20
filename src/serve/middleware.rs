@@ -7,7 +7,7 @@
 //! in constant time; a token verifies as **Full** against the admin password
 //! or, failing that, as **ReadOnly** against the optional
 //! `access.read_only_token` (2026-09-18 review — read-only tokens grant only
-//! the RAG-read allowlist, [`read_only_allowed`]); `sanitize_uri_for_logs`
+//! the RAG-read allowlist, `read_only_allowed`); `sanitize_uri_for_logs`
 //! strips the token so it never lands in logs; `rate_limit` enforces the
 //! global token-bucket limiter from `crate::access::ratelimit` (exempting
 //! the `/health` probe). The policy objects themselves — the limiter, the

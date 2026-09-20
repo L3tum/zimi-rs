@@ -63,10 +63,23 @@ function renderZims() {
     // the tooltip), a "publisher verified" badge when the source declared a
     // claim and it matched, and a drift warning when the same identity
     // served different bytes at a later install (flag, not rejection).
-    const integrityBadges =
-      `${z.content_sha256 ? `<span class="badge" title="content SHA-256: ${esc(z.content_sha256)}">sha ${esc(z.content_sha256.slice(0, 12))}…</span>` : ''}`
-      + ` ${z.publisher_sha256 ? '<span class="badge badge-green" title="publisher-declared SHA-256 verified against the installed bytes">publisher verified</span>' : ''}`
-      + ` ${z.digest_drift ? '<span class="badge badge-warn" title="same source served different bytes at a later install — inspect before relying on this ZIM">digest drift</span>' : ''}`;
+    const shaBadge = z.content_sha256
+      ? `<span class="badge" title="content SHA-256: ${esc(z.content_sha256)}">`
+        + `sha ${esc(z.content_sha256.slice(0, 12))}…</span>`
+      : '';
+    const verifiedBadge = z.publisher_sha256
+      ? '<span class="badge badge-green" '
+        + 'title="publisher-declared SHA-256 verified against '
+        + 'the installed bytes">'
+        + 'publisher verified</span>'
+      : '';
+    const driftBadge = z.digest_drift
+      ? '<span class="badge badge-warn" '
+        + 'title="same source served different bytes at a later install — '
+        + 'inspect before relying on this ZIM">'
+        + 'digest drift</span>'
+      : '';
+    const integrityBadges = `${shaBadge} ${verifiedBadge} ${driftBadge}`;
     const embedBadge = z.embed_enabled
       ? '<span class="badge badge-green">embedding on</span>'
       : '';

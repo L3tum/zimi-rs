@@ -4,10 +4,7 @@
 use crate::db::pool::Pool;
 use crate::db::raw;
 use crate::error::Result;
-use crate::settings::{
-    SettingsCache, EMBED_DEFAULT_HNSW_THRESHOLD, EMBED_DEFAULT_IVFFLAT_THRESHOLD,
-    KEY_EMBEDDING_HNSW_THRESHOLD, KEY_EMBEDDING_IVFFLAT_THRESHOLD,
-};
+use crate::settings::{SettingsCache, EMBED_DEFAULT_HNSW_THRESHOLD, KEY_EMBEDDING_HNSW_THRESHOLD};
 
 use crate::embed::auto_loop::build_probe_within_backoff;
 
@@ -68,10 +65,8 @@ pub(crate) fn classify_index_state(valid: bool, invalid: bool) -> VectorIndexSta
 
 /// Pure `idx_articles_embedding` build-statement selection: HNSW below
 /// `hnsw_threshold`, IVFFlat at/above (with `lists = √count`, floored at
-/// 100). This is the *only* threshold that chooses an index kind — the
-/// separate `embedding.ivfflat_threshold` merely documents that IVFFlat is
-/// preferred over HNSW at/above it; it never suppresses a build (there is
-/// no seq-scan fallback above it).
+/// 100). This is the *only* threshold that chooses an index kind — there is
+/// no seq-scan fallback at any scale.
 pub(crate) fn index_build_sql(count: i64, hnsw_threshold: i64) -> String {
     if count < hnsw_threshold {
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_articles_embedding ON articles USING hnsw \
@@ -216,11 +211,9 @@ pub(crate) async fn index_build_worth_probing(pool: &Pool) -> bool {
 /// refused) before the fresh build.
 ///
 /// The index *kind* is threshold-driven (`index_build_sql`): HNSW below
-/// `embedding.hnsw_threshold`, IVFFlat at/above it. `embedding.ivfflat_threshold`
-/// only documents that IVFFlat is preferred over HNSW at/above it — a build
-/// is **always** attempted once the row-count and catalog gates pass
-/// (including at/above the IVFFlat threshold); there is no seq-scan
-/// fallback at any scale.
+/// `embedding.hnsw_threshold`, IVFFlat at/above it. A build is **always**
+/// attempted once the row-count and catalog gates pass — there is no
+/// seq-scan fallback at any scale.
 ///
 /// While the build itself runs (the pre-build invalid-index drop and the
 /// `CREATE INDEX CONCURRENTLY`), the shared in-flight flag (`AppState`
@@ -312,19 +305,10 @@ pub async fn maybe_build_vector_index(
     let hnsw_threshold = settings
         .get_typed(KEY_EMBEDDING_HNSW_THRESHOLD)
         .unwrap_or(EMBED_DEFAULT_HNSW_THRESHOLD);
-    let ivfflat_threshold = settings
-        .get_typed(KEY_EMBEDDING_IVFFLAT_THRESHOLD)
-        .unwrap_or(EMBED_DEFAULT_IVFFLAT_THRESHOLD);
     // Strategy is pure and threshold-driven (`index_build_sql`): IVFFlat is
-    // preferred over HNSW at/above the IVFFlat threshold — the index is
-    // still built; a brute-force seq scan is never the fallback.
+    // chosen over HNSW at/above the threshold — the index is still built;
+    // a brute-force seq scan is never the fallback.
     let sql = index_build_sql(count, hnsw_threshold);
-    if count >= ivfflat_threshold {
-        tracing::info!(
-            "{count} vectors ≥ IVFFlat threshold — building an IVFFlat index \
-             (preferred over HNSW at this scale; no seq-scan fallback)"
-        );
-    }
     tracing::info!("building vector index CONCURRENTLY for {count} vectors");
     // CONCURRENTLY must not run inside an explicit transaction; a fresh
     // pooled connection is in autocommit, so this is safe.
@@ -413,11 +397,13 @@ mod tests {
     }
 
     #[test]
-    fn index_build_sql_never_skips_above_the_ivfflat_threshold() {
-        // Regression: the old code built *no* index above
-        // `embedding.ivfflat_threshold` (10M), degrading vector search to a
-        // sequential scan. The threshold only picks the kind (IVFFlat), it
-        // never suppresses the build. √10_000_000 ≈ 3162.27 → 3162.
+    fn index_build_sql_never_skips_above_the_hnsw_threshold() {
+        // Regression: an earlier code revision read the (now-deleted,
+        // migration-016-removed) `embedding.ivfflat_threshold` and built
+        // *no* index above it, degrading vector search to a sequential scan.
+        // The strategy threshold (`embedding.hnsw_threshold`) only picks the
+        // kind (IVFFlat), it never suppresses the build. √10_000_000 ≈
+        // 3162.27 → 3162.
         let sql = index_build_sql(10_000_000, 1_000_000);
         assert!(
             sql.contains("USING ivfflat"),

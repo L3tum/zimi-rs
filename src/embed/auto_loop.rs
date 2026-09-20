@@ -274,7 +274,7 @@ pub async fn auto_embed_loop(state: Arc<crate::AppState>, tick: Duration) {
 mod tests {
     use super::*;
     use crate::settings::{
-        SettingsCache, EMBED_DEFAULT_IVFFLAT_THRESHOLD, KEY_EMBEDDING_DIMENSION,
+        SettingsCache, EMBED_DEFAULT_HNSW_THRESHOLD, KEY_EMBEDDING_DIMENSION,
         KEY_EMBEDDING_ENDPOINT, KEY_EMBEDDING_MODEL, KEY_EMBEDDING_TIMEOUT_SECS,
     };
 
@@ -920,10 +920,10 @@ mod tests {
         // (fresh AtomicU64::new(0)) so this test's tick can spawn the build
         // regardless of earlier tests' probes.
 
-        // At/above the IVFFlat threshold the loop *would* build an IVFFlat
-        // index (lists = √count, the documented kind preference) — but that
-        // is expensive against a dev DB that already holds millions of
-        // vectors, so this test only makes sense on a small DB.
+        // At/above the HNSW threshold the loop *would* build an IVFFlat
+        // index (the `index_build_sql` kind choice) — but that is expensive
+        // against a dev DB that already holds millions of vectors, so this
+        // test only makes sense on a small DB.
         let preexisting: i64 = raw::fetch_scalar_optional(
             &pool,
             "SELECT count(*) FROM articles WHERE embedding IS NOT NULL",
@@ -932,7 +932,7 @@ mod tests {
         .await
         .expect("embedded count")
         .expect("row present");
-        if preexisting + 10_000 >= EMBED_DEFAULT_IVFFLAT_THRESHOLD {
+        if preexisting + 10_000 >= EMBED_DEFAULT_HNSW_THRESHOLD {
             eprintln!(
                 "skipping: dev DB already holds {preexisting} vectors (an IVFFlat build at \
                  this scale would be expensive)"

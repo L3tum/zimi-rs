@@ -27,11 +27,13 @@ hardlink-based file sharing, an OpenAI-compatible embedding pipeline, and an MCP
   startup resync (a DELETE/INSERT cycle on `zims`) can never interleave between
   two starting instances.
 
-- **`src/state.rs`** — `AppState`: the 11-field shared state passed to every
-  axum handler (db pool, settings, ZIM manager, search engine, qBittorrent
-  cache, rate limiter, probes, lockout, degradation, vector-index build
-  probe, index-building flag); sub-state regrouping is re-evaluated on every
-  field change (documented active trigger) and kept flat.
+- **`src/state.rs`** — `AppState`: the 14-field shared state passed to every
+  axum handler (primary db pool, optional read-replica pool, background db
+  pool, settings, ZIM manager, search engine, qBittorrent cache, rate
+  limiter, probes, lockout, degradation, vector-index build probe,
+  index-building flag, PG-notify listener); sub-state regrouping is
+  re-evaluated on every field change (documented active trigger) and kept
+  flat.
 
 - **`src/db/`** — the persistence layer: `pool.rs` (the shared
   `sqlx::PgPool`, TLS mode from the DSN, 10 s acquire timeout), `migrate.rs`
@@ -207,19 +209,35 @@ against another database's article set.
 
 ## Persistence layer
 
-Postgres through a single shared `sqlx::PgPool` (`src/db/pool.rs`; default 20
-connections, 10 s acquire timeout, TLS mode derived from the DSN's `sslmode`
-or `+tls` scheme). All subsystems — HTTP API, poller, embedding, index COPY —
-share this one pool. The single pool is therefore a shared, contended resource:
-a large reindex (`COPY`) can hold connections long enough that search/HTTP
-requests time out acquiring a connection and surface as 503 (the 10 s acquire
-timeout is a fast 503 by design, mapped in `src/error.rs`). This is a
-deliberate, bounded trade-off — the 20-connection ceiling bounds the blast
-radius rather than isolating the indexer from serving traffic.
+Postgres through three `sqlx::PgPool` pools (`src/db/pool.rs`; each with the
+10 s acquire timeout and TLS mode derived from its DSN's `sslmode` / `+tls`
+scheme):
+
+- the **primary** pool (default 20 connections): authoritative for all
+  writes and DDL, and the pool every read path uses when no read replica is
+  configured;
+- an **optional read-replica** pool (from `DATABASE_URL_READ`): foreground
+  READ checkouts (search arms, `suggest`, the `ensure_trgm` slow path,
+  `/snippet`, `/random`, the article-read DB fallback, the `/health` db
+  probe) use it via `AppState::db_read_or_primary`; when the replica is
+  unreachable those paths fail (503) rather than failing over silently —
+  `/diagnostic` (`pool_read`) is the operator's pre-503 signal, and
+  unsetting the env var reverts to the single-pool default;
+- a dedicated **background** pool on the primary URL, capped at 4
+  connections (`db_bg`, PERF-10): the auto-embed loop and the vector-index
+  builds check out from here, never from the primary pool, so a background
+  burst can never starve foreground search/API checkouts.
+
+The one writer that still shares the primary pool is the reindex `COPY`:
+the seam to route it through `db_bg` exists, and the documented trigger to
+act is observed reindex-related 503s (checkout waits are instrumented in
+`/diagnostic`). The 20-connection ceiling plus the 10 s acquire timeout (a
+fast 503 by design, mapped in `src/error.rs`) bound the blast radius in the
+meantime.
 
 **Pure sqlx.** Application-table queries go through the `db::raw` helpers
-(`src/db/mod.rs`) against the shared pool — no ORM, no extra connections, the
-same pool and TLS mode as everything else. The helper shapes (`execute`,
+(`src/db/mod.rs`) against the pool (or transaction) they are given — no ORM,
+no extra connections, the same TLS mode as everything else. The helper shapes (`execute`,
 `fetch_optional`, `fetch_all`, `fetch_scalar_optional`, `fetch_scalar_all`)
 take a plain SQL string, a `|q| q.bind(a).bind(b)` bind closure, and an
 executor (`&pool`, `&mut conn`, or `&mut *tx` for transactions). Postgres-
@@ -241,7 +259,7 @@ pg_trgm `similarity()`, pgvector distance operators, and `$n::vector` /
 `::tsvector` casts. The SQLSTATE/HTTP mapping in `Error` redacts DB details;
 23505 unique-violations are domain duplicates (409), not DB faults (503).
 
-**Migrations.** Numbered `.sql` files in `migrations/` (001–013; 005 is a
+**Migrations.** Numbered `.sql` files in `migrations/` (001–016; 005 is a
 void/retired number, never reused) are embedded
 with `include_str!` and applied by `src/db/migrate.rs` at **every** startup,
 in every subcommand mode: tracked in `schema_migrations` by filename + content

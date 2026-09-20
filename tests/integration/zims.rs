@@ -25,9 +25,10 @@ async fn mcp_tools_db_backed() {
     };
     run_migrations(&pool).await.expect("migrations");
 
-    // Dedicated fixture ZIM so this test's inserts/deletes can't collide with
-    // `smoke_search_suggest_random_on_seed`'s `__itest__` rows (suite runs
-    // single-threaded, but the fixtures must still be disjoint). The ZIM is a
+    // Dedicated fixture ZIM so this test's inserts/deletes can't collide
+    // with `smoke_search_suggest_random_on_seed`'s `__itest__` rows (the
+    // suite runs with the default parallel `--test-threads` — disjoint
+    // fixtures, not a thread pin, keep parallel runs safe). The ZIM is a
     // copy of the committed `tiny.zim` under a temp dir: `resync` populates
     // the in-memory cache + zims row, so the ZIM-first read tools (`read`,
     // `get_chunks`, `deep_search` auto-read) hit a REAL readable archive.

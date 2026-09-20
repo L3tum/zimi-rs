@@ -67,3 +67,99 @@ pub mod zim;
 pub use health::{DegradationTracker, HealthProbes};
 pub use state::AppState;
 pub use util::redact_url;
+
+/// `docs/ARCHITECTURE.md` freshness tripwires (2026-09 review, Arch Major-1):
+/// three independent facts drifted silently in the doc (AppState field count,
+/// pool topology, migration range). These two machine-checkable facts get a
+/// cheap include_str! guard — the pool-topology prose stays a review item.
+#[cfg(test)]
+// LINT-3 (doc-freshness tripwires): a stale doc must fail the suite LOUDLY —
+// the .expect()/.unwrap() panics below are the whole point, not accidental
+// panics, so the lints are grandfathered for this module.
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod docs_freshness {
+    /// The doc's `migrations/` (001–NNN) range must end at the newest
+    /// embedded migration, and no `migrations/*.sql` file may exist on disk
+    /// without an embedded entry (or vice versa by count).
+    #[test]
+    fn architecture_migration_range_matches_migrations() {
+        let doc = include_str!("../docs/ARCHITECTURE.md");
+        let start = doc
+            .find("migrations/` (")
+            .expect("doc must name the migrations/ range");
+        let window = &doc[start..start + 40];
+        let dash = window.find('\u{2013}').expect("001–NNN en-dash range");
+        let doc_max: i64 = window[dash + 3..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .expect("numeric range end");
+        let code_max = crate::db::migrate::MIGRATIONS
+            .iter()
+            .map(|(name, _)| name[..3].parse::<i64>().expect("NNN_ prefix"))
+            .max()
+            .expect("non-empty MIGRATIONS");
+        assert_eq!(
+            doc_max, code_max,
+            "ARCHITECTURE.md says migrations 001–{doc_max:03}, but MIGRATIONS tops \
+             out at {code_max:03} — update the doc"
+        );
+        let on_disk = std::fs::read_dir("migrations")
+            .expect("migrations dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".sql"))
+            .count();
+        assert_eq!(
+            on_disk,
+            crate::db::migrate::MIGRATION_COUNT,
+            "migrations/ on disk ({on_disk}) != embedded MIGRATIONS \
+             ({}): every NNN_*.sql must be embedded in src/db/migrate.rs",
+            crate::db::migrate::MIGRATION_COUNT
+        );
+    }
+
+    /// The doc's "N-field shared state" must match the actual `AppState`
+    /// field count in `src/state.rs`.
+    #[test]
+    fn architecture_appstate_field_count_matches() {
+        let doc = include_str!("../docs/ARCHITECTURE.md");
+        let marker = "-field shared state";
+        let start = doc
+            .find(marker)
+            .expect("doc must name the AppState field count");
+        let doc_count: usize = doc[..start]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>()
+            .parse()
+            .expect("digits immediately before '-field shared state'");
+        let state = include_str!("state.rs");
+        let block = state
+            .split_once("pub struct AppState {")
+            .expect("AppState struct")
+            .1
+            .split_once("\n}\n")
+            .expect("AppState closing brace")
+            .0;
+        let fields = block
+            .lines()
+            .filter(|l| {
+                l.starts_with("    pub ")
+                    && l.split_whitespace()
+                        .nth(1)
+                        .is_some_and(|t| t.ends_with(':'))
+            })
+            .count();
+        assert_eq!(
+            doc_count, fields,
+            "ARCHITECTURE.md says {doc_count}-field AppState, but src/state.rs \
+             has {fields} fields — update the doc"
+        );
+    }
+}

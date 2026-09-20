@@ -1243,4 +1243,44 @@ mod tests {
         assert!(m.open_zim("good").await.is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// m4 (2026-09 review): malformed-shape coverage of the external
+    /// `zim` crate's open path — the cheap stand-in for a fuzz harness.
+    /// Each shape must fail with a clean `Error::Zim` (no panic/abort);
+    /// a future cargo-fuzz corpus should seed from these same shapes.
+    #[tokio::test]
+    async fn open_zim_rejects_malformed_shapes_cleanly() {
+        let full = std::fs::read("tests/fixtures/tiny.zim").unwrap();
+        let shapes: Vec<(&str, Vec<u8>)> = vec![
+            // 4 KiB of 0xFF: no valid header at all.
+            ("ff", vec![0xffu8; 4096]),
+            // A valid header + garbage body (the classic truncated/rewritten
+            // swarm file: header looks right, the rest is noise).
+            ("head", {
+                let mut v = full[..full.len().min(64)].to_vec();
+                v.extend(std::iter::repeat_n(0xa5u8, 8192));
+                v
+            }),
+            // The valid archive cut mid-body.
+            ("cut", full[..full.len() / 2].to_vec()),
+            // One byte short of the valid archive (bad central-dir offset).
+            ("short", full[..full.len() - 1].to_vec()),
+        ];
+        for (name, bytes) in shapes {
+            let dir = temp_dir(&format!("malformed-{name}"));
+            std::fs::write(dir.join("bad.zim"), &bytes).unwrap();
+            let m = manager(&dir);
+            m.scan().await.unwrap();
+            let err = m
+                .open_zim("bad")
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("shape {name:?} must not open"));
+            assert!(
+                matches!(err, Error::Zim(_)),
+                "shape {name:?} must fail with Error::Zim, got: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }

@@ -89,6 +89,13 @@ pub(crate) fn find_entry(
 /// `truncated: false`).
 pub(crate) const MAX_READ_BYTES: usize = 256 * 1024;
 
+/// Default `max_length` for `GET /read` (and the MCP `read` tool parity)
+/// (P2, 2026-09 review: document the intent). The client may request any
+/// value — callers may legitimately ask for more for RAG — and the
+/// effective ceiling is the `MAX_READ_BYTES` raw-read bound via
+/// `clamp_read_max_length`, so this default is a convenience, not a cap.
+pub(crate) const DEFAULT_READ_MAX_LENGTH: usize = 8000;
+
 pub(crate) fn cap_read(b: &[u8]) -> (Vec<u8>, bool) {
     let capped = b.len() > MAX_READ_BYTES;
     (b.get(..MAX_READ_BYTES).unwrap_or(b).to_vec(), capped)

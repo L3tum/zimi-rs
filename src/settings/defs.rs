@@ -40,12 +40,8 @@ use std::collections::HashMap;
 pub const EMBED_DEFAULT_MODEL: &str = "nomic-embed-text";
 /// Default embedding vector dimension for the canonical model (nomic-embed-text).
 pub const EMBED_DEFAULT_DIMENSION: u32 = 768;
-/// Vector-index strategy thresholds (article count): below HNSW, at/above IVFFlat.
+/// Vector-index strategy threshold (article count): HNSW below, IVFFlat at/above.
 pub const EMBED_DEFAULT_HNSW_THRESHOLD: i64 = 1_000_000;
-/// Article-count threshold at which the IVFFlat index is preferred over HNSW.
-/// The index is **still built** at/above it (IVFFlat is chosen over HNSW) —
-/// there is no seq-scan fallback.
-pub const EMBED_DEFAULT_IVFFLAT_THRESHOLD: i64 = 10_000_000;
 
 /// Default `downloads.max_bytes` — 512 GiB.
 ///
@@ -210,12 +206,8 @@ pub const KEY_EMBEDDING_MAX_CONCURRENCY: &str = "embedding.max_concurrency";
 /// `embedding.timeout_secs` — per-request embedding timeout in seconds.
 pub const KEY_EMBEDDING_TIMEOUT_SECS: &str = "embedding.timeout_secs";
 /// `embedding.hnsw_threshold` — article count at/below which an HNSW index is
-/// used.
+/// used (IVFFlat is built at/above it — the single strategy threshold).
 pub const KEY_EMBEDDING_HNSW_THRESHOLD: &str = "embedding.hnsw_threshold";
-/// `embedding.ivfflat_threshold` — article count at/above which IVFFlat is
-/// preferred over HNSW (the index is still built at/above it — no seq-scan
-/// fallback).
-pub const KEY_EMBEDDING_IVFFLAT_THRESHOLD: &str = "embedding.ivfflat_threshold";
 
 // access.* — auth mode, rate limits, admin password, and read-gating.
 /// `access.mode` — auth mode (`open` or `password`; see `ACCESS_MODE_*`).
@@ -246,7 +238,7 @@ pub const KEY_ACCESS_REQUIRE_AUTH_FOR_READS: &str = "access.require_auth_for_rea
 /// `LazyLock` (not `const`) because float defaults (`0.6`, `2.0`, …) can't be
 /// built by the `json!` macro in const context; the table is still built once
 /// and shared by reference — the single source of truth for settings policy.
-pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 44]> = std::sync::LazyLock::new(|| {
+pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::LazyLock::new(|| {
     [
         SettingDef {
             key: KEY_GENERAL_ZIM_DIR,
@@ -556,12 +548,6 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 44]> = std::sync::Lazy
         SettingDef {
             key: KEY_EMBEDDING_HNSW_THRESHOLD,
             default: serde_json::json!(EMBED_DEFAULT_HNSW_THRESHOLD),
-            json_type: JsonType::Int,
-            policy: SettingPolicy::default(),
-        },
-        SettingDef {
-            key: KEY_EMBEDDING_IVFFLAT_THRESHOLD,
-            default: serde_json::json!(EMBED_DEFAULT_IVFFLAT_THRESHOLD),
             json_type: JsonType::Int,
             policy: SettingPolicy::default(),
         },
@@ -937,7 +923,6 @@ mod tests {
         const EXPECTED_OPEN_WRITABLE: &[&str] = &[
             "access.require_auth_for_reads",
             "embedding.hnsw_threshold",
-            "embedding.ivfflat_threshold",
             "embedding.max_concurrency",
             "search.default_limit",
             "search.fts_weight",
@@ -995,9 +980,10 @@ mod tests {
     /// `web/settings.js` FIELDS map and `SETTING_DEFS` must agree in both
     /// directions — a FIELDS key missing from the table would render an
     /// orphan row, and a table key missing from FIELDS would render without
-    /// label/description (and a `config_only` key would silently lose its
-    /// "restart" tag). Each entry's `restart: true` flag is pinned against
-    /// `policy.config_only` so the restart warning can't drift either.
+    /// label/description. The `config_only` guidance is conveyed by the
+    /// server's `locked: true` ("environment (not runtime)") rendering, so
+    /// no FIELDS entry may carry a `restart` flag (the former tag was
+    /// redundant: those fields render disabled and can never be edited).
     #[test]
     fn web_settings_fields_match_setting_defs() {
         let js = include_str!("../../web/settings.js");
@@ -1045,15 +1031,14 @@ mod tests {
             "duplicate FIELDS entries: {js_keys:?}"
         );
 
-        // JS → Rust: every FIELDS key is a known setting, and its `restart`
-        // flag matches the row's `config_only` policy.
+        // JS → Rust: every FIELDS key is a known setting, and no entry
+        // carries the (removed) `restart` flag.
         for (key, text) in &entries {
-            let d = def(key).unwrap_or_else(|| panic!("FIELDS key {key:?} is not a known setting"));
-            let restart = text.contains("restart: true");
-            assert_eq!(
-                restart, d.policy.config_only,
-                "restart flag for {key:?} is {restart} but policy.config_only is {}",
-                d.policy.config_only
+            def(key).unwrap_or_else(|| panic!("FIELDS key {key:?} is not a known setting"));
+            assert!(
+                !text.contains("restart: true"),
+                "restart flag for {key:?} is vestigial — config_only keys render \
+                 disabled with the server's 🔒 env-lock tag; drop the flag"
             );
         }
 

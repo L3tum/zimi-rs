@@ -77,7 +77,7 @@ idempotent and advisory-locked), so a fresh database migrates on the first
 | `/list` | GET | List ZIM archives |
 | `/search?q=...` | GET | Hybrid search (`total` is the returned page length, not a corpus-wide match count) |
 | `/suggest?q=...` | GET | Title autocomplete |
-| `/read?zim=...&path=...` | GET | Read article as text |
+| `/read?zim=...&path=...` | GET | Read article as text (truncated at `max_length` chars, default 8000 — a convenience, not a ceiling: larger values are honored up to the 256 KB raw-read bound) |
 | `/w/{zim}/{path}` | GET | Raw content (HTML) |
 | `/chunks?zim=...&path=...` | GET | RAG text chunks |
 | `/interlanguage?zim=...&path=...` | GET | Cross-language links |
@@ -102,8 +102,11 @@ Startup/process settings come from environment variables and compiled-in
 defaults (there is no config file).
 
 Runtime settings (search weights, embedding endpoint/model, torrent behavior,
-rate limits, CORS origins, access mode) live in the `settings` table and are
+rate limits, access mode) live in the `settings` table and are
 managed via the web UI at `/settings.html` — they change without a restart.
+A few rows are `config_only` (CORS origins, bind host/port, log level, …):
+they are seeded from env vars at startup and read only at startup, so the
+UI renders them locked (see [CORS](#cors)).
 
 ### Environment variables
 
@@ -146,7 +149,9 @@ driver accepts before use, and TLS is applied per `sslmode` (`require` /
 ### CORS
 
 CORS is controlled by the `general.cors_origins` setting (a comma-separated origin
-allowlist, e.g. `https://a.example,https://b.example`), applied at startup. With an
+allowlist, e.g. `https://a.example,https://b.example`), applied at startup. It is
+`config_only` — set it via the `CORS_ORIGINS` env var at startup (it seeds the
+setting and locks it in the UI) or via the `settings` table (direct SQL). With an
 empty list no `Access-Control-Allow-Origin` header is emitted at all (browsers enforce
 same-origin; `curl`, the embedded UI, and MCP are unaffected). When set, only the
 listed origins, the methods `GET/POST/PUT/DELETE/OPTIONS`, and the headers
@@ -274,6 +279,12 @@ is reachable by any network peer. Open mode is rejected at startup on a
   `X-Forwarded-For` parsing: the service expects direct (e.g. loopback)
   connections and does not support reverse proxies, where every client behind
   one proxy would share that proxy's IP (and thus lock each other out).
+- **Outbound HTTP (torrent sources, the embedding endpoint) pins DNS at
+  connect time** — `src/netguard.rs` resolves each target once, then
+  validates the IP (private/loopback blocking) and the TLS identity against
+  that pinned IP, closing the DNS-rebinding class on the outbound path.
+  Residual: redirect hops are re-resolved and re-validated per hop, leaving
+  a documented sub-second rebinding window per hop.
 - **`?access_token=` query string** — accepted **only on read-only requests
   (GET/HEAD/OPTIONS)**; mutating requests must use `Authorization: Bearer`.
   Tokens in query strings can leak via server-side logs, proxies, and
