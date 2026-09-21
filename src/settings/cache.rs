@@ -1,12 +1,13 @@
 //! `SettingsCache`: the in-memory, Postgres-backed settings cache —
-//! load/reload, env-locked write validation, redaction, the cross-process
-//! invalidation hooks (LISTEN/NOTIFY, `crate::db::notify`), and the typed
-//! accessors. The admin-auth surface (token-verify KDF call sites,
-//! legacy upgrade) lives in `auth_service` (`SettingsAuth`, Arch M2
+//! load/reload, env-locked write validation, redaction, and the typed
+//! accessors. Cross-process invalidation (LISTEN/NOTIFY,
+//! `crate::db::notify`) drives `reload()` from the composition-root
+//! closure in `startup.rs`. The admin-auth surface (token-verify KDF call
+//! sites, legacy upgrade) lives in `auth_service` (`SettingsAuth`, Arch M2
 //! 2026-09 review).
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::db::pool::Pool;
 use crate::db::raw;
@@ -22,6 +23,7 @@ use super::defs::{
     KEY_EMBEDDING_ENDPOINT, KEY_TORRENT_ALLOW_PRIVATE_NETWORKS, KEY_TORRENT_ENABLED,
     KEY_TORRENT_MAX_ACTIVE, KEY_TORRENT_OPDS_URL, KEY_TORRENT_URL,
 };
+use super::encrypt;
 
 /// In-memory settings cache backed by Postgres.
 ///
@@ -81,95 +83,121 @@ pub(crate) struct SettingsInner {
     /// (a mid-process env mutation must not change behavior). Drives the
     /// post-commit divergence warning (`warn_multi_instance_divergence`).
     multi_instance: bool,
+    /// SEC-L5: the 32-byte AES-256-GCM KEK for the at-rest-encrypted
+    /// secret settings (`None` = `SECURITY_KEY` unset = legacy plaintext
+    /// behavior). Derived ONCE from the `SECURITY_KEY` bytes
+    /// (HKDF-SHA256, [`encrypt::derive_kek`]) at construction and held
+    /// here — deliberately NOT a process global
+    /// (`docs/process_globals.md`): like `env_snapshot`, it is
+    /// per-cache-instance state, and tests can inject different keys
+    /// without touching the process env.
+    kek: Option<Arc<[u8; 32]>>,
 }
 
 impl SettingsInner {
+    /// SEC-L5: the value to PERSIST to the `settings` table for `key` —
+    /// the at-rest-encrypted form (AES-256-GCM, [`super::encrypt`]) only
+    /// when a KEK is present (`SECURITY_KEY` was set), `key` is one of
+    /// [`super::encrypt::ENCRYPTED_AT_REST_KEYS`], and the value is a
+    /// non-empty string (empty values are stored as-is — the DB never
+    /// holds an `enc:v1:` row with an empty ciphertext). Everything else
+    /// is returned unchanged. Callers insert the ORIGINAL `value` (not
+    /// this) into the in-memory cache — the cache always holds plaintext.
+    pub(crate) fn stored_value_for(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> serde_json::Value {
+        if let Some(kek) = &self.kek {
+            if super::encrypt::is_encrypted_at_rest_key(key) {
+                if let Some(s) = value.as_str() {
+                    if !s.is_empty() {
+                        return serde_json::Value::String(super::encrypt::encrypt_value(kek, s));
+                    }
+                }
+            }
+        }
+        value.clone()
+    }
+
     /// Bump the generation counter (call after a cache mutation).
     pub(crate) fn bump_generation(&self) {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// True if `token` verified successfully within the TTL (O(1) memory
-    /// work; the KDF never runs under the lock — see `auth_service`).
+    /// Centralized lock+expect for the token-cache accessors (read flavor):
+    /// one helper per flavor so the grandfathered LINT-3 expect lives in a
+    /// single place; `name` feeds the exact per-cache panic message.
     // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
     #[allow(clippy::expect_used)]
+    fn cache_read<'a>(
+        &self,
+        cache: &'a RwLock<VerifiedTokenCache>,
+        name: &str,
+    ) -> RwLockReadGuard<'a, VerifiedTokenCache> {
+        let msg = format!("{name} cache rwlock poisoned");
+        cache.read().expect(&msg)
+    }
+
+    /// Write-flavor twin of `cache_read` (same message construction).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    fn cache_write<'a>(
+        &self,
+        cache: &'a RwLock<VerifiedTokenCache>,
+        name: &str,
+    ) -> RwLockWriteGuard<'a, VerifiedTokenCache> {
+        let msg = format!("{name} cache rwlock poisoned");
+        cache.write().expect(&msg)
+    }
+
+    /// True if `token` verified successfully within the TTL (O(1) memory
+    /// work; the KDF never runs under the lock — see `auth_service`).
     pub(crate) fn token_is_fresh(&self, token: &str) -> bool {
-        self.token_cache
-            .read()
-            .expect("token cache rwlock poisoned")
-            .is_fresh(token)
+        self.cache_read(&self.token_cache, "token").is_fresh(token)
     }
 
     /// True if `token` failed verification within the negative TTL.
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
     pub(crate) fn token_is_negative_fresh(&self, token: &str) -> bool {
-        self.token_cache
-            .read()
-            .expect("token cache rwlock poisoned")
+        self.cache_read(&self.token_cache, "token")
             .is_negative_fresh(token)
     }
 
     /// Record a KDF verdict for `token` (positive or negative).
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
     pub(crate) fn token_record(&self, token: &str, ok: bool) {
-        self.token_cache
-            .write()
-            .expect("token cache rwlock poisoned")
+        self.cache_write(&self.token_cache, "token")
             .record(token, ok);
     }
 
     /// Drop all cached verified tokens (any path that can change the
     /// effective password: reload/update/upgrade).
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
     pub(crate) fn token_invalidate_all(&self) {
-        self.token_cache
-            .write()
-            .expect("token cache rwlock poisoned")
-            .clear();
+        self.cache_write(&self.token_cache, "token").clear();
     }
 
     /// Drop all cached verified read-only tokens (same sites as
     /// [`Self::token_invalidate_all`] — see `ro_token_cache`'s doc).
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
     pub(crate) fn ro_token_invalidate_all(&self) {
-        self.ro_token_cache
-            .write()
-            .expect("read-only token cache rwlock poisoned")
+        self.cache_write(&self.ro_token_cache, "read-only token")
             .clear();
     }
 
     /// True if `token` verified against the read-only token within the TTL.
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
     pub(crate) fn ro_token_is_fresh(&self, token: &str) -> bool {
-        self.ro_token_cache
-            .read()
-            .expect("read-only token cache rwlock poisoned")
+        self.cache_read(&self.ro_token_cache, "read-only token")
             .is_fresh(token)
     }
 
     /// True if `token` failed read-only verification within the negative TTL.
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
     pub(crate) fn ro_token_is_negative_fresh(&self, token: &str) -> bool {
-        self.ro_token_cache
-            .read()
-            .expect("read-only token cache rwlock poisoned")
+        self.cache_read(&self.ro_token_cache, "read-only token")
             .is_negative_fresh(token)
     }
 
     /// Record a KDF verdict for `token` against the read-only token.
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
     pub(crate) fn ro_token_record(&self, token: &str, ok: bool) {
-        self.ro_token_cache
-            .write()
-            .expect("read-only token cache rwlock poisoned")
+        self.cache_write(&self.ro_token_cache, "read-only token")
             .record(token, ok);
     }
 
@@ -230,6 +258,17 @@ impl SettingsInner {
     /// name the private fields.
     #[cfg(test)]
     pub(crate) fn inner_for_test(values: HashMap<String, serde_json::Value>) -> Arc<SettingsInner> {
+        Self::inner_for_test_with_key(values, None)
+    }
+
+    /// `inner_for_test` with the `SECURITY_KEY` (SEC-L5): `Some(key)` sets
+    /// the KEK so the at-rest boundary functions (`stored_value_for`, the
+    /// decrypt pass) run in tests without a DB or process env.
+    #[cfg(test)]
+    pub(crate) fn inner_for_test_with_key(
+        values: HashMap<String, serde_json::Value>,
+        security_key: Option<&str>,
+    ) -> Arc<SettingsInner> {
         Arc::new(SettingsInner {
             cache: RwLock::new(values),
             env_locked: RwLock::new(HashMap::new()),
@@ -241,6 +280,7 @@ impl SettingsInner {
             write_guard: tokio::sync::Mutex::new(()),
             type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
             multi_instance: false,
+            kek: security_key.map(|k| Arc::new(encrypt::derive_kek(k))),
         })
     }
 
@@ -308,11 +348,37 @@ impl SettingsCache {
     /// `env_locked` marks keys that may not be changed via API; `env_snapshot`
     /// is the startup capture of the env overrides re-applied on every
     /// `reload()`.
+    ///
+    /// Legacy form (no `SECURITY_KEY`); see
+    /// [`Self::load_with_security_key`] — the only production entry point.
     pub async fn load(
         pool: Pool,
         env_locked: HashMap<String, String>,
         env_snapshot: HashMap<String, String>,
     ) -> Result<Self> {
+        Self::load_with_security_key(pool, env_locked, env_snapshot, None).await
+    }
+
+    /// [`Self::load`] with the `SECURITY_KEY` (SEC-L5).
+    ///
+    /// `security_key: Some(key)` enables at-rest encryption for the
+    /// `encrypt::ENCRYPTED_AT_REST_KEYS` settings: their `settings`
+    /// rows are stored AES-256-GCM-encrypted (`enc:v1:` + hex) and are
+    /// transparently decrypted into the in-memory map; `None` keeps the
+    /// legacy plaintext behavior byte-for-byte (and never touches
+    /// plaintext rows). The KEK is derived ONCE from the `SECURITY_KEY`
+    /// bytes (HKDF-SHA256, `encrypt::derive_kek`) and held in
+    /// `SettingsInner` — see the module doc of `encrypt` for the full
+    /// design (storage format, fail-closed decrypt, legacy re-encryption).
+    pub async fn load_with_security_key(
+        pool: Pool,
+        env_locked: HashMap<String, String>,
+        env_snapshot: HashMap<String, String>,
+        security_key: Option<&str>,
+    ) -> Result<Self> {
+        // SEC-L5: derive the KEK once per cache construction (not per
+        // operation) — the 32-byte AES-256 key is held in `SettingsInner`.
+        let kek = security_key.map(|k| Arc::new(encrypt::derive_kek(k)));
         let inner = Arc::new(SettingsInner {
             cache: RwLock::new(HashMap::new()),
             env_locked: RwLock::new(env_locked),
@@ -325,6 +391,7 @@ impl SettingsCache {
             type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
             // M1: the opt-out is a process startup decision — capture it now.
             multi_instance: crate::startup::multi_instance_allowed(),
+            kek,
         });
 
         let cache = Self {
@@ -336,12 +403,30 @@ impl SettingsCache {
 
     /// Build a cache from an in-memory map without seeding from Postgres.
     /// The pool is still used for per-key reads/writes. Intended for tests.
+    ///
+    /// Legacy form (no `SECURITY_KEY`); see
+    /// [`Self::new_with_map_with_security_key`].
     #[doc(hidden)]
     pub fn new_with_map(
         pool: Pool,
         values: HashMap<String, serde_json::Value>,
         env_snapshot: HashMap<String, String>,
     ) -> Self {
+        Self::new_with_map_with_security_key(pool, values, env_snapshot, None)
+    }
+
+    /// `new_with_map` with the `SECURITY_KEY` (SEC-L5): `Some(key)` enables
+    /// at-rest encryption for the [`encrypt::ENCRYPTED_AT_REST_KEYS`] settings
+    /// in the same shape as [`Self::load_with_security_key`] (the in-memory
+    /// map holds plaintext either way). `new_with_map` delegates here with
+    /// `None`; production loads go through `load_with_security_key`.
+    pub(crate) fn new_with_map_with_security_key(
+        pool: Pool,
+        values: HashMap<String, serde_json::Value>,
+        env_snapshot: HashMap<String, String>,
+        security_key: Option<&str>,
+    ) -> Self {
+        let kek = security_key.map(|k| Arc::new(encrypt::derive_kek(k)));
         Self {
             inner: Arc::new(SettingsInner {
                 cache: RwLock::new(values),
@@ -356,6 +441,7 @@ impl SettingsCache {
                 // M1: same capture as `load` — the field is the process
                 // startup decision (see the struct doc).
                 multi_instance: crate::startup::multi_instance_allowed(),
+                kek,
             }),
         }
     }
@@ -369,8 +455,9 @@ impl SettingsCache {
     /// either direction: a reload that read the table before the update's
     /// commit applies its swap before the update's cache insert (and vice
     /// versa). Callers: [`Self::load`] (pre-traffic, at startup) and the
-    /// cross-process invalidation subscriber (below — a
-    /// `zimservice_settings` notification from a peer instance).
+    /// composition-root invalidation closure in `startup.rs` (a
+    /// `zimservice_settings` notification from a peer instance; see
+    /// `crate::db::notify`).
     // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
     #[allow(clippy::expect_used)]
     pub async fn reload(&self) -> Result<()> {
@@ -383,6 +470,35 @@ impl SettingsCache {
             raw::fetch_all(&self.inner.pool, "SELECT key, value FROM settings", |q| q).await?;
 
         let mut map: HashMap<String, serde_json::Value> = rows.into_iter().collect();
+
+        // SEC-L5: decrypt the at-rest-encrypted target rows into the
+        // in-memory map — the ONLY place crypto is applied (everything
+        // downstream sees plaintext, exactly as pre-SEC-L5). Prefix →
+        // AES-256-GCM open, FAIL-CLOSED: a value that cannot be decrypted
+        // (wrong/changed `SECURITY_KEY`, tampered row) aborts the load with
+        // an error that names the key, never the value. No prefix → legacy
+        // plaintext, passed through as-is. `legacy_plaintext` collects the
+        // unprefixed non-empty target rows for the re-encryption pass
+        // below (runs on every reload).
+        let mut legacy_plaintext: Vec<(String, String)> = Vec::new();
+        if let Some(kek) = &self.inner.kek {
+            for (key, value) in map.iter_mut() {
+                if !encrypt::is_encrypted_at_rest_key(key) {
+                    continue;
+                }
+                let Some(s) = value.as_str() else {
+                    // A non-string stored value (a direct SQL edit) — the
+                    // type-mismatch pass below reports it; nothing to
+                    // decrypt.
+                    continue;
+                };
+                if s.starts_with(encrypt::ENC_PREFIX) {
+                    *value = serde_json::Value::String(encrypt::decrypt_value(key, kek, s)?);
+                } else if !s.is_empty() {
+                    legacy_plaintext.push((key.clone(), s.to_string()));
+                }
+            }
+        }
 
         // Seed defaults for missing keys
         let defaults = default_settings();
@@ -412,7 +528,11 @@ impl SettingsCache {
             raw::execute(&mut *tx, &sql, |mut q| {
                 for (key, value) in &seeded {
                     let category = key.split('.').next().unwrap_or("general");
-                    q = q.bind(key).bind(value).bind(category);
+                    // SEC-L5: persist the at-rest form (a fresh seed value
+                    // is never encrypted today — defaults are empty — but
+                    // the boundary stays correct if that changes).
+                    let stored = self.inner.stored_value_for(key, value);
+                    q = q.bind(key).bind(&stored).bind(category);
                 }
                 q
             })
@@ -425,6 +545,44 @@ impl SettingsCache {
             // an idempotent peer reload.
             raw::execute(&mut *tx, crate::db::notify::NOTIFY_SETTINGS_SQL, |q| q).await?;
             tx.commit().await.map_err(Error::Database)?;
+        }
+
+        // SEC-L5: re-encrypt any legacy plaintext target rows at rest,
+        // ONE transaction of conditional `UPDATE ... WHERE key = $2 AND
+        // value = $3`. Runs on EVERY reload (no once-per-process gate): a
+        // plaintext row that appears after the first load (a direct SQL
+        // edit, a keyless peer in a mixed deployment) must be caught on
+        // the next reload, and the `value = $3` guard makes the pass
+        // idempotent and multi-instance safe — already-encrypted rows
+        // never match, a peer that re-encrypted first wins, and the rest's
+        // UPDATEs are no-ops. Skipped when there is nothing to re-encrypt
+        // (avoids an empty transaction per reload); crash-safe by
+        // rollback. No values are ever logged.
+        if let Some(kek) = &self.inner.kek {
+            if !legacy_plaintext.is_empty() {
+                let mut tx = self.inner.pool.begin().await.map_err(Error::Database)?;
+                for (key, stored) in &legacy_plaintext {
+                    let encrypted = encrypt::encrypt_value(kek, stored);
+                    // 0 affected rows = a peer instance re-encrypted first
+                    // (the conditional WHERE) — an idempotent no-op, not a
+                    // failure.
+                    raw::execute(
+                        &mut *tx,
+                        "UPDATE settings SET value = $1 WHERE key = $2 AND value = $3",
+                        |q| {
+                            q.bind(serde_json::json!(encrypted))
+                                .bind(key)
+                                .bind(serde_json::json!(stored))
+                        },
+                    )
+                    .await?;
+                }
+                tx.commit().await.map_err(Error::Database)?;
+                tracing::info!(
+                    count = legacy_plaintext.len(),
+                    "re-encrypted legacy plaintext secret(s) at rest"
+                );
+            }
         }
 
         // Environment overrides: re-apply the startup env snapshot (non-empty
@@ -454,36 +612,6 @@ impl SettingsCache {
         self.inner.ro_token_invalidate_all();
         self.inner.bump_generation();
         Ok(())
-    }
-
-    /// Cross-process invalidation subscriber (serve mode): await the
-    /// `zimservice_settings` bumps from the [`crate::db::notify`] listener
-    /// and run a full [`Self::reload`] for each. One `tokio::spawn` task
-    /// owns `self` (an `Arc`-shared `SettingsCache` clone) for the listener's
-    /// lifetime; the watch channel coalesces a burst of notifications into
-    /// one reload, which is exactly the desired behavior — `reload()` is
-    /// idempotent and re-reads the whole map. The first bump is the
-    /// (re)connect-triggered resync (the missed-notification recovery).
-    ///
-    /// B1: the reload takes the same `write_guard` `update()` holds, so a
-    /// notification-driven reload can never be lost to (or clobber) a
-    /// concurrent write — the last cache phase to take the guard wins, and
-    /// its values are the most recent committed ones (a notification's
-    /// reload always re-reads the table after the firing transaction
-    /// committed, which the NOTIFY commit-ordering guarantees).
-    pub(crate) async fn run_invalidation_subscriber(
-        self,
-        mut rx: tokio::sync::watch::Receiver<u64>,
-    ) {
-        while rx.changed().await.is_ok() {
-            let bump = *rx.borrow_and_update();
-            match self.reload().await {
-                Ok(()) => tracing::debug!(bump, "cross-process settings invalidation: reloaded"),
-                Err(e) => {
-                    tracing::error!("cross-process settings invalidation: reload failed: {e}")
-                }
-            }
-        }
     }
 
     /// Refresh the `general.*` display keys from the process `Config` (the
@@ -760,12 +888,17 @@ impl SettingsCache {
             let mut tx = self.inner.pool.begin().await.map_err(Error::Database)?;
             for (key, value) in &to_update {
                 let category = key.split('.').next().unwrap_or("general");
+                // SEC-L5: persist the at-rest form — an at-rest-eligible
+                // secret is AES-256-GCM encrypted under the KEK here; the
+                // in-memory cache in step 2 below stores the plaintext
+                // `value`, not this.
+                let stored = self.inner.stored_value_for(key, value);
                 raw::execute(
                     &mut *tx,
                     "INSERT INTO settings (key, value, category, updated_at)
                      VALUES ($1, $2, $3, now())
                      ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()",
-                    |q| q.bind(key).bind(value).bind(category),
+                    |q| q.bind(key).bind(&stored).bind(category),
                 )
                 .await?;
             }
@@ -1025,10 +1158,11 @@ mod tests {
 
     use crate::settings::auth::{TOKEN_CACHE_MAX, TOKEN_CACHE_TTL, TOKEN_NEGATIVE_TTL};
     use crate::settings::defs::{
-        KEY_EMBEDDING_API_KEY, KEY_EMBEDDING_DIMENSION, KEY_EMBEDDING_TIMEOUT_SECS,
-        KEY_GENERAL_CORS_ORIGINS, KEY_GENERAL_HOST, KEY_GENERAL_LOG_LEVEL, KEY_GENERAL_PORT,
-        KEY_GENERAL_ZIM_DIR, KEY_SEARCH_FTS_WEIGHT, KEY_SEARCH_MAX_LIMIT, KEY_TORRENT_PASSWORD,
-        KEY_TORRENT_USERNAME, SETTING_DEFS,
+        KEY_ACCESS_READ_ONLY_TOKEN, KEY_EMBEDDING_API_KEY, KEY_EMBEDDING_DIMENSION,
+        KEY_EMBEDDING_TIMEOUT_SECS, KEY_GENERAL_CORS_ORIGINS, KEY_GENERAL_HOST,
+        KEY_GENERAL_LOG_LEVEL, KEY_GENERAL_PORT, KEY_GENERAL_ZIM_DIR, KEY_SEARCH_FTS_WEIGHT,
+        KEY_SEARCH_MAX_LIMIT, KEY_TORRENT_PASSWORD, KEY_TORRENT_URL, KEY_TORRENT_USERNAME,
+        SETTING_DEFS,
     };
     use crate::testing::dead_pool;
 
@@ -1050,6 +1184,9 @@ mod tests {
                 write_guard: tokio::sync::Mutex::new(()),
                 type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
                 multi_instance: false,
+                // SEC-L5: no KEK — these write-path tests exercise the
+                // legacy plaintext boundary (stored_value_for is a no-op).
+                kek: None,
             }),
         }
     }
@@ -2217,6 +2354,9 @@ mod tests {
                     write_guard: tokio::sync::Mutex::new(()),
                     type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
                     multi_instance: true,
+                    // SEC-L5: no KEK — irrelevant to this (divergence
+                    // warning) test; the boundary stays legacy.
+                    kek: None,
                 }),
             };
             cache.warn_multi_instance_divergence();
@@ -2393,5 +2533,385 @@ mod tests {
             cache.inner.token_is_negative_fresh("flood-token-1"),
             "the negative entry must survive the release for its TTL"
         );
+    }
+
+    // ── SEC-L5: at-rest encryption boundary ─────────────────────────────
+
+    /// `stored_value_for` is the single write-side boundary: only target
+    /// keys with a KEK present and a non-empty string value are
+    /// encrypted; everything else passes through as-is.
+    #[test]
+    fn stored_value_for_encrypts_only_nonempty_targets() {
+        let inner =
+            SettingsInner::inner_for_test_with_key(default_settings(), Some("boundary-test-key"));
+        // Target key, non-empty → prefixed ciphertext.
+        let v = inner.stored_value_for(KEY_TORRENT_PASSWORD, &serde_json::json!("secret"));
+        let s = v.as_str().expect("the stored value is a string");
+        assert!(s.starts_with(encrypt::ENC_PREFIX), "{s:?}");
+        assert!(
+            !s.contains("secret"),
+            "the plaintext must not appear in the ciphertext"
+        );
+        // Target key, empty → as-is (the DB never holds an empty
+        // ciphertext).
+        assert_eq!(
+            inner.stored_value_for(KEY_TORRENT_PASSWORD, &serde_json::json!("")),
+            serde_json::json!("")
+        );
+        // Non-target key → as-is, even non-empty.
+        assert_eq!(
+            inner.stored_value_for(KEY_TORRENT_URL, &serde_json::json!("http://example.com")),
+            serde_json::json!("http://example.com")
+        );
+        // No KEK → everything as-is (legacy behavior).
+        let legacy = SettingsInner::inner_for_test(default_settings());
+        assert_eq!(
+            legacy.stored_value_for(KEY_TORRENT_PASSWORD, &serde_json::json!("secret")),
+            serde_json::json!("secret")
+        );
+        // Non-string value on a target key → as-is (the type mismatch is
+        // reported by the `type_mismatch` pass, not here).
+        assert_eq!(
+            inner.stored_value_for(KEY_TORRENT_PASSWORD, &serde_json::json!(42)),
+            serde_json::json!(42)
+        );
+    }
+
+    // ── SEC-L5: at-rest encryption (DB-gated) ───────────────────────────
+    //
+    // All five share the three fixed target keys; `test_pool`'s
+    // `DbExclusiveGuard` serializes them (and every other DB-gated test)
+    // against the shared dev DB. `load_with_security_key` decrypts ALL
+    // target rows, so each test follows a capture → sweep → restore
+    // protocol over the whole triple (never just its own key): a foreign
+    // `enc:v1:` row left by a sibling test (different test KEK) would
+    // fail the next key-bearing load closed, and the shared dev DB must
+    // not retain test KEKs — a real server booted with a real
+    // `SECURITY_KEY` would fail closed on them.
+
+    /// SEC-L5 test helper: the raw stored row for `key` (no decryption —
+    /// `#>> '{}'` unwraps the JSONB string cell to the bare text, so the
+    /// assertion sees exactly what sits in the `settings` table:
+    /// plaintext or the `enc:v1:` ciphertext, verbatim).
+    async fn raw_setting_row(pool: &Pool, key: &str) -> Option<String> {
+        raw::fetch_scalar_optional(
+            pool,
+            "SELECT value #>> '{}' FROM settings WHERE key = $1",
+            |q| q.bind(key),
+        )
+        .await
+        .expect("raw row read")
+    }
+
+    /// SEC-L5 test helper: sweep the row for `key` to a known JSONB string
+    /// value (the pre-SEC-L5 plaintext shape, or a known ciphertext).
+    async fn set_raw_row(pool: &Pool, key: &str, category: &str, value: &str) {
+        raw::execute(
+            pool,
+            "INSERT INTO settings (key, value, category) VALUES ($1, $2, $3) \
+             ON CONFLICT (key) DO UPDATE SET value = $2",
+            |q| q.bind(key).bind(serde_json::json!(value)).bind(category),
+        )
+        .await
+        .expect("raw row write");
+    }
+
+    /// SEC-L5 test helper: the three at-rest target keys with their fixed
+    /// `settings.category` (mirrors `encrypt::ENCRYPTED_AT_REST_KEYS`).
+    const TARGET_ROW_SPECS: [(&str, &str); 3] = [
+        (KEY_TORRENT_PASSWORD, "torrent"),
+        (KEY_EMBEDDING_API_KEY, "embedding"),
+        (KEY_ACCESS_READ_ONLY_TOKEN, "access"),
+    ];
+
+    /// SEC-L5 test helper: capture (key, category, raw value — `None` when
+    /// the row is absent) for ALL three target keys, before the test's
+    /// sweep (see the protocol note above).
+    async fn capture_target_rows(pool: &Pool) -> Vec<(String, String, Option<String>)> {
+        let mut out = Vec::with_capacity(3);
+        for (key, category) in TARGET_ROW_SPECS {
+            out.push((
+                key.to_string(),
+                category.to_string(),
+                raw_setting_row(pool, key).await,
+            ));
+        }
+        out
+    }
+
+    /// SEC-L5 test helper: sweep ALL three target rows to an empty string
+    /// (never encrypted — empty values are stored as-is) so a key-bearing
+    /// load starts from a known, decryptable state regardless of what a
+    /// sibling test left behind.
+    async fn sweep_target_rows(pool: &Pool) {
+        for (key, category) in TARGET_ROW_SPECS {
+            set_raw_row(pool, key, category, "").await;
+        }
+    }
+
+    /// SEC-L5 test helper: restore a captured triple (best-effort shared-DB
+    /// hygiene — see the protocol note above). Call at the very end of the
+    /// test; a mid-test panic skips it, but the next run's sweep
+    /// self-heals the poisoning.
+    async fn restore_target_rows(pool: &Pool, saved: &[(String, String, Option<String>)]) {
+        for (key, category, value) in saved {
+            match value {
+                Some(v) => set_raw_row(pool, key, category, v).await,
+                None => {
+                    raw::execute(pool, "DELETE FROM settings WHERE key = $1", |q| q.bind(key))
+                        .await
+                        .expect("target-row restore");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sec_l5_legacy_row_is_reencrypted_and_round_trips() {
+        // The spec's env-seeded variant cannot exercise the write path:
+        // env values never persist to the DB (in-memory snapshot only) —
+        // the DB round-trip runs through the legacy re-encryption pass
+        // instead (same boundary: decrypt on load, encrypt at rest).
+        let Some((pool, _db_gate)) = crate::testing::test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let saved = capture_target_rows(&pool).await;
+        sweep_target_rows(&pool).await;
+
+        let legacy = "legacy-plain-password";
+        set_raw_row(&pool, KEY_TORRENT_PASSWORD, "torrent", legacy).await;
+
+        let cache = SettingsCache::load_with_security_key(
+            pool.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            Some("test-kek-1"),
+        )
+        .await
+        .expect("load with a valid key");
+
+        // The in-memory cache holds the plaintext …
+        assert_eq!(
+            cache.get_typed::<String>(KEY_TORRENT_PASSWORD).unwrap(),
+            legacy
+        );
+        // … while the DB row is now `enc:v1:`-prefixed ciphertext.
+        let row = raw_setting_row(&pool, KEY_TORRENT_PASSWORD).await;
+        assert!(
+            row.as_deref()
+                .is_some_and(|v| v.starts_with(encrypt::ENC_PREFIX)),
+            "the legacy row must be re-encrypted at rest, got: {row:?}"
+        );
+
+        // A full reload (the NOTIFY-driven path) decrypts to the same
+        // plaintext and leaves the row byte-identical (a later load must
+        // not re-encrypt — the nonce would change).
+        cache.reload().await.expect("reload");
+        assert_eq!(
+            cache.get_typed::<String>(KEY_TORRENT_PASSWORD).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            raw_setting_row(&pool, KEY_TORRENT_PASSWORD).await,
+            row,
+            "a reload must not re-encrypt an already-encrypted row"
+        );
+
+        restore_target_rows(&pool, &saved).await;
+    }
+
+    #[tokio::test]
+    async fn sec_l5_second_load_is_a_noop_on_encrypted_rows() {
+        let Some((pool, _db_gate)) = crate::testing::test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let saved = capture_target_rows(&pool).await;
+        sweep_target_rows(&pool).await;
+
+        let known = "legacy-embed-key";
+        set_raw_row(&pool, KEY_EMBEDDING_API_KEY, "embedding", known).await;
+
+        let cache1 = SettingsCache::load_with_security_key(
+            pool.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            Some("test-kek-2"),
+        )
+        .await
+        .expect("first load");
+        assert_eq!(
+            cache1.get_typed::<String>(KEY_EMBEDDING_API_KEY).unwrap(),
+            known
+        );
+        let row1 = raw_setting_row(&pool, KEY_EMBEDDING_API_KEY).await;
+        assert!(
+            row1.as_deref()
+                .is_some_and(|v| v.starts_with(encrypt::ENC_PREFIX)),
+            "the first load must have re-encrypted the row, got: {row1:?}"
+        );
+        drop(cache1);
+
+        // A second process start (fresh cache, same key): the already-
+        // encrypted row must come back byte-identical and still decrypt.
+        let cache2 = SettingsCache::load_with_security_key(
+            pool.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            Some("test-kek-2"),
+        )
+        .await
+        .expect("second load");
+        assert_eq!(
+            raw_setting_row(&pool, KEY_EMBEDDING_API_KEY).await,
+            row1,
+            "the second load must leave the encrypted row byte-identical"
+        );
+        assert_eq!(
+            cache2.get_typed::<String>(KEY_EMBEDDING_API_KEY).unwrap(),
+            known
+        );
+
+        restore_target_rows(&pool, &saved).await;
+    }
+
+    #[tokio::test]
+    async fn sec_l5_wrong_key_fails_closed_and_names_key_not_value() {
+        let Some((pool, _db_gate)) = crate::testing::test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let saved = capture_target_rows(&pool).await;
+        sweep_target_rows(&pool).await;
+
+        // A row encrypted under KEK-A (via the module's own encryptor —
+        // the same code production uses).
+        let secret = "secret-under-kek-a";
+        let kek_a = encrypt::derive_kek("wrong-key-A");
+        let stored = encrypt::encrypt_value(&kek_a, secret);
+        set_raw_row(&pool, KEY_ACCESS_READ_ONLY_TOKEN, "access", &stored).await;
+
+        // A different key: the load must fail, name the failing key, and
+        // never the plaintext (nor the ciphertext).
+        let res = SettingsCache::load_with_security_key(
+            pool.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            Some("wrong-key-B"),
+        )
+        .await;
+        let err = match res {
+            Err(e) => e,
+            // `expect_err` needs `Debug`; `SettingsCache` has no Debug impl.
+            Ok(_) => panic!("a wrong SECURITY_KEY must fail the load"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(KEY_ACCESS_READ_ONLY_TOKEN),
+            "the error must name the failing key: {msg}"
+        );
+        assert!(
+            !msg.contains(secret),
+            "the error must not leak the plaintext: {msg}"
+        );
+        assert!(
+            !msg.contains(&stored),
+            "the error must not echo the ciphertext: {msg}"
+        );
+
+        restore_target_rows(&pool, &saved).await;
+    }
+
+    #[tokio::test]
+    async fn sec_l5_load_without_key_is_full_plaintext_passthrough() {
+        let Some((pool, _db_gate)) = crate::testing::test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let saved = capture_target_rows(&pool).await;
+        sweep_target_rows(&pool).await;
+
+        let plain = "plain-no-key";
+        set_raw_row(&pool, KEY_TORRENT_PASSWORD, "torrent", plain).await;
+
+        let cache = SettingsCache::load(pool.clone(), HashMap::new(), HashMap::new())
+            .await
+            .expect("load without a key");
+        assert_eq!(
+            raw_setting_row(&pool, KEY_TORRENT_PASSWORD).await,
+            Some(plain.to_string()),
+            "no KEK: the row must stay exactly as-is (legacy behavior)"
+        );
+        assert_eq!(
+            cache.get_typed::<String>(KEY_TORRENT_PASSWORD).unwrap(),
+            plain
+        );
+
+        restore_target_rows(&pool, &saved).await;
+    }
+
+    #[tokio::test]
+    async fn sec_l5_update_persist_path_encrypts_target_keys() {
+        let Some((pool, _db_gate)) = crate::testing::test_pool().await else {
+            return;
+        };
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        let saved = capture_target_rows(&pool).await;
+        sweep_target_rows(&pool).await;
+
+        set_raw_row(&pool, KEY_TORRENT_PASSWORD, "torrent", "pre-update-value").await;
+        let cache = SettingsCache::load_with_security_key(
+            pool.clone(),
+            HashMap::new(),
+            HashMap::new(),
+            Some("test-kek-5"),
+        )
+        .await
+        .expect("load");
+
+        // An authenticated update must persist the new value ENCRYPTED,
+        // while the in-memory cache keeps the plaintext.
+        let mut updates = HashMap::new();
+        updates.insert(
+            KEY_TORRENT_PASSWORD.into(),
+            serde_json::json!("post-update-value"),
+        );
+        let errors = cache.update(&updates, true).await.expect("update");
+        assert!(errors.is_empty(), "unexpected update errors: {errors:?}");
+        let row = raw_setting_row(&pool, KEY_TORRENT_PASSWORD).await;
+        assert!(
+            row.as_deref()
+                .is_some_and(|v| v.starts_with(encrypt::ENC_PREFIX)),
+            "update must persist the target key encrypted, got: {row:?}"
+        );
+        assert_eq!(
+            cache.get_typed::<String>(KEY_TORRENT_PASSWORD).unwrap(),
+            "post-update-value"
+        );
+
+        // Emptying the secret stores an empty string — never an
+        // `enc:v1:` row with an empty ciphertext.
+        let mut clear = HashMap::new();
+        clear.insert(KEY_TORRENT_PASSWORD.into(), serde_json::json!(""));
+        let errors = cache.update(&clear, true).await.expect("clear");
+        assert!(errors.is_empty(), "unexpected clear errors: {errors:?}");
+        assert_eq!(
+            raw_setting_row(&pool, KEY_TORRENT_PASSWORD).await,
+            Some(String::new()),
+            "an emptied secret is stored as an empty string"
+        );
+
+        restore_target_rows(&pool, &saved).await;
     }
 }

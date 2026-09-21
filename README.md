@@ -129,6 +129,7 @@ UI renders them locked (see [CORS](#cors)).
 | `EMBEDDING_API_KEY` | (none) | Seeds `embedding.api_key` |
 | `EMBEDDING_MODEL` | (none) | Seeds `embedding.model` |
 | `EMBEDDING_DIM` | (none) | Seeds `embedding.dimension` |
+| `SECURITY_KEY` | (none) | Enables **at-rest encryption** of the secret-bearing settings (`torrent.password`, `embedding.api_key`, `access.read_only_token`) in the `settings` table. Does not seed a setting. See [At-rest encryption](#at-rest-encryption-security_key) |
 
 `AUTH_PASSWORD`, `READ_ONLY_TOKEN`, `ACCESS_MODE`, `REQUIRE_AUTH_FOR_READS`, and the `EMBEDDING_*` vars seed the
 corresponding settings at startup (the env value wins) and lock them in the UI.
@@ -227,6 +228,50 @@ still requires the admin password (see MCP server authentication).
 **`GET /downloads`** redacts credentials from torrent URLs, but `file_path` reveals
 server-local paths (where downloaded files land) — expected for the operator-facing
 file-status UI, relevant if the API is exposed beyond the operator.
+
+### At-rest encryption (SECURITY_KEY)
+
+`torrent.password`, `embedding.api_key`, and `access.read_only_token` are sent
+**verbatim** to qBittorrent / the embedding provider, so the `settings` table and
+its backups must be treated as sensitive. Set **`SECURITY_KEY`** to encrypt those
+three values at rest:
+
+- **Format.** Each stored value becomes `enc:v1:` + hex(AES-256-GCM ciphertext with
+  a fresh random 12-byte nonce per write and no AAD). The key-encryption key is
+  derived from `SECURITY_KEY` with HKDF-SHA256 (fixed salt/info; the plaintext
+  value never leaves the process).
+- **No key = legacy behavior.** Without `SECURITY_KEY` the values stay plaintext
+  exactly as before — acceptable for loopback / throwaway deployments. If any of
+  the three secrets is stored while `SECURITY_KEY` is unset, startup prints a
+  **warning** (it does not refuse to start).
+- **Migration is automatic.** On the first start with the key set, any still-
+  plaintext rows for those keys are re-encrypted in a single transaction; later
+  loads never re-write an already-encrypted row. In-memory values are plaintext
+  either way — the app must use them; only the stored form changes.
+- **Fail-closed.** If an encrypted row cannot be decrypted (wrong or changed
+  `SECURITY_KEY`, corrupted row), the instance **refuses to start**. The error
+  names the failing setting but never its value. In a mixed-key deployment
+  (a peer instance restarted with a different `SECURITY_KEY`), an
+  already-running instance logs the decryption error on the next settings
+  notification and keeps serving its current in-memory values until it is
+  restarted.
+- **Key rotation.** Rotating the key does not re-encrypt the old rows — a
+  changed key makes every `enc:v1:` row undecryptable (fail-closed). Secret
+  settings are redacted in the API by design (`GET /settings` returns
+  `"***"` for them), so rotation cannot be done from the API alone.
+  Procedure: (1) stop the service; (2) in Postgres: `DELETE FROM settings
+  WHERE key IN ('torrent.password', 'embedding.api_key',
+  'access.read_only_token');` — the service re-seeds empty defaults on next
+  start; (3) set the new `SECURITY_KEY`; (4) start — no ciphertext remains
+  to decrypt, so there is no fail-closed trip; (5) re-provide the values
+  from the out-of-band source (env vars / secrets manager / upstream
+  provider): `QBITTORRENT_PASS` / `EMBEDDING_API_KEY` via env or
+  authenticated `PUT /settings` (only while their env vars are unset),
+  `READ_ONLY_TOKEN` via env only (API-immutable).
+- **Backups.** A dump of the `settings` table is only as sensitive as the
+  `SECURITY_KEY` is: with the key set, backup files hold ciphertext. Use a long
+  random key (≥32 random chars, e.g. `openssl rand -hex 32`); protect it like a
+  password — env at startup, never committed to a repo, never rotated casually.
 
 ### Threat model
 

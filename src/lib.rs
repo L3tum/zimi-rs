@@ -162,4 +162,93 @@ mod docs_freshness {
              has {fields} fields — update the doc"
         );
     }
+
+    /// The PERF-4 notes in the two docs asserted a false invariant (014
+    /// stays unused, any future migration is 015+); both sections are now
+    /// historical records. Neither doc may claim the number is unused, and
+    /// both must name the historical anchor: 014 went to
+    /// `migrations/014_drop_dead_schema.sql`.
+    #[test]
+    fn migration_014_docs_are_historical() {
+        let perf = include_str!("../docs/perf-notes.md");
+        let globals = include_str!("../docs/process_globals.md");
+        for (name, doc) in [
+            ("docs/perf-notes.md", perf),
+            ("docs/process_globals.md", globals),
+        ] {
+            for stale in [
+                "remains unused",
+                "permanently unused",
+                "last applied migration is 013",
+            ] {
+                assert!(
+                    !doc.contains(stale),
+                    "{name} still claims the 014 number is `{stale}` — 014 was \
+                     allocated to 014_drop_dead_schema.sql; keep the section a \
+                     historical record (no unused/next-number claims)"
+                );
+            }
+            assert!(
+                doc.contains("014_drop_dead_schema"),
+                "{name} must name migrations/014_drop_dead_schema.sql as the \
+                 historical anchor for the 014 number"
+            );
+        }
+    }
+
+    /// `tests/integration/trgm_plan.rs` and `benches/common/mod.rs` each
+    /// hand-define the same 40-word corpus so the plan gate and the benches
+    /// measure identical data — nothing else enforces that lockstep.
+    /// Compare the three shared literals as text; a one-sided edit fails.
+    #[test]
+    fn trgm_corpus_lockstep() {
+        let test_src = include_str!("../tests/integration/trgm_plan.rs");
+        let bench_src = include_str!("../benches/common/mod.rs");
+        for (name, a, b) in [
+            ("WORDS", corpus_words(test_src), corpus_words(bench_src)),
+            ("PROBE", corpus_probe(test_src), corpus_probe(bench_src)),
+            (
+                "EMBED_BATCH",
+                corpus_batch(test_src),
+                corpus_batch(bench_src),
+            ),
+        ] {
+            assert_eq!(
+                a, b,
+                "corpus constant {name} drifted between \
+                 tests/integration/trgm_plan.rs and benches/common/mod.rs — \
+                 the plan gate and the benches must measure identical data; \
+                 edit both"
+            );
+        }
+    }
+
+    /// WORDS array body (between `= [` and `];`), whitespace-normalized.
+    fn corpus_words(src: &str) -> String {
+        let start = src.find("const WORDS").expect("const WORDS");
+        let open = start + src[start..].find(" = [").expect("WORDS literal") + 4;
+        let close = src[open..].find(";").expect("WORDS close");
+        src[open + 1..open + close]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The PROBE string literal after `const PROBE`.
+    fn corpus_probe(src: &str) -> String {
+        let start = src.find("const PROBE").expect("const PROBE");
+        let q1 = start + src[start..].find('"').expect("PROBE open quote");
+        let q2 = q1 + 1 + src[q1 + 1..].find('"').expect("PROBE close quote");
+        src[q1 + 1..q2].to_string()
+    }
+
+    /// The EMBED_BATCH integer literal after `const EMBED_BATCH`.
+    fn corpus_batch(src: &str) -> String {
+        let start = src.find("const EMBED_BATCH").expect("const EMBED_BATCH");
+        let eq = start + src[start..].find(" = ").expect("EMBED_BATCH value");
+        src[eq + 3..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect()
+    }
 }

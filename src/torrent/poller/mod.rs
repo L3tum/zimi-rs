@@ -31,6 +31,7 @@ use crate::netguard::{
     assert_host_not_blocked, follow_pinned_get, validate_download_url, PinnedResponse,
 };
 use crate::settings::SettingsCache;
+use crate::torrent::client::{build_download_client, ClientProfile};
 use crate::torrent::files::{install_zim, locate_torrent_zim, validate_download_name, verify_zim};
 use crate::torrent::{
     connect_qbit, qbit_fingerprint, resolve_qbit_inputs, QbitClient, QbitClientCache,
@@ -45,7 +46,6 @@ mod requeue;
 mod stats;
 
 use self::direct::direct_download;
-pub(crate) use self::direct::{build_download_client, ClientProfile};
 pub(crate) use self::requeue::{
     filter_requeue_name_collisions, requeue_guard_step, GuardEntry, RequeueDecision,
     REQUEUE_ERROR_PATTERN,
@@ -182,7 +182,11 @@ impl DownloadPoller {
     /// Request a cooperative stop: [`run`](Self::run) breaks out of its loop
     /// at the next between-ticks poll. No tokio-util `CancellationToken`
     /// — a process-lifetime flag is all the run loop needs.
-    pub fn cancel(&self) {
+    // No production caller yet — main.rs aborts the task on shutdown
+    // instead; the `run_stops_on_cancel_between_ticks` test exercises the
+    // cooperative-stop path.
+    #[allow(dead_code)]
+    pub(crate) fn cancel(&self) {
         self.stopping.store(true, Ordering::SeqCst);
     }
 

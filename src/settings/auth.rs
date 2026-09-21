@@ -123,7 +123,10 @@ pub(crate) fn hex_encode(b: &[u8]) -> String {
     s
 }
 
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
+/// Hex-decode `s` (case-insensitive hex digits, even length); `None` on
+/// any non-hex input or odd length. Shared with the SEC-L5 at-rest path
+/// (`encrypt::decrypt_value`).
+pub(crate) fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let b = s.as_bytes();
     if !b.len().is_multiple_of(2) {
         return None;

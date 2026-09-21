@@ -74,8 +74,9 @@ impl EmbedConfig {
 
 /// Max bytes of a single embeddings response body (the wire budget for
 /// `resp` in `EmbedClient::embed`). Every other external read in this crate
-/// is size-capped (256 KB article reads, 64 MB downloads, 10 MiB OPDS, 1 MB
-/// MCP); the embeddings response was the one unbounded `.json()`. A
+/// is size-capped (256 KB article reads, 64 MB downloads, 10 MiB OPDS —
+/// `src/torrent/opds.rs::MAX_OPDS_BYTES`, 1 MB MCP); the embeddings response
+/// was the one unbounded `.json()`. A
 /// well-formed response is `batch_size × dimension × ~12` JSON bytes
 /// (default 64 × 768 ≈ 600 KB; the max dimension 4096 × max batch 64 ≈ 3.2
 /// MiB), so 16 MiB bounds the honest case by ~5× while still catching a

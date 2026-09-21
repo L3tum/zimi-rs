@@ -9,12 +9,14 @@
 //! resolving (used by `mcp`).
 //!
 //! Submodules: `defs` (setting table + seeds), `snapshots` (one-pass read
-//! snapshots), `cache` (`SettingsCache` itself).
+//! snapshots), `cache` (`SettingsCache` itself), `encrypt` (SEC-L5 at-rest
+//! encryption of the secret settings under `SECURITY_KEY`).
 
 pub(crate) mod auth;
 mod auth_service;
 mod cache;
 mod defs;
+pub(crate) mod encrypt;
 mod snapshots;
 
 pub use auth::{hash_admin_password, is_legacy_password, verify_admin_password};

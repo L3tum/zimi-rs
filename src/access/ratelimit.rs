@@ -305,12 +305,15 @@ mod tests {
 
     #[test]
     fn refills_after_time_passes() {
-        let limiter = RateLimiter::new(1000, 1);
+        // 1 rps: a token per SECOND, so no realistic scheduler deschedule
+        // between two adjacent calls can refill a token (the old 1000 rps
+        // refilled one per ms and this assert flaked in full-suite runs).
+        let limiter = RateLimiter::new(1, 1);
         assert!(limiter.try_acquire().is_ok());
         assert!(limiter.try_acquire().is_err());
 
-        // Simulate 200ms passing at 1000 rps → 2 tokens refilled.
-        limiter.shift_refill_ns(200_000_000);
+        // Simulate 2 s passing at 1 rps → 2 tokens refilled (capped at burst=1).
+        limiter.shift_refill_ns(2_000_000_000);
         assert!(limiter.try_acquire().is_ok());
     }
 

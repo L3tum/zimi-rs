@@ -391,169 +391,35 @@ impl SearchEngine {
     ///
     /// The selected arms run CONCURRENTLY — each text arm on its own pool
     /// checkout, the vector arm (embed + ANN seek) in the same `tokio::join!`
-    /// (PERF-10 decision record above the join): merge/dedup semantics and
-    /// per-arm soft-fail are preserved exactly, and checkout pressure is
-    /// observable per arm via the /diagnostic checkout-wait metric.
+    /// (PERF-10 decision record in `build_search_arms`): merge/dedup
+    /// semantics and per-arm soft-fail are preserved exactly, and checkout
+    /// pressure is observable per arm via the /diagnostic checkout-wait
+    /// metric.
     pub async fn search(&self, query: &str, p: &SearchParams<'_>) -> Result<Vec<SearchResult>> {
-        let SearchParams {
-            zim: zim_filter,
-            language: lang_filter,
-            mode,
-            limit,
-            offset,
-            highlight,
-        } = *p;
         let start = Instant::now();
         // WI-35: read every search-path setting in one `cache.read()` pass so
         // this request never observes a torn mix across a concurrent mutation.
         let snap = self.settings.search_params_snapshot();
-        let limit = limit
+        let limit = p
+            .limit
             .unwrap_or(snap.default_limit)
             .min(snap.max_limit)
             .min(SEARCH_HARD_LIMIT);
-        let offset = offset.unwrap_or(0).min(SEARCH_HARD_OFFSET);
+        let offset = p.offset.unwrap_or(0).min(SEARCH_HARD_OFFSET);
 
-        let run_fts = !matches!(
-            mode,
-            Some("trgm") | Some("fuzzy") | Some("prefix") | Some("vector") | Some("semantic")
-        );
-        let run_trgm = !matches!(mode, Some("fts") | Some("vector") | Some("semantic"));
-        // Vector branch: runs for explicit vector/semantic modes and for
-        // hybrid/None modes — but always only when embedding is enabled. An
-        // explicit `mode=vector` with embedding disabled degrades to no
-        // results (as documented) instead of calling the embedding API.
-        let run_vector = snap.embedding_enabled
-            && (matches!(mode, Some("vector") | Some("semantic"))
-                || !matches!(
-                    mode,
-                    Some("fts") | Some("trgm") | Some("fuzzy") | Some("prefix")
-                ));
-
-        let fts_weight = snap.fts_weight;
-        let trgm_weight = snap.trgm_weight;
-        let vector_weight = snap.vector_weight;
-        // Offset-aware per-branch fetch: each branch's LIMIT must reach
-        // `offset + limit` rows so the post-dedup merged pool can cover the
-        // requested page. The old flat `limit * 2` capped the pooled max at
-        // ~6×limit, so any offset beyond ~3 pages always came back empty
-        // even with thousands of matches. Capped at SEARCH_FETCH_HARD_CAP
-        // (= max offset + max limit = 5500).
-        let fetch_i32 = branch_fetch_limit(limit, offset);
-
-        // ── Build all branch SQL up front (pure, index-friendly shapes) ──
-        let fts_sq: Option<SqlQuery> = if run_fts {
-            Some(fts_sql(
-                query,
-                highlight,
-                zim_filter,
-                lang_filter,
-                fetch_i32,
-                fts_weight,
-            ))
-        } else {
-            None
-        };
-        // PERF-2: lift the shared lowered query + threshold so the trigram
-        // arms can be gated on length (short queries → prefix arm only).
-        let query_lower = query.to_lowercase();
-        let trgm_threshold = snap.trgm_threshold;
-        let (sq_prefix, sq_contains, sq_similarity) = build_trgm_arms(
-            run_trgm,
-            &query_lower,
-            zim_filter,
-            lang_filter,
-            fetch_i32,
-            trgm_weight,
-            trgm_threshold,
-        );
-        for sq in [&fts_sq, &sq_prefix, &sq_contains, &sq_similarity]
-            .into_iter()
-            .flatten()
-        {
-            debug_assert!(sq.placeholder_count() == sq.params.len());
-        }
-
-        // ── Concurrency design (PERF-10 decision record) ───────────────────
-        // 2026-08-30 decision (superseded — kept for the audit trail): the
-        // arm queries ran SEQUENTIALLY on ONE pool checkout. A tokio-postgres
-        // client is single-in-flight-command, and parallel arms would need
-        // 4–5 of the pool's 20 connections per request, "not justified by
-        // the few-ms of sequential DB time" (the slow arm being the embed
-        // HTTP, already concurrent via `join!`).
-        //
-        // 2026-09-18 decision (this code): the documented revisit trigger
-        // fired — Postgres moved to a remote host, so every arm seek now pays
-        // a network RTT (the sub-10ms local-DB assumption is gone), and the
-        // per-search clone/checkout churn was measured. The selected arms
-        // therefore run CONCURRENTLY: each text arm takes its own pool
-        // checkout, and the vector arm (embed HTTP + ANN seek) joins them in
-        // the same `tokio::join!`. Total latency is now
-        // max(embed, fts, trgm×3, ann) — not the sum.
-        //
-        // Preserved exactly:
-        // - Arm SQL text (tests/integration/trgm_plan.rs EXPLAINs these
-        //   builders as the plan gate — unchanged).
-        // - Merge/scoring/dedup semantics: arms keep a FIXED position in the
-        //   merge (fts, [prefix⊕contains⊕similarity pre-deduped], vector) and
-        //   every arm SQL is `ORDER BY score DESC, a.id`, so per-arm order is
-        //   deterministic regardless of completion order; `merge_results`'s
-        //   stable sort then keeps equal-score rows in that fixed arm order.
-        // - Per-arm soft-fail: an arm QUERY failure degrades that arm to
-        //   empty (`run_sql_on`), and an ANN-checkout failure soft-fails too
-        //   (warn + empty) — an error in one arm never takes down the others.
-        // - The hard-fail corner: if at least one text arm is selected and
-        //   ALL selected text arms fail to CHECK OUT, the search errors, just
-        //   like the old sequential DB-arm checkout failure (a dead pool must
-        //   not surface as a silent empty result).
-        //
-        // Deliberate changes (small, documented):
-        // - A vector-ONLY search (mode "vector"/"semantic") against a dead
-        //   pool now returns empty instead of erroring: the old hard fail
-        //   came from an incidental no-op DB-arm checkout, not from any
-        //   arm's work, and the vector arm's ANN checkout soft-fails by
-        //   contract.
-        // - Checkout count: a full hybrid search briefly holds up to 4 text
-        //   checkouts + 1 ANN (the ANN only after its embed lands — the embed
-        //   itself still holds NO connection: H2, pinned by
-        //   `search_does_not_hold_pool_connection_during_embed`). The pool
-        //   default is 20 (`db_pool_size`, clamped [1,100]); every checkout
-        //   is recorded under its own label (`search_fts`, `search_trgm_*`,
-        //   `search_vector_ann`) in the /diagnostic checkout-wait metric, so
-        //   fan-out pressure is observable per site.
-        // - trgm probe cadence unchanged: one probe per search when the
-        //   in-process cache is cold (`ensure_trgm`, own checkout — taken
-        //   before the fan-out so the arms' selected state is known up
-        //   front), zero checkouts when warm, none when the trgm arms are
-        //   off for the mode/query length.
-        // PERF-13: the settings snapshot is built EXACTLY ONCE above
-        // (`search_params_snapshot` = ~13 Value clones + per-key JSON
-        // deserializes) and shared as an `Arc` across every arm — no arm
-        // re-derives settings, and the embed cache key and the client
-        // fingerprint both come from this one snapshot.
-        let fingerprint = self.embed_fingerprint(&snap);
-        let ann_filtered = zim_filter.is_some() || lang_filter.is_some();
-        let vector_arm = VectorEmbedArm {
-            engine: self,
-            snap: Arc::new(snap),
-            fingerprint,
-            query: query.to_string(),
-            enabled: run_vector,
-            ann_zim: zim_filter,
-            ann_lang: lang_filter,
-            // Multiplier + cap interaction is documented on
-            // `vector_fetch_limit` (capped ANN top-k, see there for the
-            // filtered vector-only corner).
-            ann_limit: vector_fetch_limit(fetch_i32 as usize, ann_filtered),
-            ann_weight: vector_weight,
-        };
-        // WI-37: resolve the `pg_trgm` extension once (cached). A missing
-        // extension (or a pool blip) soft-disables all three trgm arms; FTS
-        // always runs regardless.
-        let trgm_ok = if run_trgm {
-            self.ensure_trgm().await
-        } else {
-            false
-        };
+        // Decide which arms run for this mode and build them up front (the
+        // FTS/trgm branch SQL, the vector arm, the pg_trgm probe); the
+        // arm-selection and concurrency-design decision records live in
+        // `build_search_arms`.
+        let arms = self.build_search_arms(query, p, snap, limit, offset).await;
+        let SearchArms {
+            fts_sq,
+            sq_prefix,
+            sq_contains,
+            sq_similarity,
+            vector_arm,
+            trgm_ok,
+        } = arms;
 
         // Each text arm: own checkout → query → return-to-pool (H2: no
         // connection is ever held across the embed). A CHECKOUT failure is
@@ -633,8 +499,9 @@ impl SearchEngine {
             vector_arm.run(),
         );
 
-        // Hard-fail corner (see the decision record above): at least one
-        // text arm selected AND every selected text arm failed to check out
+        // Hard-fail corner (the decision record now lives in
+        // `build_search_arms`): at least one text arm selected AND every
+        // selected text arm failed to check out
         // → the pool is dead/exhausted → the search errors, exactly like the
         // old sequential DB-arm checkout failure. Any mix with ≥1 checkout
         // that succeeded degrades the failed arms to empty (per-arm
@@ -670,6 +537,174 @@ impl SearchEngine {
         );
 
         Ok(merged)
+    }
+
+    /// The retrieval-arm half of `search()` (PONY N2 extraction): which
+    /// arms run for this mode (FTS / trgm trio / vector), their branch SQL
+    /// (or the pre-built vector arm), and the `pg_trgm` probe state — built
+    /// in `search()`'s original order of operations, so the concurrent
+    /// fan-out consuming the result only runs and merges. The arm-selection
+    /// and concurrency-design decision records live below the code.
+    async fn build_search_arms<'a>(
+        &'a self,
+        query: &str,
+        p: &SearchParams<'a>,
+        snap: SearchParamsSnapshot,
+        limit: usize,
+        offset: usize,
+    ) -> SearchArms<'a> {
+        let SearchParams {
+            zim: zim_filter,
+            language: lang_filter,
+            mode,
+            limit: _,
+            offset: _,
+            highlight,
+        } = *p;
+        let run_fts = !matches!(
+            mode,
+            Some("trgm") | Some("fuzzy") | Some("prefix") | Some("vector") | Some("semantic")
+        );
+        let run_trgm = !matches!(mode, Some("fts") | Some("vector") | Some("semantic"));
+        // Vector branch: runs for explicit vector/semantic modes and for
+        // hybrid/None modes — but always only when embedding is enabled. An
+        // explicit `mode=vector` with embedding disabled degrades to no
+        // results (as documented) instead of calling the embedding API.
+        let run_vector = snap.embedding_enabled
+            && (matches!(mode, Some("vector") | Some("semantic"))
+                || !matches!(
+                    mode,
+                    Some("fts") | Some("trgm") | Some("fuzzy") | Some("prefix")
+                ));
+
+        let fts_weight = snap.fts_weight;
+        let trgm_weight = snap.trgm_weight;
+        let vector_weight = snap.vector_weight;
+        // Offset-aware per-branch fetch: each branch's LIMIT must reach
+        // `offset + limit` rows so the post-dedup merged pool can cover the
+        // requested page. The old flat `limit * 2` capped the pooled max at
+        // ~6×limit, so any offset beyond ~3 pages always came back empty
+        // even with thousands of matches. Capped at SEARCH_FETCH_HARD_CAP
+        // (= max offset + max limit = 5500).
+        let fetch_i32 = branch_fetch_limit(limit, offset);
+
+        // ── Build all branch SQL up front (pure, index-friendly shapes) ──
+        let fts_sq: Option<SqlQuery> = if run_fts {
+            Some(fts_sql(
+                query,
+                highlight,
+                zim_filter,
+                lang_filter,
+                fetch_i32,
+                fts_weight,
+            ))
+        } else {
+            None
+        };
+        // PERF-2: lift the shared lowered query + threshold so the trigram
+        // arms can be gated on length (short queries → prefix arm only).
+        let query_lower = query.to_lowercase();
+        let trgm_threshold = snap.trgm_threshold;
+        let (sq_prefix, sq_contains, sq_similarity) = build_trgm_arms(
+            run_trgm,
+            &query_lower,
+            zim_filter,
+            lang_filter,
+            fetch_i32,
+            trgm_weight,
+            trgm_threshold,
+        );
+        for sq in [&fts_sq, &sq_prefix, &sq_contains, &sq_similarity]
+            .into_iter()
+            .flatten()
+        {
+            debug_assert!(sq.placeholder_count() == sq.params.len());
+        }
+
+        // ── Concurrency design (PERF-10 decision record) ───────────────────
+        // (sequential-arm history: docs/perf-notes.md)
+        //
+        // 2026-09-18 decision (this code): the documented revisit trigger
+        // fired — Postgres moved to a remote host, so every arm seek now pays
+        // a network RTT (the sub-10ms local-DB assumption is gone), and the
+        // per-search clone/checkout churn was measured. The selected arms
+        // therefore run CONCURRENTLY: each text arm takes its own pool
+        // checkout, and the vector arm (embed HTTP + ANN seek) joins them in
+        // the same `tokio::join!`. Total latency is now
+        // max(embed, fts, trgm×3, ann) — not the sum.
+        //
+        // Preserved exactly:
+        // - Arm SQL text (tests/integration/trgm_plan.rs EXPLAINs these
+        //   builders as the plan gate — unchanged).
+        // - Merge/scoring/dedup semantics: arms keep a FIXED position in the
+        //   merge (fts, [prefix⊕contains⊕similarity pre-deduped], vector) and
+        //   every arm SQL is `ORDER BY score DESC, a.id`, so per-arm order is
+        //   deterministic regardless of completion order; `merge_results`'s
+        //   stable sort then keeps equal-score rows in that fixed arm order.
+        // - Per-arm soft-fail: an arm QUERY failure degrades that arm to
+        //   empty (`run_sql_on`), and an ANN-checkout failure soft-fails too
+        //   (warn + empty) — an error in one arm never takes down the others.
+        // - The hard-fail corner: if at least one text arm is selected and
+        //   ALL selected text arms fail to CHECK OUT, the search errors, just
+        //   like the old sequential DB-arm checkout failure (a dead pool must
+        //   not surface as a silent empty result).
+        //
+        // Deliberate changes (small, documented):
+        // - A vector-ONLY search (mode "vector"/"semantic") against a dead
+        //   pool now returns empty instead of erroring: the old hard fail
+        //   came from an incidental no-op DB-arm checkout, not from any
+        //   arm's work, and the vector arm's ANN checkout soft-fails by
+        //   contract.
+        // - Checkout count: a full hybrid search briefly holds up to 4 text
+        //   checkouts + 1 ANN (the ANN only after its embed lands — the embed
+        //   itself still holds NO connection: H2, pinned by
+        //   `search_does_not_hold_pool_connection_during_embed`). The pool
+        //   default is 20 (`db_pool_size`, clamped [1,100]); every checkout
+        //   is recorded under its own label (`search_fts`, `search_trgm_*`,
+        //   `search_vector_ann`) in the /diagnostic checkout-wait metric, so
+        //   fan-out pressure is observable per site.
+        // - trgm probe cadence unchanged: one probe per search when the
+        //   in-process cache is cold (`ensure_trgm`, own checkout — taken
+        //   before the fan-out so the arms' selected state is known up
+        //   front), zero checkouts when warm, none when the trgm arms are
+        //   off for the mode/query length.
+        // PERF-13: the settings snapshot is built EXACTLY ONCE above
+        // (`search_params_snapshot` = ~13 Value clones + per-key JSON
+        // deserializes) and shared as an `Arc` across every arm — no arm
+        // re-derives settings, and the embed cache key and the client
+        // fingerprint both come from this one snapshot.
+        let fingerprint = self.embed_fingerprint(&snap);
+        let ann_filtered = zim_filter.is_some() || lang_filter.is_some();
+        let vector_arm = VectorEmbedArm {
+            engine: self,
+            snap: Arc::new(snap),
+            fingerprint,
+            query: query.to_string(),
+            enabled: run_vector,
+            ann_zim: zim_filter,
+            ann_lang: lang_filter,
+            // Multiplier + cap interaction is documented on
+            // `vector_fetch_limit` (capped ANN top-k, see there for the
+            // filtered vector-only corner).
+            ann_limit: vector_fetch_limit(fetch_i32 as usize, ann_filtered),
+            ann_weight: vector_weight,
+        };
+        // WI-37: resolve the `pg_trgm` extension once (cached). A missing
+        // extension (or a pool blip) soft-disables all three trgm arms; FTS
+        // always runs regardless.
+        let trgm_ok = if run_trgm {
+            self.ensure_trgm().await
+        } else {
+            false
+        };
+        SearchArms {
+            fts_sq,
+            sq_prefix,
+            sq_contains,
+            sq_similarity,
+            vector_arm,
+            trgm_ok,
+        }
     }
 
     /// Title autocomplete/suggest.
@@ -837,6 +872,28 @@ fn join_text_arms(
         };
     }
     Ok(rows)
+}
+
+/// The constructed retrieval arms of one `search()` call (returned by
+/// `SearchEngine::build_search_arms`, consumed by its concurrent fan-out):
+/// the FTS/trgm branch SQL, the pre-built vector arm, and the `pg_trgm`
+/// probe state.
+struct SearchArms<'a> {
+    /// Q0: full-text arm SQL (`None` when the mode excludes FTS).
+    fts_sq: Option<SqlQuery>,
+    /// Q1: trgm prefix arm SQL (`None` when the trgm arms are off for the
+    /// mode or the query length).
+    sq_prefix: Option<SqlQuery>,
+    /// Q2: trgm contains arm SQL (gated like the prefix arm).
+    sq_contains: Option<SqlQuery>,
+    /// Q3: trgm similarity arm SQL (gated like the prefix arm).
+    sq_similarity: Option<SqlQuery>,
+    /// The vector (embed + ANN seek) arm, run in the same `tokio::join!`.
+    vector_arm: VectorEmbedArm<'a>,
+    /// Whether the `pg_trgm` extension is live (WI-37 probe, taken before
+    /// the fan-out so the arms' selected state is known up front); `false`
+    /// soft-disables the three trgm arms even where their SQL is built.
+    trgm_ok: bool,
 }
 
 /// The vector (semantic) arm of [`SearchEngine::search`]: the embed HTTP
@@ -1131,6 +1188,17 @@ fn row_to_result(row: &SearchRow) -> SearchResult {
 /// score-ordered list. Dedup by `articles.id` (rows from the FTS/trgm/vector
 /// arms are joined on id; equal-score ties keep the first arm's row).
 /// Applies `offset` then `limit`.
+///
+/// PERF L2 (2026-09-21, evaluated — no change): the materialization peak is
+/// deliberately bounded at 3×SEARCH_FETCH_HARD_CAP rows in the absolute
+/// corner (offset=5000, limit=500 ≈ 20 MB, once per request) — every arm's
+/// SQL is already `LIMIT branch_fetch_limit(limit, offset)` /
+/// `vector_fetch_limit` (capped at SEARCH_FETCH_HARD_CAP), the trgm group
+/// arrives pre-deduped (fixed merge positions), and the scan below stops at
+/// `limit + offset` distinct ids (the provable minimum for the page). A
+/// k-way heap merge to avoid the `all` concat was considered and rejected —
+/// a large refactor for a bounded transient, zero correctness gain; see the
+/// "Closed optimizations" note in docs/perf-notes.md.
 fn merge_results(
     fts: Vec<SearchResult>,
     trgm: Vec<SearchResult>,
@@ -1464,6 +1532,49 @@ mod tests {
         ];
         for (input, expected) in cases {
             assert_eq!(escape_like(input), expected, "input: {input:?}");
+        }
+    }
+
+    // m4 property test: ALL 1555 strings of length ≤ 4 over the alphabet
+    // [a, '\\', '%', '_', 'é', '日'] (1 + 6 + 36 + 216 + 1296): (a) a local
+    // `unescape` inverse round-trips every input, and (b) inputs free of the
+    // three LIKE specials are left byte-identical (identity).
+    #[test]
+    fn escape_like_property_roundtrip_and_identity() {
+        // Local inverse of `escape_like`: a backslash always escapes the
+        // character immediately after it (in valid output that char is one
+        // of the three specials), everything else is literal.
+        fn unescape(escaped: &str) -> String {
+            let mut out = String::new();
+            let mut chars = escaped.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    match chars.next() {
+                        Some(esc) => out.push(esc),
+                        None => out.push(c), // trailing lone backslash: not
+                                             // producible by escape_like
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+        let alphabet: [char; 6] = ['a', '\\', '%', '_', 'é', '日'];
+        for len in 0..=4usize {
+            for i in 0..6usize.pow(len as u32) {
+                let mut s = String::new();
+                let mut v = i;
+                for _ in 0..len {
+                    s.push(alphabet[v % 6]);
+                    v /= 6;
+                }
+                assert_eq!(unescape(&escape_like(&s)), s, "round-trip: {s:?}");
+                let has_special = s.chars().any(|c| matches!(c, '\\' | '%' | '_'));
+                if !has_special {
+                    assert_eq!(escape_like(&s), s, "identity: {s:?}");
+                }
+            }
         }
     }
 

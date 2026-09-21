@@ -8,13 +8,16 @@
 //! segment, e.g. `wikipedia_en_all_maxi_2024-06`) against the local
 //! library; a newer date wins.
 
+use base64::Engine;
+use std::collections::HashMap;
+
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, TorrentKind};
 use crate::netguard::{follow_pinned_get, PinnedResponse};
 use crate::settings::SettingsCache;
-use crate::torrent::poller::{build_download_client, ClientProfile};
+use crate::torrent::client::{build_download_client, ClientProfile};
 use crate::zim::ZimManager;
 
 use super::strip_query_fragment;
@@ -146,49 +149,14 @@ fn hex_sha256(s: &str) -> Option<String> {
 }
 
 /// Standard-alphabet (RFC 4648) base64 decode. Malformed input (bad
-/// characters, padding mid-string) → `None`. Self-contained — no base64
-/// dependency.
+/// characters, padding mid-string, length not a multiple of 4) → `None`.
 fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    // Canonical form (RFC 4648): length must be a multiple of 4 — a 43-char
-    // unpadded string is NOT a valid 32-byte encoding (that is 44 chars with
-    // `==`), and accepting it would silently decode garbage tail bits.
-    if !bytes.len().is_multiple_of(4) {
-        return None;
-    }
-    // Padding may only trail: everything from the first '=' must be '='.
-    let first_pad = bytes.iter().position(|&b| b == b'=');
-    if let Some(pos) = first_pad {
-        if bytes[pos..].iter().any(|&b| b != b'=') || bytes.len() - pos > 2 {
-            return None;
-        }
-    }
-    let mut out = Vec::with_capacity(32);
-    let mut buf: u32 = 0;
-    let mut bits = 0;
-    for &b in &bytes {
-        if b == b'=' {
-            break;
-        }
-        let v = val(b)? as u32;
-        buf = (buf << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-        }
-    }
-    Some(out)
+    // Tolerate stray whitespace (parity with the old hand-rolled decoder,
+    // which filtered it before validating).
+    let clean: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(&clean)
+        .ok()
 }
 
 /// Standard-alphabet base64 → exactly 32 bytes (a SHA-256). Malformed input
@@ -334,6 +302,41 @@ pub fn parse_catalog(xml: &str) -> Vec<OpdsEntry> {
     entries
 }
 
+/// OPDS catalog response byte budget (L1): this was the one uncapped
+/// external read in a crate whose invariant is that every external read is
+/// size-capped (16 MiB embed responses, 64 MB direct downloads, …). The
+/// catalog URL is admin-gated / operator-settable, and the 30 s Control
+/// timeout bounds the DURATION, not the byte count, so the bytes are capped
+/// here. The honest Kiwix catalog is well under 1 MiB, so 10 MiB bounds the
+/// honest case by ~10× while still catching a rogue or mis-pointed catalog.
+const MAX_OPDS_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Budget decision for the OPDS catalog response (L1) — pure, so it is
+/// unit-testable without the pinned-GET path (netguard's DNS pinning +
+/// loopback ban make a raw-socket harness infeasible for `fetch_catalog`).
+/// `declared` is the response's `Content-Length` (when the server sent one);
+/// `actual` is the body length already read (0 on the pre-read check).
+fn check_opds_budget(declared: Option<u64>, actual: usize) -> Result<()> {
+    if let Some(cl) = declared {
+        if cl > MAX_OPDS_BYTES {
+            return Err(Error::Torrent {
+                kind: TorrentKind::Other,
+                msg: format!(
+                    "OPDS catalog response exceeds the {MAX_OPDS_BYTES}-byte budget \
+                     (Content-Length: {cl})"
+                ),
+            });
+        }
+    }
+    if (actual as u64) > MAX_OPDS_BYTES {
+        return Err(Error::Torrent {
+            kind: TorrentKind::Other,
+            msg: format!("OPDS catalog response is {actual} bytes (budget {MAX_OPDS_BYTES})"),
+        });
+    }
+    Ok(())
+}
+
 /// Fetch and parse the OPDS catalog at `url`.
 ///
 /// SEC-1: the catalog URL is user-influenced (like direct download URLs), so
@@ -342,6 +345,9 @@ pub fn parse_catalog(xml: &str) -> Vec<OpdsEntry> {
 /// address(es) that passed the check. The initial-URL gate
 /// (`validate_download_url`) is applied by the caller (`opds_check`) before
 /// any HTTP I/O.
+///
+/// L1: the response body is byte-budgeted (`MAX_OPDS_BYTES`) — pre-read on
+/// `Content-Length` when present, post-read on the actual bytes.
 pub async fn fetch_catalog(settings: &SettingsCache, url: &str) -> Result<Vec<OpdsEntry>> {
     let settings = settings.clone();
     let provider: std::sync::Arc<dyn Fn() -> bool + Send + Sync> =
@@ -354,8 +360,19 @@ pub async fn fetch_catalog(settings: &SettingsCache, url: &str) -> Result<Vec<Op
         &|c, u| c.get(u).header("Accept", "application/atom+xml"),
     )
     .await?;
-    let body = response.text().await.map_err(Error::Http)?;
-    Ok(parse_catalog(&body))
+    // Size budget (L1): a `Content-Length` over the cap is rejected BEFORE
+    // reading (the common case — the catalog server sends it); the post-
+    // read check covers chunked / lying bodies (mirrors the embed client's
+    // cap idiom).
+    let declared = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    check_opds_budget(declared, 0)?;
+    let body = response.bytes().await.map_err(Error::Http)?;
+    check_opds_budget(declared, body.len())?;
+    Ok(parse_catalog(&String::from_utf8_lossy(&body)))
 }
 
 /// Split a ZIM file name (without extension) into `(base, version)`, where
@@ -384,14 +401,51 @@ fn parse_date_tag(s: &str) -> Option<(u32, u32)> {
     }
 }
 
-/// A B10 update candidate: the newest matching catalog entry for one local
-/// ZIM (rank = (date-tag or feed-updated) prefix, see `candidate_rank`).
+/// A B10 update candidate: one catalog entry precomputed once per feed
+/// (M1) — the per-pair derivations the old O(L×E) loop repeated for every
+/// (local, entry) pair happen here, once per entry. `rank` is the (date-tag
+/// or feed-updated) prefix (see `candidate_rank`); `entry` is the borrow the
+/// undated `newer` fallback and the `title` field read. Grouped by the
+/// lowercased ZIM base (the index key, see `candidate_index`).
 struct UpdateCandidate<'a> {
     rank: (u32, u32),
     entry: &'a OpdsEntry,
+    cat_version: Option<(u32, u32)>,
     name: String,
     url: String,
     digest: Option<ZimDigest>,
+}
+
+/// M1 (perf): index the feed ONCE by lowercased ZIM base so `find_updates`
+/// is O(E + L×C) instead of O(L×E) with ~6 short-lived Strings per pair
+/// (100 local × 5,000 entries ≈ 3M allocations per poll): entries without a
+/// resolvable download URL / catalog name are dropped here, and every
+/// per-entry derivation (name, base/version split, digest, rank) happens
+/// once per entry, not once per (local × entry) pair. C = same-base
+/// candidates (typically a handful at Kiwix scale).
+fn candidate_index<'a>(entries: &'a [OpdsEntry]) -> HashMap<String, Vec<UpdateCandidate<'a>>> {
+    let mut by_base: HashMap<String, Vec<UpdateCandidate<'a>>> = HashMap::new();
+    for entry in entries {
+        let Some(url) = entry.download_url() else {
+            continue;
+        };
+        // Derive the catalog ZIM name from the download URL's file name.
+        let Some(name) = catalog_name_from_url(&url) else {
+            continue;
+        };
+        let (base, cat_version) = base_and_version(&name);
+        let base_lc = base.to_ascii_lowercase();
+        let rank = candidate_rank(cat_version, entry.updated.as_deref());
+        by_base.entry(base_lc).or_default().push(UpdateCandidate {
+            rank,
+            entry,
+            cat_version,
+            name,
+            url,
+            digest: entry.download_digest(),
+        });
+    }
+    by_base
 }
 
 /// Compare catalog entries against the local library and return available
@@ -406,34 +460,30 @@ struct UpdateCandidate<'a> {
 /// newest matching entry — instead of one per entry. `candidate_rank` orders
 /// the candidates (date tag preferred, then the feed `<updated>`); exact ties
 /// keep the first in feed order. `OpdsUpdate`'s shape is unchanged.
+///
+/// M1 (perf): the feed is indexed once up front (`candidate_index`); each
+/// local ZIM does a single `base_lc` map lookup plus a scan of the same-base
+/// candidates only. The `newer` rule (version compare when both dated, else
+/// feed-`<updated>` vs local publication-date 7-char prefix compare, with
+/// the char-boundary floor guards) is unchanged, so the behavior is
+/// identical to the old per-pair loop.
 pub fn find_updates(entries: &[OpdsEntry], local: &[(String, Option<String>)]) -> Vec<OpdsUpdate> {
+    let by_base = candidate_index(entries);
     let mut updates = Vec::new();
     for (local_name, local_date) in local {
         let (local_base, local_version) = base_and_version(local_name);
+        let local_base_lc = local_base.to_ascii_lowercase();
 
-        // Best (newest) candidate for this local ZIM.
-        let mut best: Option<UpdateCandidate<'_>> = None;
+        // Best (newest) candidate for this local ZIM: one map lookup, then a
+        // scan of the same-base candidates only (M1).
+        let mut best: Option<&UpdateCandidate<'_>> = None;
 
-        for entry in entries {
-            let url = match entry.download_url() {
-                Some(u) => u,
-                None => continue,
-            };
-            // Derive the catalog ZIM name from the download URL's file name.
-            let catalog_name = match catalog_name_from_url(&url) {
-                Some(n) => n,
-                None => continue,
-            };
-            let (cat_base, cat_version) = base_and_version(&catalog_name);
-            if !cat_base.eq_ignore_ascii_case(&local_base) {
-                continue;
-            }
-
-            let newer = match (cat_version, local_version) {
+        for c in by_base.get(&local_base_lc).into_iter().flatten() {
+            let newer = match (c.cat_version, local_version) {
                 (Some(cv), Some(lv)) => cv > lv,
                 // One side undated: fall back to the feed's <updated> vs the
                 // local publication date (both compared as YYYY-MM prefixes).
-                _ => match (entry.updated.as_deref(), local_date.as_deref()) {
+                _ => match (c.entry.updated.as_deref(), local_date.as_deref()) {
                     (Some(u), Some(d)) => {
                         // ISO-8601 date prefix compare; floor to char
                         // boundaries so a hostile feed with non-ASCII date
@@ -451,29 +501,18 @@ pub fn find_updates(entries: &[OpdsEntry], local: &[(String, Option<String>)]) -
 
             // B10: among the newer same-base entries, keep only the newest.
             // Strict `>` means an exact rank tie keeps the first in feed order.
-            let rank = candidate_rank(cat_version, entry.updated.as_deref());
-            let replace = match &best {
-                None => true,
-                Some(b) => rank > b.rank,
-            };
-            if replace {
-                best = Some(UpdateCandidate {
-                    rank,
-                    entry,
-                    name: catalog_name,
-                    url,
-                    digest: entry.download_digest(),
-                });
+            if best.is_none_or(|b| c.rank > b.rank) {
+                best = Some(c);
             }
         }
 
         if let Some(c) = best {
             updates.push(OpdsUpdate {
                 local_name: local_name.clone(),
-                catalog_name: c.name,
+                catalog_name: c.name.clone(),
                 title: c.entry.title.clone(),
-                download_url: c.url,
-                digest: c.digest,
+                download_url: c.url.clone(),
+                digest: c.digest.clone(),
             });
         }
     }
@@ -530,8 +569,8 @@ pub async fn check_updates(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        b64_decode, base_and_version, catalog_name_from_url, find_updates, parse_catalog,
-        parse_link_digest, OpdsEntry, OpdsLink, ZimDigest,
+        b64_decode, base_and_version, catalog_name_from_url, check_opds_budget, find_updates,
+        parse_catalog, parse_link_digest, OpdsEntry, OpdsLink, ZimDigest, MAX_OPDS_BYTES,
     };
 
     const FEED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -802,6 +841,41 @@ mod tests {
             "length not a multiple of 4"
         );
         assert!(b64_decode("Zm9vYmF$").is_none(), "bad character");
+    }
+
+    // ── OPDS response byte budget (L1) ────────────────────────────────────
+
+    /// L1: a declared `Content-Length` over the budget is rejected before
+    /// the body is read.
+    #[test]
+    fn opds_budget_rejects_oversized_content_length() {
+        let err = check_opds_budget(Some(MAX_OPDS_BYTES + 1), 0)
+            .expect_err("oversized Content-Length must be rejected");
+        assert!(
+            err.to_string().contains("budget"),
+            "oversized Content-Length must be a size-budget error: {err}"
+        );
+    }
+
+    /// L1: a body over the budget (chunked, or a lying `Content-Length`) is
+    /// rejected by the post-read check.
+    #[test]
+    fn opds_budget_rejects_oversized_body() {
+        let err = check_opds_budget(Some(0), (MAX_OPDS_BYTES + 1) as usize)
+            .expect_err("oversized body must be rejected");
+        assert!(
+            err.to_string().contains("budget"),
+            "oversized body must be a size-budget error: {err}"
+        );
+    }
+
+    /// L1: absent `Content-Length` and a body within budget pass (the
+    /// post-read check is the only gate for chunked bodies); a declared
+    /// `Content-Length` at the cap is the honest-catalog boundary case.
+    #[test]
+    fn opds_budget_allows_within_budget() {
+        assert!(check_opds_budget(None, 1024).is_ok());
+        assert!(check_opds_budget(Some(MAX_OPDS_BYTES), MAX_OPDS_BYTES as usize).is_ok());
     }
 
     #[test]

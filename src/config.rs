@@ -23,7 +23,7 @@ use crate::settings::{
 /// weights, embedding endpoint/model, torrent save path / category / max
 /// active, etc.) live in the `settings` table (`SettingsCache`), not here —
 /// they are runtime-editable and seed from env where applicable.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Directory scanned for `.zim` archives (`ZIM_DIR`, default `/zims`).
     pub zim_dir: PathBuf,
@@ -73,6 +73,49 @@ pub struct Config {
     pub allow_multi_db: bool,
     /// stdio MCP session password (`MCP_AUTH_PASSWORD`); `None` when unset.
     pub mcp_auth_password: Option<String>,
+    /// Master key for encrypting the secret settings at rest in the
+    /// `settings` table (`SECURITY_KEY`; SEC-L5). `None` keeps the legacy
+    /// plaintext behavior (+ the startup plaintext warning); `Some(key)`
+    /// stores the three at-rest-encrypted settings
+    /// (`settings::encrypt::ENCRYPTED_AT_REST_KEYS`) AES-256-GCM-encrypted
+    /// — the KEK is HKDF-SHA256-derived per `SettingsCache`, the raw key
+    /// is never stored, and a set-but-empty value is treated as unset.
+    pub security_key: Option<String>,
+}
+
+/// Manual `Debug` (SEC-L3): the derived impl would let any `{:?}` or
+/// `tracing::debug!(?config)` print the key material — `security_key`,
+/// `torrent_pass`, `mcp_auth_password` render as `"***"`/`None` instead.
+/// Empty `torrent_pass` renders as the empty string (nothing to leak);
+/// every other field renders as-is. `Clone` stays derived.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("zim_dir", &self.zim_dir)
+            .field("database_url", &self.database_url)
+            .field("read_database_url", &self.read_database_url)
+            .field("db_pool_size", &self.db_pool_size)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("log_level", &self.log_level)
+            .field("torrent_url", &self.torrent_url)
+            .field("torrent_user", &self.torrent_user)
+            .field(
+                "torrent_pass",
+                &if self.torrent_pass.is_empty() {
+                    ""
+                } else {
+                    "***"
+                },
+            )
+            .field("allow_multi_db", &self.allow_multi_db)
+            .field(
+                "mcp_auth_password",
+                &self.mcp_auth_password.as_ref().map(|_| "***"),
+            )
+            .field("security_key", &self.security_key.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -90,6 +133,7 @@ impl Default for Config {
             torrent_pass: String::new(),
             allow_multi_db: false,
             mcp_auth_password: None,
+            security_key: None,
         }
     }
 }
@@ -196,6 +240,14 @@ impl Config {
         // admin password in `cmd_mcp` (fail-closed in password mode).
         if let Some(v) = get("MCP_AUTH_PASSWORD") {
             self.mcp_auth_password = Some(v);
+        }
+        // SEC-L5: at-rest encryption master key for the secret settings.
+        // A set-but-empty value is treated as unset — an empty key would
+        // derive a real (but meaningless) KEK and silently enable
+        // encryption nobody asked for; the env convention (set-but-empty
+        // = unset, see `locked_env_settings`) applies here too.
+        if let Some(v) = get("SECURITY_KEY").filter(|v| !v.is_empty()) {
+            self.security_key = Some(v);
         }
         Ok(())
     }
@@ -395,6 +447,33 @@ mod tests {
         assert!(
             c2.read_database_url.is_none(),
             "absent env must stay None (single-pool default)"
+        );
+    }
+
+    #[test]
+    fn security_key_env_present_absent_and_empty() {
+        let mut c = Config::default();
+        c.apply_env(&env_from(&[(
+            "SECURITY_KEY",
+            "0123456789abcdef0123456789abcdef",
+        )]))
+        .expect("apply_env should succeed");
+        assert_eq!(
+            c.security_key.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        let mut c2 = Config::default();
+        c2.apply_env(&env_from(&[]))
+            .expect("apply_env should succeed");
+        assert!(c2.security_key.is_none(), "absent env must stay None");
+        // Set-but-empty is treated as unset (an empty key must not
+        // silently enable encryption with a meaningless KEK).
+        let mut c3 = Config::default();
+        c3.apply_env(&env_from(&[("SECURITY_KEY", "")]))
+            .expect("apply_env should succeed");
+        assert!(
+            c3.security_key.is_none(),
+            "set-but-empty SECURITY_KEY must stay None"
         );
     }
 

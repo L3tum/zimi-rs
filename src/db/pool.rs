@@ -697,6 +697,103 @@ mod tests {
         );
     }
 
+    // m4 property test: 185 DSNs = fixed head + every ordered subset (8)
+    // of a 3-param pool × sslmode in 11 spellings/case variants (absent
+    // included) placed first or last (absent: one position) + one
+    // query-less DSN. Verified invariants: the pre-`?` head is untouched;
+    // non-sslmode pairs are preserved verbatim in original order; a
+    // `sslmode` value that is `off` case-insensitively is rewritten to
+    // exactly `sslmode=disable` — and ONLY that alias (e.g. `VERIFY-FULL`
+    // keeps its case: the fn does not lowercase other values); DSNs where
+    // nothing needs normalizing are byte-identical; the rewrite is
+    // idempotent.
+    #[test]
+    fn normalize_sslmode_property_rewrites_off_alias_only() {
+        const HEAD: &str = "postgres://user:pass@host:5432/db";
+        const POOL: [&str; 3] = [
+            "app=one",
+            "sslrootcert=/etc/ssl/cert.pem",
+            "connect_timeout=5",
+        ];
+        const SPELLINGS: [&str; 11] = [
+            "off",
+            "OFF",
+            "Off",
+            "disable",
+            "require",
+            "verify-ca",
+            "verify-full",
+            "prefer",
+            "allow",
+            "weird",
+            "VERIFY-FULL",
+        ];
+
+        fn build(other: &[&str], ssl: Option<&str>, ssl_last: bool) -> Vec<String> {
+            let mut pairs: Vec<String> = Vec::new();
+            if let Some(v) = ssl {
+                if ssl_last {
+                    pairs.extend(other.iter().map(|s| s.to_string()));
+                }
+                pairs.push(format!("sslmode={v}"));
+                if !ssl_last {
+                    pairs.extend(other.iter().map(|s| s.to_string()));
+                }
+            } else {
+                pairs.extend(other.iter().map(|s| s.to_string()));
+            }
+            pairs
+        }
+
+        let mut cases = 0usize;
+        // A DSN without any `?` passes through untouched.
+        assert_eq!(normalize_sslmode(HEAD), HEAD, "no `?` → untouched");
+        cases += 1;
+        for variant in SPELLINGS
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
+            for mask in 0..(1 << POOL.len()) {
+                let other: Vec<&str> = POOL
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, p)| ((mask & (1 << i)) != 0).then_some(*p))
+                    .collect();
+                for ssl_last in [false, true] {
+                    if variant.is_none() && !ssl_last {
+                        continue; // absent sslmode: position is meaningless
+                    }
+                    let dsn = format!("{HEAD}?{}", build(&other, variant, ssl_last).join("&"));
+                    // Expected: same pairs, only an `off` (case-insensitive)
+                    // sslmode rewritten to the canonical `disable` value;
+                    // every other value stays verbatim (case included).
+                    let expected_value = variant.map(|v| {
+                        if v.eq_ignore_ascii_case("off") {
+                            "disable"
+                        } else {
+                            v
+                        }
+                    });
+                    let expected = format!(
+                        "{HEAD}?{}",
+                        build(&other, expected_value, ssl_last).join("&")
+                    );
+                    let out = normalize_sslmode(&dsn);
+                    assert_eq!(out, expected, "normalize: {dsn}");
+                    if expected == dsn {
+                        assert_eq!(out, dsn, "untouched: {dsn}");
+                    }
+                    assert_eq!(normalize_sslmode(&out), out, "idempotent: {dsn}");
+                    assert!(out.starts_with(&format!("{HEAD}?")), "head kept: {dsn}");
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 185, "185 DSNs covered");
+    }
+
     #[test]
     fn plain_postgres_no_sslmode() {
         assert_eq!(
@@ -759,6 +856,48 @@ mod tests {
             driver_dsn("postgres://user@localhost/db?sslmode=require"),
             "postgres://user@localhost/db?sslmode=require"
         );
+    }
+
+    // m4 property test: 16 scheme × shape DSNs — driver_dsn rewrites ONLY
+    // the exact `postgres+tls://` / `postgresql+tls://` prefixes to the
+    // plain scheme (rest, query included, byte-identical); it is idempotent
+    // (second application is the identity) and canonical (no output ever
+    // starts with a `+tls` scheme).
+    #[test]
+    fn driver_dsn_property_idempotent_and_canonical() {
+        const SCHEMES: [&str; 4] = [
+            "postgres://",
+            "postgresql://",
+            "postgres+tls://",
+            "postgresql+tls://",
+        ];
+        const REST: [&str; 4] = [
+            "user:pass@localhost:5432/db",
+            "u@h/db?sslmode=require",
+            "h/db?a=1&b=2",
+            "",
+        ];
+        let mut cases = 0usize;
+        for scheme in SCHEMES {
+            for rest in REST {
+                let dsn = format!("{scheme}{rest}");
+                let once = driver_dsn(&dsn);
+                assert_eq!(driver_dsn(&once), once, "idempotent: {dsn}");
+                assert!(
+                    !once.starts_with("postgres+tls://") && !once.starts_with("postgresql+tls://"),
+                    "canonical (no +tls scheme): {dsn}"
+                );
+                // The scheme rewrite is the only possible change.
+                let expected = match scheme {
+                    "postgres+tls://" => format!("postgres://{rest}"),
+                    "postgresql+tls://" => format!("postgresql://{rest}"),
+                    _ => dsn.clone(),
+                };
+                assert_eq!(once, expected, "rewrite: {dsn}");
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 16, "16 DSNs covered");
     }
 
     #[test]

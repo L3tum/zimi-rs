@@ -92,7 +92,10 @@ hardlink-based file sharing, an OpenAI-compatible embedding pipeline, and an MCP
   (`SettingsAuth`: the extracted admin-auth surface — TTL-cached token
   verification with the process-wide KDF cap, and the legacy-plaintext
   upgrade; reads the stored password through the shared cache),
-  `snapshots.rs` (read snapshots for search/poller params).
+  `encrypt.rs` (SEC-L5 at-rest encryption: `SECURITY_KEY` HKDF-derives the
+  AES-256-GCM KEK; the three secret `settings` rows are stored
+  `enc:v1:`-prefixed, transparently decrypted by `cache.rs` — the only
+  crypto boundary), `snapshots.rs` (read snapshots for search/poller params).
 
 - **`src/mcp/`** — MCP server over stdio: hand-rolled JSON-RPC 2.0,
   newline-delimited; tools: `search`, `read`, `suggest`, `list_sources`,

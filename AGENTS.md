@@ -88,6 +88,19 @@ DATABASE_URL=postgres://zimservice:zimservice@<host>:5432/zimservice \
 ZIMSERVICE_REQUIRE_DB=1 cargo test
 ```
 
+**Where the URL lives.** The repo deliberately ships no real host — the
+`<host>` above is a placeholder. On the dev machine the concrete URL is in
+`dev-database.sh` (gitignored, never commit); source it with
+`set -a; source dev-database.sh; set +a` before `cargo test`. That target is
+`192.168.0.38:5432/zimservice` (LAN).
+
+**The dev DB is test-only — disposable.** The suites wipe, rewrite, and
+re-encrypt its rows freely (the SEC-L5 at-rest-encryption tests sweep and
+restore the three secret `settings` keys; the temp-DB test modules create and
+drop databases). Treat it as scratch: never point a real deployment at it, and
+never expect data written there (real tokens, qBittorrent passwords, …) to
+survive a test run.
+
 `zimservice` must be a **superuser**: the migrations run
 `CREATE EXTENSION vector`, and pgvector's `vector` extension is `trusted = false`
 on the local server, so only a superuser can create it. In a reset/provision

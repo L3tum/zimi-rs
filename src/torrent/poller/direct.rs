@@ -1,69 +1,11 @@
-//! Direct-HTTP download path: client build, Range-resume streaming, finalize.
+//! Direct-HTTP download path: Range-resume streaming, finalize.
 
 use super::{
     follow_pinned_get, index, mark_error, status_checked, status_if_changed, validate_download_url,
     verify_zim, Arc, Duration, Error, Instant, Path, PinnedResponse, Pool, Result, SettingsCache,
     TorrentKind, ZimManager,
 };
-
-/// Build a download HTTP client. Redirects are **not** followed by this
-/// client (`Policy::none`): user-influenced URLs (direct `.zim` downloads,
-/// the OPDS catalog) follow redirects **manually** via
-/// [`crate::netguard::follow_pinned_get`] — every hop is re-validated,
-/// re-resolved, and pinned to the exact address that passed the check, so a
-/// sub-second DNS flip between check and CONNECT can't steer the fetch at a
-/// blocked host (SEC-1). `pin` optionally fixes a domain→addr resolution
-/// (validated up front by the caller) for this client; IP-literal hosts are
-/// passed with `pin = None` (no DNS → nothing to pin, no rebinding window).
-pub(crate) enum ClientProfile {
-    /// Control-plane calls (OPDS catalog fetch): bounded end-to-end.
-    Control,
-    /// Long transfers (multi-GB `.zim` body streams): connect + read-idle
-    /// bounds only, **no total timeout** — `reqwest::Client::timeout` caps
-    /// the entire request including body reception, which aborted every
-    /// realistically-sized download mid-stream (C1).
-    Transfer,
-}
-
-/// `(total, connect, read-idle)` timeouts per profile. `Transfer` is bounded
-/// instead by the `downloads.max_bytes` stream cap on total volume and by the
-/// read-idle timeout on stalled connections.
-fn client_timeouts(
-    profile: ClientProfile,
-) -> (Option<Duration>, Option<Duration>, Option<Duration>) {
-    match profile {
-        ClientProfile::Control => (Some(Duration::from_secs(30)), None, None),
-        ClientProfile::Transfer => (
-            None,
-            Some(Duration::from_secs(10)),
-            Some(Duration::from_secs(60)),
-        ),
-    }
-}
-
-pub(crate) fn build_download_client(
-    profile: ClientProfile,
-    pin: Option<(String, std::net::SocketAddr)>,
-) -> Result<reqwest::Client> {
-    let (total, connect, read) = client_timeouts(profile);
-    // SEC-1: never auto-follow — the manual redirect loop
-    // (netguard::follow_pinned_get) owns all following, with per-hop
-    // resolve + pin.
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-    if let Some(t) = total {
-        builder = builder.timeout(t);
-    }
-    if let Some(c) = connect {
-        builder = builder.connect_timeout(c);
-    }
-    if let Some(r) = read {
-        builder = builder.read_timeout(r);
-    }
-    if let Some((host, ip)) = pin {
-        builder = builder.resolve(&host, ip);
-    }
-    builder.build().map_err(Error::Http)
-}
+use crate::torrent::client::{build_download_client, ClientProfile};
 
 /// Resume decision from an existing `.part`: `Some(s)` for a non-empty
 /// file (resume from byte `s`), `None` for a fresh download. Bytes on
@@ -844,14 +786,13 @@ async fn finalize_direct_download(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::super::tests::download::test_pool;
-    use super::{build_download_client, ClientProfile};
     use crate::db::pool::Pool;
     use crate::netguard::{follow_pinned_get, PinnedResponse};
     use crate::testing::dead_pool;
+    use crate::torrent::client::{build_download_client, ClientProfile};
 
     // ── B5.4: download-client SSRF / redirect / pinning (wiremock) ───────────
-    // In-module so the private `build_download_client` / `ClientProfile` are
-    // reachable; the builder-failure path is covered by the
+    // The builder-failure path is covered by the
     // `client_from_option` unit test (propagation instead of the old silent
     // `unwrap_or_default()`).
 
@@ -888,8 +829,8 @@ mod tests {
             .await;
         // Pin `testhost` (no real DNS) at the MockServer socket: the fetch of
         // `http://testhost:{port}` succeeds only if the client carries the pin.
-        let client = super::build_download_client(
-            super::ClientProfile::Transfer,
+        let client = build_download_client(
+            ClientProfile::Transfer,
             Some(("testhost".into(), *server.address())),
         )
         .expect("client builds");
@@ -2475,8 +2416,7 @@ mod tests {
         });
 
         let url = format!("http://127.0.0.1:{}/x.zim", addr.port());
-        let client = super::build_download_client(super::ClientProfile::Transfer, None)
-            .expect("client builds");
+        let client = build_download_client(ClientProfile::Transfer, None).expect("client builds");
         // Hop 0 (ranged) → 416, the terminal response we feed to stream_part.
         let resp = client
             .get(&url)

@@ -191,8 +191,9 @@ Reason for KEEP: (1) the btree prefix range serves Q1/SUG ~20–60× faster
 than the trgm bitmap scans serve Q2/Q3, so the btree is *not* redundant for
 the prefix shape; (2) Q5 (pure ordering) also rides the btree — dropping it
 would force a full 100k-row sort for any future ordering-only endpoint.
-`migrations/014_articles_title_prefix_drop.sql` is NOT created; migration
-number 014 remains unused (any future migration is 015 or later).
+`migrations/014_articles_title_prefix_drop.sql` was never created (the KEEP
+decision stood); migration number 014 was later allocated to
+`migrations/014_drop_dead_schema.sql`.
 
 ---
 
@@ -218,3 +219,47 @@ intentionally deferred to a future pass:
    Deferred because the I/O-bound COPY is the bottleneck and Postgres itself
    serialises concurrent COPY to the same table; gains would be marginal for
    the typical < 20 ZIM deployment.
+
+---
+
+## Superseded decisions
+
+- **Sequential search arms — 2026-08-30 decision, superseded 2026-09-18
+  (DROP the sequential form; KEEP the concurrent form).** On 2026-08-30 the
+  arm queries ran SEQUENTIALLY on ONE pool checkout: a tokio-postgres
+  client is single-in-flight-command, and parallel arms would need 4–5 of
+  the pool's 20 connections per request, "not justified by the few-ms of
+  sequential DB time" (the slow arm being the embed HTTP, already
+  concurrent via `join!`). What changed since: Postgres moved to a remote
+  host, so every arm seek now pays a network RTT (the sub-10ms local-DB
+  assumption is gone), and the per-search clone/checkout churn was
+  measured — the documented revisit trigger fired. Outcome (2026-09-18):
+  the selected arms run CONCURRENTLY (each text arm on its own pool
+  checkout, the vector arm in the same `tokio::join!`), so total latency
+  is max(embed, fts, trgm×3, ann), not the sum. The in-code note lived in
+  `SearchEngine::search` (src/search/mod.rs) beside the join; the 2026-09-21
+  arm-construction extraction (PONY N2) moved the surviving 2026-09-18
+  record to `build_search_arms` and this superseded note here.
+
+## Closed optimizations (evaluated, no change)
+
+- **Search candidate materialization bound — PERF L2, evaluated
+  2026-09-21 (KEEP the current form).** A review flagged that search
+  "fully materializes all fetched rows before dedup/limit" (transient ~20
+  MB at the hard corner offset=5000, limit=500). Traced through the
+  pipeline: (1) every arm's SQL is already `LIMIT min(offset+limit,
+  SEARCH_FETCH_HARD_CAP)` — the offset-aware fetch
+  (`branch_fetch_limit`/`vector_fetch_limit` in src/search/sql.rs, pinned
+  by `branch_fetch_limit_is_offset_aware_and_capped`); (2) the trgm group
+  is pre-deduped before the final merge (fixed merge positions, record in
+  `SearchEngine::search`); (3) `merge_results` early-exits the collect
+  scan at `offset+limit` distinct ids (pinned by
+  `merge_results_serves_deep_page_from_full_pool`). The remaining
+  transient is the `all` concat in `merge_results` — provably bounded at
+  3×SEARCH_FETCH_HARD_CAP rows at the absolute corner, i.e. exactly the
+  documented worst case, once per request. The only further reduction is a
+  k-way heap merge over the three ranked arms to avoid the full concat:
+  REJECTED — a large refactor for a bounded ~20 MB transient with zero
+  correctness gain (the page output is identical by the top-k-of-union
+  property). Revisit only if a real deployment shows the corner transient
+  matters (deep pagination under memory pressure).

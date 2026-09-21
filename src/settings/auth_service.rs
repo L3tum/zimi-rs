@@ -305,7 +305,13 @@ impl SettingsAuth {
     /// both token caches are invalidated because a stored-value change
     /// makes every cached verdict stale).
     pub async fn upgrade_read_only(&self, hashed: String) {
-        let val: serde_json::Value = serde_json::json!(hashed);
+        // SEC-L5: `access.read_only_token` is an at-rest-encrypted target
+        // — persist the hash encrypted (the in-memory cache below holds
+        // the plain hash either way; `stored_value_for` is a no-op without
+        // a KEK).
+        let val = self
+            .inner
+            .stored_value_for(KEY_ACCESS_READ_ONLY_TOKEN, &serde_json::json!(hashed));
         match raw::execute(
             self.inner.pool(),
             "UPDATE settings SET value = $1 WHERE key = $2",

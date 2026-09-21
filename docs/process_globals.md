@@ -58,12 +58,12 @@ state. Listed so a grep for `static` stays auditable:
 These exist only under `cfg(test)` / test support and are not DI
 exceptions.
 
-## The unused 014 migration number
+## Migration number 014 (historical)
 
-Migration number 014 was reserved by the deferred PERF-4 decision and is now
-**permanently unused**: the 2026-09 measurement recorded KEEP for
-`idx_articles_title_prefix` (see `docs/perf-notes.md` — the fixed drop rule
-was not met), so `migrations/014_articles_title_prefix_drop.sql` was never
-created. The last applied migration is 013; any future migration is 015 or
-later — e.g. a durable replacement for a global above (persisting
-`EMBED_FAILS` as an `embed_fail_count` column).
+Migration number 014 was reserved by the deferred PERF-4 decision: the
+2026-09 measurement recorded KEEP for `idx_articles_title_prefix` (see
+`docs/perf-notes.md` — the fixed drop rule was not met), so
+`migrations/014_articles_title_prefix_drop.sql` was never created. Number
+014 was subsequently allocated to `migrations/014_drop_dead_schema.sql`. A
+future migration could still be a durable replacement for a global above
+(e.g. persisting `EMBED_FAILS` as an `embed_fail_count` column).

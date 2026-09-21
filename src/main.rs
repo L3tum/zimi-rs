@@ -11,7 +11,10 @@ use zimservice::serve;
 use zimservice::torrent;
 use zimservice::zim::index;
 
-use zimservice::settings::{KEY_ACCESS_ADMIN_PASSWORD, KEY_GENERAL_TRUSTED_PROXY_CIDRS};
+use zimservice::settings::{
+    KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_READ_ONLY_TOKEN, KEY_EMBEDDING_API_KEY,
+    KEY_GENERAL_TRUSTED_PROXY_CIDRS, KEY_TORRENT_PASSWORD,
+};
 use zimservice::startup;
 use zimservice::startup::wait_for_task_failure;
 
@@ -134,7 +137,7 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
         .settings
         .get_typed::<String>(KEY_GENERAL_TRUSTED_PROXY_CIDRS)
         .unwrap_or_default();
-    let warnings = match startup::serve_policy_checks(
+    let mut warnings = match startup::serve_policy_checks(
         &config.host,
         &state.settings.access_mode(),
         state.settings.require_auth_for_reads(),
@@ -143,6 +146,27 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
         Ok(w) => w,
         Err(msg) => anyhow::bail!("{msg}"),
     };
+    // SEC-L5: plaintext-at-rest warning. The check needs the loaded
+    // settings (which target secret, if any, is non-empty) plus the
+    // Config's `security_key`, so it runs here at the call site and pushes
+    // into the same warnings list as `serve_policy_checks`.
+    let secret_stored = [
+        KEY_TORRENT_PASSWORD,
+        KEY_EMBEDDING_API_KEY,
+        KEY_ACCESS_READ_ONLY_TOKEN,
+    ]
+    .iter()
+    .any(|key| {
+        state
+            .settings
+            .get_typed::<String>(key)
+            .is_some_and(|s| !s.is_empty())
+    });
+    if let Some(w) =
+        startup::security_key_plaintext_warning(config.security_key.is_some(), secret_stored)
+    {
+        warnings.push(w);
+    }
     for w in &warnings {
         match w.level {
             startup::WarnLevel::Warn => tracing::warn!("{}", w.message),

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result, TorrentKind};
 
+pub(crate) mod client;
 pub mod files;
 pub mod opds;
 pub mod poller;

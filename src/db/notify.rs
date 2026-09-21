@@ -15,12 +15,13 @@
 //! the listener must agree on the exact spelling):
 //! - [`crate::db::notify::SETTINGS_CHANNEL`] — settings rows changed
 //!   (`SettingsCache::update`, the seed in `SettingsCache::reload`, and the
-//!   lazy admin-password upgrade in `settings::auth_service`). Consumers:
-//!   [`crate::settings::SettingsCache`] re-reads its whole map via
-//!   `reload()`.
+//!   lazy admin-password upgrade in `settings::auth_service`). Consumer: the
+//!   `on_settings` closure wired at the composition root (`startup.rs`) —
+//!   a full `SettingsCache::reload()` re-read of the whole map.
 //! - [`crate::db::notify::CATALOG_CHANNEL`] — the ZIM catalog changed
 //!   (install finalize in the download poller, the startup/directory
-//!   `resync` persist). Consumers: `ZimManager::resync()` (re-scan +
+//!   `resync` persist). Consumer: the `on_catalog` closure wired at the
+//!   composition root (`startup.rs`) — `ZimManager::resync()` (re-scan +
 //!   reconcile + persist; idempotent).
 //!
 //! **Listener topology**: the listener runs on a **dedicated max-1 pool** —
@@ -68,6 +69,8 @@
 //! stop flag **before** aborting the tasks, so a clean shutdown never trips
 //! the supervisor.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -76,8 +79,6 @@ use sqlx::postgres::{PgListener, PgPoolOptions};
 
 use crate::db::pool;
 use crate::error::{Error, Result};
-use crate::settings::SettingsCache;
-use crate::zim::ZimManager;
 
 /// Settings-invalidation channel: settings rows changed.
 pub const SETTINGS_CHANNEL: &str = "zimservice_settings";
@@ -280,10 +281,30 @@ impl NotifyListener {
     }
 }
 
+/// Per-bump invalidation action. The persistence layer is domain-agnostic:
+/// the composition root (`startup.rs`) wires these to the domain caches —
+/// the settings channel drives a `SettingsCache::reload()`, the catalog
+/// channel a `ZimManager::resync()`. One call per coalesced bump: the watch
+/// channel collapses a burst of notifications into a single call, which is
+/// exactly the desired behavior since both domain actions are idempotent
+/// (each re-reads everything).
+type OnBump = Box<dyn FnMut(u64) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+/// The bump-driven subscriber loop shared by both subscriber tasks: run
+/// `action` once per coalesced bump until the sender is dropped (graceful
+/// stop, which also aborts the task).
+async fn run_on_bumps(mut rx: tokio::sync::watch::Receiver<u64>, mut action: OnBump) {
+    while rx.changed().await.is_ok() {
+        let bump = *rx.borrow_and_update();
+        action(bump).await;
+    }
+}
+
 /// Spawn the cross-process invalidation listener (see the module docs).
 ///
-/// `settings` / `zims` are the caches the invalidations reload; they are
-/// moved into the spawned subscriber tasks. The listener starts in
+/// `on_settings` / `on_catalog` are the composition-root invalidation
+/// actions (see the module docs); they are moved into the spawned subscriber
+/// tasks. The listener starts in
 /// [`ListenerState::Reconnecting`]: the first connect (and its full resync)
 /// happens inside the spawned task, so this never serializes startup on the
 /// database and cannot fail it — a listener that never connects degrades to
@@ -291,10 +312,15 @@ impl NotifyListener {
 /// reports `reconnecting` in `/diagnostic`.
 pub fn spawn_listener(
     database_url: &str,
-    settings: SettingsCache,
-    zims: Arc<ZimManager>,
+    on_settings: OnBump,
+    on_catalog: OnBump,
 ) -> NotifyListener {
-    spawn_listener_as(database_url, settings, zims, LISTENER_APPLICATION_NAME)
+    spawn_listener_as(
+        database_url,
+        on_settings,
+        on_catalog,
+        LISTENER_APPLICATION_NAME,
+    )
 }
 
 /// [`spawn_listener`] with an explicit `application_name` for the dedicated
@@ -303,8 +329,8 @@ pub fn spawn_listener(
 /// reconnect path.
 pub(crate) fn spawn_listener_as(
     database_url: &str,
-    settings: SettingsCache,
-    zims: Arc<ZimManager>,
+    on_settings: OnBump,
+    on_catalog: OnBump,
     application_name: &str,
 ) -> NotifyListener {
     let status = Arc::new(NotifyStatus::default());
@@ -337,12 +363,12 @@ pub(crate) fn spawn_listener_as(
 
     let settings_task = tokio::spawn(async move {
         let _report = DeathReporter("settings_subscriber", settings_report);
-        settings.run_invalidation_subscriber(settings_rx).await;
+        run_on_bumps(settings_rx, on_settings).await;
     });
 
     let catalog_task = tokio::spawn(async move {
         let _report = DeathReporter("catalog_subscriber", catalog_report);
-        catalog_subscriber(catalog_rx, zims).await;
+        run_on_bumps(catalog_rx, on_catalog).await;
     });
 
     let supervisor_task = tokio::spawn(async move {
@@ -540,30 +566,6 @@ async fn connect_listener(url: &str, application_name: &str) -> Result<PgListene
     Ok(listener)
 }
 
-/// Catalog invalidation subscriber: on every `zimservice_catalog` bump,
-/// re-scan + reconcile the ZIM catalog via [`ZimManager::resync`] (idempotent
-/// — an unchanged disk snapshot early-outs without persisting or re-firing).
-/// A failed resync (pool blip) is logged; the next bump retries, and the
-/// missed-notification recovery on the next reconnect bounds the gap.
-async fn catalog_subscriber(mut rx: tokio::sync::watch::Receiver<u64>, zims: Arc<ZimManager>) {
-    while rx.changed().await.is_ok() {
-        let bump = *rx.borrow_and_update();
-        match zims.resync().await {
-            Ok(report) if !report.is_empty() => {
-                tracing::info!(
-                    bump,
-                    ?report,
-                    "cross-process catalog invalidation: resynced"
-                )
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("cross-process catalog invalidation: resync failed: {e}")
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -571,6 +573,12 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    // Test-only coupling: the production code above is domain-agnostic (the
+    // composition root wires the closures); these tests exercise the real
+    // end-to-end invalidation against the real caches.
+    use crate::settings::SettingsCache;
+    use crate::zim::ZimManager;
 
     /// The same `DATABASE_URL` idiom as [`crate::testing::test_pool`].
     fn test_url() -> String {
@@ -617,20 +625,23 @@ mod tests {
     }
 
     /// Build the listener's dependencies against the shared suite DB (an
-    /// empty temp ZIM dir + a real `SettingsCache` load).
+    /// empty temp ZIM dir + a real `SettingsCache` load). Returns `None` —
+    /// counted as a skip inside [`crate::testing::test_pool`] via
+    /// `gate_skip` — when the compose-URL DB is unreachable.
     async fn spawn_ready(
         tag: &str,
-    ) -> (
+    ) -> Option<(
         crate::db::Pool,
         tempfile::TempDir,
         SettingsCache,
         Arc<ZimManager>,
         NotifyListener,
-    ) {
+    )> {
         let url = test_url();
-        let (pool, _gate) = crate::testing::test_pool()
-            .await
-            .expect("test_pool (DB gate)");
+        // `?` (not let-else): this fn returns `Option`, so a `None` gate
+        // propagates as the caller's counted skip (counted inside
+        // `test_pool()` via `gate_skip`).
+        let (pool, _gate) = crate::testing::test_pool().await?;
         crate::db::migrate::run_migrations(&pool)
             .await
             .expect("migrations");
@@ -639,8 +650,44 @@ mod tests {
             .await
             .expect("settings load");
         let zims = ZimManager::new(dir.path().to_path_buf(), pool.clone());
-        let listener = spawn_listener_as(&url, settings.clone(), zims.clone(), &app_name(tag));
-        (pool, dir, settings, zims, listener)
+        // Test-side stand-in for the composition-root wiring in
+        // `startup.rs`: closures over the real caches, reproducing the
+        // production per-notification behavior and log lines exactly.
+        let settings_sub = settings.clone();
+        let on_settings: OnBump = Box::new(move |bump| {
+            let cache = settings_sub.clone();
+            Box::pin(async move {
+                match cache.reload().await {
+                    Ok(()) => {
+                        tracing::debug!(bump, "cross-process settings invalidation: reloaded")
+                    }
+                    Err(e) => {
+                        tracing::error!("cross-process settings invalidation: reload failed: {e}")
+                    }
+                }
+            })
+        });
+        let zims_sub = zims.clone();
+        let on_catalog: OnBump = Box::new(move |bump| {
+            let zims = zims_sub.clone();
+            Box::pin(async move {
+                match zims.resync().await {
+                    Ok(report) if !report.is_empty() => {
+                        tracing::info!(
+                            bump,
+                            ?report,
+                            "cross-process catalog invalidation: resynced"
+                        )
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("cross-process catalog invalidation: resync failed: {e}")
+                    }
+                }
+            })
+        });
+        let listener = spawn_listener_as(&url, on_settings, on_catalog, &app_name(tag));
+        Some((pool, dir, settings, zims, listener))
     }
 
     async fn wait_connected(listener: &NotifyListener) {
@@ -677,7 +724,9 @@ mod tests {
     /// subscriber and trigger a full cache reload.
     #[tokio::test]
     async fn settings_invalidations_reload_the_cache() {
-        let (pool, _dir, settings, _zims, listener) = spawn_ready("settings").await;
+        let Some((pool, _dir, settings, _zims, listener)) = spawn_ready("settings").await else {
+            return;
+        };
         wait_connected(&listener).await;
 
         let gen_before = settings.generation();
@@ -749,7 +798,9 @@ mod tests {
     /// install/finalize and uninstall/delete propagation end to end.
     #[tokio::test]
     async fn catalog_invalidations_resync_from_disk() {
-        let (pool, dir, _settings, _zims, listener) = spawn_ready("catalog").await;
+        let Some((pool, dir, _settings, _zims, listener)) = spawn_ready("catalog").await else {
+            return;
+        };
         wait_connected(&listener).await;
 
         let name = "notifycat";
@@ -803,7 +854,9 @@ mod tests {
     /// the re-`LISTEN`ed session still receives notifications.
     #[tokio::test]
     async fn terminated_session_reconnects_resyncs_and_relistens() {
-        let (pool, _dir, _settings, _zims, listener) = spawn_ready("reconnect").await;
+        let Some((pool, _dir, _settings, _zims, listener)) = spawn_ready("reconnect").await else {
+            return;
+        };
         wait_connected(&listener).await;
         let name = app_name("reconnect");
 
@@ -856,7 +909,9 @@ mod tests {
     /// `exit(1)` here would kill the test process).
     #[tokio::test]
     async fn last_handle_drop_closes_the_session_gracefully() {
-        let (pool, _dir, _settings, _zims, listener) = spawn_ready("drop").await;
+        let Some((pool, _dir, _settings, _zims, listener)) = spawn_ready("drop").await else {
+            return;
+        };
         wait_connected(&listener).await;
         let name = app_name("drop");
 
@@ -888,6 +943,116 @@ mod tests {
             )
             .await,
             "dropping the last handle must close the dedicated LISTEN session"
+        );
+    }
+
+    /// Fix-1 meta-tripwire (S1): a DB gate must be a *counted skip*, never
+    /// a panic. The historical bug was `test_pool().await` (which returns
+    /// an Option) followed by a panic call on the result — on a DB-less
+    /// machine that panicked where [`crate::testing::gate_skip`] had to
+    /// count a skip. Walk every `.rs` file under `src/` (cwd is the crate
+    /// root under `cargo test`, same convention as the `migrations/` walk
+    /// in src/lib.rs) and fail on the panic chain over the returned
+    /// Option. The legal let-else skip idiom, `?`, and `match` on the
+    /// Option are exempt — see
+    /// [`gate_matcher_flags_panic_chains_and_exempts_skip_idioms`].
+    #[test]
+    fn test_pool_gates_must_skip_not_panic() {
+        let mut rs_files = Vec::new();
+        collect_rs_files(std::path::Path::new("src"), &mut rs_files);
+        assert!(
+            !rs_files.is_empty(),
+            "no .rs files under src/ — cwd is not the crate root?"
+        );
+        for file in &rs_files {
+            let text = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file}: {e}"));
+            if let Some(start) = find_panic_gate_chains(&text).into_iter().next() {
+                let line = text[..start].matches('\n').count() + 1;
+                panic!(
+                    "DB gate panic: {file}:{line} — test_pool() must be a counted \
+                     skip, not a panic (see gate_skip)"
+                );
+            }
+        }
+    }
+
+    /// The tripwire's chain matcher (factored for unit testing): finds a
+    /// `test_pool().await` whose statement chain then panics on the
+    /// result, and returns the start offset of each hit. The first `.` or
+    /// `;` after `.await` decides: a panic call there is a hit; a `;`, a
+    /// `?`, a `{`, or any other member access ends the chain cleanly —
+    /// which is what exempts the let-else skip idiom, `?`, and `match`
+    /// shapes. (Hand-rolled rather than `regex`: the crate's syntax has no
+    /// lookaround, and the decision is one character class.)
+    fn find_panic_gate_chains(text: &str) -> Vec<usize> {
+        const CALL: &str = "test_pool()";
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(CALL) {
+            let call = from + rel;
+            // Whitespace-only gap (line-break chains: `test_pool()` then a
+            // newline then `.await`), then the `.await` suffix.
+            let after = text[call + CALL.len()..].trim_start();
+            if let Some(rest) = after.strip_prefix(".await") {
+                // The first `.` or `;` in the statement chain decides.
+                if let Some(dot) = rest.find(['.', ';']) {
+                    let at = dot + 1;
+                    if rest.as_bytes()[dot] == b'.'
+                        && (rest[at..].starts_with("expect(") || rest[at..].starts_with("unwrap("))
+                    {
+                        out.push(call);
+                    }
+                }
+            }
+            from = call + CALL.len();
+        }
+        out
+    }
+
+    /// Recursively collect `*.rs` paths under `dir` (crate root is the
+    /// cwd under `cargo test` — the docs_freshness walk in src/lib.rs
+    /// relies on the same convention for `migrations/`).
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<String>) {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}"));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|e| panic!("read dir entry: {e}"))
+                .path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path.display().to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn gate_matcher_flags_panic_chains_and_exempts_skip_idioms() {
+        // The historical bug shape. `\n` escapes on purpose: at runtime
+        // the string holds real line breaks (the chain spans them), while
+        // this file's own scanner pass sees literal backslash-n and never
+        // self-trips.
+        let bad = "crate::testing::test_pool()\n.await\n.expect(\"test_pool (DB gate)\")";
+        assert_eq!(
+            find_panic_gate_chains(bad).len(),
+            1,
+            "chained panic call on test_pool() must be flagged"
+        );
+        // The legal counted-skip idiom (plus its `?` / `match` siblings).
+        let good = "let Some((pool, _gate)) = test_pool().await else { return };";
+        assert!(
+            find_panic_gate_chains(good).is_empty(),
+            "let-else skip idiom must be exempt"
+        );
+        let good_q = "let (pool, _gate) = test_pool().await?;";
+        assert!(
+            find_panic_gate_chains(good_q).is_empty(),
+            "`?` on the Option must be exempt"
+        );
+        let good_m = "match test_pool().await { Some(_) => (), None => return }";
+        assert!(
+            find_panic_gate_chains(good_m).is_empty(),
+            "`match` on the Option must be exempt"
         );
     }
 }

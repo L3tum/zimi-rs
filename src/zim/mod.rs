@@ -832,8 +832,10 @@ impl ZimManager {
             report.push(format!("{name} (removed)"));
         }
 
+        // Use a HashSet for O(1) lookups instead of O(n) Vec::contains
+        let added_set: std::collections::HashSet<&str> = added.iter().map(String::as_str).collect();
         for name in added.iter().chain(changed.iter()) {
-            let kind = if added.contains(name) {
+            let kind = if added_set.contains(name.as_str()) {
                 "added"
             } else {
                 "changed"

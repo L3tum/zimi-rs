@@ -4,6 +4,12 @@
 //! `serve::middleware`'s auth gate, and the over-broad / `/0` guards are
 //! checked at startup (`startup::serve_policy_checks`), so they live in
 //! `access` rather than inside `serve`.
+//!
+//! PONY S3: the hand-rolled CIDR bitmath is now the `ipnet` crate —
+//! `IpNet::from_str` parses/validates each entry (rejecting plain
+//! literals and out-of-range prefixes) and `IpNet::contains` does the
+//! version-aware, host-bit-masked containment (same results as the old
+//! `ip4_in_cidr`/`ip6_in_cidr` bitmath, which is deleted).
 
 /// WI-14: check if `ip` falls within any CIDR in the comma-separated `cidrs`
 /// string. Supports both IPv4 and IPv6 CIDRs (e.g. "10.0.0.0/8,192.168.1.0/24").
@@ -18,42 +24,33 @@ pub(crate) fn cidrs_contains(cidrs: &str, ip: &std::net::IpAddr) -> bool {
         if !s.contains('/') {
             return s.parse::<std::net::IpAddr>() == Ok(*ip);
         }
-        // CIDR match — shared entry parser (S1) so the request-time check and
-        // the startup over-broad guard parse identically.
-        let Some((net, prefix)) = parse_cidr_entry(s) else {
+        // CIDR match — shared entry parser (S1) so the request-time check
+        // and the startup over-broad guard parse identically. `IpNet`
+        // containment is version-aware (a v4 entry never matches a v6 ip)
+        // and masks host bits; the old explicit `prefix <= 32`/`<= 128`
+        // guards are subsumed by `IpNet::from_str` rejecting out-of-range
+        // prefixes (PONY S3).
+        let Some(net) = parse_cidr_entry(s) else {
             return false;
         };
-        match (net, *ip) {
-            (std::net::IpAddr::V4(net_v4), std::net::IpAddr::V4(target)) => {
-                prefix <= 32 && ip4_in_cidr(net_v4, target, prefix)
-            }
-            (std::net::IpAddr::V6(net_v6), std::net::IpAddr::V6(target)) => {
-                prefix <= 128 && ip6_in_cidr(net_v6, target, prefix)
-            }
-            _ => false, // version mismatch
-        }
+        net.contains(ip)
     })
 }
 
 /// SEC-M3: parse one comma-separated entry of a `general.trusted_proxy_cidrs`
-/// value into `(network address, prefix length)`. Shared by the request-time
-/// containment check (`cidrs_contains`), the startup over-broad guard
-/// (`has_over_broad_cidr`), and the startup /0 refusal
+/// value into a network (`ipnet::IpNet`, PONY S3). Shared by the
+/// request-time containment check (`cidrs_contains`), the startup
+/// over-broad guard (`has_over_broad_cidr`), and the startup /0 refusal
 /// (`has_zero_prefix_cidr`) so the three can never drift apart (S1).
 ///
-/// Returns `None` for an empty entry or a plain (prefix-less) IP literal.
-pub fn parse_cidr_entry(s: &str) -> Option<(std::net::IpAddr, u32)> {
-    let s = s.trim();
-    if s.is_empty() || !s.contains('/') {
-        return None;
-    }
-    let (addr_s, prefix_s) = s.rsplit_once('/').unwrap_or_default();
-    let addr: std::net::IpAddr = addr_s.trim().parse().ok()?;
-    let prefix: u32 = match addr {
-        std::net::IpAddr::V4(_) => prefix_s.trim().parse().unwrap_or(32),
-        std::net::IpAddr::V6(_) => prefix_s.trim().parse().unwrap_or(128),
-    };
-    Some((addr, prefix))
+/// Returns `None` for an empty entry, a plain (prefix-less) IP literal, or
+/// an out-of-range prefix (v4 > /32, v6 > /128) — all rejected by
+/// `IpNet::from_str` (subsumes the old parser's `prefix <= 32`/`<= 128`
+/// guards). Host bits in the entry do not change containment: `contains`
+/// compares against the masked network/broadcast bounds, so `10.1.2.3/8`
+/// matches the same addresses as `10.0.0.0/8`.
+pub fn parse_cidr_entry(s: &str) -> Option<ipnet::IpNet> {
+    s.trim().parse::<ipnet::IpNet>().ok()
 }
 
 /// SEC-M3: true when any entry of a `general.trusted_proxy_cidrs` value is an
@@ -69,16 +66,16 @@ pub fn has_over_broad_cidr(cidrs: &str) -> bool {
         return false;
     }
     cidrs.split(',').any(|s| match parse_cidr_entry(s) {
-        Some((std::net::IpAddr::V4(_), prefix)) => prefix <= 8,
-        Some((std::net::IpAddr::V6(_), prefix)) => prefix <= 56,
+        Some(ipnet::IpNet::V4(net)) => net.prefix_len() <= 8,
+        Some(ipnet::IpNet::V6(net)) => net.prefix_len() <= 56,
         None => false,
     })
 }
 
 /// M-3: true when any entry of a `general.trusted_proxy_cidrs` value has
 /// **prefix length 0** — any `x.x.x.x/0` or `X:X::/0`, including
-/// `0.0.0.0/0` and `::/0`. The network address is irrelevant: the
-/// request-time containment check (`ip4_in_cidr`/`ip6_in_cidr`) treats any
+/// `0.0.0.0/0` and `::/0`. The network address is irrelevant:
+/// the request-time containment check (`IpNet::contains`) treats any
 /// prefix-0 entry as match-all, so even `1.2.3.4/0` trusts *every*
 /// `X-Forwarded-For` value unconditionally and a distributed attacker can
 /// rotate the header to defeat the per-IP auth-failure lockout entirely.
@@ -93,7 +90,7 @@ pub fn has_zero_prefix_cidr(cidrs: &str) -> bool {
     }
     cidrs
         .split(',')
-        .any(|s| matches!(parse_cidr_entry(s), Some((_, 0))))
+        .any(|s| parse_cidr_entry(s).is_some_and(|net| net.prefix_len() == 0))
 }
 
 /// WI-14: resolve the lockout client IP from the direct peer address and
@@ -154,36 +151,6 @@ pub(crate) fn client_ip_from_xff(
         .find(|c| !cidrs_contains(cidrs, c))
         .copied()
         .unwrap_or_else(|| *entries.first().expect("entries non-empty (checked above)"))
-}
-
-fn ip4_in_cidr(net: std::net::Ipv4Addr, target: std::net::Ipv4Addr, prefix: u32) -> bool {
-    let net_b = u32::from(net);
-    let tgt_b = u32::from(target);
-    if prefix == 0 {
-        return true;
-    }
-    let mask = 0xFFFF_FFFF << (32 - prefix);
-    (net_b & mask) == (tgt_b & mask)
-}
-
-fn ip6_in_cidr(net: std::net::Ipv6Addr, target: std::net::Ipv6Addr, prefix: u32) -> bool {
-    let net_b = net.octets();
-    let tgt_b = target.octets();
-    let full_bytes = (prefix / 8) as usize;
-    let rem_bits = prefix % 8;
-    if full_bytes > 16 {
-        return false;
-    }
-    if net_b[..full_bytes] != tgt_b[..full_bytes] {
-        return false;
-    }
-    if rem_bits > 0 && full_bytes < 16 {
-        let mask = 0xFFu8 << (8 - rem_bits);
-        if (net_b[full_bytes] & mask) != (tgt_b[full_bytes] & mask) {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(test)]

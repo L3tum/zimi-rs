@@ -13,6 +13,8 @@
 //! need only `Config` (the DSN + `zim_dir`), so they come first.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use sqlx::postgres::PgConnection;
@@ -287,9 +289,18 @@ pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result
     config.apply_require_reads_default(&mut env_snapshot);
     // SEC L-1: an env-seeded legacy plaintext password must never ride the
     // snapshot (and the lazy upgrade write) into the settings table as
-    // plaintext — hash it here, before `SettingsCache::load` applies it.
+    // plaintext — hash it here, before the settings load applies it.
     hash_legacy_env_seeded_password(&mut env_snapshot);
-    let settings = SettingsCache::load(pool.clone(), env_locked, env_snapshot).await?;
+    // Load settings (seeds defaults on first run). `config.security_key`
+    // enables the at-rest encryption of the secret settings (SEC-L5);
+    // `None` keeps the legacy plaintext behavior.
+    let settings = SettingsCache::load_with_security_key(
+        pool.clone(),
+        env_locked,
+        env_snapshot,
+        config.security_key.as_deref(),
+    )
+    .await?;
     settings.sync_from_config(config); // ARCH-1: general.* display keys <- Config
 
     // Password mode with no password would fail open on every request —
@@ -395,10 +406,55 @@ pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result
     // resync has already converged the caches and the listener's
     // connect-resync is a no-op.
     let notify = if mode == StartupMode::Serve {
+        // Composition-root invalidation wiring: `db::notify` is
+        // domain-agnostic, so the per-bump domain actions are closures over
+        // the caches built here (settings channel → full reload, catalog
+        // channel → resync).
+        let settings_action = settings.clone();
+        let on_settings = Box::new(
+            move |bump: u64| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                let cache = settings_action.clone();
+                Box::pin(async move {
+                    match cache.reload().await {
+                        Ok(()) => {
+                            tracing::debug!(bump, "cross-process settings invalidation: reloaded")
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "cross-process settings invalidation: reload failed: {e}"
+                            )
+                        }
+                    }
+                })
+            },
+        );
+        let catalog_action = zims.clone();
+        let on_catalog = Box::new(
+            move |bump: u64| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                let zims = catalog_action.clone();
+                Box::pin(async move {
+                    match zims.resync().await {
+                        Ok(report) if !report.is_empty() => {
+                            tracing::info!(
+                                bump,
+                                ?report,
+                                "cross-process catalog invalidation: resynced"
+                            )
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!(
+                                "cross-process catalog invalidation: resync failed: {e}"
+                            )
+                        }
+                    }
+                })
+            },
+        );
         Some(crate::db::notify::spawn_listener(
             &config.database_url,
-            settings.clone(),
-            zims.clone(),
+            on_settings,
+            on_catalog,
         ))
     } else {
         None
@@ -1030,7 +1086,9 @@ pub fn serve_policy_checks(
                      exposed to any network peer. Set REQUIRE_AUTH_FOR_READS=true \
                      to gate reads."
                 ),
-                level: WarnLevel::Info,
+                // Explicit operator opt-out exposing full article content to
+                // any network peer — same level as its effective-true sibling.
+                level: WarnLevel::Warn,
             });
         }
     }
@@ -1101,6 +1159,32 @@ pub fn serve_policy_checks(
     Ok(warnings)
 }
 
+/// SEC-L5: the plaintext-at-rest warning — present when `SECURITY_KEY` is
+/// unset (`key_set == false`) while one of the at-rest-encrypted settings
+/// `crate::settings::encrypt::ENCRYPTED_AT_REST_KEYS`]) is non-empty
+/// after `SettingsCache::load` (`secret_stored == true`). The legacy
+/// plaintext behavior stays VALID (loopback / throwaway deployments may
+/// accept it), so this WARNS rather than refusing. Both inputs are
+/// precomputed at the call site (`src/main.rs` — the one place that owns
+/// both the `Config` and the loaded settings cache); this helper keeps the
+/// text + level pure and unit-testable without I/O.
+pub fn security_key_plaintext_warning(
+    key_set: bool,
+    secret_stored: bool,
+) -> Option<StartupWarning> {
+    if key_set || !secret_stored {
+        return None;
+    }
+    Some(StartupWarning {
+        message: "SECURITY_KEY is not set — the settings table stores \
+                  torrent.password / embedding.api_key / access.read_only_token \
+                  in PLAINTEXT at rest; set SECURITY_KEY to enable \
+                  AES-256-GCM encryption at rest (README 'Security' section)"
+            .to_string(),
+        level: WarnLevel::Warn,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1111,6 +1195,29 @@ mod tests {
         assert!(StartupMode::Serve.resync());
         assert!(StartupMode::Mutating.resync());
         assert!(!StartupMode::ReadOnly.resync());
+    }
+
+    #[test]
+    fn security_key_plaintext_warning_matrix() {
+        // No key + a stored secret → the Warn is present and named.
+        let w = security_key_plaintext_warning(false, true)
+            .expect("unset key + stored secret must warn");
+        assert_eq!(w.level, WarnLevel::Warn);
+        assert!(
+            w.message.contains("SECURITY_KEY is not set"),
+            "{}",
+            w.message
+        );
+        // Key set → no warning, even with a stored secret.
+        assert!(
+            security_key_plaintext_warning(true, true).is_none(),
+            "a set SECURITY_KEY must not warn"
+        );
+        // No stored secret → nothing exposed, no warning.
+        assert!(
+            security_key_plaintext_warning(false, false).is_none(),
+            "an empty settings table must not warn"
+        );
     }
 
     #[test]
@@ -2040,16 +2147,18 @@ mod serve_policy_checks_tests {
     }
 
     #[test]
-    fn info_level_for_open_reads() {
+    fn warn_level_for_open_reads() {
         let result =
             serve_policy_checks("0.0.0.0", crate::settings::ACCESS_MODE_PASSWORD, false, "")
                 .unwrap();
-        // The "reads stay open" warning should be at Info level.
+        // The "reads stay open" warning is an explicit operator opt-out
+        // exposing full article content to any network peer — Warn level,
+        // same as its effective-true sibling.
         let open_reads = result
             .iter()
             .find(|w| w.message.contains("reads (GET/HEAD/OPTIONS) stay open"))
             .expect("open-reads warning present");
-        assert_eq!(open_reads.level, WarnLevel::Info);
+        assert_eq!(open_reads.level, WarnLevel::Warn);
     }
 
     // Sec M2 (2026-09 review): open mode + proxy CIDRs must warn, because the

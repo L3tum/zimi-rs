@@ -45,6 +45,31 @@ pub enum Error {
     #[error("config error: {0}")]
     Config(String),
 
+    /// SEC-L5: a settings row stored at-rest-encrypted cannot be
+    /// decrypted — the `SECURITY_KEY` changed (or was lost), or the row
+    /// is corrupted/tampered. The message names the failing `key` and
+    /// deliberately never the value (it is a secret; echoing it into an
+    /// error would put it in logs). A startup `SettingsCache::load`
+    /// failure aborts the process (fail-closed); a mid-run
+    /// NOTIFY-driven reload failure is swallowed by the composition-root
+    /// invalidation closure in `startup.rs` into an error-level log and the
+    /// instance keeps serving its current in-memory values until restarted
+    /// (no exit, no 500). If it ever surfaced to a
+    /// client instead, the catch-all in `status_and_message` would
+    /// redact it to a 500 like the other internal variants, and
+    /// `Self::log` records it at error level (key only).
+    #[error(
+        "settings key {key}: stored value is encrypted with a different \
+         SECURITY_KEY (or is corrupted) — restore the original \
+         SECURITY_KEY, or clear the stored value and re-provide it \
+         (env var, or authenticated PUT /settings for keys that are not \
+         API-immutable — access.read_only_token is env-only)"
+    )]
+    SettingsDecrypt {
+        /// The settings key whose stored value failed to decrypt.
+        key: String,
+    },
+
     /// Error from an upstream HTTP request (downloads, API calls to external
     /// services). Distinct from [`Error::Torrent`] which is specific to the
     /// qBittorrent backend. Both map to HTTP 502 to the client.

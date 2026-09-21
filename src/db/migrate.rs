@@ -449,4 +449,66 @@ mod tests {
             assert!(!is_safe_index_name(bad), "{bad:?} must be rejected");
         }
     }
+
+    // m4 property tests: the fn's actual rule — every char must be an ASCII
+    // alphanumeric or '_' (leading digits legal, empty string vacuously
+    // true — both pinned by the boundary test above) — over exhaustive +
+    // structured inputs (5665 cases total).
+    #[test]
+    fn is_safe_index_name_property_accepts_only_identifier_chars() {
+        // (a) Accepted: exhaustive over [a Z 5 _] at lengths 1..=6 (5460
+        // cases) + every legal char at 1-char and 3-char shapes (126).
+        let mini: [char; 4] = ['a', 'Z', '5', '_'];
+        for len in 1..=6usize {
+            for i in 0..4usize.pow(len as u32) {
+                let mut s = String::new();
+                let mut v = i;
+                for _ in 0..len {
+                    s.push(mini[v % 4]);
+                    v /= 4;
+                }
+                assert!(is_safe_index_name(&s), "{s:?} must be accepted");
+            }
+        }
+        let mut legal: Vec<char> = vec!['_'];
+        legal.extend('A'..='Z');
+        legal.extend('a'..='z');
+        legal.extend('0'..='9');
+        for c in &legal {
+            assert!(is_safe_index_name(&c.to_string()), "{c:?} must be accepted");
+            let wrapped = format!("{c}x{c}");
+            assert!(is_safe_index_name(&wrapped), "{wrapped:?} must be accepted");
+        }
+        // (b) Rejected: every ASCII 0x20..=0x7E outside [A-Za-z0-9_] as a
+        // 1-char and a 3-char wrapped string (64 cases), plus control / DEL /
+        // non-ASCII chars (14 cases).
+        for b in 0x20u8..=0x7E {
+            let c = b as char;
+            if c.is_ascii_alphanumeric() || c == '_' {
+                continue;
+            }
+            assert!(
+                !is_safe_index_name(&c.to_string()),
+                "{c:?} must be rejected"
+            );
+            let wrapped = format!("a{c}z");
+            assert!(
+                !is_safe_index_name(&wrapped),
+                "{wrapped:?} must be rejected"
+            );
+        }
+        for c in ['\t', '\0', '\n', '\u{7F}', 'é', '日', '\u{1F600}'] {
+            assert!(
+                !is_safe_index_name(&c.to_string()),
+                "{c:?} must be rejected"
+            );
+            let wrapped = format!("a{c}z");
+            assert!(
+                !is_safe_index_name(&wrapped),
+                "{wrapped:?} must be rejected"
+            );
+        }
+        // (c) Empty string: vacuously safe (pinned by the boundary test).
+        assert!(is_safe_index_name(""), "empty string is vacuously safe");
+    }
 }

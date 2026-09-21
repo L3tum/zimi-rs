@@ -61,10 +61,25 @@ sha2 = "0.11"
 argon2 = "0.5"
 # salt generation for argon2id (OsRng) — feature unifies with argon2's dep
 password-hash = { version = "0.5", features = ["getrandom"] }
+# SEC-L5: at-rest encryption (AES-256-GCM) + KEK derivation (HKDF-SHA256)
+# for the secret settings under `SECURITY_KEY` — already compiled via
+# rustls (sqlx/reqwest TLS) → zero build-time cost.
+ring = "0.17"
+# SEC-L5: fresh random 12-byte GCM nonce per encryption — already at
+# 0.2.17 in Cargo.lock via password-hash's getrandom feature → zero
+# build-time cost.
+getrandom = "0.2"
 # StreamExt::next over reqwest's bytes_stream() in the torrent poller's stream_part
 tokio-stream = "0.1"
 
 url = "2"
+# RFC 4648 base64 — OPDS feed digest decoding (already in the build graph
+# transitively via reqwest, so direct use is zero build-time cost).
+base64 = "0.23"
+# Trusted-proxy CIDR containment + prefix parsing (access::cidr,
+# WI-14/SEC-M3) — already in the build graph transitively via hyper-util,
+# so direct use is zero build-time cost.
+ipnet = "2"
 
 # HTTP client (embeddings, qBittorrent)
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "cookies", "form", "rustls"] }
