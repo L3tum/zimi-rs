@@ -115,7 +115,7 @@ dtor = "0.0.7"
 # false`). Dev-only — never enters the production build. 0.6 line: the
 # conservative latest of the 0.5/0.6 range the benches target (0.7/0.8 exist
 # with the same core API but raise the MSRV to 1.86+).
-criterion = "0.6"
+criterion = "0.8"
 
 # Criterion bench targets: `harness = false` because criterion provides its
 # own `main` (the default libtest harness would ignore the criterion API).
