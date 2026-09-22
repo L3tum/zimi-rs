@@ -3,6 +3,11 @@ on:
   push:
     branches: [main]
   pull_request:
+# Least-privilege GITHUB_TOKEN: every job here only reads the repository
+# (no job pushes, publishes, or uploads). Keep this block — the default
+# token otherwise carries write access to the repo.
+permissions:
+  contents: read
 jobs:
   lint:
     runs-on: ubuntu-latest

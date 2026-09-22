@@ -36,6 +36,13 @@ on:
   # Manual run (Actions → Bench → Run workflow) to validate or re-sample.
   workflow_dispatch:
 
+# Least-privilege GITHUB_TOKEN: read the repo + write artifacts only
+# (the criterion-data upload). The default token otherwise carries write
+# access to the repo.
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   bench:
     runs-on: ubuntu-latest
