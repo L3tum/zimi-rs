@@ -2,10 +2,12 @@
 target/
 *.rs.bk
 
-# ZIM files (large, not in git)
+# ZIM files (large, not in git) — except the small committed test
+# fixture that unit tests, integration tests and the benches open by path.
 zims/
 downloads/
 *.zim
+!tests/fixtures/*.zim
 
 # Config (may contain secrets)
 config.toml
