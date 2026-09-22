@@ -243,7 +243,10 @@ three values at rest:
 - **No key = legacy behavior.** Without `SECURITY_KEY` the values stay plaintext
   exactly as before — acceptable for loopback / throwaway deployments. If any of
   the three secrets is stored while `SECURITY_KEY` is unset, startup prints a
-  **warning** (it does not refuse to start).
+  **boxed warning banner** (it does not refuse to start). **Treat `SECURITY_KEY`
+  as required for any deployment reachable beyond loopback** (password mode
+  with a non-loopback bind, or behind a proxy): a plaintext settings dump is a
+  full credential leak.
 - **Migration is automatic.** On the first start with the key set, any still-
   plaintext rows for those keys are re-encrypted in a single transaction; later
   loads never re-write an already-encrypted row. In-memory values are plaintext
@@ -537,8 +540,12 @@ the real client IP. Without this setting, the lockout keys on the proxy IP
 (everyone shares one bucket). The server **refuses to start** if the list
 contains an all-zero CIDR (`0.0.0.0/0` or `::/0`) — such a list trusts every
 `X-Forwarded-For` value, letting a distributed attacker rotate the header and
-defeat the per-IP lockout (M-3); over-broad (but not all-zero) CIDRs (≥ /8
-IPv4, ≥ /56 IPv6) still warn at startup. This is a config-only setting
+defeat the per-IP lockout (M-3). Over-broad (but not all-zero) CIDRs (≥ /8
+IPv4, ≥ /56 IPv6) still warn at startup. List only ranges the proxy itself
+sources from — never a range your clients can reach or spoof: a client
+able to put a value inside your trusted range in `X-Forwarded-For`
+defeats the per-IP lockout too, and the size warnings above catch overly
+broad ranges, not client-reachable ones. This is a config-only setting
 (restart required).
 
 > **⚠ Open mode behind a proxy defeats the loopback-only guarantee.** In

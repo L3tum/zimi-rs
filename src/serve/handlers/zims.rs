@@ -27,10 +27,13 @@ pub struct HealthResponse {
     /// qBittorrent liveness probe result (memoized, 2 s TTL).
     pub qbit_connected: bool,
     /// True when this process started with `ZIMSERVICE_ALLOW_MULTI_INSTANCE=1`
-    /// (M1): its in-memory caches (settings, rate limiter, ZIM metadata) have
-    /// no cross-instance invalidation, so settings edits made via another
-    /// instance are invisible here until a restart. Monitors polling several
-    /// instances can surface the mode from this field.
+    /// (M1): this instance's single-instance guards are off, so it may run
+    /// alongside peers. Connected serves still invalidate each other's
+    /// in-memory caches (settings, ZIM catalog) over `LISTEN`/`NOTIFY`
+    /// (`db::notify`); the residual gap is one-shot CLI instances and any
+    /// process whose listener is offline — their changes land here only at
+    /// the next local resync or restart. Monitors polling several instances
+    /// can surface the mode from this field.
     pub multi_instance: bool,
     /// True when this process started with `ZIMSERVICE_ALLOW_MULTI_DB=1`
     /// (m-7 partial opt-out): the per-database advisory lock is best-effort

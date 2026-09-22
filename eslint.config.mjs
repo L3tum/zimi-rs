@@ -4,6 +4,8 @@
 //      browser scripts (no import/export) → sourceType: 'script'.
 //   2. The web-UI test suite: tests/web/**/*.mjs. These are ESM + node:test
 //      modules → sourceType: 'module' with the node globals.
+//   3. The CSS check script: web/check-css.mjs — a node CLI (ESM) that
+//      parses the embedded CSS/inline styles, not a browser script.
 //
 // The pages load web/common.js first and use its helpers + timing constants
 // as globals (declared below as readonly for the per-page scripts only): this
@@ -47,6 +49,17 @@ export default [
     },
     rules: {
       'no-unused-vars': ['error', { args: 'none' }],
+      'max-len': ['error', { code: 100 }],
+    },
+  },
+  {
+    files: ['web/check-css.mjs'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'module',
+      globals: globals.node,
+    },
+    rules: {
       'max-len': ['error', { code: 100 }],
     },
   },

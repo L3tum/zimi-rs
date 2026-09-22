@@ -238,7 +238,8 @@ async fn bearer_wins_over_query_when_present() {
     assert_eq!(
         resp.status(),
         403,
-        "the Bearer (read-only) must decide the outcome; the admin query token must not upgrade it — got {}",
+        "the Bearer (read-only) must decide the outcome; the admin query \
+         token must not upgrade it — got {}",
         resp.status()
     );
 

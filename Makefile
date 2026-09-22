@@ -275,7 +275,8 @@ web-test:
 # mode (CI) fails instead.
 web-lint:
 	$(call WEB_WRAP,web-lint,yes,JS lint,\
-	./node_modules/.bin/eslint web/common.js web/index.js web/search.js web/settings.js tests/web/*.mjs)
+	./node_modules/.bin/eslint web/common.js web/index.js web/search.js web/settings.js \
+	  web/check-css.mjs tests/web/*.mjs)
 
 # eslint --fix for the embedded web UI (the JS half of `make fmt`): auto-fixes
 # fixable rules in web/common.js and the per-page scripts — all real files,
@@ -285,7 +286,8 @@ web-lint:
 # node/eslint.
 web-fmt:
 	$(call WEB_WRAP,web-fmt,yes,JS auto-fix,\
-	./node_modules/.bin/eslint --fix web/common.js web/index.js web/search.js web/settings.js)
+	./node_modules/.bin/eslint --fix web/common.js web/index.js web/search.js web/settings.js \
+	  web/check-css.mjs)
 
 # Full pre-merge check suite: type-check, format check, lint, full test run,
 # and the web UI checks (syntax, unit tests, eslint).

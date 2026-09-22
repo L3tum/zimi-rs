@@ -5,8 +5,17 @@ use crate::torrent::TorrentInfo;
 use super::{Pool, Result};
 
 /// Convert qBittorrent KiB/s speed to bytes per second.
+///
+/// Saturating (Bugs #1, 2026 project-wide review): the speed is qB-provided
+/// (an operator-configured endpoint, typically plain HTTP), so an
+/// i64-magnitude value must not overflow the multiplication by 1024 — that
+/// used to panic in debug builds (the poller's supervisor fail-closes the
+/// whole process: an availability DoS) and to wrap silently to garbage in
+/// release, persisting the junk into `downloads.speed_bps`. Saturates to
+/// `i64::MAX` instead. Out-of-domain (negative) speeds are clamped before
+/// they get here (`TorrentInfo::sanitize` at the deserialization boundary).
 pub(super) fn kibs_to_bps(kibs: i64) -> i64 {
-    kibs * 1024
+    kibs.saturating_mul(1024)
 }
 
 /// ETA in seconds: remaining **bytes** / (dlspeed **KiB/s** → bytes/s).
@@ -154,6 +163,16 @@ mod tests {
         assert_eq!(super::kibs_to_bps(0), 0);
         assert_eq!(super::kibs_to_bps(1), 1024);
         assert_eq!(super::kibs_to_bps(1024), 1_048_576);
+    }
+
+    #[test]
+    fn kibs_to_bps_saturates_instead_of_overflowing() {
+        // Bugs #1: a hostile i64-magnitude speed (corrupt/malicious qB
+        // response) saturates instead of overflowing — the old `* 1024`
+        // panicked in debug builds (process-level availability DoS via the
+        // poller supervisor) and wrapped to garbage in release.
+        assert_eq!(super::kibs_to_bps(i64::MAX / 2), i64::MAX);
+        assert_eq!(super::kibs_to_bps(i64::MAX), i64::MAX);
     }
 
     #[test]

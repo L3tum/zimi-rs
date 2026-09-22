@@ -69,7 +69,8 @@ async fn digest_schema_applies_fresh_and_enforces_format() {
     .expect("well-formed digest must be accepted (downloads)");
     raw::execute(
         &pool,
-        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime, content_sha256, publisher_sha256)
+        "INSERT INTO zims (name, display_title, file_path, file_size, \
+         file_mtime, content_sha256, publisher_sha256)
              VALUES ('digcheck-zims', 'digcheck', '/nonexistent/digcheck.zim', 10, now(), $1, $2)",
         |q| q.bind(&ok).bind(&ok),
     )

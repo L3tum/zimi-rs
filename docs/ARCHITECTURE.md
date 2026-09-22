@@ -196,9 +196,11 @@ Enforcement (`src/startup.rs`):
    (read-only subcommands, opt-outs).
 5. **Mutating-CLI guard.** `index`, `embed`, and `list --sync` take the same
    advisory lock via `MutatingGuard` *before* any mutation and refuse when a
-   running server holds it, since a server reconciles its in-memory caches
-   with Postgres only at startup and would otherwise serve stale data with no
-   signal.
+   running server holds it: a server refreshes its in-memory caches at the
+   startup resync and on `LISTEN`/`NOTIFY` invalidation (covering settings
+   writes and catalog-membership changes), but a mutating CLI's index/embed
+   status updates are not invalidation sources, so the server would keep
+   serving its stale copy (and race the CLI's `zims` table rewrites).
 
 Opt-outs: `ZIMSERVICE_ALLOW_MULTI_DB=1` keeps the PID lock but makes the
 advisory lock best-effort (different-database deployments sharing a `zim_dir`);
@@ -262,7 +264,7 @@ pg_trgm `similarity()`, pgvector distance operators, and `$n::vector` /
 `::tsvector` casts. The SQLSTATE/HTTP mapping in `Error` redacts DB details;
 23505 unique-violations are domain duplicates (409), not DB faults (503).
 
-**Migrations.** Numbered `.sql` files in `migrations/` (001–016; 005 is a
+**Migrations.** Numbered `.sql` files in `migrations/` (001–017; 005 is a
 void/retired number, never reused) are embedded
 with `include_str!` and applied by `src/db/migrate.rs` at **every** startup,
 in every subcommand mode: tracked in `schema_migrations` by filename + content

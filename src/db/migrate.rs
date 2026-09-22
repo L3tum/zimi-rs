@@ -75,6 +75,10 @@ pub(crate) const MIGRATIONS: &[(&str, &str)] = &[
         "016_drop_ivfflat_threshold_setting.sql",
         include_str!("../../migrations/016_drop_ivfflat_threshold_setting.sql"),
     ),
+    (
+        "017_embed_claim_index.sql",
+        include_str!("../../migrations/017_embed_claim_index.sql"),
+    ),
 ];
 
 /// Number of embedded migrations. The integration suite
@@ -345,9 +349,9 @@ mod tests {
     /// - every filename is `NNN_slug.sql` (exactly 3-digit numeric prefix,
     ///   non-empty slug) and all filenames are unique;
     /// - numeric prefixes strictly increase in the const's order;
-    /// - the set of numbers equals exactly {1,2,3,4,6,7,8,9,10,11,12,13,14,15}
+    /// - the set of numbers equals exactly {1,2,3,4,6,7,8,9,10,11,12,13,14,15,16,17}
     ///   — pinning the current set and proving 5 is the ONLY missing number
-    ///   in 1..=15, with the set size cross-checked against `MIGRATION_COUNT`.
+    ///   in 1..=17, with the set size cross-checked against `MIGRATION_COUNT`.
     #[test]
     fn migration_numbering_keeps_the_005_void_gap() {
         use std::collections::{BTreeSet, HashSet};
@@ -401,9 +405,9 @@ mod tests {
             );
         }
 
-        // The full set is exactly 1..=16 minus 5: pins the current migration
-        // set and proves the ONLY missing number in 1..=16 is the reserved 5.
-        let expected: BTreeSet<usize> = (1..=16).filter(|n| *n != 5).collect();
+        // The full set is exactly 1..=17 minus 5: pins the current migration
+        // set and proves the ONLY missing number in 1..=17 is the reserved 5.
+        let expected: BTreeSet<usize> = (1..=17).filter(|n| *n != 5).collect();
         let actual: BTreeSet<usize> = numbers.iter().copied().collect();
         assert_eq!(
             actual.len(),

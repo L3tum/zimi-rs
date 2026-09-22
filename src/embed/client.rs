@@ -174,7 +174,8 @@ impl EmbedClient {
                 let body = resp.bytes().await.map_err(Error::Http)?;
                 if (body.len() as u64) > MAX_EMBED_RESPONSE_BYTES {
                     return Err(Error::Embedding(format!(
-                        "embedding endpoint response is {} bytes (budget {MAX_EMBED_RESPONSE_BYTES})",
+                        "embedding endpoint response is {} bytes \
+                         (budget {MAX_EMBED_RESPONSE_BYTES})",
                         body.len()
                     )));
                 }

@@ -215,7 +215,8 @@ pub async fn auth_middleware(
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({
                     "error": "read-only token",
-                    "hint": "this endpoint requires the admin credential (Authorization: Bearer <admin-password>)"
+                    "hint": "this endpoint requires the admin credential \
+                             (Authorization: Bearer <admin-password>)"
                 })),
             )
                 .into_response());

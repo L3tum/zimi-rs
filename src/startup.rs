@@ -400,6 +400,18 @@ pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result
     // stale. Spawn the listener only for `serve` — the long-running process
     // whose freshness matters; one-shot CLI subcommands (mutating / read-only
     // / MCP) read the DB fresh and must not keep a background listener alive.
+    //
+    // Deliberately NOT gated on `multi_instance_allowed()` (2026 project-wide
+    // review, D1): that env var describes *this* process's lock posture, not
+    // whether peers may write to this database. A default-mode deployment is
+    // not write-protected by its own env — an opted-out peer (a second serve,
+    // or a mutating CLI run with the opt-out) can write settings/catalog rows
+    // while this server runs, and this listener is that server's only
+    // freshness path for such writes (this process's guards only keep
+    // same-posture peers out). Gating would leave exactly the mixed-posture
+    // deployment stale with no signal; the cost in a truly isolated
+    // deployment is one dedicated connection plus a few idle tasks.
+    //
     // The listener starts in `reconnecting` and never blocks or fails startup
     // (a lost session degrades to the next local resync / restart and reports
     // itself in `/diagnostic`). Spawned after `populate_zims` so the startup
@@ -589,13 +601,18 @@ async fn try_acquire_advisory_lock(config: &Config) -> anyhow::Result<Option<PgC
 /// (`index`, `embed`, `list --sync`).
 ///
 /// A running `serve` holds this lock for its whole lifetime (see
-/// [`acquire_instance_guard`]) and reconciles its in-memory caches (settings,
-/// ZIM metadata, article counts, ETags) with Postgres only at startup. A
-/// mutating CLI racing it would therefore leave the server serving stale data
-/// indefinitely, with no signal — the previous protection was a warn-only
-/// `pg_locks` notice. Mutating subcommands now **refuse** in that case: they
-/// take the same `hashtext('zimservice:instance')` lock non-blockingly
-/// (see [`acquire_mutating_guard`]) and bail when another session holds it.
+/// [`acquire_instance_guard`]) and refreshes its in-memory caches (settings,
+/// ZIM metadata, article counts, ETags) at the startup resync and on
+/// `LISTEN`/`NOTIFY` invalidation (`crate::db::notify`) — which covers
+/// settings writes and catalog-membership changes, but *not* a mutating
+/// CLI's index/embed status updates. A mutating CLI racing it would rewrite
+/// the shared `zims` table (its resync is a DELETE/INSERT cycle) under a
+/// live server and leave the server's in-memory copy of the un-notified
+/// status columns stale, with no signal — the previous protection was a
+/// warn-only `pg_locks` notice. Mutating subcommands now **refuse** in that
+/// case: they take the same `hashtext('zimservice:instance')` lock
+/// non-blockingly (see [`acquire_mutating_guard`]) and bail when another
+/// session holds it.
 ///
 /// While acquired, the lock also serializes concurrent mutating runs against
 /// each other (their startup resyncs are DELETE/INSERT cycles on the shared
@@ -625,10 +642,12 @@ pub struct MutatingGuard {
 /// divergence warnings all agree.
 ///
 /// In that mode every instance keeps its own in-memory caches (settings,
-/// rate limiter, ZIM metadata) with **no cross-instance invalidation path**:
-/// a change persisted by one instance is invisible to the others until
-/// restart. The callers use this to surface the divergence continuously
-/// instead of only via the one startup `tracing::warn!`.
+/// rate limiter, ZIM metadata); connected serve processes invalidate each
+/// other over `LISTEN`/`NOTIFY` (`crate::db::notify`), so the residual gap
+/// is narrow — a one-shot CLI instance (which runs no listener) or any
+/// process whose listener is offline stays stale until its own resync or
+/// restart. The callers use this to surface that residual divergence
+/// continuously instead of only via the one startup `tracing::warn!`.
 ///
 /// This is the **single, deliberate** reader of
 /// `ZIMSERVICE_ALLOW_MULTI_INSTANCE`, kept outside `Config` on purpose: it
@@ -672,9 +691,11 @@ pub async fn acquire_mutating_guard(config: &Config) -> anyhow::Result<Option<Mu
     if multi_instance_allowed() {
         tracing::warn!(
             "ZIMSERVICE_ALLOW_MULTI_INSTANCE=1: this mutating command will run even \
-             while a server holds this database's advisory lock — the server's \
-             in-memory caches (ZIM metadata, article counts, ETags) will be stale \
-             until it is restarted"
+             while a server holds this database's advisory lock — connected serves \
+             pick up settings and catalog-membership writes over LISTEN/NOTIFY, \
+             but this command's index/embed status updates are not \
+             invalidation sources, so the server's in-memory copy of them stays \
+             stale until its next resync or restart"
         );
         return Ok(None);
     }
@@ -705,11 +726,12 @@ pub async fn acquire_mutating_guard(config: &Config) -> anyhow::Result<Option<Mu
         drop(client);
         anyhow::bail!(
             "another zimservice instance ({holder}) is already using this database. A \
-             running server reconciles its in-memory caches (ZIM metadata, article \
-             counts, ETags) with the database only at startup, so this mutation would \
-             be silently stale. Stop the server and re-run this command, use a \
-             different DATABASE_URL, or set ZIMSERVICE_ALLOW_MULTI_INSTANCE=1 to \
-             override (not recommended)."
+             running server keeps its ZIM catalog (metadata, article counts, \
+             index/embed status) in memory, and this command's writes would race it \
+             — several of them (index/embed status updates) are not cache-invalidation \
+             sources, so the server would keep serving its stale copy. Stop the server \
+             and re-run this command, use a different DATABASE_URL, or set \
+             ZIMSERVICE_ALLOW_MULTI_INSTANCE=1 to override (not recommended)."
         );
     }
 
@@ -787,30 +809,63 @@ fn spawn_advisory_lock_monitor(conn: PgConnection) -> tokio::task::JoinHandle<()
 /// S2: cross-database PID lock with PID-liveness check. If the file exists but
 /// the recorded PID is dead, steal it (remove + recreate). This makes a
 /// graceful shutdown's residual lock file self-healing on the next start.
+///
+/// File format: line 1 = holder PID, line 2 = creation timestamp (unix
+/// seconds — operator diagnostics: how old is this lock?). One-line files
+/// from older builds still parse (no timestamp).
+///
+/// Sec L3 / Bugs #3 — the *live*-PID check is not liveness alone: after a
+/// crash the kernel may reuse the holder's PID for an unrelated process,
+/// and a bare liveness probe then refuses startup forever even though the
+/// lock is stale. On Linux the holder's identity is verified via
+/// /proc/<pid>/comm — a live PID whose process image is not a zimservice
+/// executable is a reused PID, and the lock is stolen. Where /proc is
+/// unavailable (non-Linux, or unreadable) the check is conservative: a
+/// live PID still refuses, and the operator deletes the file manually as
+/// before.
+///
 /// Returns the lock path on success (keep it for cleanup on guard drop).
 fn acquire_zim_dir_pid_lock(config: &Config) -> anyhow::Result<std::path::PathBuf> {
     let lock_path = config.zim_dir.join(".zimservice.lock");
     if lock_path.exists() {
-        // Read the PID from the existing lock file.
-        let existing_pid: u32 = std::fs::read_to_string(&lock_path)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
+        // Read the holder PID (line 1) and, when present, the creation
+        // timestamp (line 2) from the existing lock file.
+        let existing = std::fs::read_to_string(&lock_path).unwrap_or_default();
+        let mut lines = existing.lines();
+        let existing_pid: u32 = lines
+            .next()
+            .and_then(|l| l.trim().parse().ok())
             .unwrap_or(0);
+        let created_ts: Option<u64> = lines.next().and_then(|l| l.trim().parse().ok());
         if existing_pid != 0 && pid_is_alive(existing_pid) {
-            // Live process holds the lock — bail.
-            anyhow::bail!(
-                "another zimservice instance (PID {existing_pid}) is using this \
-                 zim_dir ({}) — stopping. Stop the other instance, or delete \
-                 {} if it is stale.",
-                config.zim_dir.display(),
+            if pid_lock_holder_is_zimservice(existing_pid) {
+                // Live zimservice process holds the lock — bail.
+                let age_note = match created_ts {
+                    Some(ts) => format!(" (lock created at unix {ts})"),
+                    None => String::new(),
+                };
+                anyhow::bail!(
+                    "another zimservice instance (PID {existing_pid}{age_note}) is \
+                     using this zim_dir ({}) — stopping. Stop the other \
+                     instance, or delete {} if it is stale.",
+                    config.zim_dir.display(),
+                    lock_path.display()
+                );
+            }
+            // Live PID that is not a zimservice process: the kernel reused
+            // the crashed holder's PID — the lock is stale, steal it.
+            tracing::info!(
+                "stealing instance lock file {}: recorded PID {existing_pid} \
+                 is alive but is not a zimservice process (PID reuse after \
+                 the holder crashed) — treating the lock as stale",
                 lock_path.display()
             );
         }
-        // Stale lock (dead PID or unreadable) — steal it.
+        // Stale lock (dead PID, unreadable, or a reused PID) — steal it.
         tracing::info!(
-            "removing stale instance lock file {} (PID {} not alive)",
-            lock_path.display(),
-            existing_pid
+            "removing stale instance lock file {} (PID {existing_pid} not \
+             alive or not a zimservice process)",
+            lock_path.display()
         );
         std::fs::remove_file(&lock_path)
             .map_err(|e| anyhow::anyhow!("remove stale lock file: {e}"))?;
@@ -825,11 +880,45 @@ fn acquire_zim_dir_pid_lock(config: &Config) -> anyhow::Result<std::path::PathBu
         .write(true)
         .open(&lock_path)
         .map_err(|e| anyhow::anyhow!("create lock file {}: {e}", lock_path.display()))?;
-    let _ = writeln!(file, "{}", std::process::id());
+    // Format: PID + creation timestamp (see the fn doc).
+    let created_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(file, "{}\n{created_ts}", std::process::id());
     let _ = file.flush();
     // Drop the file handle — the caller keeps the path for cleanup on guard drop.
     drop(file);
     Ok(lock_path)
+}
+
+/// Holder-identity check for a *live* PID recorded in the instance lock
+/// file (see [`acquire_zim_dir_pid_lock`]): `true` when the process owning
+/// that PID looks like a zimservice instance — its `/proc/<pid>/comm` is
+/// `zimservice` or a `zimservice-*` build (the latter covers the test
+/// binaries, which must still refuse each other in tests). `false` on
+/// Linux when /proc names a different executable: the kernel reused the
+/// crashed holder's PID, so the lock is stale.
+///
+/// Conservative by design: on non-Linux (no /proc) or an unreadable /proc
+/// entry, returns `true` — a live PID then refuses startup exactly as
+/// before, and the operator deletes the stale file manually.
+fn pid_lock_holder_is_zimservice(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+            Ok(comm) => {
+                let name = comm.trim();
+                name == "zimservice" || name.starts_with("zimservice-")
+            }
+            Err(_) => true, // unreadable → assume a live holder (refuse)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 /// Acquire the single-instance guards (advisory lock + PID lock). Returns `None`
@@ -1168,6 +1257,12 @@ pub fn serve_policy_checks(
 /// precomputed at the call site (`src/main.rs` — the one place that owns
 /// both the `Config` and the loaded settings cache); this helper keeps the
 /// text + level pure and unit-testable without I/O.
+///
+/// The message is rendered as a boxed banner (Sec M1 follow-up): this is
+/// the only warning that secrets sit in plaintext at rest, so it must be
+/// unmissable in the startup log, and it states the policy that
+/// `SECURITY_KEY` is required for any deployment reachable beyond
+/// loopback.
 pub fn security_key_plaintext_warning(
     key_set: bool,
     secret_stored: bool,
@@ -1176,10 +1271,16 @@ pub fn security_key_plaintext_warning(
         return None;
     }
     Some(StartupWarning {
-        message: "SECURITY_KEY is not set — the settings table stores \
-                  torrent.password / embedding.api_key / access.read_only_token \
-                  in PLAINTEXT at rest; set SECURITY_KEY to enable \
-                  AES-256-GCM encryption at rest (README 'Security' section)"
+        message: "\
+======================================================================\n\
+SECURITY_KEY is not set — the settings table stores\n\
+torrent.password / embedding.api_key / access.read_only_token\n\
+in PLAINTEXT at rest. A database dump, a backup file, or\n\
+any read access to the DB exposes those secrets in the clear.\n\
+Set SECURITY_KEY to enable AES-256-GCM encryption at rest.\n\
+It is REQUIRED for any deployment reachable beyond loopback\n\
+(README 'At-rest encryption (SECURITY_KEY)').\n\
+======================================================================"
             .to_string(),
         level: WarnLevel::Warn,
     })
@@ -1206,6 +1307,15 @@ mod tests {
         assert!(
             w.message.contains("SECURITY_KEY is not set"),
             "{}",
+            w.message
+        );
+        // The message is a multi-line boxed banner (unmissable): framed by
+        // '=' borders, each content line its own line (Sec M1).
+        assert!(w.message.starts_with("======"), "{}", w.message);
+        assert!(w.message.ends_with("===="), "{}", w.message);
+        assert!(
+            w.message.contains("stores\ntorrent.password"),
+            "banner lines must not collapse into one: {}",
             w.message
         );
         // Key set → no warning, even with a stored secret.
@@ -1359,17 +1469,25 @@ mod tests {
 
     #[test]
     fn pid_lock_no_lock_file_created_with_our_pid() {
-        // (a) no lock file → created, recording our PID.
+        // (a) no lock file → created, recording our PID on line 1 and the
+        // creation timestamp on line 2.
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_zim_dir(dir.path());
         let path = acquire_zim_dir_pid_lock(&config).unwrap();
         assert_eq!(path, lock_file(dir.path()));
         assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut lines = content.lines();
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap().trim(),
+            lines.next().unwrap_or(""),
             std::process::id().to_string(),
-            "lock file must record our PID"
+            "lock file must record our PID on line 1"
         );
+        assert!(
+            lines.next().and_then(|ts| ts.parse::<u64>().ok()).is_some(),
+            "line 2 must be a numeric creation timestamp: {content:?}"
+        );
+        assert_eq!(lines.next(), None, "exactly two lines: {content:?}");
     }
 
     #[test]
@@ -1380,13 +1498,84 @@ mod tests {
         let path = lock_file(dir.path());
         let dead = a_dead_pid();
         std::fs::write(&path, dead.to_string()).unwrap();
-        // Steal: the stale file is removed and recreated with our PID.
+        // Steal: the stale file is removed and recreated with our PID on
+        // line 1. (The fixture is a legacy one-line file — the older
+        // build's format must still parse and be stealable.)
         let new_path = acquire_zim_dir_pid_lock(&config).unwrap();
         assert_eq!(new_path, path);
         assert_eq!(
-            std::fs::read_to_string(&new_path).unwrap().trim(),
+            std::fs::read_to_string(&new_path)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap_or(""),
             std::process::id().to_string(),
             "stolen lock file must be rewritten with our PID"
+        );
+    }
+
+    /// (e) the lock file records a LIVE pid that is **not** a zimservice
+    /// process → the kernel reused the crashed holder's PID: the lock is
+    /// stale and must be stolen, not refused (Bugs #3 / Sec L3). Linux
+    /// only — the identity check reads /proc/<pid>/comm; on other
+    /// platforms a live PID is conservatively refused (see
+    /// [`pid_lock_holder_is_zimservice`]).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_lock_live_reused_pid_is_stolen() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_zim_dir(dir.path());
+        let path = lock_file(dir.path());
+        // A live, non-zimservice PID: spawn `sleep` and leave it running
+        // (its /proc comm is "sleep").
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn `sleep`");
+        let reused = child.id();
+        std::fs::write(&path, format!("{reused}\n1234567890")).unwrap();
+        let new_path = acquire_zim_dir_pid_lock(&config).unwrap();
+        assert_eq!(new_path, path);
+        assert_eq!(
+            std::fs::read_to_string(&new_path)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap_or(""),
+            std::process::id().to_string(),
+            "a live reused PID must not block startup — the lock is stolen"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// (f) the identity check itself: our own `zimservice-*` test binary is
+    /// recognized as a holder; a live unrelated process is not; a dead
+    /// PID's missing /proc entry is conservative-true.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_lock_holder_identity_matrix() {
+        assert!(
+            pid_lock_holder_is_zimservice(std::process::id()),
+            "our zimservice-* test binary must be recognized as a holder"
+        );
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn `sleep`");
+        assert!(
+            !pid_lock_holder_is_zimservice(child.id()),
+            "a live non-zimservice process must not pass as the holder"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            pid_lock_holder_is_zimservice(a_dead_pid()),
+            "an unreadable /proc entry (dead PID) must be conservative-true"
         );
     }
 
@@ -1421,7 +1610,11 @@ mod tests {
         let new_path = acquire_zim_dir_pid_lock(&config).unwrap();
         assert_eq!(new_path, path);
         assert_eq!(
-            std::fs::read_to_string(&new_path).unwrap().trim(),
+            std::fs::read_to_string(&new_path)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap_or(""),
             std::process::id().to_string(),
             "garbage lock file must be stolen and rewritten with our PID"
         );

@@ -1708,7 +1708,9 @@ mod tests {
         // adapted: `SqlQuery.params` stays the pub `Vec<String>` contract, so
         // the "typed bind" is the explicit `::float8` cast on the threshold).
         let sq = trgm_similarity_sql("alp", 0.5, None, Some("en"), 20, 0.5);
-        assert_eq!(sq.params.len(), 4); // query, threshold, lang, limit
+        // query, threshold, weight (Sec L1: bound, not interpolated), lang,
+        // limit
+        assert_eq!(sq.params.len(), 5);
         assert_eq!(sq.params[0], "alp");
         assert_eq!(sq.params[1], "0.5");
         assert!(

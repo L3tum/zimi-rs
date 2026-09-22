@@ -280,7 +280,8 @@ mod tests {
             .unwrap();
         crate::db::raw::execute(
             &pool,
-            "INSERT INTO downloads (name, url, status, sha256) VALUES ('vk-match', $1, 'complete', $2)",
+            "INSERT INTO downloads (name, url, status, sha256) \
+             VALUES ('vk-match', $1, 'complete', $2)",
             |q| q.bind(x).bind(DIGEST_OLD),
         )
         .await
@@ -332,7 +333,8 @@ mod tests {
             .unwrap();
         crate::db::raw::execute(
             &pool,
-            "INSERT INTO downloads (name, url, status, sha256) VALUES ('vk-change', $1, 'complete', $2)",
+            "INSERT INTO downloads (name, url, status, sha256) \
+             VALUES ('vk-change', $1, 'complete', $2)",
             |q| q.bind(x).bind(DIGEST_OLD),
         )
         .await

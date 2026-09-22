@@ -179,21 +179,30 @@ const SIMILARITY_SCORE: &str = "GREATEST(similarity(a.title_lower, $1), 0.0)";
 /// Skeleton for the four single-source score builders (trgm prefix/contains/
 /// similarity + vector): the shared
 /// `SELECT <cols>, a.snippet<tail>, <weight> * <score> as score FROM articles
-/// a JOIN zims z ON z.id = a.zim_id WHERE <where>` prefix, then the shared
-/// [`push_filters`] tail. The FTS builder is left standalone — its `tsq` CTE +
+/// a JOIN zims z ON z.id = a.zim_id WHERE <where>` prefix (`<weight>` is a
+/// bound parameter, see below), then the shared [`push_filters`] tail. The
+/// FTS builder is left standalone — its `tsq` CTE +
 /// `CROSS JOIN` + `ts_headline` don't fit this shape.
 fn score_query(
     score_expr: &str,
     where_clause: &str,
-    params: Vec<String>,
+    mut params: Vec<String>,
     order_by: &str,
     filters: (Option<&str>, Option<&str>),
     limit: i32,
     weight: f64,
 ) -> SqlQuery {
     let (zim, lang) = filters;
+    // Sec L1: `weight` is operator-settable (settings), so it is bound as a
+    // parameter — text + `::float8` cast, the same pattern as `threshold`
+    // and `limit` — instead of interpolated into the SQL text. By the time
+    // it reaches here it is clamped to a finite [0.0, 10.0]
+    // (`settings/snapshots.rs`), so `to_string()` is always a plain number.
+    params.push(weight.to_string());
+    let weight_idx = params.len();
     let sql = format!(
-        "SELECT {SELECT_ARTICLE_COLS}, a.snippet{SELECT_ARTICLE_TAIL}, {weight} * {score_expr} \
+        "SELECT {SELECT_ARTICLE_COLS}, a.snippet{SELECT_ARTICLE_TAIL}, \
+         ${weight_idx}::float8 * {score_expr} \
          as score FROM articles a JOIN zims z ON z.id = a.zim_id WHERE {where_clause}"
     );
     let mut sq = SqlQuery { sql, params };
@@ -235,21 +244,23 @@ pub fn fts_sql(
         "a.snippet"
     };
 
+    // Sec L1: `weight` is bound as a parameter (text + `::float8` cast — see
+    // `score_query`) instead of interpolated into the SQL text.
+    let mut params = vec![query.to_string()];
+    params.push(weight.to_string());
+    let weight_idx = params.len();
+
     let mut sql = String::from("WITH tsq AS (SELECT websearch_to_tsquery('simple', $1) AS q) ");
     sql.push_str(&format!(
         "SELECT {SELECT_ARTICLE_COLS}, {snippet_col}{SELECT_ARTICLE_TAIL},"
     ));
     sql.push_str(&format!(
-        " {} * ts_rank_cd(a.search_vector, tsq.q) as score",
-        weight
+        " ${weight_idx}::float8 * ts_rank_cd(a.search_vector, tsq.q) as score"
     ));
     sql.push_str(" FROM articles a JOIN zims z ON z.id = a.zim_id CROSS JOIN tsq");
     sql.push_str(" WHERE a.search_vector @@ websearch_to_tsquery('simple', $1)");
 
-    let mut sq = SqlQuery {
-        sql,
-        params: vec![query.to_string()],
-    };
+    let mut sq = SqlQuery { sql, params };
     push_filters(&mut sq, zim, lang, ORDER_BY_SCORE_DESC, limit);
     sq
 }

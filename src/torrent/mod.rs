@@ -150,6 +150,48 @@ impl TorrentInfo {
     pub fn is_fatal(&self) -> bool {
         matches!(self.state.as_str(), "error" | "missingFiles")
     }
+
+    /// Clamp every numeric field to its valid domain (Bugs #1/#2, 2026
+    /// project-wide review). `TorrentInfo` values arrive from an
+    /// operator-configured qBittorrent endpoint (typically plain HTTP), so
+    /// their numerics are hostile input: out-of-domain values would
+    /// otherwise reach `downloads` columns with no CHECK constraint
+    /// (`progress: 1e30` → `f32::INFINITY`-class out-of-domain values after
+    /// the `as f32` casts at the stats write sites; a negative `size` /
+    /// `downloaded` distorts the remaining-bytes ETA derivation; negative
+    /// speeds would persist as negative `speed_bps`). Applied at the single
+    /// deserialization point (`QbitClient::get_torrents`), so every consumer
+    /// (poller stats, seeding refresh, reconcile, the just-added candidate
+    /// match) sees in-domain values.
+    ///
+    /// `clamp` alone would pass NaN through (NaN is neither `< lo` nor `> hi`),
+    /// so NaNs are mapped to the domain floor explicitly first. JSON cannot
+    /// spell NaN, but the direct-construction arm of the trust boundary (and
+    /// any future serde source that can) is covered by the same rule.
+    pub fn sanitize(&mut self) {
+        // `progress` is documented `0.0..=1.0`; qB reports it that way, and
+        // the stats write sites cast it `as f32` into a float4 column.
+        self.progress = if self.progress.is_nan() {
+            0.0
+        } else {
+            self.progress.clamp(0.0, 1.0)
+        };
+        // `ratio` is unbounded above in practice (a long seeder exceeds any
+        // invented domain) but must stay finite after the `as f32` casts —
+        // cap at the float4 ceiling rather than invent a domain.
+        self.ratio = if self.ratio.is_nan() {
+            0.0
+        } else {
+            self.ratio.clamp(0.0, f32::MAX as f64)
+        };
+        // Speeds / sizes / counts are non-negative by construction in qB;
+        // `kibs_to_bps` saturates the magnitudes, this removes the sign.
+        self.dlspeed = self.dlspeed.max(0);
+        self.upspeed = self.upspeed.max(0);
+        self.size = self.size.max(0);
+        self.downloaded = self.downloaded.max(0);
+        self.num_seeds = self.num_seeds.max(0);
+    }
 }
 
 impl QbitClient {
@@ -271,7 +313,16 @@ impl QbitClient {
             });
         }
 
-        let list = resp.json::<Vec<TorrentInfo>>().await.map_err(Error::Http)?;
+        // Trust boundary (Bugs #1/#2): the qB endpoint is operator-
+        // configured (typically plain HTTP) — clamp the deserialized
+        // numerics to their valid domain before any consumer can derive
+        // from them or persist them into `downloads` columns that have no
+        // CHECK constraint. This is the single deserialization point for
+        // qB-provided torrent data, so one pass covers every consumer.
+        let mut list = resp.json::<Vec<TorrentInfo>>().await.map_err(Error::Http)?;
+        for t in &mut list {
+            t.sanitize();
+        }
         Ok(list)
     }
 
@@ -589,6 +640,117 @@ mod tests {
         assert!(
             !info("checking", 0.5).is_complete(),
             "checking at partial progress is doubly incomplete"
+        );
+    }
+
+    /// Bugs #1/#2, 2026 project-wide review: the deserialization trust
+    /// boundary. `TorrentInfo` values come from an operator-configured
+    /// (typically plain-HTTP) qB endpoint, so hostile numerics must be
+    /// clamped to their valid domain at the single deserialization point —
+    /// `progress` (documented `0.0..=1.0`, later cast `as f32` into a float4
+    /// column), `ratio` (unbounded above in practice, but must stay finite
+    /// after the `as f32` casts — only values above `f32::MAX` ≈ 3.4e38
+    /// overflow the cast to INFINITY), and the non-negative
+    /// speeds/sizes/counts (a negative `size`/`downloaded` distorts the
+    /// remaining-bytes ETA derivation; a negative speed would persist as a
+    /// negative `speed_bps`). The JSON arm runs the exact serde path
+    /// `get_torrents` uses; JSON cannot spell NaN, so the NaN arm is direct.
+    #[test]
+    fn sanitize_clamps_hostile_qb_numerics_to_their_domain() {
+        let raw = r#"[{
+            "hash": "h", "name": "n", "progress": 1e30,
+            "state": "downloading", "dlspeed": -5, "upspeed": 9223372036854775807,
+            "ratio": 1e40, "size": -1, "downloaded": -2, "num_seeds": -3
+        }]"#;
+        let mut list: Vec<TorrentInfo> = serde_json::from_str(raw).expect("hostile JSON parses");
+        let mut t = list.pop().expect("one element");
+        t.sanitize();
+
+        // progress 1e30 → the domain ceiling: the `as f32` casts at the
+        // stats write sites now stay in-domain (no INFINITY-class values in
+        // the float4 column).
+        assert_eq!(t.progress, 1.0);
+        // ratio 1e40 → the float4 ceiling: above `f32::MAX` the `as f32`
+        // casts at the stats write sites would overflow to INFINITY (a real
+        // ratio is unbounded above — a long seeder — so we cap at the
+        // float4 ceiling rather than invent a domain).
+        assert_eq!(t.ratio, f32::MAX as f64);
+        assert!((t.ratio as f32).is_finite());
+        // Speeds: negatives → 0; the i64::MAX magnitude survives (it is
+        // non-negative) and saturates downstream in `kibs_to_bps` (pinned
+        // in poller::stats).
+        assert_eq!(t.dlspeed, 0);
+        assert_eq!(t.upspeed, i64::MAX);
+        // Sizes/counts: negatives → 0 (non-negative by construction in qB).
+        assert_eq!(t.size, 0);
+        assert_eq!(t.downloaded, 0);
+        assert_eq!(t.num_seeds, 0);
+        // Untouched fields keep their values (the clamp is per-field).
+        assert_eq!(t.hash, "h");
+        assert_eq!(t.state, "downloading");
+
+        // NaN arm (direct: JSON has no NaN literal) — clamped to the floor,
+        // not passed through `clamp`'s NaN hole.
+        let mut nan = TorrentInfo {
+            hash: String::new(),
+            name: String::new(),
+            progress: f64::NAN,
+            state: String::new(),
+            dlspeed: 0,
+            upspeed: 0,
+            ratio: f64::NAN,
+            category: None,
+            save_path: None,
+            content_path: None,
+            size: 0,
+            downloaded: 0,
+            num_seeds: 0,
+            err_str: None,
+        };
+        nan.sanitize();
+        assert_eq!(nan.progress, 0.0);
+        assert_eq!(nan.ratio, 0.0);
+
+        // In-domain values pass through unchanged (no behavior drift for
+        // honest endpoints) — including a realistic long-seeder ratio
+        // (1e30, below `f32::MAX`) which must NOT be clamped.
+        let mut ok = TorrentInfo {
+            hash: "h".into(),
+            name: "n".into(),
+            progress: 0.42,
+            state: "downloading".into(),
+            dlspeed: 1024,
+            upspeed: 512,
+            ratio: 1e30,
+            category: None,
+            save_path: None,
+            content_path: None,
+            size: 1 << 30,
+            downloaded: 1 << 29,
+            num_seeds: 3,
+            err_str: None,
+        };
+        let before = (
+            ok.progress,
+            ok.ratio,
+            ok.dlspeed,
+            ok.upspeed,
+            ok.size,
+            ok.downloaded,
+            ok.num_seeds,
+        );
+        ok.sanitize();
+        assert_eq!(
+            (
+                ok.progress,
+                ok.ratio,
+                ok.dlspeed,
+                ok.upspeed,
+                ok.size,
+                ok.downloaded,
+                ok.num_seeds
+            ),
+            before
         );
     }
 
