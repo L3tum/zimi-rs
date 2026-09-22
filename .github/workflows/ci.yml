@@ -8,10 +8,16 @@ on:
 # token otherwise carries write access to the repo.
 permissions:
   contents: read
-# Runner note: the actions/* @v7 steps (checkout, setup-node) run on the
-# runner's Node 24 (the @v4 series ran on node20). If a self-hosted runner
-# image here predates Node 24, update the image — or drop those actions
-# back to @v4.
+# Runner notes (self-hosted, act-based):
+# - The runner resolves `uses:` from the data.forgejo.org mirror, which
+#   serves only `actions/*`; third-party actions (dtolnay/rust-toolchain,
+#   taiki-e/install-action, rustsec/audit-check) 404 there. Rust toolchains
+#   therefore come from the repo-local ./.github/actions/setup-rust
+#   composite action, cargo-llvm-cov/cargo-audit install from crates.io,
+#   and the RUSTSEC advisory-db is cloned from github.com.
+# - The actions/* @v7 steps (checkout, setup-node) run on the runner's
+#   Node 24 (the @v4 series ran on node20). The act-latest runner image
+#   ships Node 24, so this holds today; revisit if the image changes.
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -21,8 +27,8 @@ jobs:
       # a moving `stable` once made the docs gate flaky. Bump deliberately; the
       # MSRV job below still guards 1.94. rust-toolchain.toml pins the same
       # 1.96.0 so local dev lints match this gate.
-      - uses: dtolnay/rust-toolchain@1.96.0
-        with: { components: rustfmt, clippy }
+      - uses: ./.github/actions/setup-rust
+        with: { toolchain: "1.96.0", components: "clippy rustfmt" }
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       # Doctests live here (moved out of the `test` job).
@@ -72,9 +78,16 @@ jobs:
   # `cargo check`) so a runtime/toolchain dependency is caught too.
   msrv:
     runs-on: ubuntu-latest
+    # rust-toolchain.toml pins 1.96.0 (dev parity with the lint gate); the
+    # RUSTUP_TOOLCHAIN env var takes precedence over the file, so this job
+    # really runs on 1.94 — without it the "MSRV" gate would silently
+    # exercise the 1.96.0 toolchain.
+    env:
+      RUSTUP_TOOLCHAIN: "1.94"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.94
+      - uses: ./.github/actions/setup-rust
+        with: { toolchain: "1.94" }
       - run: cargo test --lib --bins --test wiremock
   # MSRV gate for the strict-DB half: the `msrv` job above only runs the
   # DB-less unit tests, so a runtime/toolchain dependency surfaced only by the
@@ -82,6 +95,9 @@ jobs:
   # through. Runs the same DB-backed selection as `test`, but pinned to 1.94.
   msrv-db:
     runs-on: ubuntu-latest
+    # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml (1.96.0) — see `msrv`.
+    env:
+      RUSTUP_TOOLCHAIN: "1.94"
     services:
       postgres:
         image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
@@ -95,7 +111,8 @@ jobs:
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.94
+      - uses: ./.github/actions/setup-rust
+        with: { toolchain: "1.94" }
       - run: |
           ZIMSERVICE_REQUIRE_DB=1 \
           DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
@@ -105,8 +122,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.96.0
-        with: { components: rustdoc }
+      - uses: ./.github/actions/setup-rust
+        with: { toolchain: "1.96.0", components: "rust-docs" }
       - run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
@@ -130,7 +147,8 @@ jobs:
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: ./.github/actions/setup-rust
+        with: { toolchain: "1.96.0" }
       - run: |
           ZIMSERVICE_REQUIRE_DB=1 \
           DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
@@ -150,9 +168,11 @@ jobs:
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.96.0
-        with: { components: llvm-tools-preview }
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: ./.github/actions/setup-rust
+        with: { toolchain: "1.96.0", components: "llvm-tools-preview" }
+      # The mirror has no taiki-e/install-action — build the same tool from
+      # crates.io (llvm-tools-preview, above, is its runtime dependency).
+      - run: cargo install cargo-llvm-cov
       # Coverage-ratchet-only job: the plain `test` job above is the
       # behavioral gate (uninstrumented, same DB-backed selection). This job
       # only enforces the ratchet — its llvm-cov run must not drop below the
@@ -179,18 +199,23 @@ jobs:
           cargo llvm-cov --lib --bins --test wiremock --test integration \
             --fail-under-lines "$(cat .github/coverage_floor.txt)"
   # RUSTSEC audit (2026-09 review, Sec): fail CI on known-vulnerable
-  # dependencies. Binary-based action (no toolchain step) — reads
-  # `Cargo.lock` only. The lock file was inspected clean in the review; this
-  # pins that against future `cargo update` drift. Track the external `zim`
-  # 0.5 crate's robustness against malformed archives separately (most
-  # likely future code-execution-adjacent risk; RUSTSEC can't see it).
+  # dependencies — `cargo audit` reads `Cargo.lock` only. The lock file was
+  # inspected clean in the review; this pins that against future
+  # `cargo update` drift. Track the external `zim` 0.5 crate's robustness
+  # against malformed archives separately (most likely future
+  # code-execution-adjacent risk; RUSTSEC can't see it). The mirror has no
+  # rustsec/audit-check, so the equivalent runs inline — which is what the
+  # action did under the hood (install cargo-audit + clone advisory-db).
   audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/setup-rust
+        with: { toolchain: "1.96.0" }
+      - run: |
+          cargo install cargo-audit
+          git clone --depth 1 https://github.com/RustSec/advisory-db /tmp/advisory-db
+          cargo audit --db /tmp/advisory-db
   # Docker image build gate: catch the toolchain (H1) and build-context
   # (H2) regressions that only surface during an actual image build, plus
   # (m3, 2026-09 review) an e2e run of the built image: boot it against a
@@ -237,17 +262,6 @@ jobs:
           done
           docker logs zimservice-e2e
           exit 1
-  # Cross-platform smoke: the crate builds and its DB-less unit tests pass on
-  # macOS and Windows (DB-gated tests skip — no Postgres service here). Catches
-  # platform-specific compile/link issues a Linux-only CI would miss.
-  non-linux:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.96.0
-      - run: cargo build
-      - run: cargo test --lib --bins --test wiremock
+  # Cross-platform smoke (macOS/Windows): removed — this runner fleet is
+  # Linux-only (no macos-latest/windows-latest labels exist to schedule on).
+  # Re-add a matrix job here if non-Linux runners appear.

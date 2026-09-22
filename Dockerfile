@@ -3,7 +3,12 @@ FROM rust:1.96.0-slim AS builder
 WORKDIR /build
 # Dependency-layer caching: fetch the manifest-only layer first so the
 # Cargo.lock-driven download layer stays valid across source-only changes.
+# The manifest relies on target autodiscovery (no explicit [lib]/[[bin]]
+# sections), and cargo refuses to parse it until src/lib.rs + src/main.rs
+# exist — so stub them here (empty: `cargo fetch` never compiles) and let
+# `COPY . .` below replace the stubs with the real sources.
 COPY Cargo.toml Cargo.lock .
+RUN mkdir -p src && touch src/lib.rs src/main.rs
 RUN cargo fetch
 COPY . .
 RUN cargo build --release --locked

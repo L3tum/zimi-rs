@@ -3,8 +3,8 @@
 #
 # WHY a separate file (and not a job in ci.yml): the `on: schedule` trigger
 # fires the ENTIRE workflow it is declared in — putting a scheduled job in
-# ci.yml would re-run every gate (lint/test/coverage/docker/cross-platform)
-# on Mondays for no reason. A dedicated file keeps the weekly run scoped to
+# ci.yml would re-run every gate (lint/test/coverage/docker) on Mondays for
+# no reason. A dedicated file keeps the weekly run scoped to
 # the benches. `workflow_dispatch` makes the job's config verifiable
 # on-demand (a broken scheduled job would otherwise stay broken until the
 # next cron fire) without ever running automatically.
@@ -43,8 +43,10 @@ permissions:
   contents: read
   actions: write
 
-# Runner note: actions/* @v7 (checkout, upload-artifact) run on the
-# runner's Node 24 (the @v4 series ran on node20). See ci.yml.
+# Runner notes: actions/* @v7 (checkout, upload-artifact) run on the
+# runner's Node 24; the Rust toolchain comes from the repo-local
+# ./.github/actions/setup-rust composite (the runner's action mirror 404s
+# third-party actions). See ci.yml for the full note.
 
 jobs:
   bench:
@@ -62,7 +64,8 @@ jobs:
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: ./.github/actions/setup-rust
+        with: { toolchain: "1.96.0" }
       - name: Run benches against the committed week0 baseline
         run: |
           set -o pipefail

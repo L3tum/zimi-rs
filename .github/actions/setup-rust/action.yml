@@ -1,0 +1,40 @@
+# Repo-local composite action — `uses: ./.github/actions/setup-rust`
+# resolves from the checked-out repository, so it never touches the
+# runner's action mirror (data.forgejo.org), which only serves `actions/*`
+# and 404s third-party actions like dtolnay/rust-toolchain.
+#
+# The `ubuntu-latest` runner image (catthehacker/ubuntu:act-latest) ships
+# no Rust at all (git/docker/node only), so this also bootstraps rustup on
+# first use, from sh.rustup.rs / static.rust-lang.org — the same
+# non-github.com hosts the build already depends on (crates.io).
+name: "Pinned Rust toolchain (rustup)"
+description: "Bootstrap rustup, install a pinned toolchain (+components), make it the job default"
+inputs:
+  toolchain:
+    description: "Toolchain version to install and set as default (e.g. 1.96.0, 1.94)"
+    required: true
+  components:
+    description: "Extra rustup components, space separated (e.g. 'clippy rustfmt')"
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: "Install Rust ${{ inputs.toolchain }}"
+      shell: bash
+      run: |
+        export PATH="$HOME/.cargo/bin:$PATH"
+        if ! command -v rustup >/dev/null 2>&1; then
+          # --default-toolchain none: the job installs its pinned
+          # toolchain explicitly (below); do not also pull `stable`.
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+        fi
+        rustup toolchain install "${{ inputs.toolchain }}" --profile minimal
+        for c in ${{ inputs.components }}; do
+          rustup component add "$c" --toolchain "${{ inputs.toolchain }}"
+        done
+        rustup default "${{ inputs.toolchain }}"
+        # A fresh install lands in $HOME/.cargo/bin — expose it to the
+        # job's later steps (a no-op if it is already on PATH).
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        rustc --version && cargo --version
