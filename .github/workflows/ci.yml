@@ -1,18 +1,22 @@
 name: CI
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 # Least-privilege GITHUB_TOKEN: every job here only reads the repository
 # (no job pushes, publishes, or uploads). Keep this block — the default
 # token otherwise carries write access to the repo.
 permissions:
   contents: read
+# Runner note: the actions/* @v7 steps (checkout, setup-node) run on the
+# runner's Node 24 (the @v4 series ran on node20). If a self-hosted runner
+# image here predates Node 24, update the image — or drop those actions
+# back to @v4.
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Pinned toolchain (1.96.0): keeps the rustdoc/clippy gates deterministic —
       # a moving `stable` once made the docs gate flaky. Bump deliberately; the
       # MSRV job below still guards 1.94. rust-toolchain.toml pins the same
@@ -36,7 +40,7 @@ jobs:
       # document — so the install comes first. Strict because the targets
       # skip silently without node/their dependency; CI always has node,
       # so a missing node/css-tree/jsdom must fail the gate, not pass it.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: 22 }
       - run: npm install --no-audit --no-fund
       - run: make web-check
@@ -56,8 +60,8 @@ jobs:
   web-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with: { node-version: 22 }
       - run: npm install --no-audit --no-fund
       - run: make web-lint
@@ -69,7 +73,7 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94
       - run: cargo test --lib --bins --test wiremock
   # MSRV gate for the strict-DB half: the `msrv` job above only runs the
@@ -90,7 +94,7 @@ jobs:
           --health-cmd "pg_isready -U zimservice"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94
       - run: |
           ZIMSERVICE_REQUIRE_DB=1 \
@@ -100,7 +104,7 @@ jobs:
   docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
         with: { components: rustdoc }
       - run: cargo doc --no-deps
@@ -125,7 +129,7 @@ jobs:
           --health-cmd "pg_isready -U zimservice"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
       - run: |
           ZIMSERVICE_REQUIRE_DB=1 \
@@ -145,7 +149,7 @@ jobs:
           --health-cmd "pg_isready -U zimservice"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
         with: { components: llvm-tools-preview }
       - uses: taiki-e/install-action@cargo-llvm-cov
@@ -183,7 +187,7 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -207,7 +211,7 @@ jobs:
           --health-cmd "pg_isready -U zimservice"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: docker build -t zimservice:ci .
       # e2e: `--network host` lets the container reach the `postgres`
       # service hostname the runner resolves (a default-bridge container
@@ -243,7 +247,7 @@ jobs:
         os: [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
       - run: cargo build
       - run: cargo test --lib --bins --test wiremock

@@ -43,6 +43,9 @@ permissions:
   contents: read
   actions: write
 
+# Runner note: actions/* @v7 (checkout, upload-artifact) run on the
+# runner's Node 24 (the @v4 series ran on node20). See ci.yml.
+
 jobs:
   bench:
     runs-on: ubuntu-latest
@@ -58,7 +61,7 @@ jobs:
           --health-cmd "pg_isready -U zimservice"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
       - name: Run benches against the committed week0 baseline
         run: |
@@ -96,7 +99,7 @@ jobs:
       # it is the persistent record the trend comparison is read from.
       - name: Upload criterion data (persistent per-run record)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: criterion-data
           path: target/criterion
