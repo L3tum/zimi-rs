@@ -363,8 +363,19 @@ fn cross_process_lock_path() -> std::path::PathBuf {
 /// different pid — or an unparseable/empty lockfile (treated as different
 /// pid) — keeps the deadline + steal behavior.
 fn acquire_cross_process(timeout: std::time::Duration) -> std::io::Result<std::fs::File> {
+    acquire_cross_process_at(&cross_process_lock_path(), timeout)
+}
+
+/// Path-parameterized core of [`acquire_cross_process`] — identical behavior
+/// on any lockfile path. The parameter exists for
+/// `same_process_holder_is_waited_out_not_deadlined`, which must exercise the
+/// same-pid wait on a *private* path (see that test's note: the shared path
+/// is contended with any concurrent test binary).
+fn acquire_cross_process_at(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::fs::File> {
     use std::io::Write;
-    let path = cross_process_lock_path();
     let deadline = std::time::Instant::now() + timeout;
     let started = std::time::Instant::now();
     loop {
@@ -377,7 +388,7 @@ fn acquire_cross_process(timeout: std::time::Duration) -> std::io::Result<std::f
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        match opts.open(&path) {
+        match opts.open(path) {
             Ok(mut f) => {
                 // Record our PID in the file (debug aid; staleness is by mtime).
                 let _ = f
@@ -387,13 +398,13 @@ fn acquire_cross_process(timeout: std::time::Duration) -> std::io::Result<std::f
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 // Someone else holds it. If it is stale (holder killed), steal.
-                if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+                if let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) {
                     if modified
                         .elapsed()
                         .ok()
                         .is_some_and(|age| age > STALE_THRESHOLD)
                     {
-                        let _ = std::fs::remove_file(&path);
+                        let _ = std::fs::remove_file(path);
                         continue; // retry the claim
                     }
                 }
@@ -404,7 +415,7 @@ fn acquire_cross_process(timeout: std::time::Duration) -> std::io::Result<std::f
                 // [`HOLD_DEADLINE`]: a same-pid holder that long
                 // is wedged (typically a query on a half-open connection),
                 // and a loud failure beats an invisible suite hang.
-                let holder_pid = std::fs::read_to_string(&path)
+                let holder_pid = std::fs::read_to_string(path)
                     .ok()
                     .and_then(|s| s.trim().parse::<u32>().ok());
                 let same_process_holder = holder_pid == Some(std::process::id());
@@ -780,10 +791,25 @@ mod tests {
     /// same-binary test holding the in-process slot) must be waited out,
     /// not deadlined — both threads here share the process PID, which is
     /// exactly that scenario.
+    ///
+    /// Runs on a *private* lockfile path: on the shared path, a concurrent
+    /// test binary (CI runs lib + integration as parallel processes of one
+    /// `cargo test`) can claim the slot in the window between the helper's
+    /// release and the main thread's re-acquire — the waiter then sees a
+    /// foreign PID and applies the cross-process deadline, failing the test
+    /// for behaving exactly as designed (2026-10 coverage-job flake).
     #[test]
     fn same_process_holder_is_waited_out_not_deadlined() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let path = cross_process_lock_path();
+        let shared = cross_process_lock_path();
+        let path = shared.with_file_name(format!(
+            "{}.samepid-selftest-{}.lock",
+            shared
+                .file_name()
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_default(),
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         // A helper thread claims the lockfile first (signalling "held") and
         // then holds it ~500 ms — past the main thread's short 200 ms
@@ -793,7 +819,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let holder_path = path.clone();
         let holder = std::thread::spawn(move || {
-            let file = acquire_cross_process(std::time::Duration::from_secs(30))
+            let file = acquire_cross_process_at(&holder_path, std::time::Duration::from_secs(30))
                 .expect("helper must claim the lockfile");
             held_tx.send(()).expect("signal held");
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -808,7 +834,7 @@ mod tests {
         // polling and succeed once the helper releases.
         held_rx.recv().expect("helper is holding the lockfile");
         let started = std::time::Instant::now();
-        let file = acquire_cross_process(std::time::Duration::from_millis(200))
+        let file = acquire_cross_process_at(&path, std::time::Duration::from_millis(200))
             .expect("same-pid holder must be waited out, not deadlined");
         assert!(
             started.elapsed() >= std::time::Duration::from_millis(200),

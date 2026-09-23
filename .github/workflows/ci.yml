@@ -105,6 +105,10 @@ jobs:
     # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml (1.96.0) — see `msrv`.
     env:
       RUSTUP_TOOLCHAIN: "1.94"
+      # Contended runner (parallel DB jobs + cold compiles): extra wall-clock
+      # for the real-clock loop tests (`loop_wait_budget`, src/embed/
+      # auto_loop.rs). Only the failure path stretches; green is unaffected.
+      ZIMSERVICE_LOOP_TEST_BUDGET_SECS: "300"
     services:
       postgres:
         image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
@@ -144,6 +148,11 @@ jobs:
   # failure there must not vacate DB-backed regression coverage.
   test:
     runs-on: ubuntu-latest
+    env:
+      # Contended runner (parallel DB jobs + cold compiles): extra wall-clock
+      # for the real-clock loop tests (`loop_wait_budget`, src/embed/
+      # auto_loop.rs). Only the failure path stretches; green is unaffected.
+      ZIMSERVICE_LOOP_TEST_BUDGET_SECS: "300"
     services:
       postgres:
         image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
@@ -167,6 +176,11 @@ jobs:
           cargo test --lib --bins --test wiremock --test integration
   coverage:
     runs-on: ubuntu-latest
+    env:
+      # Contended runner (parallel DB jobs + cold compiles): extra wall-clock
+      # for the real-clock loop tests (`loop_wait_budget`, src/embed/
+      # auto_loop.rs). Only the failure path stretches; green is unaffected.
+      ZIMSERVICE_LOOP_TEST_BUDGET_SECS: "300"
     services:
       postgres:
         image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates

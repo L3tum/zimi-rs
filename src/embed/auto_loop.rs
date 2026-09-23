@@ -410,6 +410,21 @@ mod tests {
     /// real clock, so this bounds the wall-clock poll waits; it is a generous
     /// safety net, not the expected duration.
     const LOOP_WAIT_BUDGET: Duration = Duration::from_secs(60);
+
+    /// [`LOOP_WAIT_BUDGET`], overridable via `ZIMSERVICE_LOOP_TEST_BUDGET_SECS`.
+    /// CI runs the DB jobs in parallel with cold compiles on a shared runner,
+    /// and a loaded box can hand a test far less wall clock than the budget
+    /// assumes (a 2026-10 msrv-db run lost the full 60 s to load while the
+    /// same tests pass in well under a second on an unloaded host — fresh-DB
+    /// repro). The override only stretches the *failure* path: a green
+    /// condition still returns the instant it is seen.
+    fn loop_wait_budget() -> Duration {
+        std::env::var("ZIMSERVICE_LOOP_TEST_BUDGET_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(LOOP_WAIT_BUDGET)
+    }
     /// Small real-time cadence for the loop tests (production uses 60 s). A small
     /// tick keeps the tests fast and, running on a *real* clock, immune to the
     /// paused-clock auto-advance limitation that breaks a spawned loop under a
@@ -628,7 +643,7 @@ mod tests {
         (0..n).map(|_| val.to_string()).collect()
     }
 
-    /// Poll `check` (real DB I/O) within a real-time budget (`LOOP_WAIT_BUDGET`).
+    /// Poll `check` (real DB I/O) within a real-time budget (`loop_wait_budget`).
     /// The loop tests run on a real clock, so the 25 ms sleep between probes
     /// is wall-clock: the loop (tick = `TEST_TICK`) makes its real I/O pass
     /// between polls, and the poll simply waits for it. `None` from a check
@@ -638,7 +653,7 @@ mod tests {
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Option<bool>>,
     {
-        let deadline = std::time::Instant::now() + LOOP_WAIT_BUDGET;
+        let deadline = std::time::Instant::now() + loop_wait_budget();
         loop {
             if check().await.is_some_and(|b| b) {
                 return;
@@ -990,22 +1005,51 @@ mod tests {
         let state = loop_state(pool.clone(), settings);
         let loop_task = tokio::spawn(auto_embed_loop(state, TEST_TICK));
 
-        // The early build lands as a valid index in the background.
-        wait_until(
-            || async { index_valid(&pool).await },
-            "early background index build",
-        )
-        .await;
-
-        // The loop did not block on the build: its tick proceeded to the
-        // per-ZIM pipeline and attempted an embed (which 500'd).
+        // The early build lands as a valid index in the background, and the
+        // loop did not block on it: the pass that spawns the build fires its
+        // pipeline HTTP request within milliseconds, long before the build
+        // completes. Both events are observed on one poll cadence, and the
+        // first request must be seen no later than the first valid index.
+        // (The 2026-10 form — an immediate assert after `index_valid` —
+        // raced the in-flight pipeline pass on the loaded CI runner: the
+        // build can land while the pass's HTTP call is still unscheduled.)
+        let deadline = std::time::Instant::now() + loop_wait_budget();
+        let mut first_request_at: Option<std::time::Instant> = None;
+        let mut build_valid_at: Option<std::time::Instant> = None;
+        loop {
+            // One timestamp per iteration: events first observed in the same
+            // iteration are order-tied, and the assert below accepts a tie
+            // (an ordering gap smaller than one 25 ms poll interval is below
+            // this test's resolution; a real blocking regression delays the
+            // request by the whole build duration — many intervals).
+            let now = std::time::Instant::now();
+            if build_valid_at.is_none() && index_valid(&pool).await.unwrap_or(false) {
+                build_valid_at = Some(now);
+            }
+            if first_request_at.is_none()
+                && !server
+                    .received_requests()
+                    .await
+                    .expect("wiremock requests")
+                    .is_empty()
+            {
+                first_request_at = Some(now);
+            }
+            if build_valid_at.is_some() && first_request_at.is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "loop test: timed out (build valid: {}, request: {})",
+                    build_valid_at.is_some(),
+                    first_request_at.is_some()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         assert!(
-            !server
-                .received_requests()
-                .await
-                .expect("wiremock requests")
-                .is_empty(),
-            "loop must continue to the per-ZIM pipeline after spawning the build"
+            first_request_at <= build_valid_at,
+            "pipeline request must land before the build completes — \n             a later request means the loop blocked on the build"
         );
         // The endpoint failed, so the article is still unembedded — the
         // index came from the loop's early-build path, not from a
