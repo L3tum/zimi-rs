@@ -58,9 +58,13 @@ jobs:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
           POSTGRES_DB: zimservice
-        ports: ["5433:5432"]
+          # Host-network runner (ci.yml note): this job's real port — 5436
+          # so a scheduled bench run can overlap a push-triggered CI run
+          # without a bind collision.
+          PGPORT: "5436"
+        ports: ["5436:5436"]
         options: >-
-          --health-cmd "pg_isready -U zimservice"
+          --health-cmd "pg_isready -U zimservice -p 5436"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v7
@@ -84,9 +88,9 @@ jobs:
           # harness would reject criterion's --baseline flag and fail the
           # job before any benchmark runs.
           echo "::notice::comparing against the committed week0 baseline (dev-box capture) — read week-over-week drift in the deltas, not the absolute hardware offset"
-          DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
+          DATABASE_URL=postgres://zimservice:zimservice@localhost:5436/zimservice \
             cargo bench --bench retrieval -- --baseline week0 2>&1 | tee "$out"
-          DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
+          DATABASE_URL=postgres://zimservice:zimservice@localhost:5436/zimservice \
             cargo bench --bench search -- --baseline week0 2>&1 | tee -a "$out"
           # The benches' loud-skip policy (benches/{search,retrieval}.rs)
           # prints `BENCH SKIPPED (<name>): no reachable Postgres` and exits

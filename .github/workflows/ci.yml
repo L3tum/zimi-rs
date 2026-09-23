@@ -18,6 +18,13 @@ permissions:
 # - The actions/* @v7 steps (checkout, setup-node) run on the runner's
 #   Node 24 (the @v4 series ran on node20). The act-latest runner image
 #   ships Node 24, so this holds today; revisit if the image changes.
+# - Every container (jobs AND services) runs on the host network: `ports:`
+#   host mappings are ignored and service hostnames don't resolve, so each
+#   Postgres service listens on its own real port (PGPORT) and clients
+#   connect to localhost:<port>. Ports are fixed per job — test=5432,
+#   msrv-db=5433, coverage=5434, docker=5435 (bench=5436 in bench.yml) —
+#   because parallel jobs share the host network and would collide on a
+#   common port (a losing postgres can never bind and never goes healthy).
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -105,9 +112,12 @@ jobs:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
           POSTGRES_DB: zimservice
-        ports: ["5433:5432"]
+          # Host-network runner (note at top): this job's real port;
+          # clients below connect to localhost:5433.
+          PGPORT: "5433"
+        ports: ["5433:5433"]
         options: >-
-          --health-cmd "pg_isready -U zimservice"
+          --health-cmd "pg_isready -U zimservice -p 5433"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v7
@@ -141,9 +151,11 @@ jobs:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
           POSTGRES_DB: zimservice
-        ports: ["5433:5432"]
+          # Host-network runner (note at top): this job's real port.
+          PGPORT: "5432"
+        ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U zimservice"
+          --health-cmd "pg_isready -U zimservice -p 5432"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v7
@@ -151,7 +163,7 @@ jobs:
         with: { toolchain: "1.96.0" }
       - run: |
           ZIMSERVICE_REQUIRE_DB=1 \
-          DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
+          DATABASE_URL=postgres://zimservice:zimservice@localhost:5432/zimservice \
           cargo test --lib --bins --test wiremock --test integration
   coverage:
     runs-on: ubuntu-latest
@@ -162,9 +174,11 @@ jobs:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
           POSTGRES_DB: zimservice
-        ports: ["5433:5432"]
+          # Host-network runner (note at top): this job's real port.
+          PGPORT: "5434"
+        ports: ["5434:5434"]
         options: >-
-          --health-cmd "pg_isready -U zimservice"
+          --health-cmd "pg_isready -U zimservice -p 5434"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v7
@@ -195,7 +209,7 @@ jobs:
       # so the floor can only effectively rise.
       - run: |
           ZIMSERVICE_REQUIRE_DB=1 \
-          DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
+          DATABASE_URL=postgres://zimservice:zimservice@localhost:5434/zimservice \
           cargo llvm-cov --lib --bins --test wiremock --test integration \
             --fail-under-lines "$(cat .github/coverage_floor.txt)"
   # RUSTSEC audit (2026-09 review, Sec): fail CI on known-vulnerable
@@ -231,23 +245,27 @@ jobs:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
           POSTGRES_DB: zimservice
-        ports: ["5433:5432"]
+          # Host-network runner (note at top): this job's real port.
+          PGPORT: "5435"
+        ports: ["5435:5435"]
         options: >-
-          --health-cmd "pg_isready -U zimservice"
+          --health-cmd "pg_isready -U zimservice -p 5435"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
       - uses: actions/checkout@v7
       - run: docker build -t zimservice:ci .
-      # e2e: `--network host` lets the container reach the `postgres`
-      # service hostname the runner resolves (a default-bridge container
-      # could not). `HOST=0.0.0.0` + `ACCESS_MODE=password` is the only
+      # e2e: `--network host` puts the app in the host network, where its
+      # 0.0.0.0:8899 bind is reachable at 127.0.0.1 and the postgres
+      # service is at localhost:5435 (its real port — the host-network
+      # runner ignores `ports:` mappings; see the note at the top).
+      # `HOST=0.0.0.0` + `ACCESS_MODE=password` is the only
       # startup combination allowed on a non-loopback bind (open mode is
       # refused at boot — the Threat model); `/health` stays open, which is
       # what we poll. `ZIMSERVICE_REQUIRE_DB=1` turns a misrouted
       # DATABASE_URL into a hard boot failure instead of a limp serve.
       - run: |
           docker run -d --name zimservice-e2e --network host \
-            -e DATABASE_URL=postgres://zimservice:zimservice@postgres:5432/zimservice \
+            -e DATABASE_URL=postgres://zimservice:zimservice@localhost:5435/zimservice \
             -e ZIMSERVICE_REQUIRE_DB=1 \
             -e HOST=0.0.0.0 \
             -e ACCESS_MODE=password \
