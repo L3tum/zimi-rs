@@ -1,0 +1,19 @@
+# cargo-audit configuration (cargo-audit >= 0.21: `.cargo/audit.toml`; the
+# older `.cargo-audit.toml` name is no longer read).
+#
+# Every ignored advisory must carry a reason here; a bare ignore without one
+# is a future security debt.
+
+[advisories]
+# RUSTSEC-2022-0004: stack overflow in rustc_serialize when parsing deeply
+# nested JSON. No fixed version exists (the advisory itself says so; the
+# crate is abandoned at 0.3.25). It reaches this lockfile only through
+#   zimservice -> zim 0.5.0 (latest published) -> stopwatch 0.0.7
+#             -> num 0.1.43 -> num-bigint/num-complex/num-rational 0.1.x
+#             -> rustc-serialize 0.3.25
+# — the numeric-type path used by ZIM archive counters. That path never
+# calls rustc_serialize's JSON deserializer, so the vulnerable code
+# (untrusted deeply-nested JSON) is not reachable from this crate's usage.
+# Revisit if a `zim` release drops `stopwatch`/`num` 0.1 (checked: 0.5.0
+# is the latest, 2026-07).
+ignore = ["RUSTSEC-2022-0004"]
