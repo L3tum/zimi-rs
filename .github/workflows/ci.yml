@@ -277,7 +277,12 @@ jobs:
       # refused at boot — the Threat model); `/health` stays open, which is
       # what we poll. `ZIMSERVICE_REQUIRE_DB=1` turns a misrouted
       # DATABASE_URL into a hard boot failure instead of a limp serve.
+      # The runner is persistent (self-hosted, host network): a previous
+      # run's container outlives this job, so clean up first (exited
+      # container -> `docker run` name Conflict; live one -> :8899 held)
+      # and again in the `always()` step below so green runs don't leak.
       - run: |
+          docker rm -f zimservice-e2e >/dev/null 2>&1 || true
           docker run -d --name zimservice-e2e --network host \
             -e DATABASE_URL=postgres://zimservice:zimservice@localhost:5435/zimservice \
             -e ZIMSERVICE_REQUIRE_DB=1 \
@@ -294,6 +299,10 @@ jobs:
           done
           docker logs zimservice-e2e
           exit 1
+      # Always tear the container down (success or failure) — see the
+      # cleanup note above the run step.
+      - if: always()
+        run: docker rm -f zimservice-e2e >/dev/null 2>&1 || true
   # Cross-platform smoke (macOS/Windows): removed — this runner fleet is
   # Linux-only (no macos-latest/windows-latest labels exist to schedule on).
   # Re-add a matrix job here if non-Linux runners appear.
