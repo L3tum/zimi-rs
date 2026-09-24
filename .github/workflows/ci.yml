@@ -274,13 +274,18 @@ jobs:
       # runner ignores `ports:` mappings; see the note at the top).
       # `HOST=0.0.0.0` + `ACCESS_MODE=password` is the only
       # startup combination allowed on a non-loopback bind (open mode is
-      # refused at boot — the Threat model); `/health` stays open, which is
-      # what we poll. `ZIMSERVICE_REQUIRE_DB=1` turns a misrouted
+      # refused at boot — the Threat model). `ZIMSERVICE_REQUIRE_DB=1` turns a misrouted
       # DATABASE_URL into a hard boot failure instead of a limp serve.
       # The runner is persistent (self-hosted, host network): a previous
       # run's container outlives this job, so clean up first (exited
       # container -> `docker run` name Conflict; live one -> :8899 held)
       # and again in the `always()` step below so green runs don't leak.
+      # The health poll is unauthenticated on purpose: `/health` is public
+      # by design (README threat model — version/counts/liveness, "treat as
+      # not confidential") and is exempt from the fail-closed 503, the rate
+      # limit, and the M-1 read gate (require_auth_for_reads effective-true
+      # on this non-loopback bind) — exactly how a load-balancer probe will
+      # hit it. A 401 here means the probe exemption regressed.
       - run: |
           docker rm -f zimservice-e2e >/dev/null 2>&1 || true
           docker run -d --name zimservice-e2e --network host \

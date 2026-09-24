@@ -1331,6 +1331,46 @@ mod tests {
         );
     }
 
+    /// M-1 + public-probe invariant: with the read gate on, the
+    /// unauthenticated `/health` probe must still reach the health handler —
+    /// public by design (README threat model: "`/health` is public by
+    /// design", treated as not confidential), exempt like the fail-closed
+    /// 503 and the rate limit. Without the exemption a non-loopback
+    /// deployment (require_auth_for_reads effective-true) 401s its own
+    /// load-balancer/monitor probe and the instance reports down. The dead
+    /// test pool makes the handler report its own 503 "degraded" — the very
+    /// DB-down signal the probe exists to carry (BUG-2) — which distinguishes
+    /// "reached the handler" from the read gate's 401.
+    #[tokio::test]
+    async fn m1_flag_on_health_probe_stays_public() {
+        let app = build_router(password_state(true));
+        let resp = app
+            .clone()
+            .oneshot(get_with_token("/health", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unauthenticated GET /health must reach the health handler \
+             (dead pool → its own 503 degraded), not the read gate's 401"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v["db_connected"], false);
+        // The exemption is health-scoped: every other read stays gated.
+        let settings = app
+            .clone()
+            .oneshot(get_with_token("/settings", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            settings.status(),
+            StatusCode::UNAUTHORIZED,
+            "flag on + no token on a non-health route → 401"
+        );
+    }
+
     #[tokio::test]
     async fn m1_flag_on_read_with_token_is_200() {
         let app = build_router(password_state(true));

@@ -2,7 +2,8 @@
 //! read-only token), `access_token` sanitisation, and the global
 //! rate-limiting middleware.
 //!
-//! `auth_required` gates mutating endpoints (and, behind a flag, reads);
+//! `auth_required` gates mutating endpoints (and, behind a flag, reads —
+//! except the public `/health` probe, exempted in `auth_middleware`);
 //! `is_authorized` matches a Bearer header and/or `access_token` query param
 //! in constant time; a token verifies as **Full** against the admin password
 //! or, failing that, as **ReadOnly** against the optional
@@ -70,12 +71,24 @@ pub async fn auth_middleware(
             .into_response());
     }
 
-    if !auth_required(
-        request.method().as_str(),
-        &mode,
-        &password,
-        state.settings.require_auth_for_reads(),
-    ) {
+    // The M-1 read gate never applies to the health probe: `/health` is
+    // public by design (README threat model — version/counts/liveness,
+    // "treat as not confidential"), the third exemption shared with the
+    // fail-closed 503 and the rate limiter above/below, both via
+    // `is_health_path`. Without it a non-loopback deployment
+    // (require_auth_for_reads effective-true, M-1) 401s its own
+    // unauthenticated load-balancer or monitor probe and the instance
+    // reports down. Read verbs only: a mutating /health stays gated (no
+    // such route exists today).
+    let health_probe = is_health && is_read_verb(request.method().as_str());
+    if health_probe
+        || !auth_required(
+            request.method().as_str(),
+            &mode,
+            &password,
+            state.settings.require_auth_for_reads(),
+        )
+    {
         return Ok(next.run(request).await);
     }
 
