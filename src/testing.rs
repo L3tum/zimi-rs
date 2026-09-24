@@ -146,17 +146,27 @@ fn print_lib_skip_summary() {
 
 /// The DB-gate skip/panic decision, shared by [`test_pool`], [`test_conn`],
 /// and any DB-gated test with custom pool options (e.g. `embed::auto_loop`):
-/// `ZIMSERVICE_REQUIRE_DB` set → a hard failure; unset → counted in
-/// [`LIB_SKIPPED`] (the `#[dtor]` exit summary reads it) + a skip notice.
-/// Every DB-connection skip in the lib suite goes through here so the exit
-/// summary never under-reports on a DB-less machine (env-condition skips,
-/// e.g. the vector-index dev-DB guard and multi-instance opt-outs, are
-/// counted separately). Generic in the return type so each caller's `Option<T>` arm
-/// can delegate to it directly.
+/// `ZIMSERVICE_REQUIRE_DB` set → a hard failure; `DATABASE_URL` set but
+/// unreachable → a hard failure (an explicit URL is a signal of intent —
+/// "there is a database here" — so silently skipping would report a
+/// vacuous green); otherwise → counted in [`LIB_SKIPPED`] (the `#[dtor]`
+/// exit summary reads it) + a skip notice. Every DB-connection skip in the
+/// lib suite goes through here so the exit summary never under-reports on
+/// a DB-less machine (env-condition skips, e.g. the vector-index dev-DB
+/// guard and multi-instance opt-outs, are counted separately). Generic in
+/// the return type so each caller's `Option<T>` arm can delegate to it
+/// directly.
+///
+/// Reference implementation: `skip()` in tests/integration/common.rs — the
+/// two decision ladders (REQUIRE_DB → explicit-URL → counted skip) must
+/// stay in sync; the integration copy is the one the Makefile greps.
 #[cfg(test)]
-pub fn gate_skip<T>(test: &str, url: &str, why: &str) -> Option<T> {
+pub fn gate_skip<T>(test: &str, url: &str, url_explicit: bool, why: &str) -> Option<T> {
     if std::env::var("ZIMSERVICE_REQUIRE_DB").is_ok() {
         panic!("{test}: ZIMSERVICE_REQUIRE_DB is set but cannot reach {url}: {why}");
+    }
+    if url_explicit {
+        panic!("{test}: DATABASE_URL is set but unreachable: {url}: {why}");
     }
     LIB_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     eprintln!("skipping {test}: cannot reach {url} ({why})");
@@ -172,6 +182,7 @@ pub fn gate_skip<T>(test: &str, url: &str, why: &str) -> Option<T> {
 /// layer (e.g. `db::downloads`) can share it without depending on it (A-1).
 #[cfg(test)]
 pub async fn test_pool() -> Option<(crate::db::Pool, DbExclusiveGuard)> {
+    let url_explicit = std::env::var("DATABASE_URL").is_ok();
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into());
     let config = crate::config::Config {
@@ -186,8 +197,8 @@ pub async fn test_pool() -> Option<(crate::db::Pool, DbExclusiveGuard)> {
     .await
     {
         Ok(Ok(pool)) => Some((pool, DbExclusiveGuard::acquire())),
-        Ok(Err(e)) => gate_skip("test_pool", &url, &e.to_string()),
-        Err(_) => gate_skip("test_pool", &url, "timed out connecting"),
+        Ok(Err(e)) => gate_skip("test_pool", &url, url_explicit, &e.to_string()),
+        Err(_) => gate_skip("test_pool", &url, url_explicit, "timed out connecting"),
     }
 }
 
@@ -205,6 +216,7 @@ pub async fn test_pool() -> Option<(crate::db::Pool, DbExclusiveGuard)> {
 /// [`gate_skip`].
 #[cfg(test)]
 pub async fn test_conn(test: &str) -> Option<sqlx::postgres::PgConnection> {
+    let url_explicit = std::env::var("DATABASE_URL").is_ok();
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into());
     match tokio::time::timeout(
@@ -214,8 +226,8 @@ pub async fn test_conn(test: &str) -> Option<sqlx::postgres::PgConnection> {
     .await
     {
         Ok(Ok(conn)) => Some(conn),
-        Ok(Err(e)) => gate_skip(test, &url, &e.to_string()),
-        Err(_) => gate_skip(test, &url, "timed out connecting"),
+        Ok(Err(e)) => gate_skip(test, &url, url_explicit, &e.to_string()),
+        Err(_) => gate_skip(test, &url, url_explicit, "timed out connecting"),
     }
 }
 

@@ -47,6 +47,16 @@ jobs:
       # there (move the SQL into a named src/db/ helper). POSIX sh, no
       # dependencies.
       - run: make raw-sql-lint
+      # M2: module-boundary lint (scripts/check-boundaries.sh) — the
+      # use-graph half of the same boundary contract (companion to
+      # raw-sql-lint, which owns the raw-SQL call-site rules): P1
+      # presentation-layer separation (src/mcp <-> src/serve), P2 no
+      # raw-SQL string literals in presentation layers, P3 no pool creation
+      # in presentation layers (pools are startup-owned, passed via
+      # AppState), P4 no db::raw::* call sites in src/serve/ files OUTSIDE
+      # handlers/ (extends the raw-sql lint's rule-2 scope). POSIX sh, no
+      # dependencies.
+      - run: make boundary-lint
       # web-check (JS syntax + CSS parse) and web-test both read
       # node_modules: the CSS half parses with css-tree (the sanctioned
       # parser dependency, mirroring jsdom), web-test boots a JSDOM
@@ -229,9 +239,12 @@ jobs:
   # RUSTSEC audit (2026-09 review, Sec): fail CI on known-vulnerable
   # dependencies — `cargo audit` reads `Cargo.lock` only. The lock file was
   # inspected clean in the review; this pins that against future
-  # `cargo update` drift. Track the external `zim` 0.5 crate's robustness
-  # against malformed archives separately (most likely future
-  # code-execution-adjacent risk; RUSTSEC can't see it). The mirror has no
+  # `cargo update` drift. The external `zim` 0.5 crate's robustness against
+  # malformed archives (the most likely future code-execution-adjacent
+  # risk; RUSTSEC can't see it) is tracked by the standalone `fuzz/`
+  # cargo-fuzz workspace (fuzz_zim + fuzz_opds targets — see fuzz/README.md);
+  # it is NOT yet a CI job (self-hosted runner constraints), so run it
+  # locally: `cargo +nightly fuzz run <target>`. The mirror has no
   # rustsec/audit-check, so the equivalent runs inline — which is what the
   # action did under the hood (install cargo-audit + clone advisory-db).
   audit:
@@ -286,6 +299,15 @@ jobs:
       # limit, and the M-1 read gate (require_auth_for_reads effective-true
       # on this non-loopback bind) — exactly how a load-balancer probe will
       # hit it. A 401 here means the probe exemption regressed.
+      # After the health poll: the M-1 read gate itself, exercised as an
+      # unauthenticated client (GET /list must be rejected — 401 for no
+      # credential, 403 for a valid-but-unscoped one), and the happy path
+      # (authenticated GET /list with the admin password as Bearer must
+      # return 200 — the middleware's `Authorization: Bearer <password>`
+      # form, src/serve/middleware.rs). Both checks print docker logs on
+      # failure, same as the health poll; the curls use `-s -o /dev/null
+      # -w '%{http_code}'` with `|| true` so a transport failure (000/
+      # empty) falls into the failure branch instead of tripping set -e.
       - run: |
           docker rm -f zimservice-e2e >/dev/null 2>&1 || true
           docker run -d --name zimservice-e2e --network host \
@@ -298,12 +320,35 @@ jobs:
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8899/health >/dev/null 2>&1; then
               echo "e2e: /health is green"
-              exit 0
+              break
             fi
             sleep 2
           done
-          docker logs zimservice-e2e
-          exit 1
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8899/health || true)
+          if [ "$code" != "200" ]; then
+            echo "e2e: /health never went green (last status: ${code:-none})" >&2
+            docker logs zimservice-e2e
+            exit 1
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8899/list || true)
+          case "$code" in
+            401|403)
+              echo "e2e: unauthenticated /list rejected as required ($code)"
+              ;;
+            *)
+              echo "e2e: unauthenticated /list returned ${code:-none} (want 401/403 — the M-1 read gate)" >&2
+              docker logs zimservice-e2e
+              exit 1
+              ;;
+          esac
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer e2e-ci-password" http://127.0.0.1:8899/list || true)
+          if [ "$code" != "200" ]; then
+            echo "e2e: authenticated /list returned ${code:-none} (want 200)" >&2
+            docker logs zimservice-e2e
+            exit 1
+          fi
+          echo "e2e: authenticated /list returned 200"
       # Always tear the container down (success or failure) — see the
       # cleanup note above the run step.
       - if: always()

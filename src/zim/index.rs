@@ -234,15 +234,28 @@ async fn run_index(
 
     // Skip when already indexed and the file is unchanged. reconcile/resync
     // reset the status to 'pending' whenever the file size changes, so
-    // "ready + same size" reliably means "up to date".
+    // "ready + same size" reliably means "up to date". A transient stat
+    // failure is NOT "size 0": re-indexing a healthy ZIM because the stat
+    // blipped would needlessly re-run the whole pipeline (and its DB
+    // writes), so keep the current index and let the next run re-check.
     if meta.index_status == "ready" {
-        let actual = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
-        if actual == meta.file_size {
-            tracing::info!(
-                "ZIM '{}' already indexed and unchanged — skipping",
-                meta.name
-            );
-            return Ok(());
+        match std::fs::metadata(&file_path).ok() {
+            Some(md) if md.len() == meta.file_size => {
+                tracing::info!(
+                    "ZIM '{}' already indexed and unchanged — skipping",
+                    meta.name
+                );
+                return Ok(());
+            }
+            Some(_) => {}
+            None => {
+                tracing::warn!(
+                    "ZIM '{}' is ready but its file is transiently un-stat-able — \
+                     keeping the current index",
+                    meta.name
+                );
+                return Ok(());
+            }
         }
     }
 
@@ -1270,8 +1283,8 @@ fn file_mtime_u64(path: &Path) -> u64 {
 mod tests {
     use super::{
         escape_copy_text_into, extract_qid, extract_qid_windowed, generate_snippet, is_wikipedia,
-        mark_index_error, open_zim_blocking, parse_zim_date, strip_head, truncate_at_sentence,
-        PREVIEW_CHARS, QID_SCAN_BYTES, STRIP_HEAD_BYTES,
+        mark_index_error, open_zim_blocking, parse_zim_date, run_index, strip_head,
+        truncate_at_sentence, PREVIEW_CHARS, QID_SCAN_BYTES, STRIP_HEAD_BYTES,
     };
     use crate::error::Error;
     use chrono::NaiveDate;
@@ -1741,5 +1754,51 @@ mod tests {
                 "{label}: expected Error::Zim, got: {err}"
             );
         }
+    }
+
+    /// The skip-if-unchanged gate must survive a transient stat failure:
+    /// "ready + stat blip" keeps the current index (Ok), never re-running
+    /// the pipeline as if the file were size 0 (the old `unwrap_or(0)` did
+    /// exactly that — a one-tick ENOENT re-indexed a healthy multi-GB ZIM
+    /// and re-wrote its DB rows).
+    #[tokio::test]
+    async fn run_index_ready_gate_survives_transient_stat_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let zims = std::sync::Arc::new(crate::zim::ZimManager::new(
+            dir.path().to_path_buf(),
+            crate::testing::dead_pool(),
+        ));
+        let pool = zims.db.clone();
+
+        // Seed: a reconciled "gate" entry flipped to ready (100 bytes).
+        let path = dir.path().join("gate.zim");
+        std::fs::write(&path, vec![b'Z'; 100]).unwrap();
+        zims.reconcile(&crate::zim::discovery::scan_snapshot_blocking(dir.path()).unwrap());
+        zims.cache
+            .write()
+            .unwrap()
+            .get_mut("gate")
+            .unwrap()
+            .index_status = "ready".into();
+        let meta = zims.get("gate").unwrap();
+
+        // 1) ready + unchanged file: the gate skips (Ok, no DB writes — the
+        // dead pool would otherwise fail any query).
+        run_index(&zims, &pool, &meta, &None).await.unwrap();
+
+        // 2) ready + transient stat failure (the file vanishes): keep the
+        // current index (Ok) — the regression the gate fix addresses.
+        std::fs::remove_file(&path).unwrap();
+        run_index(&zims, &pool, &meta, &None)
+            .await
+            .expect("a stat blip must not re-index a ready ZIM");
+
+        // 3) ready + REAL size change still proceeds: garbage bytes fail the
+        // open with Error::Zim (the gate must not over-skip).
+        std::fs::write(&path, vec![b'X'; 300]).unwrap();
+        let err = run_index(&zims, &pool, &meta, &None)
+            .await
+            .expect_err("a real size change must re-index");
+        assert!(matches!(err, Error::Zim(_)), "got: {err}");
     }
 }

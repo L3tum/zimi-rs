@@ -90,6 +90,11 @@ fn clamp_weight(v: Option<f64>, dflt: f64) -> f64 {
 
 /// Read a single key from a snapshot's map, deserialising into `T`.
 /// Returns `None` when the key is absent or its value is mistyped.
+///
+/// This is the generic (slow) path: `from_value` takes the `Value` by
+/// value, so each call clones it. The per-search snapshot keys use the
+/// zero-clone [`FastRead`] variants instead (PERF F2); this stays the
+/// reference semantics the fast path falls back to.
 fn read<T: serde::de::DeserializeOwned>(
     cache: &HashMap<String, serde_json::Value>,
     key: &str,
@@ -97,6 +102,69 @@ fn read<T: serde::de::DeserializeOwned>(
     cache
         .get(key)
         .and_then(|v| serde_json::from_value::<T>(v.clone()).ok())
+}
+
+/// Zero-clone read of a cached `Value` for the snapshot fast path (PERF
+/// F2): `Self` is materialised from the borrowed `Value` without cloning
+/// it (the old generic [`read`] cloned one `Value` per key per call — the
+/// search snapshot takes one per search, per key).
+///
+/// Only implemented for the snapshot's primitive/string key types; for
+/// those, `from_cached` is exactly as strict as
+/// `serde_json::from_value::<T>` (same `Some`/`None` outcome, equal value
+/// when `Some`), so [`read_fast`]'s fallback to [`read`] is defensive and
+/// never changes the result.
+trait FastRead: serde::de::DeserializeOwned {
+    /// Materialise `Self` from a borrowed cached `Value` (no clone).
+    fn from_cached(v: &serde_json::Value) -> Option<Self>;
+}
+
+impl FastRead for f64 {
+    fn from_cached(v: &serde_json::Value) -> Option<Self> {
+        v.as_f64()
+    }
+}
+
+impl FastRead for bool {
+    fn from_cached(v: &serde_json::Value) -> Option<Self> {
+        v.as_bool()
+    }
+}
+
+impl FastRead for u64 {
+    fn from_cached(v: &serde_json::Value) -> Option<Self> {
+        v.as_u64()
+    }
+}
+
+impl FastRead for u32 {
+    fn from_cached(v: &serde_json::Value) -> Option<Self> {
+        v.as_u64().and_then(|n| u32::try_from(n).ok())
+    }
+}
+
+impl FastRead for usize {
+    fn from_cached(v: &serde_json::Value) -> Option<Self> {
+        v.as_u64().and_then(|n| usize::try_from(n).ok())
+    }
+}
+
+impl FastRead for String {
+    fn from_cached(v: &serde_json::Value) -> Option<Self> {
+        // One string allocation — no `Value` clone, no serde round-trip.
+        v.as_str().map(str::to_owned)
+    }
+}
+
+/// Zero-clone counterpart of [`read`] (PERF F2): the primitive fast path
+/// first, falling back to the generic [`read`] (the fallback is defensive —
+/// see [`FastRead`] — and never changes the result). Same semantics: `None`
+/// when the key is absent or mistyped.
+fn read_fast<T: FastRead>(cache: &HashMap<String, serde_json::Value>, key: &str) -> Option<T> {
+    match cache.get(key) {
+        Some(v) => T::from_cached(v).or_else(|| read::<T>(cache, key)),
+        None => None,
+    }
 }
 
 /// The `SETTING_DEFS`-declared default for a key, deserialised into `T`.
@@ -107,13 +175,13 @@ fn seed_default<T: serde::de::DeserializeOwned>(key: &str) -> T {
         .unwrap_or_else(|_| panic!("broken settings seed for {}", key))
 }
 
-/// Read a key, falling back to the `SETTING_DEFS`-declared default; the
-/// `seed_default` `expect` is the unreachable last-resort.
-fn read_or_seed<T: serde::de::DeserializeOwned>(
-    cache: &HashMap<String, serde_json::Value>,
-    key: &str,
-) -> T {
-    read::<T>(cache, key).unwrap_or_else(|| seed_default::<T>(key))
+/// Zero-clone successor of the old generic `read_or_seed` (PERF F2): same
+/// seed/default behaviour (the same `seed_default` fallback, the same read
+/// semantics via [`read_fast`]'s defensive fallback to [`read`]), the
+/// cached-value path is just clone-free. Used by the per-search / per-tick
+/// snapshots for every key whose type implements [`FastRead`].
+fn read_fast_or_seed<T: FastRead>(cache: &HashMap<String, serde_json::Value>, key: &str) -> T {
+    read_fast::<T>(cache, key).unwrap_or_else(|| seed_default::<T>(key))
 }
 
 /// One read-lock pass over every setting the poller reads per tick/per call
@@ -189,33 +257,33 @@ impl SettingsCache {
         // back to the declared default. The `expect` last-resort is
         // unreachable while a test pins every key's seed
         // (`default_settings_seeds_all_typed_accessor_keys`).
-        let threshold = read_or_seed::<f64>(&cache, KEY_SEARCH_TRGM_THRESHOLD);
+        let threshold = read_fast_or_seed::<f64>(&cache, KEY_SEARCH_TRGM_THRESHOLD);
         SearchParamsSnapshot {
             generation: self.generation(),
-            default_limit: read_or_seed::<usize>(&cache, KEY_SEARCH_DEFAULT_LIMIT),
-            max_limit: read_or_seed::<usize>(&cache, KEY_SEARCH_MAX_LIMIT),
+            default_limit: read_fast_or_seed::<usize>(&cache, KEY_SEARCH_DEFAULT_LIMIT),
+            max_limit: read_fast_or_seed::<usize>(&cache, KEY_SEARCH_MAX_LIMIT),
             fts_weight: clamp_weight(
-                read::<f64>(&cache, KEY_SEARCH_FTS_WEIGHT),
+                read_fast::<f64>(&cache, KEY_SEARCH_FTS_WEIGHT),
                 seed_default::<f64>(KEY_SEARCH_FTS_WEIGHT),
             ),
             trgm_weight: clamp_weight(
-                read::<f64>(&cache, KEY_SEARCH_TRGM_WEIGHT),
+                read_fast::<f64>(&cache, KEY_SEARCH_TRGM_WEIGHT),
                 seed_default::<f64>(KEY_SEARCH_TRGM_WEIGHT),
             ),
             vector_weight: clamp_weight(
-                read::<f64>(&cache, KEY_SEARCH_VECTOR_WEIGHT),
+                read_fast::<f64>(&cache, KEY_SEARCH_VECTOR_WEIGHT),
                 seed_default::<f64>(KEY_SEARCH_VECTOR_WEIGHT),
             ),
             // See [`floor_trgm_threshold`] for why the floor exists.
             trgm_threshold: floor_trgm_threshold(threshold),
-            embedding_enabled: read_or_seed::<bool>(&cache, KEY_EMBEDDING_ENABLED),
-            embed_endpoint: read_or_seed::<String>(&cache, KEY_EMBEDDING_ENDPOINT),
-            embed_api_key: read::<String>(&cache, KEY_EMBEDDING_API_KEY).unwrap_or_default(),
-            embed_model: read::<String>(&cache, KEY_EMBEDDING_MODEL)
+            embedding_enabled: read_fast_or_seed::<bool>(&cache, KEY_EMBEDDING_ENABLED),
+            embed_endpoint: read_fast_or_seed::<String>(&cache, KEY_EMBEDDING_ENDPOINT),
+            embed_api_key: read_fast::<String>(&cache, KEY_EMBEDDING_API_KEY).unwrap_or_default(),
+            embed_model: read_fast::<String>(&cache, KEY_EMBEDDING_MODEL)
                 .unwrap_or_else(|| EMBED_DEFAULT_MODEL.to_string()),
-            embed_dimension: read::<u32>(&cache, KEY_EMBEDDING_DIMENSION)
+            embed_dimension: read_fast::<u32>(&cache, KEY_EMBEDDING_DIMENSION)
                 .unwrap_or(EMBED_DEFAULT_DIMENSION),
-            embed_batch_size: read_or_seed::<usize>(&cache, KEY_EMBEDDING_BATCH_SIZE),
+            embed_batch_size: read_fast_or_seed::<usize>(&cache, KEY_EMBEDDING_BATCH_SIZE),
         }
     }
 
@@ -233,7 +301,7 @@ impl SettingsCache {
             .read()
             .expect("settings cache lock poisoned");
         let str_v = |k: &str| -> String {
-            read::<String>(&cache, k)
+            read_fast::<String>(&cache, k)
                 .or_else(|| serde_json::from_value::<String>(default_value(k)).ok())
                 .unwrap_or_default()
         };
@@ -248,17 +316,20 @@ impl SettingsCache {
             },
             category: str_v(KEY_TORRENT_CATEGORY),
             save_path: str_v(KEY_TORRENT_SAVE_PATH),
-            seed_ratio: read::<f64>(&cache, KEY_TORRENT_SEED_RATIO),
+            seed_ratio: read_fast::<f64>(&cache, KEY_TORRENT_SEED_RATIO),
             file_strategy: str_v(KEY_TORRENT_FILE_STRATEGY),
-            keep_completed: read_or_seed::<bool>(&cache, KEY_TORRENT_KEEP_COMPLETED),
-            opds_auto_update: read_or_seed::<bool>(&cache, KEY_TORRENT_AUTO_UPDATE),
+            keep_completed: read_fast_or_seed::<bool>(&cache, KEY_TORRENT_KEEP_COMPLETED),
+            opds_auto_update: read_fast_or_seed::<bool>(&cache, KEY_TORRENT_AUTO_UPDATE),
             opds_url: str_v(KEY_TORRENT_OPDS_URL),
-            allow_private_networks: read_or_seed::<bool>(
+            allow_private_networks: read_fast_or_seed::<bool>(
                 &cache,
                 KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS,
             ),
-            qbit_allow_private: read_or_seed::<bool>(&cache, KEY_TORRENT_ALLOW_PRIVATE_NETWORKS),
-            max_bytes: read::<u64>(&cache, KEY_DOWNLOADS_MAX_BYTES)
+            qbit_allow_private: read_fast_or_seed::<bool>(
+                &cache,
+                KEY_TORRENT_ALLOW_PRIVATE_NETWORKS,
+            ),
+            max_bytes: read_fast::<u64>(&cache, KEY_DOWNLOADS_MAX_BYTES)
                 .or_else(|| {
                     serde_json::from_value::<u64>(default_value(KEY_DOWNLOADS_MAX_BYTES)).ok()
                 })

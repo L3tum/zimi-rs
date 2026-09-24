@@ -362,6 +362,34 @@ mod tests {
 
     use super::*;
 
+    /// Wait (bounded) for the fire-and-forget auto-index spawned at the end
+    /// of `handle_complete` to settle: the `zims` row's `index_status`
+    /// reaching a terminal state (`ready`/`error`). Without this the
+    /// spawned task outlives the test — the tempdir drops and the row
+    /// cleanup below races the index's article inserts, leaking work into
+    /// the next test (the suite DB is shared; only the DbExclusiveGuard
+    /// serializes the tests themselves, not their spawns).
+    async fn wait_index_settled(pool: &crate::db::Pool, name: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status: Option<String> = crate::db::raw::fetch_scalar_optional(
+                pool,
+                "SELECT index_status FROM zims WHERE name = $1",
+                |q| q.bind(name),
+            )
+            .await
+            .expect("read index_status");
+            if matches!(status.as_deref(), Some("ready" | "error")) {
+                return status.unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "auto-index of '{name}' did not settle within 30 s (status: {status:?})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
     /// TEST-5 (CI-DB): completion with no qBittorrent — the staged content
     /// file is installed per `torrent.file_strategy` and the row settles to
     /// `complete` with `file_path` and `ratio` NULL (`keep_seeding` is false
@@ -511,6 +539,16 @@ mod tests {
         );
         assert!(!drift, "first observation is never drift");
 
+        // Let the fire-and-forget auto-index settle BEFORE the cleanup: it
+        // indexes the file just installed, and the row deletes below would
+        // race its article inserts (and the tempdir drop would kill its
+        // open mid-run).
+        let status = wait_index_settled(&pool, "utiny").await;
+        assert_eq!(
+            status, "ready",
+            "the auto-index of the installed fixture must succeed"
+        );
+
         // Cleanup (shared single-DB suite; articles cascade off zims).
         crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))
             .await
@@ -641,6 +679,16 @@ mod tests {
         .expect("row must exist");
         assert_eq!(status, "complete");
         assert_eq!(file_path, Some(installed.display().to_string()));
+
+        // Both handle_complete passes spawned a fire-and-forget auto-index
+        // of the pre-placed fixture; let the last one settle before the
+        // cleanup (the row deletes would race its article inserts, and the
+        // tempdir drop would kill its open mid-run).
+        let status = wait_index_settled(&pool, "utiny").await;
+        assert_eq!(
+            status, "ready",
+            "the auto-index of the installed fixture must succeed"
+        );
 
         // Cleanup (shared single-DB suite; articles cascade off zims).
         crate::db::raw::execute(&pool, "DELETE FROM downloads WHERE id = $1", |q| q.bind(id))

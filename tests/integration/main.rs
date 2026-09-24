@@ -35,6 +35,7 @@
 mod auth_tokens;
 mod common;
 mod constraints;
+mod contract;
 mod embed_claim_fifo;
 mod embed_claim_plan;
 mod embedding;

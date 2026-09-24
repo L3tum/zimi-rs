@@ -13,8 +13,11 @@
 //
 // Run: node --test tests/web/search.test.mjs   (or: make web-test)
 
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { bootScripts, tick } from './jsdom.mjs';
 
 // Minimal skeleton of web/index... of web/search.html: everything search.js
@@ -96,14 +99,15 @@ function routingFetch(routes) {
   return { fetchStub, calls };
 }
 
-const RESULTS = [{
-  zim_name: 'wiki_en',
-  path: 'a/b',
-  title: 'T & <x>',
-  snippet: 'before <b>match</b> after',
-  language: 'eng',
-  score: 0.12345,
-}];
+// Shared JS<->Rust response contract (Tests Major #5): the canned /search
+// payload is loaded from the SAME fixture file the Rust integration test
+// asserts the live handler response against (tests/integration/contract.rs,
+// tests/web/fixtures/search.json) - a handler field rename breaks both halves.
+const here = dirname(fileURLToPath(import.meta.url));
+const SEARCH_FIXTURE = JSON.parse(
+  readFileSync(join(here, 'fixtures', 'search.json'), 'utf8'),
+);
+const RESULTS = SEARCH_FIXTURE.results;
 
 // /list route so the top-level loadZims() that runs at script load time is
 // always expected.

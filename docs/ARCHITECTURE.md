@@ -27,7 +27,7 @@ hardlink-based file sharing, an OpenAI-compatible embedding pipeline, and an MCP
   startup resync (a DELETE/INSERT cycle on `zims`) can never interleave between
   two starting instances.
 
-- **`src/state.rs`** — `AppState`: the 14-field shared state passed to every
+- **`src/state.rs`** — `AppState`: the 14-field shared state passed to every (field count mirrored by name from `state::APP_STATE_FIELD_COUNT`; the `docs_freshness` tripwire in `src/lib.rs` fails if the count drifts from the struct)
   axum handler (primary db pool, optional read-replica pool, background db
   pool, settings, ZIM manager, search engine, qBittorrent cache, rate
   limiter, probes, lockout, degradation, vector-index build probe,
@@ -265,7 +265,7 @@ pg_trgm `similarity()`, pgvector distance operators, and `$n::vector` /
 23505 unique-violations are domain duplicates (409), not DB faults (503).
 
 **Migrations.** Numbered `.sql` files in `migrations/` (001–017; 005 is a
-void/retired number, never reused) are embedded
+void/retired number, never reused; the top number mirrors `db::migrate::LATEST_MIGRATION` by name — the `docs_freshness` tripwire in `src/lib.rs` fails if the embedded migrations drift from it) are embedded
 with `include_str!` and applied by `src/db/migrate.rs` at **every** startup,
 in every subcommand mode: tracked in `schema_migrations` by filename + content
 hash, idempotent, and serialized by a session-level advisory lock so
@@ -314,7 +314,10 @@ Explicitly declared out of scope:
   itself the DoS vector the service-wide bucket avoids). Until then, the
   loopback / few-client trade-off stands: one global bucket means one
   aggressive authenticated client can self-DoS the others, and the 1 M
-  ceilings only stop operator misconfiguration.
+  ceilings only stop operator misconfiguration. Ownership and the agreed fix
+  when triggered (per-client buckets keyed by trusted-proxy-resolved IP via
+  `general.trusted_proxy_cidrs`, or token-derived; owner = repo owner) are
+  tracked in AGENTS.md "Accepted trade-offs (review decisions)".
 - **Persistent bounded-retry counts for the download requeue guard.** The
   give-up-after-N-consecutive-transient-failures policy is process-local
   (`DownloadPoller::last_error` / `requeue_passes`) and **resets on process

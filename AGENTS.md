@@ -138,3 +138,32 @@ catch everything — see the retracted 2026-09 perf F1). The weekly non-blocking
 sustained regression in its output is a signal to investigate, not an
 automatic block. If a hot path changes, run `cargo bench` locally and compare
 before pushing.
+
+## Accepted trade-offs (review decisions)
+
+**Plaintext HTTP without server-side TLS: ACCEPTED** (operator decision,
+2026-09-24). The server speaks plain HTTP; TLS terminates at a reverse proxy
+(README "TLS termination"). The startup warning for password mode on a
+non-loopback bind remains the mitigation; the single shared admin credential
+is the only secret for all mutating endpoints. Revisit trigger: exposure
+beyond the LAN or multi-tenant operation. No code change (no
+`ZIMSERVICE_ALLOW_PLAINTEXT` gate or similar).
+
+**Dev Postgres credentials `zimservice`/`zimservice` at `192.168.0.38`
+(LAN): ACCEPTED** (operator decision, 2026-09-24). `dev-database.sh` is
+gitignored; the DB is test-only/disposable per the "Running the DB-gated
+tests" section above. Never point a real deployment at it.
+
+**Open accept-or-tighten decisions** (no code change yet; each needs an
+owner decision):
+- Over-broad trusted-proxy CIDRs are warn-only — recommend making a prefix
+  of >=/8 (v4) or >=/56 (v6) fatal, like the all-zero CIDR already is.
+- At-rest secret encryption stays opt-in via `SECURITY_KEY` (keep the
+  startup warning prominent).
+- `torrent.enabled` defaults to true — consider defaulting it to false.
+
+**Rate-limiter ownership pointer.** The service-wide single token bucket is
+a documented non-goal (docs/ARCHITECTURE.md "Per-client rate limiting";
+README "Threat model"). Trigger = the instance becomes multi-tenant /
+network-facing; agreed fix when triggered = per-client buckets (IP via the
+existing trusted-proxy CIDRs, or token-derived). Owner = repo owner.

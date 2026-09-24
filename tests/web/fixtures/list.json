@@ -1,0 +1,17 @@
+{
+  "zims": [
+    {
+      "name": "wiki_en",
+      "display_title": "Wiki EN",
+      "language": "eng",
+      "category": "Wiki",
+      "date": "2024",
+      "entry_count": 100,
+      "file_size": 1048576,
+      "index_status": "indexing",
+      "index_progress": 0.5,
+      "indexed_entries": 50,
+      "embed_enabled": true
+    }
+  ]
+}

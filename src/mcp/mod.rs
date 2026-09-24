@@ -11,6 +11,12 @@
 //! `unsupported_notification_is_ignored_and_loop_continues`,
 //! `oversized_line_gets_pinned_parse_error_and_closes_session`).
 //!
+//! **Spec-drift check (dated).** Last checked against the JSON-RPC 2.0
+//! specification and the Model Context Protocol spec (protocol version
+//! "2025-03-26") on 2026-09-24. Re-check cadence: on each MCP spec release,
+//! at most quarterly — the pinned conformance vectors above are the
+//! artifact that gets updated on a re-check.
+//!
 //! **Deliberately unsupported** (silent spec-drift is the realistic failure
 //! mode of a hand-rolled server, so this list is the contract):
 //!

@@ -321,7 +321,10 @@ is reachable by any network peer. Open mode is rejected at startup on a
   with a single operator, per-client tracking is overkill, and the accepted
   trade-off is that one heavy client can 429 everyone. Raise
   `access.rate_limit_rps` / `access.rate_limit_burst` rather than expecting
-  per-IP fairness.
+  per-IP fairness. Revisit trigger (multi-tenant / network-facing deployment)
+  and the agreed fix (per-client buckets via trusted-proxy CIDR or
+  token-derived; owner: repo owner) are tracked in AGENTS.md
+  "Accepted trade-offs (review decisions)".
 - **Auth lockout is per source IP (no reverse-proxy support)** — the
   brute-force lockout keys on the raw TCP peer address and does **no**
   `X-Forwarded-For` parsing: the service expects direct (e.g. loopback)

@@ -222,6 +222,27 @@ intentionally deferred to a future pass:
 
 ---
 
+## Accepted residuals
+
+- **Blocking `getaddrinfo` in the download client's SYNC redirect policy —
+  ACCEPTED residual (2026-09 review, Perf F1 × Sec).** Confirmed and real, but
+  bounded: the sync DNS resolution lives in `redirect_hop_ok`
+  (`src/netguard.rs`), reached only on the rare 3xx hops of the *download*
+  client's manual, bounded redirect following — the initial resolve is async
+  (the host is pinned at connect time via `resolve_download_host`, which is
+  where DNS-rebinding is closed). It exists because reqwest's
+  `Policy::custom` closure is sync and cannot await, and it **is** the SSRF
+  guard: every redirect hop is re-resolved and re-validated against the
+  blocked ranges before it is followed, so any async variant would need the
+  same pre-follow validation anyway. Action: recorded as an accepted
+  residual (no code change). Revisit with a bounded pre-resolve ONLY if
+  download concurrency grows — a single blocking resolve per rare 3xx hop is
+  negligible today; a high-concurrency download fan-out would amplify the
+  thread-pool stall and would justify a `spawn_blocking` pre-resolve in front
+  of the sync hop check.
+
+---
+
 ## Superseded decisions
 
 - **Sequential search arms — 2026-08-30 decision, superseded 2026-09-18

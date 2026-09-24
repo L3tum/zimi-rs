@@ -1,13 +1,15 @@
 //! `SettingsCache`: the in-memory, Postgres-backed settings cache —
-//! load/reload, env-locked write validation, redaction, and the typed
-//! accessors. Cross-process invalidation (LISTEN/NOTIFY,
+//! load/reload, env-locked write validation, and the typed accessors.
+//! Cross-process invalidation (LISTEN/NOTIFY,
 //! `crate::db::notify`) drives `reload()` from the composition-root
 //! closure in `startup.rs`. The admin-auth surface (token-verify KDF call
 //! sites, legacy upgrade) lives in `auth_service` (`SettingsAuth`, Arch M2
-//! 2026-09 review).
+//! 2026-09 review); the two token-verify caches, the in-memory secret
+//! stores, the type-mismatch record, and the read redaction rules live in
+//! `tokens` (Arch M1, this wave).
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock};
 
 use crate::db::pool::Pool;
 use crate::db::raw;
@@ -17,13 +19,19 @@ use super::auth::VerifiedTokenCache;
 use super::auth_service::SettingsAuth;
 use super::defs::{
     apply_env_snapshot, def, default_settings, default_value, is_security_sensitive, known_keys,
-    normalize_embedding_endpoint, redact, sync_config_values, type_mismatch, ACCESS_MODE_OPEN,
-    KEY_ACCESS_ADMIN_PASSWORD, KEY_ACCESS_MODE, KEY_ACCESS_READ_ONLY_TOKEN,
-    KEY_ACCESS_REQUIRE_AUTH_FOR_READS, KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS, KEY_EMBEDDING_ENABLED,
-    KEY_EMBEDDING_ENDPOINT, KEY_TORRENT_ALLOW_PRIVATE_NETWORKS, KEY_TORRENT_ENABLED,
-    KEY_TORRENT_MAX_ACTIVE, KEY_TORRENT_OPDS_URL, KEY_TORRENT_URL,
+    normalize_embedding_endpoint, sync_config_values, type_mismatch, ACCESS_MODE_OPEN,
+    KEY_ACCESS_MODE, KEY_ACCESS_REQUIRE_AUTH_FOR_READS, KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS,
+    KEY_EMBEDDING_ENABLED, KEY_EMBEDDING_ENDPOINT, KEY_TORRENT_ALLOW_PRIVATE_NETWORKS,
+    KEY_TORRENT_ENABLED, KEY_TORRENT_MAX_ACTIVE, KEY_TORRENT_OPDS_URL, KEY_TORRENT_URL,
 };
 use super::encrypt;
+use super::tokens::{redacted_entry, snapshot_type_mismatches, warn_type_mismatches};
+
+// M1 extraction: consumed only by `mod tests` (pulled in via `use super::*`);
+// gated so the non-test build has no unused imports. (The tests module
+// imports `KEY_ACCESS_READ_ONLY_TOKEN` explicitly, so it is not re-exposed.)
+#[cfg(test)]
+use super::defs::{redact, KEY_ACCESS_ADMIN_PASSWORD};
 
 /// In-memory settings cache backed by Postgres.
 ///
@@ -52,13 +60,15 @@ pub(crate) struct SettingsInner {
     /// `write_guard` (B1). All `token_cache`/`ro_token_cache` sections are
     /// O(1) memory work — the KDF runs *after* the guard is dropped, so a
     /// slow hash never serializes lookups.
-    token_cache: RwLock<VerifiedTokenCache>,
+    // `pub(super)`: the accessors live in `tokens` (M1 extraction).
+    pub(super) token_cache: RwLock<VerifiedTokenCache>,
     /// 2026-09-18 review (read-only API tokens): the read-only token gets its
     /// OWN short-TTL verify cache, kept separate from `token_cache` so the
     /// admin level's invalidation rules (and its test seams) stay exactly as
     /// they were. Same TTLs/cap (shared `VerifiedTokenCache`); invalidated at
     /// the same sites (`reload()` / `update()` / `upgrade_read_only`).
-    ro_token_cache: RwLock<VerifiedTokenCache>,
+    // `pub(super)`: the accessors live in `tokens` (M1 extraction).
+    pub(super) ro_token_cache: RwLock<VerifiedTokenCache>,
     /// Monotonic generation counter bumped after every cache mutation
     /// (reload/update/upgrade). Lets long-lived readers (the search
     /// snapshot, the poller — WI-44) detect "settings changed" without
@@ -76,7 +86,8 @@ pub(crate) struct SettingsInner {
     /// its (fail-closed) default; without this record the operator gets no
     /// signal that a stored setting is being ignored. Read by
     /// [`SettingsCache::type_mismatches`] and surfaced by the authenticated `/diagnostic` route.
-    type_mismatches: RwLock<std::collections::BTreeMap<String, String>>,
+    // `pub(super)`: the accessors live in `tokens` (M1 extraction).
+    pub(super) type_mismatches: RwLock<std::collections::BTreeMap<String, String>>,
     /// M1: whether this process started with the multi-instance opt-out
     /// (`ZIMSERVICE_ALLOW_MULTI_INSTANCE=1`), captured at construction time —
     /// it is a process startup decision, same philosophy as `env_snapshot`
@@ -124,132 +135,6 @@ impl SettingsInner {
     pub(crate) fn bump_generation(&self) {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Centralized lock+expect for the token-cache accessors (read flavor):
-    /// one helper per flavor so the grandfathered LINT-3 expect lives in a
-    /// single place; `name` feeds the exact per-cache panic message.
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    fn cache_read<'a>(
-        &self,
-        cache: &'a RwLock<VerifiedTokenCache>,
-        name: &str,
-    ) -> RwLockReadGuard<'a, VerifiedTokenCache> {
-        let msg = format!("{name} cache rwlock poisoned");
-        cache.read().expect(&msg)
-    }
-
-    /// Write-flavor twin of `cache_read` (same message construction).
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    fn cache_write<'a>(
-        &self,
-        cache: &'a RwLock<VerifiedTokenCache>,
-        name: &str,
-    ) -> RwLockWriteGuard<'a, VerifiedTokenCache> {
-        let msg = format!("{name} cache rwlock poisoned");
-        cache.write().expect(&msg)
-    }
-
-    /// True if `token` verified successfully within the TTL (O(1) memory
-    /// work; the KDF never runs under the lock — see `auth_service`).
-    pub(crate) fn token_is_fresh(&self, token: &str) -> bool {
-        self.cache_read(&self.token_cache, "token").is_fresh(token)
-    }
-
-    /// True if `token` failed verification within the negative TTL.
-    pub(crate) fn token_is_negative_fresh(&self, token: &str) -> bool {
-        self.cache_read(&self.token_cache, "token")
-            .is_negative_fresh(token)
-    }
-
-    /// Record a KDF verdict for `token` (positive or negative).
-    pub(crate) fn token_record(&self, token: &str, ok: bool) {
-        self.cache_write(&self.token_cache, "token")
-            .record(token, ok);
-    }
-
-    /// Drop all cached verified tokens (any path that can change the
-    /// effective password: reload/update/upgrade).
-    pub(crate) fn token_invalidate_all(&self) {
-        self.cache_write(&self.token_cache, "token").clear();
-    }
-
-    /// Drop all cached verified read-only tokens (same sites as
-    /// [`Self::token_invalidate_all`] — see `ro_token_cache`'s doc).
-    pub(crate) fn ro_token_invalidate_all(&self) {
-        self.cache_write(&self.ro_token_cache, "read-only token")
-            .clear();
-    }
-
-    /// True if `token` verified against the read-only token within the TTL.
-    pub(crate) fn ro_token_is_fresh(&self, token: &str) -> bool {
-        self.cache_read(&self.ro_token_cache, "read-only token")
-            .is_fresh(token)
-    }
-
-    /// True if `token` failed read-only verification within the negative TTL.
-    pub(crate) fn ro_token_is_negative_fresh(&self, token: &str) -> bool {
-        self.cache_read(&self.ro_token_cache, "read-only token")
-            .is_negative_fresh(token)
-    }
-
-    /// Record a KDF verdict for `token` against the read-only token.
-    pub(crate) fn ro_token_record(&self, token: &str, ok: bool) {
-        self.cache_write(&self.ro_token_cache, "read-only token")
-            .record(token, ok);
-    }
-
-    /// The raw (unredacted) stored admin password, or empty when unset. The
-    /// in-memory map always holds the real (possibly `sha2:`-hashed) value —
-    /// `redact()` only applies to `all_grouped_for` output.
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    pub(crate) fn admin_password_raw(&self) -> String {
-        self.cache
-            .read()
-            .expect("settings cache lock poisoned")
-            .get(KEY_ACCESS_ADMIN_PASSWORD)
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_default()
-    }
-
-    /// Overwrite the cached admin password (the legacy-upgrade path; the
-    /// sticky in-memory half of `SettingsAuth::upgrade`).
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    pub(crate) fn admin_password_set(&self, hashed: &str) {
-        self.cache
-            .write()
-            .expect("settings cache lock poisoned")
-            .insert(KEY_ACCESS_ADMIN_PASSWORD.into(), serde_json::json!(hashed));
-    }
-
-    /// The raw (unredacted) stored read-only token, or empty when unset.
-    /// Mirrors [`Self::admin_password_raw`]: the in-memory map always holds
-    /// the real (possibly hashed) value — `redact()` only applies to
-    /// `all_grouped_for` output.
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    pub(crate) fn read_only_token_raw(&self) -> String {
-        self.cache
-            .read()
-            .expect("settings cache lock poisoned")
-            .get(KEY_ACCESS_READ_ONLY_TOKEN)
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_default()
-    }
-
-    /// Overwrite the cached read-only token (the legacy-upgrade path; the
-    /// sticky in-memory half of `SettingsAuth::upgrade_read_only`).
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    pub(crate) fn read_only_token_set(&self, hashed: &str) {
-        self.cache
-            .write()
-            .expect("settings cache lock poisoned")
-            .insert(KEY_ACCESS_READ_ONLY_TOKEN.into(), serde_json::json!(hashed));
     }
 
     /// Test-only constructor: a full [`SettingsInner`] over an in-memory map
@@ -316,30 +201,6 @@ fn check_zim_update_affected(affected: &[u64], zim_name: &str) -> Result<()> {
         return Err(Error::NotFound(format!("ZIM '{zim_name}' not found")));
     }
     Ok(())
-}
-
-/// Collect the keys whose value fails its `json_type` check — the same check
-/// `update()` runs at write time, applied to *stored* contents (a corrupted
-/// row, a bad direct SQL edit, or a migration that wrote the wrong shape). A
-/// failed key silently runs on its (fail-closed) default; this is what makes
-/// that visible (ARCH Major #3). Pure + DB-free, so unit-testable. Ordered by
-/// key so the warn log and the `/diagnostic` report are deterministic.
-fn snapshot_type_mismatches(
-    map: &HashMap<String, serde_json::Value>,
-) -> std::collections::BTreeMap<String, String> {
-    map.iter()
-        .filter_map(|(key, value)| type_mismatch(key, value).map(|reason| (key.clone(), reason)))
-        .collect()
-}
-
-/// Log one warn per type-mismatched key (the warn pass `reload()` runs).
-/// Extracted so the format is asserted against the *code path* — `reload()`
-/// and the test both call this — instead of the test verbatim-copying the
-/// log string (which a `reload()` regression could silently diverge from).
-fn warn_type_mismatches(mismatches: &std::collections::BTreeMap<String, String>) {
-    for (key, reason) in mismatches {
-        tracing::warn!("settings value ignored, running on the default: {reason} ({key})");
-    }
 }
 
 impl SettingsCache {
@@ -654,57 +515,6 @@ impl SettingsCache {
         self.get(key).and_then(|v| serde_json::from_value(v).ok())
     }
 
-    /// Keys whose stored value does not match its expected JSON type, each as
-    /// `"key: reason"`. These settings silently run on their defaults —
-    /// surfaced by the authenticated `/diagnostic` route as
-    /// `settings_mismatches` so a corrupted settings row is not invisible.
-    /// The record is seeded at each `reload()` (startup)
-    /// and pruned per-key as a successful [`Self::update`] re-validates a row,
-    /// so it tracks the current cache, not a frozen startup view. Empty when
-    /// every value deserializes.
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    pub fn type_mismatches(&self) -> Vec<String> {
-        let g = self
-            .inner
-            .type_mismatches
-            .read()
-            .expect("settings type-mismatch lock poisoned");
-        g.iter()
-            .map(|(key, reason)| format!("{key}: {reason}"))
-            .collect()
-    }
-
-    /// Set the recorded type mismatches (used by `reload()` and tests).
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    pub(crate) fn set_type_mismatches(
-        &self,
-        mismatches: std::collections::BTreeMap<String, String>,
-    ) {
-        *self
-            .inner
-            .type_mismatches
-            .write()
-            .expect("settings type-mismatch lock poisoned") = mismatches;
-    }
-
-    /// Drop the mismatch record for each key (a successful [`Self::update`]
-    /// re-validates the row, so a stale startup flag must not survive the
-    /// fix until a restart). No-op for keys with no record.
-    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
-    #[allow(clippy::expect_used)]
-    pub(crate) fn clear_type_mismatches(&self, keys: &[&str]) {
-        let mut mm = self
-            .inner
-            .type_mismatches
-            .write()
-            .expect("settings type-mismatch lock poisoned");
-        for key in keys {
-            mm.remove(*key);
-        }
-    }
-
     /// Get all settings grouped by category, redacting topology values for
     /// unauthenticated callers (S6).
     // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
@@ -726,27 +536,7 @@ impl SettingsCache {
         for (key, value) in cache.iter() {
             let category = key.split('.').next().unwrap_or("general");
             let short_key = key.split('.').nth(1).unwrap_or(key);
-            let setting = def(key);
-            let mut entry = serde_json::json!({ "value": redact(key, value) });
-            // Topology keys (policy flag) exposed to unauthenticated callers
-            // are replaced with "[redacted]" so an open GET /settings doesn't
-            // leak internal URLs.
-            if !authenticated
-                && setting.is_some_and(|d| d.policy.topology)
-                && value.as_str().is_some_and(|s| !s.is_empty())
-            {
-                entry["value"] = serde_json::json!("[redacted]");
-            }
-            if let Some(env_var) = env_locked.get(key) {
-                entry["locked"] = serde_json::json!(true);
-                entry["locked_by"] = serde_json::json!(env_var);
-            } else if setting.is_some_and(|d| d.policy.api_immutable) {
-                entry["locked"] = serde_json::json!(true);
-                entry["locked_by"] = serde_json::json!("set via environment at startup");
-            } else if setting.is_some_and(|d| d.policy.config_only) {
-                entry["locked"] = serde_json::json!(true);
-                entry["locked_by"] = serde_json::json!("environment (not runtime)");
-            }
+            let entry = redacted_entry(key, value, authenticated, env_locked.get(key));
             grouped
                 .entry(category.to_string())
                 .or_default()

@@ -355,7 +355,14 @@ pub async fn raw_content(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    let archive = state.zims.open_zim(&zim_name).await?;
+    // The raw-content path emits a file-level ETag from a fresh stat, so
+    // the handle must be consistent with that same fresh (mtime, size) —
+    // `open_zim_fresh` skips the stat-TTL fast path that could otherwise
+    // serve the pre-replacement body under the NEW file's ETag (HTTP cache
+    // poisoning). A sub-second replace between the handle stat and the ETag
+    // stat is the residual TOCTOU (unavoidable without file locking; the
+    // TTL window is the practical exposure).
+    let archive = state.zims.open_zim_fresh(&zim_name).await?;
 
     // PERF-1: pass the raw Range header into the blocking read so a
     // satisfiable slice is copied window-by-window straight out of the mmap —

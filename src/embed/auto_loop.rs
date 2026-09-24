@@ -444,6 +444,7 @@ mod tests {
     /// pre-opened (`min_connections = max_connections`) so the initial
     /// `acquire` below is immediate.
     async fn loop_pool_or_skip(test: &str) -> Option<Pool> {
+        let url_explicit = std::env::var("DATABASE_URL").is_ok();
         let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
         });
@@ -462,19 +463,22 @@ mod tests {
         .await
         {
             Ok(Ok(p)) => p,
-            Ok(Err(e)) => return skip_loop_test(test, &url, &format!("connect failed: {e}")),
-            Err(_) => return skip_loop_test(test, &url, "connect timed out (15s)"),
+            Ok(Err(e)) => {
+                return skip_loop_test(test, &url, url_explicit, &format!("connect failed: {e}"))
+            }
+            Err(_) => return skip_loop_test(test, &url, url_explicit, "connect timed out (15s)"),
         };
         if pool.acquire().await.is_err() {
-            return skip_loop_test(test, &url, "pool acquire failed");
+            return skip_loop_test(test, &url, url_explicit, "pool acquire failed");
         }
         Some(pool)
     }
 
-    fn skip_loop_test(test: &str, url: &str, why: &str) -> Option<Pool> {
+    fn skip_loop_test(test: &str, url: &str, url_explicit: bool, why: &str) -> Option<Pool> {
         // The lib's single skip/panic authority: counts LIB_SKIPPED for the
-        // #[dtor] exit summary and hard-fails under ZIMSERVICE_REQUIRE_DB.
-        crate::testing::gate_skip(test, url, why)
+        // #[dtor] exit summary and hard-fails under ZIMSERVICE_REQUIRE_DB
+        // (and on an explicit-but-unreachable DATABASE_URL).
+        crate::testing::gate_skip(test, url, url_explicit, why)
     }
 
     /// Current `articles.embedding` column dimension. pgvector stores the
@@ -1049,7 +1053,8 @@ mod tests {
         }
         assert!(
             first_request_at <= build_valid_at,
-            "pipeline request must land before the build completes — \n             a later request means the loop blocked on the build"
+            "pipeline request must land before the build completes — \n             a \
+             later request means the loop blocked on the build"
         );
         // The endpoint failed, so the article is still unembedded — the
         // index came from the loop's early-build path, not from a

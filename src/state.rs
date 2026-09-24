@@ -25,6 +25,14 @@ use crate::{
     search, settings, torrent, zim,
 };
 
+/// The number of [`AppState`] fields. `docs/ARCHITECTURE.md` mirrors this
+/// value **by name** (its "the 14-field shared state" line), and so does
+/// this module's doc ("1-3 of the 14 fields") — that prose is
+/// human-maintained; bump this const when a field is added or removed, and
+/// the tripwire in `src/lib.rs` (`appstate_field_count_matches_the_const`)
+/// fails if it drifts from the actual struct.
+pub const APP_STATE_FIELD_COUNT: usize = 14;
+
 /// Shared application state, passed to all axum handlers.
 #[derive(Clone)]
 pub struct AppState {

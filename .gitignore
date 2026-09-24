@@ -8,6 +8,7 @@ zims/
 downloads/
 *.zim
 !tests/fixtures/*.zim
+!fuzz/corpus/**/*.zim
 
 # Config (may contain secrets)
 config.toml

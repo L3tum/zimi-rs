@@ -1,0 +1,43 @@
+[package]
+name = "zimservice-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Standalone cargo-fuzz workspace: the EMPTY [workspace] table detaches this
+# crate from the repo-root package, so `cargo check` / `make all` at the root
+# never see it (and the libfuzzer harnesses never enter the normal build
+# graph). Fuzzing is NOT wired into CI (runner constraints — see the
+# `audit` job note in .github/workflows/ci.yml); run it locally per
+# fuzz/README.md.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+# One harness per target (cargo-fuzz 0.13 layout: sources in fuzz_targets/,
+# libfuzzer-sys `fuzz_target!` with #![no_main], test/doc/bench disabled).
+[[bin]]
+name = "fuzz_zim"
+path = "fuzz_targets/fuzz_zim.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_opds"
+path = "fuzz_targets/fuzz_opds.rs"
+test = false
+doc = false
+bench = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# The parse entry point the production path uses, at the root Cargo.toml's
+# exact version: `zim` 0.5 (the archive open/parse call in
+# src/zim/index.rs, called directly by the fuzz_zim harness). `quick-xml` 0.41
+# (the OPDS Atom feed parser in src/torrent/opds.rs) is exercised here
+# transitively, through the production `zimservice::torrent::opds::
+# parse_catalog` entry point.
+zim = "0.5"
+zimservice = { path = ".." }

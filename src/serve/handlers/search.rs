@@ -30,6 +30,29 @@ fn log_deprecated_query_param() {
     }
 }
 
+/// Resolve and validate the shared `q`/`query` query-parameter pair used by
+/// both `search` and `suggest`: warn (once per process, see
+/// `log_deprecated_query_param`) when the deprecated `query` alias is used,
+/// 400 when neither parameter is present, and enforce the length cap (see
+/// `MAX_QUERY_CHARS`) before any DB work. The blank-query short-circuit
+/// stays in each handler — the two response DTOs differ.
+fn resolve_query(q: Option<String>, query: Option<String>) -> Result<String, crate::error::Error> {
+    if q.is_none() && query.is_some() {
+        log_deprecated_query_param();
+    }
+    let query = q.or(query).ok_or_else(|| {
+        crate::error::Error::InvalidInput("query parameter 'q' is required".into())
+    })?;
+
+    // Cap the query length (see MAX_QUERY_CHARS) before any DB work.
+    if query.chars().count() > MAX_QUERY_CHARS {
+        return Err(crate::error::Error::InvalidInput(format!(
+            "query parameter 'q' exceeds {MAX_QUERY_CHARS} characters"
+        )));
+    }
+    Ok(query)
+}
+
 // ─── Search + random + interlanguage: response DTOs (OpenAPI schemas) ────────
 
 /// `GET /search` response: the merged multi-engine result page.
@@ -151,19 +174,7 @@ pub async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchQuery>,
 ) -> Result<Json<SearchResponse>, crate::error::Error> {
-    if params.q.is_none() && params.query.is_some() {
-        log_deprecated_query_param();
-    }
-    let query = params.q.or(params.query).ok_or_else(|| {
-        crate::error::Error::InvalidInput("query parameter 'q' is required".into())
-    })?;
-
-    // Cap the query length (see MAX_QUERY_CHARS) before any DB work.
-    if query.chars().count() > MAX_QUERY_CHARS {
-        return Err(crate::error::Error::InvalidInput(format!(
-            "query parameter 'q' exceeds {MAX_QUERY_CHARS} characters"
-        )));
-    }
+    let query = resolve_query(params.q, params.query)?;
 
     // A blank/whitespace query matches everything in the LIKE/similarity
     // predicates — short-circuit to empty results instead of a full-table scan.
@@ -241,19 +252,7 @@ pub async fn suggest(
     State(state): State<AppState>,
     Query(params): Query<SuggestQuery>,
 ) -> Result<Json<SuggestResponse>, crate::error::Error> {
-    if params.q.is_none() && params.query.is_some() {
-        log_deprecated_query_param();
-    }
-    let query = params.q.or(params.query).ok_or_else(|| {
-        crate::error::Error::InvalidInput("query parameter 'q' is required".into())
-    })?;
-
-    // Cap the query length (see MAX_QUERY_CHARS) before any DB work.
-    if query.chars().count() > MAX_QUERY_CHARS {
-        return Err(crate::error::Error::InvalidInput(format!(
-            "query parameter 'q' exceeds {MAX_QUERY_CHARS} characters"
-        )));
-    }
+    let query = resolve_query(params.q, params.query)?;
 
     // A blank/whitespace query would ILIKE '%%' over the whole table —
     // short-circuit to empty suggestions instead.

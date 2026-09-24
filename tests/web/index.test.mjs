@@ -13,8 +13,11 @@
 //
 // Run: node --test tests/web/index.test.mjs   (or: make web-test)
 
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { bootScripts, tick } from './jsdom.mjs';
 
 // Minimal skeleton of web/index.html: every element index.js touches by id.
@@ -75,19 +78,15 @@ function routingFetch(routes) {
 }
 
 const HEALTH = { version: '1.2.3', articles_count: 12345, qbit_connected: true };
-const ZIMS = [{
-  name: 'wiki_en',
-  display_title: 'Wiki EN',
-  language: 'eng',
-  category: 'Wiki',
-  date: '2024',
-  entry_count: 100,
-  file_size: 1048576,
-  index_status: 'indexing',
-  index_progress: 0.5,
-  indexed_entries: 50,
-  embed_enabled: true,
-}];
+// Shared JS<->Rust response contract (Tests Major #5): the canned /list
+// payload is loaded from the SAME fixture file the Rust integration test
+// asserts the live handler response against (tests/integration/contract.rs,
+// tests/web/fixtures/list.json) - a handler field rename breaks both halves.
+const here = dirname(fileURLToPath(import.meta.url));
+const LIST_FIXTURE = JSON.parse(
+  readFileSync(join(here, 'fixtures', 'list.json'), 'utf8'),
+);
+const ZIMS = LIST_FIXTURE.zims;
 
 function libraryRoutes(extra = []) {
   return [

@@ -10,7 +10,9 @@
 //!
 //! Submodules: `defs` (setting table + seeds), `snapshots` (one-pass read
 //! snapshots), `cache` (`SettingsCache` itself), `encrypt` (SEC-L5 at-rest
-//! encryption of the secret settings under `SECURITY_KEY`).
+//! encryption of the secret settings under `SECURITY_KEY`), and `tokens`
+//! (the two token-verify caches, the in-memory secret stores, the
+//! type-mismatch record, and the read redaction rules).
 
 pub(crate) mod auth;
 mod auth_service;
@@ -18,6 +20,7 @@ mod cache;
 mod defs;
 pub(crate) mod encrypt;
 mod snapshots;
+mod tokens;
 
 pub use auth::{hash_admin_password, is_legacy_password, verify_admin_password};
 pub use auth_service::SettingsAuth;

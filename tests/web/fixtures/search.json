@@ -1,0 +1,13 @@
+{
+  "results": [
+    {
+      "zim_name": "wiki_en",
+      "path": "a/b",
+      "title": "T & <x>",
+      "snippet": "before <b>match</b> after",
+      "language": "eng",
+      "score": 0.12345
+    }
+  ],
+  "total": 1
+}

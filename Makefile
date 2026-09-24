@@ -62,7 +62,7 @@ $(if $2,&& { if [ ! -x node_modules/.bin/eslint ]; then \
 && $4 && echo "$1: OK"
 endef
 
-.PHONY: all help check fmt fmt-check clippy raw-sql-lint test test-fast test-integration test-strict test-strict-ci bench bench-baseline bench-compare build release install uninstall doc run clean web-check web-fmt web-test web-lint
+.PHONY: all help check fmt fmt-check clippy raw-sql-lint boundary-lint test test-fast test-integration test-strict test-strict-ci bench bench-baseline bench-compare build release install uninstall doc run clean web-check web-fmt web-test web-lint
 
 # Quick pre-commit checks
 check:
@@ -85,6 +85,18 @@ clippy:
 # POSIX sh + grep only so it runs on the dev box and in CI alike.
 raw-sql-lint:
 	@sh scripts/check-raw-sql.sh
+
+# M2: module-boundary lint — the use-graph/denylist half of the same
+# boundary contract (companion to raw-sql-lint, which owns the raw-SQL
+# call-site rules): P1 presentation-layer separation (src/mcp <->
+# src/serve), P2 no raw-SQL string literals in presentation layers,
+# P3 no pool creation in presentation layers (pools are startup-owned,
+# passed via AppState), P4 no db::raw::* call sites in src/serve/ files
+# OUTSIDE handlers/ (extends raw-sql-lint's rule-2 scope to the remaining
+# serve-layer files). POSIX sh + grep only so it runs on the dev box and
+# in CI alike.
+boundary-lint:
+	@sh scripts/check-boundaries.sh
 
 # The integration half skips cleanly with no Postgres; `--nocapture` surfaces
 # the one-shot "DB unreachable — suite skipped" banner (a fully-skipped run
@@ -291,7 +303,7 @@ web-fmt:
 
 # Full pre-merge check suite: type-check, format check, lint, full test run,
 # and the web UI checks (syntax, unit tests, eslint).
-all: check fmt-check clippy raw-sql-lint test web-check web-test web-lint
+all: check fmt-check clippy raw-sql-lint boundary-lint test web-check web-test web-lint
 
 help:
 	@echo "zimservice — make targets"
@@ -303,6 +315,7 @@ help:
 	@echo "  make fmt-check    Check formatting (CI)"
 	@echo "  make clippy       Lint (warnings as errors)"
 	@echo "  make raw-sql-lint  Flag unmarked raw SQL: sqlx::query* outside src/db/, db::raw::* call sites in handlers (M2)"
+	@echo "  make boundary-lint  Enforce module boundaries: presentation-layer separation (mcp<->serve), no raw-SQL literals / pool creation in presentation layers (M2)"
 	@echo "  make test         Run full test suite"
 	@echo "  make test-fast    Run unit tests only (lib + bins; no integration/doctests)"
 	@echo "  make test-integration  Boot compose Postgres, run DB integration tests"

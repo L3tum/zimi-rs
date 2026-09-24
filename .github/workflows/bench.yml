@@ -24,8 +24,12 @@
 # box against the shared dev DB, and the runner differs (CPU + loopback
 # Postgres), so the reported deltas include a roughly CONSTANT hardware
 # offset — read week-over-week DRIFT in the deltas (a sudden extra shift is
-# the signal), not the absolute delta vs the dev box. The comparison is
-# informational: the job still only hard-fails on a vacuous (DB-skip) run.
+# the signal), not the absolute delta vs the dev box. Machine-specific
+# caveat: week-over-week comparisons are machine-specific — the runner's
+# CPU is not a fixed property of the repo, so a runner swap reads as a
+# global level shift; treat every week-over-week comparison as a trend
+# signal only, not a measurement. The comparison is informational: the job
+# still only hard-fails on a vacuous (DB-skip) run.
 # When bench code or the fixture changes, refresh with `make bench-baseline`
 # and commit criterion/ — comparing stale fixture data is worse than no
 # comparison.
@@ -87,7 +91,7 @@ jobs:
           # a bare run also selects the lib/bin targets, whose libtest
           # harness would reject criterion's --baseline flag and fail the
           # job before any benchmark runs.
-          echo "::notice::comparing against the committed week0 baseline (dev-box capture) — read week-over-week drift in the deltas, not the absolute hardware offset"
+          echo "::notice::comparing against the committed week0 baseline (dev-box capture) — read week-over-week drift in the deltas, not the absolute hardware offset; week-over-week comparisons are machine-specific, trend signal only"
           DATABASE_URL=postgres://zimservice:zimservice@localhost:5436/zimservice \
             cargo bench --bench retrieval -- --baseline week0 2>&1 | tee "$out"
           DATABASE_URL=postgres://zimservice:zimservice@localhost:5436/zimservice \

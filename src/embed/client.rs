@@ -416,9 +416,11 @@ mod tests {
             }
             let _ = sock
                 .write_all(
-                    // Byte-exact response head (single literal: adjacent
-                    // literals do not concatenate across lines).
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+                    // Byte-exact response head (single literal: the `\`
+                    // continuation skips the newline + indent, so the wire
+                    // bytes are exactly the un-split head).
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n",
                 )
                 .await;
             let _ = sock.write_all(frame.as_bytes()).await;

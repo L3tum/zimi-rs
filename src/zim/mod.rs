@@ -520,9 +520,27 @@ impl ZimManager {
     /// Async because the cold-path `zim::Zim::new` (multi-GB central-dir parse)
     /// runs on the blocking pool; both fast paths (stat-TTL, mtime compare)
     /// stay sync.
+    pub async fn open_zim(&self, name: &str) -> Result<Arc<zim::Zim>> {
+        self.open_zim_impl(name, false).await
+    }
+
+    /// [`open_zim`](Self::open_zim) for paths that emit an HTTP `ETag`
+    /// computed from a FRESH file stat (the raw-content endpoint): the
+    /// stat-TTL fast path is skipped, so the returned handle is always
+    /// consistent with the file's current (mtime, size) — the same (mtime,
+    /// size) pair the ETag is derived from. Without this, a file replaced
+    /// in-place within `STAT_TTL_MS` would be served through the
+    /// pre-replacement handle: the response carries the NEW file's ETag
+    /// over the OLD file's body (HTTP cache poisoning — the client caches
+    /// the stale body under the new tag). Fast path 2 (mtime+size compare)
+    /// still applies, so an unchanged file costs one stat, not a re-parse.
+    pub async fn open_zim_fresh(&self, name: &str) -> Result<Arc<zim::Zim>> {
+        self.open_zim_impl(name, true).await
+    }
+
     // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
     #[allow(clippy::expect_used)]
-    pub async fn open_zim(&self, name: &str) -> Result<Arc<zim::Zim>> {
+    async fn open_zim_impl(&self, name: &str, skip_stat_ttl: bool) -> Result<Arc<zim::Zim>> {
         let meta = self
             .get(name)
             .ok_or_else(|| Error::NotFound(format!("ZIM '{name}' not found")))?;
@@ -533,9 +551,11 @@ impl ZimManager {
             .unwrap_or(0);
 
         // Fast path 1: a recently-stat'd cached handle is trusted without a
-        // re-stat (the 5s TTL) — the common case for a hot ZIM. This skips
-        // the `stat` syscall entirely on the hot path.
-        {
+        // re-stat (the 30 s stat TTL) — the common case for a hot ZIM.
+        // This skips the `stat` syscall entirely on the hot path. Skipped
+        // by `open_zim_fresh` (ETag-emitting paths need the handle
+        // consistent with a fresh stat, see there).
+        if !skip_stat_ttl {
             let handles = self
                 .open_handles
                 .read()
@@ -697,10 +717,19 @@ impl ZimManager {
         for (name, path, meta) in found {
             // Prefer the snapshot's size (already stat'd during the scan);
             // fall back to a fresh stat only when the snapshot is `None`
-            // (stat raced the file disappearing).
-            let file_size = meta
+            // (stat raced the file disappearing). If BOTH stats fail the
+            // file is transiently un-stat-able — NOT "size 0": treating it
+            // as 0 would reset a healthy ZIM's index to pending and persist
+            // `file_size = 0` for a tick (and register a phantom size-0
+            // stub for a new name). Treat it as "no change this tick"; the
+            // next tick re-stats (the file is back, or the name drops out
+            // of the scan and is removed then).
+            let Some(file_size) = meta
                 .map(|(_, size)| size)
-                .unwrap_or_else(|| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
+                .or_else(|| std::fs::metadata(path).ok().map(|m| m.len()))
+            else {
+                continue;
+            };
             let file_path = path.display().to_string();
             match cache.get(name) {
                 Some(meta) if meta.file_size == file_size && meta.file_path == file_path => {}
@@ -989,6 +1018,52 @@ mod tests {
         assert!(removed.is_empty());
         assert!(changed.is_empty());
         assert_eq!(m.get("alpha").unwrap().index_status, "ready");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scan entry that is un-stat-able BOTH times — the snapshot stat
+    /// raced a rename (`None`) and the fallback stat also fails because the
+    /// name no longer resolves — must be treated as "no change this tick",
+    /// never as "size 0": a healthy entry keeps its size, status and
+    /// digest (the old `unwrap_or(0)` reset the index to pending and
+    /// persisted `file_size = 0` for a tick), and no phantom size-0 stub
+    /// is registered.
+    #[test]
+    fn reconcile_double_stat_failure_is_noop() {
+        let dir = temp_dir("statfail");
+        let m = manager(&dir);
+        write_zim(&dir, "alpha", 100);
+        m.reconcile(&found(&dir));
+        set_status(&m, "alpha", "ready");
+        // A digest recorded at install time must survive a stat blip.
+        m.cache
+            .write()
+            .unwrap()
+            .get_mut("alpha")
+            .unwrap()
+            .content_sha256 = Some("abc123".into());
+
+        // The file vanishes between `read_dir` and stat: the second scan
+        // lists "alpha" with no snapshot metadata, and the fallback stat
+        // fails (the file is gone).
+        std::fs::remove_file(dir.join("alpha.zim")).unwrap();
+        let phantom: discovery::ScanEntry = ("alpha".to_string(), dir.join("alpha.zim"), None);
+        let (added, removed, changed) = m.reconcile(&[phantom]);
+
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+        assert!(changed.is_empty(), "a stat blip must not count as a change");
+        let meta = m.get("alpha").unwrap();
+        assert_eq!(meta.file_size, 100, "size must not be reset to 0");
+        assert_eq!(
+            meta.index_status, "ready",
+            "status must not be reset to pending"
+        );
+        assert_eq!(
+            meta.content_sha256.as_deref(),
+            Some("abc123"),
+            "the recorded digest must survive a stat blip"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1284,5 +1359,48 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Regression (HTTP cache poisoning): a ZIM file replaced in-place
+    /// within the stat-TTL window must not be served through the
+    /// pre-replacement handle by `open_zim_fresh` — the raw-content path
+    /// emits a fresh-stat file ETag, so the handle must match the file's
+    /// current (mtime, size) pair (a same-size rewrite keeps the size, so
+    /// only the mtime catches it — pinned here with deterministic mtimes).
+    /// The plain `open_zim` fast path is intentionally unchanged: its
+    /// callers emit no ETag, so the TTL window there cannot poison a
+    /// cache.
+    #[tokio::test]
+    async fn open_zim_fresh_detects_in_place_replace_within_stat_ttl() {
+        let dir = temp_dir("etag-fresh");
+        let m = manager(&dir);
+        let path = dir.join("fresh.zim");
+        let v1 = std::fs::read("tests/fixtures/tiny.zim").unwrap();
+
+        // v1 on disk with a pinned past mtime (T1).
+        std::fs::write(&path, &v1).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(3_600))
+            .unwrap();
+        m.reconcile(&found(&dir));
+        let h1 = m.open_zim("fresh").await.unwrap();
+
+        // In-place replace: same bytes, same size, new mtime (T2) — the
+        // rewrite-a-file scenario within the TTL window.
+        std::fs::write(&path, &v1).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7_200))
+            .unwrap();
+
+        // `open_zim_fresh` re-stats: (mtime, size) changed → a fresh
+        // handle, never the pre-replacement one.
+        let h2 = m.open_zim_fresh("fresh").await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&h2, &h1),
+            "open_zim_fresh must re-open after an in-place replace (new mtime)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

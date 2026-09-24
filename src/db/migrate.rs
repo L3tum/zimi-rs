@@ -86,6 +86,14 @@ pub(crate) const MIGRATIONS: &[(&str, &str)] = &[
 /// of a hand-copied count, so adding a migration needs no test-side edit.
 pub const MIGRATION_COUNT: usize = MIGRATIONS.len();
 
+/// The highest embedded migration number (the `NNN` of `NNN_*.sql`).
+/// `docs/ARCHITECTURE.md` mirrors this value **by name** (its
+/// "migrations/ (001-NNN)" range line) — the prose is human-maintained; bump
+/// this const in the same change, and the tripwire in `src/lib.rs`
+/// (`migration_range_const_matches_embedded_migrations`) fails if it drifts
+/// from the actual `MIGRATIONS` array.
+pub const LATEST_MIGRATION: i32 = 17;
+
 /// Historical migration order for legacy databases (numbered 1..N sequentially
 /// before the 005 removal). Legacy versions 1..5 corresponded to the first
 /// five migrations (001, 002, 003, 004, 006 — 005 is the permanent gap).
