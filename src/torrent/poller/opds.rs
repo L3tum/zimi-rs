@@ -17,6 +17,15 @@ impl DownloadPoller {
     // ── OPDS auto-update ─────────────────────────────────────────────────────
 
     pub(super) async fn opds_check(&self) -> Result<()> {
+        // Master switch (H2, 2026-09 review): read LIVE (a cheap RwLock read,
+        // like `tick()`'s gate) so an operator toggle takes effect within
+        // one check cycle. Load-bearing, not defense in depth: this method
+        // runs on its own cadence (every `OPDS_EVERY_N_TICKS` ticks),
+        // independently of `tick()`, so the tick gate alone would leave
+        // OPDS auto-seeding running with the switch off.
+        if !self.settings.torrent_enabled() {
+            return Ok(());
+        }
         // PERF-12: snapshot all poller settings once per opds_check.
         let p = self.settings.poller_params_snapshot();
         if !p.opds_auto_update {
@@ -156,6 +165,13 @@ mod tests {
         let server = MockServer::start().await;
         let pool = crate::testing::dead_pool();
         let mut map = crate::settings::default_settings();
+        // The H2 opt-in default is `false` — enable the master switch so the
+        // test reaches the SSRF gate under test instead of the master-switch
+        // early-return.
+        map.insert(
+            crate::settings::KEY_TORRENT_ENABLED.into(),
+            serde_json::json!(true),
+        );
         map.insert(KEY_TORRENT_AUTO_UPDATE.into(), serde_json::json!(true));
         map.insert(KEY_TORRENT_OPDS_URL.into(), serde_json::json!(server.uri()));
         let settings = crate::settings::SettingsCache::new_with_map(

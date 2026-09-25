@@ -51,6 +51,15 @@ pub const RAW_CONTENT_CSP: &str =
 /// downloaded archives, so gating on the broader "browser-rendered-as-HTML"
 /// set (not just the `text/html` prefix) closes the
 /// `application/xhtml+xml` / `image/svg+xml` sandbox bypass (SEC-M1).
+///
+/// Deliberately not in the set: the XSLT types (`application/xslt+xml`,
+/// `text/xsl`). A directly-navigated XSL document can execute
+/// `xsl:script` in engines that process XSL, whether the sandbox CSP's
+/// `script-src 'none'` reaches `xsl:script` is engine-dependent, and
+/// `X-Frame-Options` (a framing control) cannot contain top-frame
+/// execution at all — so no header combination closes this the way the
+/// `content_type_for` script-MIME rewrite does. Rare ZIM content; accepted
+/// residual risk (2026-09 review F4).
 fn is_browser_html(content_type: &str) -> bool {
     let ct = content_type.split(';').next().unwrap_or("").trim();
     ct == "text/html" || ct == "application/xhtml+xml" || ct == "image/svg+xml"

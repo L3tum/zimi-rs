@@ -505,8 +505,12 @@ pub async fn raw_content(
 }
 
 /// Append the SEC-M2 sandboxing headers returned by
-/// [`super::web::raw_content_security_headers`] (CSP + `X-Frame-Options: DENY`
-/// for `text/html`; a no-op for every other content type) to `resp`.
+/// [`super::web::raw_content_security_headers`] to `resp`: the sandbox CSP
+/// on **every** raw-content response (H1, 2026-09 review — the
+/// script-executing MIME types are rewritten to `text/plain` by
+/// `content_type_for` before this runs, so no `/w` response ever
+/// advertises a script MIME) plus `X-Frame-Options: DENY` for the
+/// browser-HTML types only.
 fn append_sec_headers(resp: &mut Response, sec: Vec<(axum::http::HeaderName, String)>) {
     for (name, value) in sec {
         if let Ok(hv) = value.parse::<axum::http::HeaderValue>() {

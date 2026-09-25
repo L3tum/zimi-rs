@@ -20,6 +20,7 @@ fn resume_plan(part: &Path) -> Option<u64> {
 }
 
 /// Outcome of a single `stream_part` call.
+#[derive(Debug)]
 struct StreamOutcome {
     /// Final on-disk size of `part` after the stream.
     size: u64,
@@ -232,10 +233,14 @@ const CANCEL_CHECK_WINDOW: Duration = Duration::from_secs(5);
 /// prefix), `PROGRESS_WINDOW` progress updates, `CANCEL_CHECK_WINDOW` cancel
 /// check — a CANCEL removes the staged `.part` there (see [`observe_cancel`])
 /// so the post-loop guard can not strand it.
-/// Post-loop: truncation guard — a declared total that was not fully
-/// received means the body was cut short (skipped for a row observed
-/// `cancelled` mid-stream: the file is already gone and the row must not be
-/// error-marked).
+/// Post-loop: declared-total mismatch guard, both directions — if
+/// `received` does not match the declared total the `.part` is corrupt:
+/// fewer bytes means the body was cut short, more means a non-conformant
+/// body (e.g. a 416 served with an error page — on the R4 byte-complete
+/// fast path those bytes are APPENDED to the `.part` and would be
+/// installed as ZIM content). Skipped for a row observed `cancelled`
+/// mid-stream: the file is already gone and the row must not be
+/// error-marked.
 // request context (url/client/resp/part) + per-row state (resume/cap/db/row id)
 #[allow(clippy::too_many_arguments)]
 async fn stream_part(
@@ -416,14 +421,24 @@ async fn stream_part(
     file.flush().await?;
     drop(file);
 
-    // Truncated-stream guard: a declared total that was not fully received
-    // means the body was cut short (server lied / connection dropped).
+    // Declared-total mismatch, both directions: `received < t` is a
+    // truncated stream (server lied / connection dropped mid-body);
+    // `received > t` is a non-conformant body — a server that sends bytes
+    // past the declared Content-Range/Content-Length (nginx and S3 answer
+    // an unsatisfiable Range with 416 plus an error page; on the R4
+    // byte-complete fast path above that page would be APPENDED to the
+    // untouched `.part` and installed as part of the ZIM). Both corrupt
+    // the `.part`; neither may reach finalize.
     // Skipped for a mid-stream cancel: the `.part` is already removed and
     // the row must stay `cancelled` with no error mark — the same route as
     // the `finalize_direct_download` cancel sites.
     if let Some(t) = total {
-        if received < t && !cancelled_observed {
-            let msg = format!("stream ended at {received} of {t} bytes (truncated)");
+        if received != t && !cancelled_observed {
+            let msg = if received < t {
+                format!("stream ended at {received} of {t} bytes (truncated)")
+            } else {
+                format!("stream delivered {received} of {t} declared bytes (oversized body)")
+            };
             mark_error(db, id, &msg).await;
             return Err(Error::Torrent {
                 kind: TorrentKind::Other,
@@ -2363,6 +2378,140 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// F3 (2026-09 review): a NON-conformant 416 — the byte-complete fast
+    /// path is confirmed (`Content-Range: bytes */N`, FULL == N) yet the
+    /// server sends a body anyway (nginx/S3 answer an unsatisfiable Range
+    /// with an error page). Those bytes must not be appended to the
+    /// untouched `.part` and installed as ZIM content: the post-loop guard
+    /// errors on `received > total` (the pre-fix one-sided guard silently
+    /// accepted the oversized body and let finalize run on the corrupted
+    /// file).
+    #[tokio::test]
+    async fn stream_part_416_body_after_complete_part_is_error() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        const N: usize = 12;
+        let part_bytes: &[u8] = b"hello world!";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/x.zim"))
+            .and(header("range", format!("bytes={N}-")))
+            .respond_with(
+                ResponseTemplate::new(416)
+                    .append_header("Content-Range", format!("bytes */{N}"))
+                    .set_body_bytes(b"ERROR PAGE".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let pins = [("testhost".to_string(), *server.address())];
+        let pr = pinned_chain(
+            &format!("http://testhost:{}/x.zim", server.address().port()),
+            &pins,
+            false,
+            |c, u| c.get(u).header("Range", format!("bytes={N}-")),
+        )
+        .await;
+        assert_eq!(pr.response.status(), 416);
+        let dir = std::env::temp_dir().join(format!("zimi-sp-416body-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("x.zim.part");
+        // The crash window: all N bytes already on disk, finalize never ran.
+        std::fs::write(&part, part_bytes).unwrap();
+        let pool = dead_pool();
+        let err = super::stream_part(
+            &pr.url,
+            &pr.client,
+            pr.response,
+            &part,
+            Some(N as u64),
+            1024,
+            &pool,
+            999_999,
+        )
+        .await
+        .expect_err("a 416 body after a complete part must be an error");
+        assert!(
+            err.to_string().contains("oversized body"),
+            "expected the oversized-body guard, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A body that delivers fewer bytes than the declared Content-Length
+    /// must never finalize — pinned with a raw-TCP server that closes
+    /// mid-body (wiremock always sends a complete body, so a short stream
+    /// needs a real socket). Note on mechanism: hyper surfaces a short
+    /// Content-Length body as a body-decode error at the in-loop `chunk?`
+    /// BEFORE the post-loop truncation guard can run — both routes end in
+    /// `Err`, and this test pins the property (never `Ok`), not which one
+    /// fires. The post-loop guard remains the backstop for a clean EOF
+    /// below the declared total (a shape hyper does not currently produce
+    /// for Content-Length bodies). `mark_error` is best-effort (a pool
+    /// blip is swallowed), so the dead pool is fine.
+    #[tokio::test]
+    async fn stream_part_short_body_is_error() {
+        const DECLARED: u64 = 20;
+        const SENT: &[u8] = b"hello world!"; // 12 < 20
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            // Read the request head (everything up to the blank line).
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut buf).await.expect("read head");
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&buf[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = sock
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {DECLARED}\r\n\r\n").as_bytes(),
+                )
+                .await;
+            let _ = sock.write_all(SENT).await;
+            let _ = sock.shutdown().await;
+        });
+        let pins = [("testhost".to_string(), addr)];
+        let pr = pinned_chain(
+            &format!("http://testhost:{}/x.zim", addr.port()),
+            &pins,
+            false,
+            |c, u| c.get(u),
+        )
+        .await;
+        assert_eq!(pr.response.status(), 200);
+        let dir = std::env::temp_dir().join(format!("zimi-sp-short-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("x.zim.part");
+        let pool = dead_pool();
+        super::stream_part(
+            &pr.url,
+            &pr.client,
+            pr.response,
+            &part,
+            None,
+            1024,
+            &pool,
+            999_999,
+        )
+        .await
+        .expect_err(
+            "a short body must be an error (decode error or the post-loop truncation guard)",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A 206 whose `Content-Range` does NOT start at the resumed offset
     /// (a mirror serving a different revision answered `bytes=6-` with the
     /// start of ITS file) must take the 416 route: discard the stale
@@ -2495,8 +2644,7 @@ mod tests {
             999_999,
         )
         .await
-        .err()
-        .expect("an over-cap fallback must be rejected up front");
+        .expect_err("an over-cap fallback must be rejected up front");
         assert!(
             err.to_string().contains("exceeds"),
             "expected the cap message, got: {err}"
@@ -2572,8 +2720,7 @@ mod tests {
         let pool = dead_pool();
         let _ = super::stream_part(&url, &client, resp, &part, Some(6), 1024, &pool, 999_999)
             .await
-            .err()
-            .expect("a failed reissue must error");
+            .expect_err("a failed reissue must error");
         assert!(
             part.exists(),
             "a transient fallback failure must keep the .part for resume"

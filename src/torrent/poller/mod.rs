@@ -15,6 +15,12 @@
 //!    copy), resync the library, then index in the background.
 //! 5. **OPDS** — periodically check the Kiwix catalog for newer versions and
 //!    queue auto-updates when `torrent.auto_update` is enabled.
+//!
+//! **Master switch:** while `torrent.enabled` is `false`, the poller is fully
+//! inert — no qBittorrent connect, no queued-row claims (direct or torrent),
+//! no requeue, no in-flight processing, no OPDS auto-seed. The switch is
+//! read live from the settings cache each cycle, so an operator toggle
+//! takes effect within one poll interval (no restart).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -295,10 +301,26 @@ impl DownloadPoller {
 
     /// Runs until the process exits.
     pub async fn run(self) {
-        let p0 = self.settings.poller_params_snapshot();
-        let qbit = self.resolve_torrent(&p0).await;
-        if let Err(e) = self.reconcile(qbit).await {
-            tracing::warn!("startup download reconciliation failed: {e}");
+        // Master switch (H2, 2026-09 review): a disabled poller must not
+        // establish a qB session — `startup.rs`'s initial-connect gate
+        // mirrors this, and without it the first tick's `resolve_torrent`
+        // reconnects anyway (the cache is empty at startup). Read live, not
+        // latched: the per-cycle gates in `tick()`/`opds_check()` re-read
+        // `torrent.enabled` every cycle. `reconcile` is startup-only, so an
+        // instance that starts disabled defers its adoption/orphan cleanup
+        // to the next restart (accepted trade-off; a live enable does
+        // everything else).
+        if self.settings.torrent_enabled() {
+            let p0 = self.settings.poller_params_snapshot();
+            let qbit = self.resolve_torrent(&p0).await;
+            if let Err(e) = self.reconcile(qbit).await {
+                tracing::warn!("startup download reconciliation failed: {e}");
+            }
+        } else {
+            tracing::info!(
+                "torrent poller idle: torrent.enabled=false — set torrent.enabled=true \
+                 to enable acquisition"
+            );
         }
         let mut ticks: u64 = 0;
         loop {
@@ -324,6 +346,14 @@ impl DownloadPoller {
     // ── One poll cycle ───────────────────────────────────────────────────────
 
     async fn tick(&self) -> Result<()> {
+        // Master switch (H2, 2026-09 review): read LIVE (a cheap RwLock read,
+        // deliberately not via the PERF-12 snapshot below) so an operator's
+        // settings toggle takes effect within one poll interval without a
+        // restart. While off: no qB connect, no claims, no requeue, no
+        // in-flight processing.
+        if !self.settings.torrent_enabled() {
+            return Ok(());
+        }
         // PERF-12: snapshot all poller settings once per tick.
         let p = self.settings.poller_params_snapshot();
         // Resolve the effective qBittorrent client for this cycle (rebuilds
@@ -1186,10 +1216,25 @@ mod tests {
         // the helper itself now lives in `crate::testing` (A-1).
         pub(crate) use crate::testing::test_pool;
 
+        /// Seed defaults + `torrent.enabled = true`. Since the H2 (2026-09
+        /// review) opt-in default flipped `torrent.enabled` to `false`, a test
+        /// poller built from the bare seed defaults is fully inert (the
+        /// master-switch gates in `tick()`/`opds_check()`/`run()`), so every
+        /// suite that drives the acquisition lifecycle must enable it
+        /// explicitly.
+        fn download_settings_values() -> std::collections::HashMap<String, serde_json::Value> {
+            let mut values = crate::settings::default_settings();
+            values.insert(
+                crate::settings::KEY_TORRENT_ENABLED.to_string(),
+                serde_json::json!(true),
+            );
+            values
+        }
+
         pub(crate) fn download_settings() -> crate::settings::SettingsCache {
             crate::settings::SettingsCache::new_with_map(
                 crate::testing::dead_pool(),
-                crate::settings::default_settings(),
+                download_settings_values(),
                 std::collections::HashMap::new(),
             )
         }
@@ -1201,7 +1246,7 @@ mod tests {
         /// reject the private host *before* the claim runs, leaving `file_path`
         /// unset.
         pub(crate) fn download_settings_allow_private() -> crate::settings::SettingsCache {
-            let mut values = crate::settings::default_settings();
+            let mut values = download_settings_values();
             values.insert(
                 crate::settings::KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS.to_string(),
                 serde_json::json!(true),
@@ -1218,7 +1263,7 @@ mod tests {
         /// `complete` and runs the post-install qB-delete branch rather than
         /// staying `seeding`.
         pub(crate) fn download_settings_no_keep_completed() -> crate::settings::SettingsCache {
-            let mut values = crate::settings::default_settings();
+            let mut values = download_settings_values();
             values.insert(
                 crate::settings::KEY_TORRENT_KEEP_COMPLETED.to_string(),
                 serde_json::json!(false),
@@ -1367,6 +1412,252 @@ mod tests {
                 "DELETE FROM downloads WHERE id IN ($1, $2)",
                 |q| q.bind(zim_id).bind(qb_id),
             )
+            .await;
+            let _ = tmp;
+        }
+
+        /// H2 (2026-09 review): `torrent.enabled` is the master switch — while
+        /// off, the poller is fully inert: no qBittorrent connect (not even a
+        /// login), no queued-row claims (the direct `.zim` row stays
+        /// unclaimed), and no OPDS auto-check. The gates read the setting
+        /// LIVE, so a runtime re-enable re-activates the very next tick (a
+        /// live toggle, not a startup latch): the same row left unclaimed
+        /// while disabled is claimed after re-enable.
+        ///
+        /// SSRF note (why exactly ONE wiremock): direct `.zim` URLs and OPDS
+        /// catalog URLs are loopback-banned by `validate_download_url`
+        /// ("downloads never allow loopback") — only the qBittorrent URL
+        /// setting admits loopback. So the file host is an unroutable
+        /// TEST-NET literal (admitted by `downloads.allow_private_networks`,
+        /// mirroring the sibling tick tests) and the catalog URL is a
+        /// loopback literal with no server at all: a regressed opds gate
+        /// fails the SSRF validation *before* any HTTP I/O (the `Ok`
+        /// assertion in phase 2 is the pin), while the disabled gate returns
+        /// `Ok(())` without touching it.
+        // Real clock (not `start_paused`): `test_pool()` wraps the eager
+        // (`min_connections = 1`) connect in a 3 s `tokio::time::timeout`, and
+        // every pool acquire runs a bounded liveness ping — under a paused
+        // clock the virtual deadline fires while the real (remote-DB) I/O is
+        // still in flight, so the gate fails with "timed out connecting".
+        #[tokio::test]
+        async fn disabled_master_switch_keeps_poller_fully_inert() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let Some((pool, _db_gate)) = test_pool().await else {
+                return;
+            };
+            crate::db::migrate::run_migrations(&pool)
+                .await
+                .expect("migrations");
+
+            // The qBittorrent Web API — the only wiremock target (qB is the
+            // one setting that admits loopback). A regressed tick gate must
+            // get PAST these, so login and the `filter=all` info fetch
+            // answer with normal success shapes. No `.expect(n)` mounts: the
+            // disabled phases assert via `received_requests()` (an
+            // expect(1) mount would fail on drop when the gate correctly
+            // sends nothing).
+            let qbit = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/v2/login"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("Ok."))
+                .mount(&qbit)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/v2/torrents/info"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+                .mount(&qbit)
+                .await;
+            // The OPDS catalog URL: a loopback literal with no server.
+            // `opds_check` runs the same loopback-banning
+            // `validate_download_url` before any HTTP I/O, so a regressed
+            // gate errors here instead of fetching — the `Ok` assertion in
+            // phase 2 is the pin for the disabled path.
+            let catalog_url = "http://127.0.0.1:1/__disabled_gate_opds__";
+
+            // Live pool for the settings cache: the re-enable (phase 3) goes
+            // through the production `update()` path (persist + cache swap),
+            // which needs a real DB. `downloads.allow_private_networks` must
+            // admit the unroutable TEST-NET file host at claim time —
+            // otherwise a regressed gate would SSRF-reject the row before
+            // claiming it and the "no claims" assertion would pass vacuously.
+            let mut values = crate::settings::default_settings();
+            values.insert(
+                crate::settings::KEY_TORRENT_ENABLED.to_string(),
+                serde_json::json!(false),
+            );
+            values.insert(
+                crate::settings::KEY_TORRENT_URL.to_string(),
+                serde_json::json!(qbit.uri()),
+            );
+            values.insert(
+                crate::settings::KEY_TORRENT_AUTO_UPDATE.to_string(),
+                serde_json::json!(true),
+            );
+            values.insert(
+                crate::settings::KEY_TORRENT_OPDS_URL.to_string(),
+                serde_json::json!(catalog_url),
+            );
+            values.insert(
+                crate::settings::KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS.to_string(),
+                serde_json::json!(true),
+            );
+            let settings = crate::settings::SettingsCache::new_with_map(
+                pool.clone(),
+                values,
+                std::collections::HashMap::new(),
+            );
+            // Phase 3's `update()` persists to the shared `settings` table —
+            // capture the row so the scratch DB comes back as found.
+            let prev_enabled: Option<serde_json::Value> = raw::fetch_scalar_optional(
+                &pool,
+                "SELECT value FROM settings WHERE key = $1",
+                |q| q.bind(crate::settings::KEY_TORRENT_ENABLED),
+            )
+            .await
+            .expect("read prev setting");
+
+            // One queued DIRECT `.zim` row — the row kind the poller claims
+            // even without qBittorrent, so the tick gate's "no claims" must
+            // hold here. TEST-NET host (loopback is banned for download
+            // URLs unconditionally) that is also unroutable, so a regressed
+            // claim's spawned fetch cannot touch any real host. Sweep any
+            // stale row first: the partial unique indexes on active rows
+            // (name and url) would break the insert if a crashed earlier run
+            // left one behind.
+            let name = "disabled-gate-zim";
+            let url = "http://10.255.255.255:8080/disabled-gate.zim";
+            let _ = raw::execute(&pool, "DELETE FROM downloads WHERE name = $1", |q| {
+                q.bind(name)
+            })
+            .await;
+            let zim_id: i32 = raw::fetch_scalar_optional(
+                &pool,
+                "INSERT INTO downloads (name, url, status) VALUES ($1, $2, 'queued') RETURNING id",
+                |q| q.bind(name).bind(url),
+            )
+            .await
+            .expect("insert direct row")
+            .expect("row");
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
+            let poller = super::super::DownloadPoller::new(
+                pool.clone(),
+                settings.clone(),
+                zims,
+                crate::torrent::QbitClientCache::new(),
+                None,
+                "user".into(),
+                "pass".into(),
+            );
+
+            // 1) Disabled tick: no qB connect (no login, no fetch), no
+            //    claim (the row stays queued, no `.part` target).
+            poller.tick().await.expect("disabled tick is Ok");
+            assert!(
+                qbit.received_requests().await.unwrap().is_empty(),
+                "disabled tick must not connect to qBittorrent (no login, no fetch)"
+            );
+            let (status, file_path): (String, Option<String>) = raw::fetch_optional(
+                &pool,
+                "SELECT status, file_path FROM downloads WHERE id = $1",
+                |q| q.bind(zim_id),
+            )
+            .await
+            .expect("read direct row")
+            .expect("row");
+            assert_eq!(status, "queued", "disabled tick must not claim the row");
+            assert!(
+                file_path.is_none(),
+                "disabled tick must not set the .part target, got: {file_path:?}"
+            );
+
+            // 2) Disabled opds_check: this runs on its own cadence inside
+            //    the run loop (every `OPDS_EVERY_N_TICKS` ticks,
+            //    independently of `tick()`), so the tick gate alone would
+            //    not cover it. With the switch off it must return `Ok`
+            //    BEFORE even reaching the catalog SSRF validation — a
+            //    regressed gate fails that validation on the loopback
+            //    catalog URL (before any HTTP I/O) and this panics.
+            poller
+                .opds_check()
+                .await
+                .expect("disabled opds_check must return Ok without touching the catalog");
+            let seeded: i64 = raw::fetch_scalar_optional(
+                &pool,
+                "SELECT count(*) FROM downloads WHERE url = $1",
+                |q| q.bind(catalog_url),
+            )
+            .await
+            .expect("count seeded rows")
+            .expect("count");
+            assert_eq!(seeded, 0, "disabled opds_check must not queue catalog rows");
+
+            // 3) Re-enable at runtime: the gates read `torrent.enabled`
+            //    LIVE, so the very next tick attempts the qB connect AND
+            //    claims the same row phase 1 left queued — proving a live
+            //    toggle, not a startup latch. `file_path` is asserted (not
+            //    `status`): the spawned direct-download task races the read
+            //    (the unroutable TEST-NET fetch may already have marked the
+            //    row `error`), while the synchronous claim's `.part` target
+            //    is never cleared.
+            let mut updates = std::collections::HashMap::new();
+            updates.insert(
+                crate::settings::KEY_TORRENT_ENABLED.to_string(),
+                serde_json::json!(true),
+            );
+            let errs = settings
+                .update(&updates, true)
+                .await
+                .expect("re-enable write");
+            assert!(errs.is_empty(), "re-enable must succeed: {errs:?}");
+            poller.tick().await.expect("enabled tick runs");
+            let qbit_reqs = qbit.received_requests().await.expect("qB requests");
+            assert!(
+                qbit_reqs.iter().any(|r| r.url.path() == "/api/v2/login"),
+                "enabled tick must attempt the qBittorrent connect (login); saw: {:?}",
+                qbit_reqs
+                    .iter()
+                    .map(|r| r.url.as_str().to_string())
+                    .collect::<Vec<_>>()
+            );
+            let zp: Option<String> = raw::fetch_scalar_optional(
+                &pool,
+                "SELECT file_path FROM downloads WHERE id = $1",
+                |q| q.bind(zim_id),
+            )
+            .await
+            .expect("read claimed row");
+            assert!(
+                zp.as_deref().unwrap_or("").ends_with(".part"),
+                "re-enabled tick must claim the row its disabled sibling left queued, got: {zp:?}"
+            );
+
+            // Cleanup: restore the settings row the `update()` touched, then
+            // delete the test's download row (sibling-test style).
+            match prev_enabled {
+                Some(v) => {
+                    let _ = raw::execute(
+                        &pool,
+                        "UPDATE settings SET value = $2 WHERE key = $1",
+                        |q| q.bind(crate::settings::KEY_TORRENT_ENABLED).bind(&v),
+                    )
+                    .await;
+                }
+                None => {
+                    let _ = raw::execute(&pool, "DELETE FROM settings WHERE key = $1", |q| {
+                        q.bind(crate::settings::KEY_TORRENT_ENABLED)
+                    })
+                    .await;
+                }
+            }
+            let _ = pool.acquire().await; // keep pool alive for cleanup
+            let mut c2 = pool.acquire().await.expect("conn");
+            let _ = raw::execute(&mut *c2, "DELETE FROM downloads WHERE id = $1", |q| {
+                q.bind(zim_id)
+            })
             .await;
             let _ = tmp;
         }
