@@ -29,7 +29,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Pinned toolchain (1.96.0): keeps the rustdoc/clippy gates deterministic —
       # a moving `stable` once made the docs gate flaky. Bump deliberately; the
       # MSRV job below still guards 1.94. rust-toolchain.toml pins the same
@@ -63,7 +63,7 @@ jobs:
       # document — so the install comes first. Strict because the targets
       # skip silently without node/their dependency; CI always has node,
       # so a missing node/css-tree/jsdom must fail the gate, not pass it.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with: { node-version: 22 }
       - run: npm install --no-audit --no-fund
       - run: make web-check
@@ -83,8 +83,8 @@ jobs:
   web-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with: { node-version: 22 }
       - run: npm install --no-audit --no-fund
       - run: make web-lint
@@ -102,7 +102,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "1.94"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.94" }
       - run: cargo test --lib --bins --test wiremock
@@ -121,7 +121,7 @@ jobs:
       ZIMSERVICE_LOOP_TEST_BUDGET_SECS: "300"
     services:
       postgres:
-        image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
+        image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b   # stock postgres:16 lacks the `vector` extension migration 001 creates
         env:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
@@ -134,7 +134,7 @@ jobs:
           --health-cmd "pg_isready -U zimservice -p 5433"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.94" }
       - run: |
@@ -145,7 +145,7 @@ jobs:
   docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0", components: "rust-docs" }
       - run: cargo doc --no-deps
@@ -165,7 +165,7 @@ jobs:
       ZIMSERVICE_LOOP_TEST_BUDGET_SECS: "300"
     services:
       postgres:
-        image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
+        image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b   # stock postgres:16 lacks the `vector` extension migration 001 creates
         env:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
@@ -177,7 +177,7 @@ jobs:
           --health-cmd "pg_isready -U zimservice -p 5432"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0" }
       - run: |
@@ -193,7 +193,7 @@ jobs:
       ZIMSERVICE_LOOP_TEST_BUDGET_SECS: "300"
     services:
       postgres:
-        image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
+        image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b   # stock postgres:16 lacks the `vector` extension migration 001 creates
         env:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
@@ -205,7 +205,7 @@ jobs:
           --health-cmd "pg_isready -U zimservice -p 5434"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0", components: "llvm-tools-preview" }
       # The mirror has no taiki-e/install-action — build the same tool from
@@ -250,7 +250,7 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0" }
       - run: |
@@ -267,7 +267,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
+        image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b   # stock postgres:16 lacks the `vector` extension migration 001 creates
         env:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
@@ -279,7 +279,7 @@ jobs:
           --health-cmd "pg_isready -U zimservice -p 5435"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: docker build -t zimservice:ci .
       # e2e: `--network host` puts the app in the host network, where its
       # 0.0.0.0:8899 bind is reachable at 127.0.0.1 and the postgres

@@ -57,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
+        image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b   # stock postgres:16 lacks the `vector` extension migration 001 creates
         env:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
@@ -71,7 +71,7 @@ jobs:
           --health-cmd "pg_isready -U zimservice -p 5436"
           --health-interval 2s --health-timeout 3s --health-retries 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0" }
       - name: Run benches against the committed week0 baseline
@@ -110,7 +110,7 @@ jobs:
       # it is the persistent record the trend comparison is read from.
       - name: Upload criterion data (persistent per-run record)
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: criterion-data
           path: target/criterion

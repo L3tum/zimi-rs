@@ -5,7 +5,7 @@
 # binary that dies at container start with `GLIBC_2.38 not found`. Pin the
 # base variant explicitly; the build-time check after `cargo build` enforces
 # the invariant so a future base drift fails the build, not the boot.
-FROM rust:1.96.0-slim-bookworm AS builder
+FROM rust:1.96.0-slim-bookworm@sha256:4732ca96fd086cb9be682050c3f0176288eebaac2b80aa2bcefccfaf198e1950 AS builder
 WORKDIR /build
 # Dependency-layer caching: fetch the manifest-only layer first so the
 # Cargo.lock-driven download layer stays valid across source-only changes.
@@ -26,7 +26,7 @@ RUN max_glibc=$(objdump -T target/release/zimservice | grep -oE 'GLIBC_[0-9.]+' 
     && dpkg --compare-versions "$max_glibc" le 2.36 \
     && echo "glibc check: binary needs GLIBC_${max_glibc} (runtime is bookworm, 2.36)"
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
