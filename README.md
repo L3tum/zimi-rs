@@ -122,7 +122,7 @@ UI renders them locked (see [CORS](#cors)).
 | `READ_ONLY_TOKEN` | (none) | Optional **read-only** API token; locks `access.read_only_token`. When set, it authenticates a restricted caller that can hit only the RAG-read allowlist (`/search`, `/suggest`, `/read`, `/snippet`, `/random`, `/chunks`, `/interlanguage`, `/w/…`, `/list`, `/health`, `/openapi.json`) — settings, diagnostics, collections, downloads, the web UI, and every mutating verb are 403 for it. See [Read-only API token](#read-only-api-token) |
 | `ACCESS_MODE` | (none) | Sets `access.mode` (`open` or `password`) |
 | `REQUIRE_AUTH_FOR_READS` | (none) | Sets `access.require_auth_for_reads`. Without it, the startup default is bind-based: `true` on a non-loopback `HOST` (reads gated), `false` on loopback (reads open) |
-| `QBITTORRENT_URL` | (disabled) | qBittorrent WebUI URL; its presence enables torrent support |
+| `QBITTORRENT_URL` | (disabled) | qBittorrent WebUI URL; its presence enables torrent support. The poller additionally requires the `torrent.enabled` setting, which defaults to `false` (opt-in) — set it `true` to actually acquire |
 | `QBITTORRENT_USER` | (none) | qBittorrent username (optional; some installs run without auth) |
 | `QBITTORRENT_PASS` | (none) | qBittorrent password (optional; some installs run without auth) |
 | `EMBEDDING_ENDPOINT` | (none) | OpenAI-compatible `/v1` URL; seeds `embedding.endpoint` |
@@ -389,6 +389,17 @@ is reachable by any network peer. Open mode is rejected at startup on a
   browser CSP sandbox (`script-src 'none'` + `object-src 'none'`), not
   content inspection. Hash-pinning or a separate origin for untrusted
   sources is future work.
+- **Torrent-based acquisition is opt-in** (`torrent.enabled` defaults to
+  `false`, migration 018 flipped pre-existing deployments). Enabling it is
+  a **source-trust decision**: the poller then auto-seeds from the
+  configured OPDS feed, and entries whose catalog declares **no digest**
+  (the current live Kiwix catalog shape) are accepted **unverified** —
+  structurally valid bytes are indexed and served as if they were the real
+  archive (see ZIM content trust boundary). Feeds that *do* declare a
+  digest are verified fail-closed, and changed bytes for a known identity
+  are flagged as drift, never auto-rejected. High-trust deployments should
+  apply the M-2 out-of-band size + SHA-256 pinning to downloaded artifacts
+  (see Download SSRF protection).
 - **`downloads.max_bytes` defaults to 512 GiB** — an operator-settable cap, far
   above any real ZIM (English Wikipedia ≈ 111 GiB) while bounding a single
   download's disk blast radius (the 2026-09 review flagged the previous
