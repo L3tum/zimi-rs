@@ -421,6 +421,101 @@ async fn snippet_live_returns_title_and_snippet() {
         .unwrap();
 }
 
+/// (T1, 2026-09 review): `GET /snippet` DB-miss → 404 with the JSON error
+/// envelope. Sibling of `snippet_live_returns_title_and_snippet` (hit
+/// path): same fixture-state + router pattern, but the requested (zim,
+/// path) has NO `articles` row — the ZIM exists and holds an article at a
+/// DIFFERENT path, so the 404 must come from the article lookup
+/// (`fetch_article_snippet` → `None` → `Error::NotFound`), not from the
+/// ZIM lookup. The envelope is `ErrorResponse` (`{ "error": ... }` —
+/// `serve/openapi.rs`); `Error::NotFound` surfaces its message verbatim
+/// (`error.rs` `status_and_message`), so the exact string is pinned.
+#[tokio::test]
+async fn snippet_db_miss_returns_404() {
+    let (pool, _db_gate) = match pool_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    run_migrations(&pool).await.expect("migrations");
+    const ZIM: &str = "__itest_snip404__";
+    const EXISTING: &str = "A/existing";
+    const MISSING: &str = "A/missing";
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+        .await
+        .unwrap();
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 1, 1)",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap();
+    let zim_id: i32 = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT id FROM zims WHERE name = $1",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap()
+    .expect("row present");
+    // The ZIM is indexed with ONE article at a different path — the
+    // requested path below has no row (the DB-miss under test).
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO articles (path, title, content_preview, snippet, search_vector, language, \
+        namespace, zim_id)
+         VALUES ($1, $2, 'Some preview', 'The snippet', to_tsvector('simple', $2), 'en', 'C', $3)",
+        |q| q.bind(EXISTING).bind("Existing Article").bind(zim_id),
+    )
+    .await
+    .unwrap();
+
+    let state = live_state(pool.clone()).await;
+    let app = zimservice::serve::build_router(state);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/snippet?zim={ZIM}&path={MISSING}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    let text = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    // The ErrorResponse envelope is exactly `{ "error": ... }` (one key),
+    // carrying the NotFound message verbatim.
+    let v: serde_json::Value = serde_json::from_slice(&text).unwrap();
+    let obj = v.as_object().expect("404 body must be a JSON object");
+    assert_eq!(
+        obj.len(),
+        1,
+        "envelope is exactly {{\"error\": ...}}, got: {v}"
+    );
+    let expected = format!("article '{ZIM}' / '{MISSING}' not indexed");
+    assert_eq!(
+        obj.get("error").and_then(|e| e.as_str()),
+        Some(expected.as_str()),
+        "404 body must carry the NotFound message, got: {v}"
+    );
+
+    // Cleanup.
+    zimservice::db::raw::execute(
+        &pool,
+        "DELETE FROM articles WHERE zim_id IN (SELECT id FROM zims WHERE name = $1)",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap();
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+        .await
+        .unwrap();
+}
+
 /// `GET /suggest` returns matching titles for a prefix query (dead-pool 503
 /// is covered by the handler unit test; here the trigram prefix arm runs live).
 #[tokio::test]

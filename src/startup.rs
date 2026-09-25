@@ -2094,8 +2094,8 @@ mod serve_shutdown_tests {
                 Err(join_err) => tracing::error!("background task '{name}' died: {join_err}"),
                 Ok(()) => {
                     tracing::error!(
-                        "background task '{name}' returned before shutdown 
-                         (it must run for the lifetime of the server)"
+                        "background task '{name}' returned before shutdown \
+                             (it must run for the lifetime of the server)"
                     )
                 }
             }

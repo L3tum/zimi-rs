@@ -60,23 +60,8 @@ use zimservice::search::{
 /// flip is unreliable and the gate proves little.
 const ROWS: usize = 100_000;
 
-/// 40 varied words; `quixotic` + `granite` are the probe phrase. The exact
-/// adjacent pair occurs in 63 of the 100k titles: `i ≡ 17 (mod 40)` for word 1
-/// and `(i/40) ≡ 7 (mod 40)` for word 2 combine to `i ≡ 297 (mod 1600)`
-/// (297, 1697, … — 63 values below 100000).
-const WORDS: [&str; 40] = [
-    "amber", "boulder", "canyon", "dune", "ember", "fjord", "glacier", "granite", "heath", "islet",
-    "jungle", "lichen", "meadow", "niche", "oasis", "plateau", "quarry", "quixotic", "ridge",
-    "shoal", "tundra", "upland", "valley", "wadi", "xylem", "yarrow", "zephyr", "basalt", "cinder",
-    "delta", "estuary", "fissure", "gully", "habitat", "inlet", "lagoon", "moraine", "nexus",
-    "outcrop", "pinnacle",
-];
-
-/// The probe phrase: long enough for both trgm arms (≥ 3 chars), selective
-/// enough that the trgm index is overwhelmingly cheaper than a seq scan.
-/// Also the FTS arm's probe (`websearch_to_tsquery` ANDs the two words —
-/// the pair occurs in only a few hundred titles).
-const PROBE: &str = "quixotic granite";
+// Single definition in zimservice::testing::trgm_corpus — M2, 2026-09 review.
+use zimservice::testing::trgm_corpus::{EMBED_BATCH, PROBE, WORDS};
 
 /// Fixture ZIM name — the arms JOIN `zims`, so it must exist.
 const ZIM_NAME: &str = "__trgm_plan__";
@@ -88,11 +73,6 @@ const ZIM_NAME: &str = "__trgm_plan__";
 /// directly and only inspects plan shape, so it uses the migration's
 /// dimension verbatim — a 768-dim literal would not fit the 1536 column.)
 const EMBED_DIM: usize = 1536;
-
-/// One embedding UPDATE batch: `EMBED_BATCH` rows share one bind (one
-/// vector literal), keeping the population to 50 small statements instead
-/// of 100k per-row updates.
-const EMBED_BATCH: usize = 2000;
 
 /// `EXPLAIN (FORMAT TEXT)` the arm SQL with its bound params; join the plan
 /// lines for substring assertions.

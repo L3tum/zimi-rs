@@ -2,10 +2,10 @@
 //! crate root so `zimservice::AppState` / `crate::AppState` stay stable).
 //!
 //! The fields are intentionally broad for handler convenience — each handler
-//! uses only 1–3 of the 14 fields.
+//! uses only 1–3 of the fields.
 //!
 //! Regrouping the fields into sub-states (e.g. `core` / `downloads` /
-//! `settings`) was evaluated and rejected: the 14 fields belong to 8
+//! `settings`) was evaluated and rejected: the fields belong to 8
 //! distinct top-level modules (`db` ×4, `settings`, `zim`, `search`,
 //! `torrent`, `health` ×2, `access` ×2, plus the two `embed` build-state
 //! fields `build_probe` / `index_building`) and every handler group would
@@ -24,14 +24,6 @@ use crate::{
     health::{DegradationTracker, HealthProbes},
     search, settings, torrent, zim,
 };
-
-/// The number of [`AppState`] fields. `docs/ARCHITECTURE.md` mirrors this
-/// value **by name** (its "the 14-field shared state" line), and so does
-/// this module's doc ("1-3 of the 14 fields") — that prose is
-/// human-maintained; bump this const when a field is added or removed, and
-/// the tripwire in `src/lib.rs` (`appstate_field_count_matches_the_const`)
-/// fails if it drifts from the actual struct.
-pub const APP_STATE_FIELD_COUNT: usize = 14;
 
 /// Shared application state, passed to all axum handlers.
 #[derive(Clone)]

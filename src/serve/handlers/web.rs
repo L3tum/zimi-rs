@@ -45,28 +45,32 @@ pub const RAW_CONTENT_CSP: &str =
     font-src data:; frame-ancestors 'none'";
 
 /// MIME types that browsers render as HTML documents (i.e. can execute
-/// scripts). Used to decide whether the sandbox CSP + `X-Frame-Options: DENY`
-/// must be applied to a `/w` response. The ZIM's central directory is
-/// attacker-controlled for downloaded archives, so gating on the broader
-/// "browser-rendered-as-HTML" set (not just the `text/html` prefix) closes
-/// the `application/xhtml+xml` / `image/svg+xml` sandbox bypass (SEC-M1).
+/// scripts). Used to decide whether the `X-Frame-Options: DENY` backstop
+/// (for browsers without `frame-ancestors` CSP support) must be applied to a
+/// `/w` response. The ZIM's central directory is attacker-controlled for
+/// downloaded archives, so gating on the broader "browser-rendered-as-HTML"
+/// set (not just the `text/html` prefix) closes the
+/// `application/xhtml+xml` / `image/svg+xml` sandbox bypass (SEC-M1).
 fn is_browser_html(content_type: &str) -> bool {
     let ct = content_type.split(';').next().unwrap_or("").trim();
     ct == "text/html" || ct == "application/xhtml+xml" || ct == "image/svg+xml"
 }
 
-/// Sandbox headers for `/w` responses: applied to every MIME type browsers
-/// render as an HTML document (see `is_browser_html`); empty for all other
-/// content types.
+/// Sandbox headers for `/w` responses (SEC-M2 + H1, 2026-09 review): the
+/// CSP attaches to **every** raw response, not just the browser-HTML set —
+/// a directly-navigated script document (e.g. a ZIM entry whose MIME is
+/// `text/javascript`) must still carry `script-src 'none'` and
+/// `default-src 'none'`, so it can neither execute nor exfiltrate even if a
+/// script-executing MIME ever slipped past the `content_type_for` rewrite.
+/// For subresources (images, CSS, …) the response's own CSP is ignored by
+/// browsers — harmless. `X-Frame-Options: DENY` is only meaningful for the
+/// types browsers render as HTML documents (see `is_browser_html`).
 pub fn raw_content_security_headers(content_type: &str) -> Vec<(header::HeaderName, String)> {
+    let mut headers = vec![(header::CONTENT_SECURITY_POLICY, RAW_CONTENT_CSP.to_string())];
     if is_browser_html(content_type) {
-        vec![
-            (header::CONTENT_SECURITY_POLICY, RAW_CONTENT_CSP.to_string()),
-            (header::X_FRAME_OPTIONS, "DENY".to_string()),
-        ]
-    } else {
-        Vec::new()
+        headers.push((header::X_FRAME_OPTIONS, "DENY".to_string()));
     }
+    headers
 }
 
 /// Version stamp appended to the embedded asset URLs in the served pages
@@ -570,16 +574,34 @@ mod tests {
 
     #[test]
     fn raw_content_security_headers_non_html() {
+        // H1 (2026-09 review): the sandbox CSP now attaches to EVERY /w
+        // response (script documents must be fenced even if a script MIME
+        // slips past the content_type rewrite); only X-Frame-Options stays
+        // gated on the browser-HTML set, so non-HTML types carry exactly the
+        // CSP, and nothing else.
         for ct in [
             "text/plain; charset=utf-8",
             "application/octet-stream",
             "image/png",
         ] {
-            assert!(
-                raw_content_security_headers(ct).is_empty(),
-                "{ct} must carry no sandbox headers"
+            let h = raw_content_security_headers(ct);
+            assert_eq!(
+                h,
+                vec![(header::CONTENT_SECURITY_POLICY, RAW_CONTENT_CSP.to_string())],
+                "{ct} must carry exactly the sandbox CSP"
             );
         }
+    }
+
+    // H1 (2026-09 review): a directly-navigated script document must carry
+    // the sandbox CSP (defense-in-depth behind the content_type rewrite).
+    #[test]
+    fn raw_content_security_headers_script_mime() {
+        let h = raw_content_security_headers("text/javascript");
+        assert_eq!(
+            h,
+            vec![(header::CONTENT_SECURITY_POLICY, RAW_CONTENT_CSP.to_string())]
+        );
     }
 
     // SEC-M1: non-`text/html` MIME types that browsers render as HTML must

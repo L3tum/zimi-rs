@@ -186,9 +186,11 @@ pub(crate) async fn read_article_payload(
     // `clamp_read_max_length`; keeps the HTTP and MCP front ends in parity.
     let max_len = clamp_read_max_length(max_len);
 
+    // Existence check only — no full-`ZimMeta` clone per request (Perf #2).
     state
         .zims
-        .get(zim_name)
+        .is_known(zim_name)
+        .then_some(())
         .ok_or_else(|| crate::error::Error::NotFound(format!("ZIM '{zim_name}' not found")))?;
 
     // ZIM-first: the normal path reads text + entry title straight from the

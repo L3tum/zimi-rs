@@ -13,8 +13,10 @@
 //! end; a killed run leaves it behind (clearly named, and dropped by the
 //! next run).
 //!
-//! The corpus mirrors `tests/integration/trgm_plan.rs` (the same 40-word
-//! grid; 10,000 rows instead of 100,000 so a bench run stays in minutes):
+//! The corpus shares its word list / probe / batch with
+//! `tests/integration/trgm_plan.rs` (one definition in
+//! `zimservice::testing::trgm_corpus` — M2, 2026-09 review; the same 40-word
+//! grid, 10,000 rows instead of 100,000 so a bench run stays in minutes):
 //! - `path`:   `A/bench_00000` … `A/bench_09999`
 //! - `title`:  `"{w1} {w2} {w3} entry {i}"` with `w1 = WORDS[i % 40]`,
 //!   `w2 = WORDS[(i / 40) % 40]`, `w3 = WORDS[(i / 1600) % 40]` — the
@@ -62,6 +64,9 @@ use zimservice::db::raw;
 use zimservice::health::{DegradationTracker, HealthProbes};
 use zimservice::search::{SearchEngine, SearchParams};
 use zimservice::settings::SettingsCache;
+// Single definition in zimservice::testing::trgm_corpus — M2, 2026-09 review
+// (`pub` so `common::PROBE` stays reachable from benches/search.rs).
+pub use zimservice::testing::trgm_corpus::{EMBED_BATCH, PROBE, WORDS};
 use zimservice::torrent::QbitClientCache;
 use zimservice::zim::index::UPSERT_ARTICLES_FROM_STAGING_SQL;
 use zimservice::zim::ZimManager;
@@ -76,23 +81,6 @@ pub const FIXTURE_ZIM: &str = "bench_fixture";
 /// `tests/integration/trgm_plan.rs` proves the same corpus shape at 100k.
 pub const ROWS: usize = 10_000;
 
-/// 40 varied words; `quixotic` + `granite` are the probe phrase (kept in
-/// lockstep with `tests/integration/trgm_plan.rs`, so the benches and the
-/// plan gate measure the same title shapes).
-pub const WORDS: [&str; 40] = [
-    "amber", "boulder", "canyon", "dune", "ember", "fjord", "glacier", "granite", "heath", "islet",
-    "jungle", "lichen", "meadow", "niche", "oasis", "plateau", "quarry", "quixotic", "ridge",
-    "shoal", "tundra", "upland", "valley", "wadi", "xylem", "yarrow", "zephyr", "basalt", "cinder",
-    "delta", "estuary", "fissure", "gully", "habitat", "inlet", "lagoon", "moraine", "nexus",
-    "outcrop", "pinnacle",
-];
-
-/// The probe phrase (FTS/trgm benches): long enough for both trgm arms
-/// (≥ 3 chars), selective enough that the trgm index is overwhelmingly
-/// cheaper than a seq scan — `quixotic granite` occurs in exactly 7 of the
-/// 10,000 fixture titles.
-pub const PROBE: &str = "quixotic granite";
-
 /// The committed one-article ZIM the retrieval benches serve (its
 /// `main.html` is 207 bytes — the /w range bench slices against that).
 pub const TINY_ZIM: &str = "tiny";
@@ -100,11 +88,6 @@ pub const TINY_ZIM: &str = "tiny";
 /// Absolute path of the committed fixture archive (the zims row's
 /// `file_path`; `open_zim` stats/opens it directly).
 pub const TINY_ZIM_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tiny.zim");
-
-/// One embedding batch: `EMBED_BATCH` rows share one one-hot vector bind
-/// (mirrors `trgm_plan.rs` — 10k rows → 5 statements instead of 10k
-/// per-row updates).
-const EMBED_BATCH: usize = 2000;
 
 /// A single multi-thread runtime driving every measured async call:
 /// criterion is synchronous, so each measured future is driven with

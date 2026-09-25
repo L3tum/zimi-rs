@@ -45,11 +45,40 @@ pub struct ReadQuery {
     pub max_length: Option<usize>,
 }
 
+/// MIME types a browser executes as a script document when navigated to
+/// directly (top-level) — `text/javascript` and its IANA/legacy aliases.
+/// The ZIM central directory is attacker-controlled for downloaded
+/// archives, so advertising one of these verbatim on `/w` would let a
+/// crafted entry run same-origin JavaScript in a visitor's browser (H1,
+/// 2026-09 review). Rewriting to `text/plain` kills execution while keeping
+/// the source visible; the `RAW_CONTENT_CSP` attached to every `/w`
+/// response (see `web::raw_content_security_headers`) is the defense-in-
+/// depth backstop.
+fn is_script_executing_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "text/javascript"
+            | "text/ecmascript"
+            | "application/javascript"
+            | "application/x-javascript"
+            | "application/ecmascript"
+            | "application/x-ecmascript"
+            | "text/jscript"
+            | "application/x-jscript"
+            | "text/typescript"
+    )
+}
+
 /// Map a ZIM entry's MIME type to a `Content-Type` header value.
 fn content_type_for(mt: &zim::MimeType) -> String {
     match mt {
         zim::MimeType::Type(s) => {
             let lower = s.to_ascii_lowercase();
+            // H1: never advertise a script-executing MIME for raw entry
+            // bytes — serve the source as plain text instead.
+            if is_script_executing_mime(lower.split(';').next().unwrap_or("").trim()) {
+                return "text/plain; charset=utf-8".to_string();
+            }
             if lower.starts_with("text/") && !lower.contains("charset") {
                 format!("{s}; charset=utf-8")
             } else {
@@ -338,18 +367,14 @@ pub async fn raw_content(
     headers: axum::http::HeaderMap,
     AxumPath((zim_name, path)): AxumPath<(String, String)>,
 ) -> Result<Response, crate::error::Error> {
-    let meta = state
-        .zims
-        .get(&zim_name)
-        .ok_or_else(|| crate::error::Error::NotFound(format!("ZIM '{zim_name}' not found")))?;
-
-    // W6.1: the ETag stat + 304 revalidation moved into the blocking read
-    // below (off the async worker — a `stat` must not run on a tokio worker).
-    // The tag is file-level, so a match implies byte-identical entries; the
-    // closure stats fresh (a TTL'd etag would stale-304 after an in-place
-    // replace) and returns `NotModified` before any entry lookup / mmap copy
-    // (PERF-7: a 304 pays no mmap copy).
-    let file_path = std::path::PathBuf::from(meta.file_path);
+    // Narrow path accessor — the full-`ZimMeta` clone per `/w` request was
+    // measurable churn (Perf #2, 2026-09 review).
+    let file_path = std::path::PathBuf::from(
+        state
+            .zims
+            .file_path_of(&zim_name)
+            .ok_or_else(|| crate::error::Error::NotFound(format!("ZIM '{zim_name}' not found")))?,
+    );
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())

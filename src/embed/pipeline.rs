@@ -296,6 +296,13 @@ pub async fn run_pipeline(
             // A mismatch would mis-zip the vectors below — skip this batch
             // (its rows stay NULL and are retried next cycle).
             if let Err(e) = store_guard(ids.len(), embeddings.len()) {
+                // (R1, 2026-09 review): a persistently mismatched count must
+                // converge to the W6.5 poison drop like any other repeated
+                // batch failure — bump each row's poison counter (as the
+                // sibling `embed` Err arm does) so `filter_poisoned_ids`
+                // stops re-claiming the rows after `POISON_FAIL_MAX` cycles
+                // instead of re-sending them forever.
+                record_batch_failure(&ids);
                 tracing::error!("{e} (zim: {z}); skipping this batch, rows retry next cycle");
                 return Ok(());
             }
@@ -525,5 +532,177 @@ mod tests {
             let m = EMBED_FAILS.lock().unwrap();
             assert!(m.is_empty(), "over-cap map is cleared (fail-open)");
         }
+    }
+
+    // (R1, 2026-09 review) — a provider that *persistently* returns a
+    // mismatched vector count must converge to the W6.5 poison drop instead
+    // of being re-claimed forever: the store_guard skip path bumps the
+    // per-row poison counter exactly like the sibling `embed` Err arm, so
+    // after `POISON_FAIL_MAX` (3) mismatched cycles `filter_poisoned_ids`
+    // stops re-claiming the rows. DB-gated (`test_pool` counted skip on a
+    // DB-less machine; runs in CI) — wiremock provider + live pool, the
+    // same end-to-end shape as the 500-endpoint regression
+    // (`tests/integration/embedding.rs::embed_poisoned_rows_not_resent_within_
+    // run`), exercised over the mismatch path. It mutates the in-process
+    // `EMBED_FAILS` static the counter tests above share, so it serializes
+    // against them via the `DbExclusiveGuard` `test_pool` returns — every
+    // counter test acquires that guard before asserting on the map (the
+    // same seam the 500-endpoint regression relies on). The guard is safe
+    // to hold across `.await` (unlike a std `MutexGuard`, which would trip
+    // `clippy::await_holding_lock`).
+    #[tokio::test]
+    async fn count_mismatch_converges_to_poison_drop() {
+        // DB gate (src/testing.rs): counted skip, strict-mode hard-fail.
+        // The guard serializes this test against the in-process `EMBED_FAILS`
+        // counter tests (all of which hold it) for the whole body.
+        let Some((pool, _db_gate)) = crate::testing::test_pool().await else {
+            return;
+        };
+        reset_embed_fails();
+        crate::db::migrate::run_migrations(&pool)
+            .await
+            .expect("migrations");
+        const ZIM: &str = "__libit_embed_mismatch__";
+        const DIM: u32 = 1536; // == baseline articles.embedding dimension → no ALTER
+
+        let zim_id: i32 = {
+            raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+                .await
+                .unwrap();
+            raw::execute(
+                &pool,
+                "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime,
+                           index_status, indexed_entries, article_count)
+         VALUES ($1, $1, $1, 0, now(), 'ready', 2, 2)",
+                |q| q.bind(ZIM),
+            )
+            .await
+            .unwrap();
+            raw::fetch_scalar_optional(&pool, "SELECT id FROM zims WHERE name = $1", |q| {
+                q.bind(ZIM)
+            })
+            .await
+            .unwrap()
+            .expect("row present")
+        };
+        for (path, title) in [("A/m1", "M1"), ("A/m2", "M2")] {
+            raw::execute(
+                &pool,
+                "INSERT INTO articles (path, title, content_preview, snippet, search_vector, \
+                 language, namespace, zim_id)
+                 VALUES ($1, $2, 'preview '||$2, 'snip '||$2, to_tsvector('simple', $2), 'en', \
+                 'C', $3)",
+                |q| q.bind(path).bind(title).bind(zim_id),
+            )
+            .await
+            .unwrap();
+        }
+        let article_ids: Vec<i64> = raw::fetch_scalar_all(
+            &pool,
+            "SELECT id FROM articles WHERE zim_id = $1 ORDER BY id",
+            |q| q.bind(zim_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(article_ids.len(), 2, "both rows seeded");
+
+        // The provider persistently under-delivers: 1 vector for the 2
+        // claimed texts (the store_guard count mismatch). The vector's
+        // dimension is irrelevant — the guard fires before any write.
+        use wiremock::matchers::{method, path as wpath};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wpath("/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"data":[{"index":0,"embedding":[0.0]}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let values: std::collections::HashMap<String, serde_json::Value> = vec![
+            ("embedding.endpoint".into(), serde_json::json!(server.uri())),
+            ("embedding.api_key".into(), serde_json::json!("")),
+            ("embedding.model".into(), serde_json::json!("test-model")),
+            ("embedding.dimension".into(), serde_json::json!(DIM)),
+            ("embedding.batch_size".into(), serde_json::json!(64)),
+            ("embedding.max_concurrency".into(), serde_json::json!(1)),
+            ("embedding.timeout_secs".into(), serde_json::json!(5)),
+        ]
+        .into_iter()
+        .collect();
+        let settings = crate::settings::SettingsCache::new_with_map(
+            pool.clone(),
+            values,
+            std::collections::HashMap::new(),
+        );
+
+        let probe = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let in_flight = std::sync::atomic::AtomicBool::new(false);
+
+        // Runs 1-3: each re-claims the 2 rows (the `embed_at` reset simulates
+        // the 10-minute claim window elapsing); the mismatched count is
+        // skipped (Ok — not an error) but must bump both rows' poison
+        // counter by one per cycle.
+        for cycle in 1..=3u32 {
+            raw::execute(
+                &pool,
+                "UPDATE articles SET embed_at = NULL WHERE zim_id = $1",
+                |q| q.bind(zim_id),
+            )
+            .await
+            .unwrap();
+            run_pipeline(pool.clone(), settings.clone(), ZIM, &probe, &in_flight)
+                .await
+                .expect("a mismatched count is skipped (Ok), not an error");
+            {
+                let m = EMBED_FAILS.lock().unwrap();
+                for id in &article_ids {
+                    assert_eq!(
+                        m.get(id),
+                        Some(&cycle),
+                        "cycle {cycle}: row {id} must be at failure count {cycle}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            3,
+            "each mismatched cycle sends exactly one embed HTTP call"
+        );
+
+        // Run 4: both rows sit at the cap (POISON_FAIL_MAX = 3) — the poison
+        // filter drops them before the embed, so no further HTTP call.
+        raw::execute(
+            &pool,
+            "UPDATE articles SET embed_at = NULL WHERE zim_id = $1",
+            |q| q.bind(zim_id),
+        )
+        .await
+        .unwrap();
+        run_pipeline(pool.clone(), settings.clone(), ZIM, &probe, &in_flight)
+            .await
+            .expect("an all-poison claim stops the pipeline with Ok");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            3,
+            "poison rows (3 mismatched cycles) are dropped — run 4 sends no embed call"
+        );
+        let n: i64 = raw::fetch_scalar_optional(
+            &pool,
+            "SELECT count(*) FROM articles WHERE zim_id = $1 AND embedding IS NOT NULL",
+            |q| q.bind(zim_id),
+        )
+        .await
+        .unwrap()
+        .expect("row present");
+        assert_eq!(n, 0, "mismatched rows are never embedded");
+
+        // Cleanup (cascades to articles).
+        raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+            .await
+            .unwrap();
     }
 }

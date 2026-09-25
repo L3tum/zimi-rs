@@ -147,20 +147,38 @@ where
         let response = match msg.get("method").and_then(|m| m.as_str()) {
             Some(method) => {
                 let id = msg.get("id").cloned();
-                let params = msg.get("params").cloned().unwrap_or(json!({}));
-                let result = dispatch(&state, method, &params).await;
-                // Notifications (no id) don't get a response
-                if id.is_none() {
-                    None
+                // (R3, 2026-09 review): JSON-RPC 2.0 requires the `id`
+                // member to be a String, Number, or Null (absent =
+                // notification, no response). A boolean/object/array id is
+                // an invalid request — reply `-32600` with `id` null and do
+                // NOT dispatch (the spec answers an invalid id with `id`
+                // null).
+                if matches!(
+                    id,
+                    Some(Value::Bool(_)) | Some(Value::Object(_)) | Some(Value::Array(_))
+                ) {
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": { "code": -32600, "message": "Invalid Request: id must be a \
+                        String, Number, or Null (JSON-RPC 2.0)" },
+                    }))
                 } else {
-                    Some(match result {
-                        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                        Err((code, message)) => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": { "code": code, "message": message },
-                        }),
-                    })
+                    let params = msg.get("params").cloned().unwrap_or(json!({}));
+                    let result = dispatch(&state, method, &params).await;
+                    // Notifications (no id) don't get a response
+                    if id.is_none() {
+                        None
+                    } else {
+                        Some(match result {
+                            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                            Err((code, message)) => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": { "code": code, "message": message },
+                            }),
+                        })
+                    }
                 }
             }
             // Not a request or notification (e.g. a JSON-RPC batch — which we
@@ -808,6 +826,50 @@ mod tests {
             run_session(&state, &[r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#]).await;
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0]["error"]["code"], -32600);
+    }
+
+    /// (R3, 2026-09 review): JSON-RPC 2.0 restricts `id` to String | Number
+    /// | Null (absent = notification, no response). A boolean or object
+    /// `id` is an invalid request — each must get exactly one `-32600`
+    /// response with `id` null (the spec answers an invalid id with `id`
+    /// null; the non-conformant id is never echoed back), and the method
+    /// must not be dispatched. An explicit conformant `"id": null` is a
+    /// *request* (not a notification) — it still gets a response, carrying
+    /// `id` null.
+    #[tokio::test]
+    async fn nonconformant_id_gets_invalid_request_with_null_id() {
+        let state = test_state();
+        let responses = run_session(
+            &state,
+            &[
+                r#"{"jsonrpc":"2.0","id":true,"method":"ping"}"#,
+                r#"{"jsonrpc":"2.0","id":{"a":1},"method":"ping"}"#,
+                r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+            ],
+        )
+        .await;
+        // One response per request — including the `"id": null` one.
+        assert_eq!(responses.len(), 3);
+        // Boolean id: the exact pinned `-32600` reply, `id` null.
+        assert_eq!(
+            responses[0],
+            json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": -32600,
+                    "message": "Invalid Request: id must be a String, Number, or Null (JSON-RPC \
+                    2.0)"
+                }
+            })
+        );
+        // Object id: the identical reply (the object is not echoed back).
+        assert_eq!(responses[1], responses[0]);
+        // Conformant explicit null id: a request, so a response IS produced.
+        assert_eq!(
+            responses[2],
+            json!({ "jsonrpc": "2.0", "id": null, "result": {} })
+        );
     }
 
     #[tokio::test]

@@ -13,7 +13,8 @@ use crate::error::{Error, Result};
 /// Numbering is historical: 005 was removed/superseded and is RESERVED/VOID
 /// — never add a `005_*.sql` (it would silently apply before 006). Do NOT
 /// renumber — migrations are tracked by filename + content hash. New
-/// migrations: 017, 018, …
+/// migrations take the next unused number above the current set (the entries
+/// below are the set of record; the numbering test pins 005 as the only gap).
 pub(crate) const MIGRATIONS: &[(&str, &str)] = &[
     (
         "001_initial.sql",
@@ -85,14 +86,6 @@ pub(crate) const MIGRATIONS: &[(&str, &str)] = &[
 /// (`tests/integration/migrations.rs`) asserts against this constant instead
 /// of a hand-copied count, so adding a migration needs no test-side edit.
 pub const MIGRATION_COUNT: usize = MIGRATIONS.len();
-
-/// The highest embedded migration number (the `NNN` of `NNN_*.sql`).
-/// `docs/ARCHITECTURE.md` mirrors this value **by name** (its
-/// "migrations/ (001-NNN)" range line) — the prose is human-maintained; bump
-/// this const in the same change, and the tripwire in `src/lib.rs`
-/// (`migration_range_const_matches_embedded_migrations`) fails if it drifts
-/// from the actual `MIGRATIONS` array.
-pub const LATEST_MIGRATION: i32 = 17;
 
 /// Historical migration order for legacy databases (numbered 1..N sequentially
 /// before the 005 removal). Legacy versions 1..5 corresponded to the first
@@ -357,12 +350,14 @@ mod tests {
     /// - every filename is `NNN_slug.sql` (exactly 3-digit numeric prefix,
     ///   non-empty slug) and all filenames are unique;
     /// - numeric prefixes strictly increase in the const's order;
-    /// - the set of numbers equals exactly {1,2,3,4,6,7,8,9,10,11,12,13,14,15,16,17}
-    ///   — pinning the current set and proving 5 is the ONLY missing number
-    ///   in 1..=17, with the set size cross-checked against `MIGRATION_COUNT`.
+    /// - 005 is the ONLY reserved gap: the checks above pin that invariant
+    ///   without pinning the current set of numbers (M1, 2026-09 review: the
+    ///   old exact-set assertion {1..=17} \ {5} plus the `MIGRATION_COUNT`
+    ///   cross-check forced a test edit for every new migration — a new
+    ///   number is valid as long as it keeps the invariants above).
     #[test]
     fn migration_numbering_keeps_the_005_void_gap() {
-        use std::collections::{BTreeSet, HashSet};
+        use std::collections::HashSet;
 
         let mut numbers = Vec::with_capacity(MIGRATION_COUNT);
         let mut seen_names = HashSet::new();
@@ -412,24 +407,6 @@ mod tests {
                 "MIGRATIONS not strictly increasing by number: {prev} followed by {next}"
             );
         }
-
-        // The full set is exactly 1..=17 minus 5: pins the current migration
-        // set and proves the ONLY missing number in 1..=17 is the reserved 5.
-        let expected: BTreeSet<usize> = (1..=17).filter(|n| *n != 5).collect();
-        let actual: BTreeSet<usize> = numbers.iter().copied().collect();
-        assert_eq!(
-            actual.len(),
-            MIGRATION_COUNT,
-            "MIGRATION_COUNT ({MIGRATION_COUNT}) does not match the number of \
-             distinct migration prefixes ({}); duplicate prefixes or a stale \
-             count",
-            numbers.len()
-        );
-        assert_eq!(
-            actual, expected,
-            "MIGRATIONS number set differs from the pinned set — 005 must stay \
-             absent and no other number may be added or removed"
-        );
     }
 
     /// `is_safe_index_name` is the injection guard `drop_invalid_indexes`

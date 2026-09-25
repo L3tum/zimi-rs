@@ -195,6 +195,8 @@ bench:
 bench-baseline:
 	@DATABASE_URL="$$${DATABASE_URL:-$(DEV_DSN)}" $(CARGO) bench --bench retrieval -- --save-baseline week0
 	@DATABASE_URL="$$${DATABASE_URL:-$(DEV_DSN)}" $(CARGO) bench --bench search -- --save-baseline week0
+	# sync the tracked baseline ↔ criterion's home (target/criterion): the tracked copy is the only
+	# persistent artifact — criterion's home is gitignored and dies with make clean; do not "simplify" this cp loop
 	@for d in target/criterion/*/week0; do \
 	  [ -d "$$d" ] || continue; \
 	  g="$${d#target/criterion/}"; \
@@ -211,6 +213,8 @@ bench-compare:
 	@ls criterion/*/week0/estimates.json >/dev/null 2>&1 || { \
 	  echo "no tracked baseline in criterion/ — run make bench-baseline first" >&2; exit 1; \
 	}
+	# sync the tracked baseline ↔ criterion's home (inverse of bench-baseline): criterion's home is gitignored
+	# and wiped by make clean, so restore it from the tracked copy first; do not "simplify" this cp loop
 	@for d in criterion/*/week0; do \
 	  g="$${d#criterion/}"; \
 	  mkdir -p "target/criterion/$$g" && cp -r "$$d/." "target/criterion/$$g/"; \

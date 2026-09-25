@@ -56,6 +56,36 @@
 #![allow(clippy::expect_used)]
 use std::sync::{Condvar, Mutex};
 
+/// The trgm corpus shared by the plan gate (`tests/integration/trgm_plan.rs`,
+/// 100k rows) and the bench fixture (`benches/common/mod.rs`, 10k rows): one
+/// definition, so both measure identical title shapes. (M2, 2026-09 review:
+/// the two use sites hand-defined these and a source-text-parsing test in
+/// `src/lib.rs` policed the duplication — the shared const IS the lockstep
+/// now.)
+pub mod trgm_corpus {
+    /// 40 varied words; `quixotic` + `granite` are the probe phrase. Their
+    /// exact adjacent pair occurs in 63 of the plan gate's 100k titles
+    /// (`i ≡ 297 (mod 1600)`) and in exactly 7 of the bench fixture's 10k.
+    pub const WORDS: &[&str] = &[
+        "amber", "boulder", "canyon", "dune", "ember", "fjord", "glacier", "granite", "heath",
+        "islet", "jungle", "lichen", "meadow", "niche", "oasis", "plateau", "quarry", "quixotic",
+        "ridge", "shoal", "tundra", "upland", "valley", "wadi", "xylem", "yarrow", "zephyr",
+        "basalt", "cinder", "delta", "estuary", "fissure", "gully", "habitat", "inlet", "lagoon",
+        "moraine", "nexus", "outcrop", "pinnacle",
+    ];
+
+    /// The probe phrase: long enough for both trgm arms (≥ 3 chars),
+    /// selective enough that the trgm index is overwhelmingly cheaper than a
+    /// seq scan. Also the FTS arm's probe (`websearch_to_tsquery` ANDs the
+    /// two words — the pair occurs in only a few hundred titles).
+    pub const PROBE: &str = "quixotic granite";
+
+    /// One embedding UPDATE batch: `EMBED_BATCH` rows share one bind (one
+    /// vector literal), keeping corpus population to a handful of small
+    /// statements instead of one per row.
+    pub const EMBED_BATCH: usize = 2000;
+}
+
 /// Test seam for the MCP tool pipeline: delegates to the crate-internal
 /// `mcp::call_tool` so integration tests can drive the exact production
 /// tool dispatch without it being part of the `mcp` module's public API.

@@ -60,6 +60,14 @@ struct Checkpoint {
     /// leftover stale rows, cleaned on the next run).
     #[serde(default)]
     index_started_at: String,
+    /// R2 (2026-09 review): content identity of the first article-namespace
+    /// entry — `"{url}:{content_size_bytes}"`. The (mtime, entry count)
+    /// resume gate alone cannot distinguish a swapped-in file with the same
+    /// mtime and count (silent mixed corpus); a first-entry mismatch forces
+    /// a fresh run. `#[serde(default)]` → legacy checkpoints (no field)
+    /// fail the gate and re-index fresh (safe: no data loss).
+    #[serde(default)]
+    content_key: String,
 }
 
 /// Q-ID extraction: matches wikidata.org/wiki/Q12345 or Q12345#identifiers
@@ -289,6 +297,10 @@ struct OpenedZim {
     article_ns: zim::Namespace,
     entry_range: std::ops::Range<u32>,
     article_count: u32,
+    /// R2 (2026-09 review): content key of the first article-namespace
+    /// entry (`"{url}:{content_size_bytes}"`); empty when unreadable — the
+    /// resume gate treats an empty key as "never resumable".
+    first_entry_key: String,
 }
 
 /// Open + metadata + namespace resolution on the blocking pool (B11a).
@@ -321,6 +333,12 @@ fn open_zim_blocking(
     // (C); new format (6.1+): Namespace::UserContent.
     let (article_ns, entry_range) = find_article_namespace(&archive)?;
 
+    // R2 (2026-09 review): capture the first-entry content key while the
+    // archive is open (one small size-only read — negligible vs a multi-GB
+    // index run). The key hardens the resume gate against a swapped-in file
+    // with the same mtime and entry count (silent mixed corpus).
+    let first_entry_key = first_entry_content_key(&archive, entry_range.start);
+
     Ok(OpenedZim {
         article_count: archive.header.article_count,
         archive,
@@ -332,6 +350,7 @@ fn open_zim_blocking(
         date,
         article_ns,
         entry_range,
+        first_entry_key,
     })
 }
 
@@ -398,6 +417,7 @@ async fn index_body(
         article_ns,
         entry_range,
         article_count,
+        first_entry_key,
     } = opened;
     // Record the actual article namespace in the DB: 'U' for the 6.1+
     // Namespace::UserContent, 'C' for the legacy Namespace::Articles.
@@ -438,9 +458,12 @@ async fn index_body(
     let checkpoint = load_checkpoint(&checkpoint_path).await;
 
     let start_idx: u64 = if let Some(cp) = &checkpoint {
-        if cp.file_mtime == file_mtime_u64(&file_path_for_mtime)
-            && cp.total_entries == total_entries
-        {
+        if checkpoint_resumable(
+            cp,
+            file_mtime_u64(&file_path_for_mtime),
+            total_entries,
+            &first_entry_key,
+        ) {
             tracing::info!(
                 "resuming from entry {} / {} (interrupted run started {:?} ago)",
                 cp.completed,
@@ -449,7 +472,14 @@ async fn index_body(
             );
             cp.completed
         } else {
-            // File changed or entry count mismatch — start fresh
+            // File changed, entry count mismatch, or the first-entry content
+            // key mismatched / is absent (R2, 2026-09 review) — start fresh
+            // (a resumed run onto a swapped-in file would be a silent mixed
+            // corpus).
+            tracing::info!(
+                "checkpoint for '{}' does not match (mtime / entry count / first-entry key) — starting fresh",
+                meta.name
+            );
             0
         }
     } else {
@@ -593,7 +623,8 @@ async fn index_body(
         let progress = completed as f64 / total_entries as f64;
         update_progress(pool, meta, progress, completed).await?;
 
-        // Save checkpoint
+        // Save checkpoint (R2, 2026-09 review: persist the first-entry
+        // content key so the next run's resume gate can verify identity).
         save_checkpoint(
             &checkpoint_path,
             &Checkpoint {
@@ -602,6 +633,7 @@ async fn index_body(
                 completed,
                 started_at: std::time::SystemTime::now(),
                 index_started_at: index_started_at.clone(),
+                content_key: first_entry_key.clone(),
             },
         )
         .await;
@@ -623,6 +655,61 @@ async fn index_body(
     finalize_zim(pool, meta, total_entries, &index_started_at, &start).await?;
 
     Ok(())
+}
+
+/// R2 (2026-09 review): content identity of the first article-namespace
+/// entry — `"{url}:{content_size_bytes}"`, resolved with the same archive
+/// API the extraction path uses (`get_by_url_index` → `resolve` →
+/// `entry_content`). The content read is size-only (`Content::len` — no
+/// copy): one small read, negligible against a multi-GB index run.
+///
+/// The (mtime, entry count) resume gate alone cannot distinguish a
+/// swapped-in file with the same mtime and the same article-entry count:
+/// resuming would stage the new file's rows on top of the old run's
+/// surviving `articles` rows (the reused `index_started_at` only prunes
+/// rows older than the ORIGINAL run start, so same-name rows from the
+/// previous file survive) — a silent mixed corpus. A first-entry mismatch
+/// forces a fresh run instead.
+///
+/// Returns an empty string when the first entry cannot be read (error, or a
+/// redirect chain ending in no content) — the gate treats an empty key as
+/// "never resumable": the fresh run still proceeds, and a key absent on
+/// either side always re-indexes (conservative: no data loss, at most one
+/// redundant run).
+fn first_entry_content_key(archive: &zim::Zim, start_idx: u32) -> String {
+    let entry = match archive.get_by_url_index(start_idx) {
+        Ok(e) => e,
+        Err(_) => return String::new(),
+    };
+    let url = entry.url.clone();
+    let resolved = match archive.resolve(entry) {
+        Ok(e) => e,
+        Err(_) => return String::new(),
+    };
+    let content = match archive.entry_content(&resolved) {
+        Ok(Some(c)) => c,
+        // No content (a redirect chain ending in no target) or read error:
+        // unreadable first entry → empty key (never resumable).
+        _ => return String::new(),
+    };
+    match content.len() {
+        Ok(size) => format!("{url}:{size}"),
+        Err(_) => String::new(),
+    }
+}
+
+/// R2 (2026-09 review): the checkpoint resume gate, factored out as a pure
+/// predicate so the decision is unit-testable without a DB or an archive
+/// (same convention as `resume_206_decision` / `seeding_row_action`): resume
+/// only when the file mtime AND the entry count match AND the first-entry
+/// content key matches and is non-empty. An absent/empty key (a legacy
+/// checkpoint without the field, or an unreadable first entry) never
+/// resumes — re-indexing fresh is the safe direction (no data loss).
+fn checkpoint_resumable(cp: &Checkpoint, mtime: u64, total: u64, key: &str) -> bool {
+    cp.file_mtime == mtime
+        && cp.total_entries == total
+        && !cp.content_key.is_empty()
+        && cp.content_key == key
 }
 
 /// Find the namespace that contains articles.
@@ -1282,9 +1369,10 @@ fn file_mtime_u64(path: &Path) -> u64 {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        escape_copy_text_into, extract_qid, extract_qid_windowed, generate_snippet, is_wikipedia,
+        checkpoint_resumable, escape_copy_text_into, extract_qid, extract_qid_windowed,
+        find_article_namespace, first_entry_content_key, generate_snippet, is_wikipedia,
         mark_index_error, open_zim_blocking, parse_zim_date, run_index, strip_head,
-        truncate_at_sentence, PREVIEW_CHARS, QID_SCAN_BYTES, STRIP_HEAD_BYTES,
+        truncate_at_sentence, Checkpoint, PREVIEW_CHARS, QID_SCAN_BYTES, STRIP_HEAD_BYTES,
     };
     use crate::error::Error;
     use chrono::NaiveDate;
@@ -1800,5 +1888,124 @@ mod tests {
             .await
             .expect_err("a real size change must re-index");
         assert!(matches!(err, Error::Zim(_)), "got: {err}");
+    }
+
+    // ── R2 (2026-09 review): checkpoint content-key resume gate ────────────
+
+    fn cp_fixture(file_mtime: u64, total_entries: u64, content_key: &str) -> Checkpoint {
+        Checkpoint {
+            file_mtime,
+            total_entries,
+            completed: 123,
+            started_at: std::time::SystemTime::now(),
+            index_started_at: "2026-09-01 00:00:00".into(),
+            content_key: content_key.into(),
+        }
+    }
+
+    #[test]
+    fn checkpoint_resumable_matching_identity_resumes() {
+        // mtime + entry count + first-entry key all agree (key non-empty)
+        // → resume from the checkpoint's progress.
+        assert!(checkpoint_resumable(
+            &cp_fixture(100, 10, "A/Article:512"),
+            100,
+            10,
+            "A/Article:512"
+        ));
+    }
+
+    #[test]
+    fn checkpoint_resumable_identity_mismatch_does_not_resume() {
+        // mtime changed → fresh.
+        assert!(!checkpoint_resumable(
+            &cp_fixture(101, 10, "A/Article:512"),
+            100,
+            10,
+            "A/Article:512"
+        ));
+        // Entry count changed → fresh.
+        assert!(!checkpoint_resumable(
+            &cp_fixture(100, 11, "A/Article:512"),
+            100,
+            10,
+            "A/Article:512"
+        ));
+        // THE R2 case: same mtime AND same entry count, but the file was
+        // swapped (different first-entry url) → must NOT resume (a resumed
+        // run would be a silent mixed corpus).
+        assert!(!checkpoint_resumable(
+            &cp_fixture(100, 10, "A/Other:999"),
+            100,
+            10,
+            "A/Article:512"
+        ));
+        // Same first-entry url, different content size (edited in place
+        // with the same mtime and count) → must NOT resume.
+        assert!(!checkpoint_resumable(
+            &cp_fixture(100, 10, "A/Article:999"),
+            100,
+            10,
+            "A/Article:512"
+        ));
+    }
+
+    #[test]
+    fn checkpoint_resumable_empty_key_never_resumes() {
+        // Legacy checkpoint (field absent → serde default "") never
+        // resumes, even when mtime + count match.
+        assert!(!checkpoint_resumable(
+            &cp_fixture(100, 10, ""),
+            100,
+            10,
+            "A/Article:512"
+        ));
+        // Both keys empty (first entry unreadable on both runs): still no
+        // resume — a key we cannot verify is not trusted (conservative
+        // re-index; no data loss).
+        assert!(!checkpoint_resumable(&cp_fixture(100, 10, ""), 100, 10, ""));
+    }
+
+    #[test]
+    fn checkpoint_legacy_json_without_content_key_deserializes_empty() {
+        // Pre-R2 checkpoint JSON (no `content_key` field): the field must
+        // deserialize to "" (`#[serde(default)]`) so the gate rejects the
+        // checkpoint and re-indexes fresh (no data loss, no panic).
+        let json = r#"{"file_mtime":100,"total_entries":10,"completed":3,
+                       "started_at":[1000,0],"index_started_at":"2026-09-01 00:00:00"}"#;
+        let cp: Checkpoint = serde_json::from_str(json).expect("legacy checkpoint deserializes");
+        assert_eq!(cp.content_key, "");
+        assert!(!checkpoint_resumable(&cp, 100, 10, "A/Article:512"));
+        // Round-trip: a modern checkpoint serializes the key and reads it
+        // back unchanged.
+        let modern = cp_fixture(100, 10, "A/Article:512");
+        let s = serde_json::to_string(&modern).expect("serialize");
+        assert!(s.contains("content_key"));
+        let back: Checkpoint = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back.content_key, "A/Article:512");
+    }
+
+    #[test]
+    fn first_entry_content_key_fixture_shape_is_url_colon_size() {
+        // The tiny.zim fixture's first article-namespace entry is readable:
+        // the key is "url:size" with a non-empty url and a numeric size,
+        // and is stable across reopens of the same file (the identity the
+        // resume gate compares across runs).
+        let path = std::path::Path::new("tests/fixtures/tiny.zim");
+        let archive = zim::Zim::new(path).expect("fixture opens");
+        let (_, range) = find_article_namespace(&archive).expect("article namespace present");
+        let k1 = first_entry_content_key(&archive, range.start);
+        assert!(!k1.is_empty(), "fixture first entry must be readable");
+        let (url, size) = k1.rsplit_once(':').expect("key is url:size");
+        assert!(!url.is_empty(), "the url part must be present");
+        assert!(
+            size.parse::<u64>().is_ok(),
+            "the size part must be numeric: {k1:?}"
+        );
+        // Stable across a reopen of the same file.
+        drop(archive);
+        let archive2 = zim::Zim::new(path).expect("fixture opens (reopen)");
+        let (_, range2) = find_article_namespace(&archive2).expect("article namespace present");
+        assert_eq!(first_entry_content_key(&archive2, range2.start), k1);
     }
 }

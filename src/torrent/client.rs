@@ -66,3 +66,40 @@ pub(crate) fn build_download_client(
     }
     builder.build().map_err(Error::Http)
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{client_timeouts, ClientProfile};
+    use std::time::Duration;
+
+    /// (T2, 2026-09 review): pins the ENTIRE `client_timeouts` table — every
+    /// `ClientProfile` variant (the match is exhaustive; there is no
+    /// fallback/default arm) — so any value change is a conscious,
+    /// test-visible edit. Lockstep pin of the ACTUAL current values, not an
+    /// opinion about them.
+    #[test]
+    fn client_timeouts_pins_the_whole_profile_table() {
+        // Control: bounded end-to-end — a 30 s total cap, no separate
+        // connect/read caps (`timeout()` covers the whole request).
+        assert_eq!(
+            client_timeouts(ClientProfile::Control),
+            (Some(Duration::from_secs(30)), None, None),
+            "Control profile must stay bounded end-to-end"
+        );
+        // Transfer: connect (10 s) + read-idle (60 s) only, NO total
+        // timeout (C1: `timeout()` caps body reception and aborted
+        // multi-GB downloads mid-stream; total volume is bounded by the
+        // `downloads.max_bytes` stream cap instead).
+        assert_eq!(
+            client_timeouts(ClientProfile::Transfer),
+            (
+                None,
+                Some(Duration::from_secs(10)),
+                Some(Duration::from_secs(60))
+            ),
+            "Transfer profile must stay total-unbounded (C1)"
+        );
+    }
+}

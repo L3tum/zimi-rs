@@ -1,5 +1,65 @@
 use super::*;
 
+// ── Content-Type mapping (H1) ──────────────────────────────────────────────
+
+#[test]
+fn content_type_for_never_advertises_script_mimes() {
+    // H1 (2026-09 review): script-executing MIME types are rewritten to
+    // text/plain — a top-level navigation to a `text/javascript` response
+    // must not execute same-origin JS in the visitor's browser (the
+    // admin-token-theft chain: search results link straight to /w).
+    for mime in [
+        "text/javascript",
+        "application/javascript",
+        "application/x-javascript",
+        "text/ecmascript",
+        "application/ecmascript",
+        "application/x-ecmascript",
+        "text/jscript",
+        "application/x-jscript",
+        "text/typescript",
+    ] {
+        assert_eq!(
+            content_type_for(&zim::MimeType::Type(mime.to_string())),
+            "text/plain; charset=utf-8",
+            "{mime} must be rewritten to text/plain"
+        );
+    }
+    // Case-insensitive (MIME types are case-insensitive per RFC 2045).
+    assert_eq!(
+        content_type_for(&zim::MimeType::Type("TEXT/JAVASCRIPT".to_string())),
+        "text/plain; charset=utf-8"
+    );
+}
+
+#[test]
+fn content_type_for_passes_through_non_script_mimes() {
+    // text/html keeps its declared type — the sandbox CSP + X-Frame-Options
+    // attached to the /w response fence it (no MIME rewrite needed).
+    assert_eq!(
+        content_type_for(&zim::MimeType::Type("text/html".to_string())),
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(
+        content_type_for(&zim::MimeType::Type("text/css".to_string())),
+        "text/css; charset=utf-8"
+    );
+    assert_eq!(
+        content_type_for(&zim::MimeType::Type("image/png".to_string())),
+        "image/png".to_string()
+    );
+    // A charset parameter is preserved verbatim for non-text types.
+    assert_eq!(
+        content_type_for(&zim::MimeType::Type("application/pdf".to_string())),
+        "application/pdf".to_string()
+    );
+    // Defensive redirect mapping is unchanged.
+    assert_eq!(
+        content_type_for(&zim::MimeType::Redirect),
+        "text/html".to_string()
+    );
+}
+
 // ── Range parsing ─────────────────────────────────────────────────────────
 
 #[test]

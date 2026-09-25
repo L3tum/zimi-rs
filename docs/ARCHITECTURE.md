@@ -27,13 +27,13 @@ hardlink-based file sharing, an OpenAI-compatible embedding pipeline, and an MCP
   startup resync (a DELETE/INSERT cycle on `zims`) can never interleave between
   two starting instances.
 
-- **`src/state.rs`** — `AppState`: the 14-field shared state passed to every (field count mirrored by name from `state::APP_STATE_FIELD_COUNT`; the `docs_freshness` tripwire in `src/lib.rs` fails if the count drifts from the struct)
-  axum handler (primary db pool, optional read-replica pool, background db
-  pool, settings, ZIM manager, search engine, qBittorrent cache, rate
-  limiter, probes, lockout, degradation, vector-index build probe,
-  index-building flag, PG-notify listener); sub-state regrouping is
-  re-evaluated on every field change (documented active trigger) and kept
-  flat.
+- **`src/state.rs`** — `AppState`: the shared state object passed to every
+  axum handler (field set in `src/state.rs`: primary db pool, optional
+  read-replica pool, background db pool, settings, ZIM manager, search
+  engine, qBittorrent cache, rate limiter, probes, lockout, degradation,
+  vector-index build probe, index-building flag, PG-notify listener);
+  sub-state regrouping is re-evaluated on every field change (documented
+  active trigger) and kept flat.
 
 - **`src/db/`** — the persistence layer: `pool.rs` (the shared
   `sqlx::PgPool`, TLS mode from the DSN, 10 s acquire timeout), `migrate.rs`
@@ -264,9 +264,10 @@ pg_trgm `similarity()`, pgvector distance operators, and `$n::vector` /
 `::tsvector` casts. The SQLSTATE/HTTP mapping in `Error` redacts DB details;
 23505 unique-violations are domain duplicates (409), not DB faults (503).
 
-**Migrations.** Numbered `.sql` files in `migrations/` (001–017; 005 is a
-void/retired number, never reused; the top number mirrors `db::migrate::LATEST_MIGRATION` by name — the `docs_freshness` tripwire in `src/lib.rs` fails if the embedded migrations drift from it) are embedded
-with `include_str!` and applied by `src/db/migrate.rs` at **every** startup,
+**Migrations.** Numbered `.sql` files in `migrations/` (005 is a reserved
+void/retired number, never reused — the numbering test in `src/db/migrate.rs`
+pins it) are embedded with `include_str!` and applied by `src/db/migrate.rs`
+at **every** startup,
 in every subcommand mode: tracked in `schema_migrations` by filename + content
 hash, idempotent, and serialized by a session-level advisory lock so
 concurrent startups cannot interleave DDL. DDL does not live in Rust: even

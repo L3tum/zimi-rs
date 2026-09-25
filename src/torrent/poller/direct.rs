@@ -141,9 +141,11 @@ enum FileStream {
 
 /// Reissue a fresh GET (no Range) to the pinned final `url` and stream its
 /// body into a re-created `part`. Reached on a 416 (source changed, or the
-/// `.part` was already complete) and on a 206 whose `Content-Range` start
-/// does not match the resumed offset (a mirror serving a different
-/// revision answered our Range — see [`resume_206_decision`]).
+/// `.part` is NOT byte-complete — a 416 whose `Content-Range` FULL matches
+/// the resumed offset takes the R4 complete-part fast path instead of the
+/// re-download) and on a 206 whose `Content-Range` start does not match the
+/// resumed offset (a mirror serving a different revision answered our Range
+/// — see [`resume_206_decision`]).
 ///
 /// The stale `.part` is removed only **after** the reissue is confirmed a
 /// success status within the byte cap: a transient `send()` failure must
@@ -211,11 +213,17 @@ const CANCEL_CHECK_WINDOW: Duration = Duration::from_secs(5);
 ///   offset (S == `from`); a mismatch or an unknowable S takes the 416
 ///   route instead. `total` from `Content-Range` (or
 ///   `from + Content-Length` fallback).
-/// - **416 + Range sent** (and the 206 mismatch above) → source changed
-///   (or the `.part` was already complete): reissue once, fresh, without
-///   Range. The stale partial is removed only after the reissue is
-///   confirmed (a transient `send()` failure keeps it for resume), and the
-///   reissue gets the same up-front `max_bytes` check as a 200.
+/// - **416 + Range sent** → source changed (or the `.part` was already
+///   complete). When the 416's `Content-Range` declares `FULL == from`
+///   (R4, 2026-09 review: the crash window between the final byte write and
+///   finalize — the `.part` is byte-complete), reopen the untouched `.part`
+///   in append mode and let the empty 416 body stream to completion (no
+///   re-download). Otherwise (no `Content-Range`, or a genuinely changed /
+///   smaller source) the 206 mismatch above takes the same route: reissue
+///   once, fresh, without Range. The stale partial is removed only after the
+///   reissue is confirmed (a transient `send()` failure keeps it for
+///   resume), and the reissue gets the same up-front `max_bytes` check as a
+///   200.
 /// - **200** → fresh download (also covers servers that ignore Range);
 ///   truncates any existing partial.
 /// - Anything else → `mark_error` + `Err`.
@@ -274,11 +282,49 @@ async fn stream_part(
                 FileStream::Append(f, from, total, resp)
             }
         }
-        (s, Some(_)) if s.as_u16() == 416 => {
-            // 416: source changed (or the .part was already complete) —
-            // discard the stale partial (once the reissue is confirmed) and
-            // reissue once, fresh, without a Range.
-            fresh_fallback(url, client, part, max_bytes, db, id).await?
+        (s, Some(from)) if s.as_u16() == 416 => {
+            // R4 (2026-09 review): a crash between the final byte write and
+            // finalize leaves a byte-complete `.part`; the resume re-issues
+            // `Range: bytes={size}-` with size == total, and the server
+            // answers 416 (`Content-Range: bytes */FULL`) even though there
+            // is nothing left to download. `full == from` is the server's
+            // confirmation that our last byte is the file's last byte — the
+            // same trust model as the fresh path's Content-Length check (no
+            // stronger guarantee is available without hashing, and the
+            // direct path measures content_sha256 at finalize as a flag).
+            // Close that window instead of re-downloading multi-GB: reopen
+            // the UNTOUCHED `.part` in append mode (create/append — no
+            // truncate) and let the empty 416 body stream to completion —
+            // zero chunks, the post-loop truncation guard passes (received
+            // == from == total), and finalize proceeds on the existing
+            // bytes.
+            match content_range_total(resp.headers()) {
+                Some(full) if full == from => {
+                    // Same up-front cap check as the 206-append branch: a
+                    // declared size over the cap is rejected before the
+                    // untouched `.part` is treated as complete.
+                    if full > max_bytes {
+                        let msg =
+                            format!("file is {full} bytes, exceeds the {max_bytes}-byte limit");
+                        mark_error(db, id, &msg).await;
+                        return Err(Error::Torrent {
+                            kind: TorrentKind::Other,
+                            msg,
+                        });
+                    }
+                    let f = tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(part)
+                        .await?;
+                    FileStream::Append(f, from, Some(full), resp)
+                }
+                // No `Content-Range`, or full != from (a genuinely changed
+                // or smaller source): the stale partial cannot be trusted —
+                // discard it (once the reissue is confirmed) and reissue
+                // once, fresh, without a Range (PERF-11).
+                _ => fresh_fallback(url, client, part, max_bytes, db, id).await?,
+            }
         }
         (s, _) if s.is_success() => {
             // 200: fresh download — also covers servers that ignore Range.
@@ -2221,6 +2267,99 @@ mod tests {
         assert_eq!(outcome.total, Some(12));
         let on_disk = std::fs::read(&part).unwrap();
         assert_eq!(on_disk, body, "file must be fresh after 416 fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R4 (2026-09 review): a crash between the final byte write and
+    /// finalize re-issues `Range: bytes={size}-` with size == total; the
+    /// server answers 416 with `Content-Range: bytes */FULL` (FULL == size)
+    /// — the local `.part` is byte-complete. The fast path must NOT
+    /// re-download: it reopens the untouched `.part` in append mode,
+    /// consumes the empty 416 body, and reports complete — exactly one
+    /// request ever leaves, the file stays byte-identical.
+    #[tokio::test]
+    async fn stream_part_416_complete_part_no_redownload() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        const N: usize = 12;
+        let part_bytes: &[u8] = b"hello world!"; // N bytes
+        let server = MockServer::start().await;
+        // Range request (bytes=N-) → 416, FULL == N: the .part is complete.
+        Mock::given(method("GET"))
+            .and(path("/x.zim"))
+            .and(header("range", format!("bytes={N}-")))
+            .respond_with(
+                ResponseTemplate::new(416).append_header("Content-Range", format!("bytes */{N}")),
+            )
+            .mount(&server)
+            .await;
+        // Plain GET (no range) → 200 full body: if the fast path regressed
+        // to `fresh_fallback`, this mock would be hit and the file rewritten
+        // (different bytes/length — caught by the assertions below).
+        Mock::given(method("GET"))
+            .and(path("/x.zim"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"REWRITTEN  BODY".to_vec())
+                    .append_header("Content-Length", "15"),
+            )
+            .mount(&server)
+            .await;
+        let pins = [("testhost".to_string(), *server.address())];
+        // Hop 0 goes out with the Range header; the mock answers 416 (the
+        // terminal response of the chain).
+        let pr = pinned_chain(
+            &format!("http://testhost:{}/x.zim", server.address().port()),
+            &pins,
+            false,
+            |c, u| c.get(u).header("Range", format!("bytes={N}-")),
+        )
+        .await;
+        assert_eq!(pr.response.status(), 416);
+
+        let dir = std::env::temp_dir().join(format!("zimi-sp-416complete-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("x.zim.part");
+        // The crash window: all N bytes already on disk, finalize never ran.
+        std::fs::write(&part, part_bytes).unwrap();
+        let pool = dead_pool();
+        let outcome = super::stream_part(
+            &pr.url,
+            &pr.client,
+            pr.response,
+            &part,
+            Some(N as u64),
+            1024,
+            &pool,
+            999_999,
+        )
+        .await
+        .expect("stream_part ok");
+        assert_eq!(
+            outcome.size, N as u64,
+            "complete: the on-disk size is the final size (no download)"
+        );
+        assert_eq!(
+            outcome.total,
+            Some(N as u64),
+            "complete: the total comes from the 416's Content-Range FULL"
+        );
+        assert_eq!(
+            std::fs::read(&part).unwrap(),
+            part_bytes,
+            "the .part must be byte-identical (untouched)"
+        );
+        // No second request: the fresh_fallback reissue never went out.
+        let got = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            got.len(),
+            1,
+            "exactly the initial ranged request, no reissue"
+        );
+        assert!(
+            got[0].headers.contains_key("range"),
+            "the single request carries the Range header"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

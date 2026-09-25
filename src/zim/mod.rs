@@ -334,6 +334,31 @@ impl ZimManager {
             .cloned()
     }
 
+    /// The on-disk path of one cached ZIM file, without cloning the full
+    /// [`ZimMeta`] (per-request narrow accessor: the raw-content and open
+    /// paths need only the path, and a whole-metadata clone per `/w` request
+    /// was measurable churn — 2026-09 review, Perf #2).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub fn file_path_of(&self, name: &str) -> Option<String> {
+        self.cache
+            .read()
+            .expect("zim cache lock poisoned")
+            .get(name)
+            .map(|z| z.file_path.clone())
+    }
+
+    /// Whether a ZIM name is present in the cache (per-request existence
+    /// check without a [`ZimMeta`] clone — Perf #2).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub fn is_known(&self, name: &str) -> bool {
+        self.cache
+            .read()
+            .expect("zim cache lock poisoned")
+            .contains_key(name)
+    }
+
     /// Strong ETag for the ZIM file: `"{mtime_ms}-{size}"` — the same
     /// (mtime, size) pair `open_zim` trusts as its file-change signal. File-level,
     /// so a matching tag implies every entry is byte-identical, and it is
@@ -541,10 +566,12 @@ impl ZimManager {
     // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
     #[allow(clippy::expect_used)]
     async fn open_zim_impl(&self, name: &str, skip_stat_ttl: bool) -> Result<Arc<zim::Zim>> {
-        let meta = self
-            .get(name)
+        // Narrow path accessor (not a full `ZimMeta` clone) — Perf #2: this
+        // runs on every raw-content request.
+        let file_path = self
+            .file_path_of(name)
             .ok_or_else(|| Error::NotFound(format!("ZIM '{name}' not found")))?;
-        let path = Path::new(&meta.file_path);
+        let path = Path::new(&file_path);
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)

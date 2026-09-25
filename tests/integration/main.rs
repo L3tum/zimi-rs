@@ -43,6 +43,7 @@ mod health;
 mod integrity;
 mod invalid_index;
 mod migrations;
+mod pool_soak;
 mod raw;
 mod search;
 mod serve;
