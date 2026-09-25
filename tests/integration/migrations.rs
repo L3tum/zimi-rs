@@ -509,3 +509,76 @@ async fn smoke_two_statement_script_via_single_execute() {
     // of the synthetic two-statement cases and the committed corpus.
     close_and_drop(&base_pool, &pool, &name).await;
 }
+
+/// 018 (H2, 2026-09 review): the existing-deployment half of the
+/// `torrent.enabled` opt-in default. The settings cache only ever INSERTs
+/// *missing* keys (`ON CONFLICT DO NOTHING` in `SettingsCache::reload`),
+/// so a fresh `SETTING_DEFS` default flip alone would never reach an
+/// upgraded database — this migration must flip the seed-era `true` row.
+///
+/// Simulated by inserting the seed-era row after the fresh apply, clearing
+/// 018's `schema_migrations` tracking row (001–017 hashes stay recorded),
+/// and re-running: only 018 may re-apply, and it must flip the row.
+#[tokio::test]
+async fn smoke_migration_018_flips_torrent_enabled_to_opt_in() {
+    let (base_pool, _db_gate) = match pool_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    let (pool, name) = match create_temp_db(&base_pool).await {
+        Some(t) => t,
+        None => return,
+    };
+
+    // (1) Fresh apply: 018 runs against an EMPTY settings table (no-op —
+    // there is no seed-era row yet; seeding happens at server startup, not
+    // in migrations).
+    run_migrations(&pool).await.expect("fresh apply");
+    let empty: i64 =
+        zimservice::db::raw::fetch_scalar_optional(&pool, "SELECT count(*) FROM settings", |q| q)
+            .await
+            .expect("count settings")
+            .expect("settings row");
+    assert_eq!(empty, 0, "migrations must not seed settings rows");
+
+    // (2) Simulate an upgraded deployment: the seed-era `true` row a
+    // pre-H2 version wrote, then clear 018's tracking row so only it
+    // re-applies on the next run.
+    zimservice::db::raw::execute(
+        &pool,
+        "INSERT INTO settings (key, value, category) VALUES ($1, $2, 'torrent')",
+        |q| q.bind("torrent.enabled").bind(serde_json::json!(true)),
+    )
+    .await
+    .expect("seed-era row insert");
+    zimservice::db::raw::execute(
+        &pool,
+        "DELETE FROM schema_migrations WHERE name = $1",
+        |q| q.bind("018_torrent_enabled_opt_in.sql"),
+    )
+    .await
+    .expect("clear 018 tracking");
+
+    // (3) Re-run: idempotent for 001–017, flips the 018 row.
+    run_migrations(&pool).await.expect("re-apply with 018");
+    let v: serde_json::Value = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT value FROM settings WHERE key = $1",
+        |q| q.bind("torrent.enabled"),
+    )
+    .await
+    .expect("query flipped row")
+    .expect("row present");
+    assert_eq!(
+        v,
+        serde_json::json!(false),
+        "018 must flip the seed-era torrent.enabled=true row to opt-in false"
+    );
+    // The recorded hash stays the committed one (no drift introduced by the
+    // re-apply).
+    run_migrations(&pool)
+        .await
+        .expect("post-flip re-run must stay idempotent");
+
+    close_and_drop(&base_pool, &pool, &name).await;
+}

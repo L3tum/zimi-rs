@@ -897,9 +897,10 @@ impl SettingsCache {
 
     /// Typed read accessor for this setting (`torrent.enabled`).
     /// Every key is seeded by `reload()`; the `unwrap_or` is an honest
-    /// fallback to the `SETTING_DEFS` seed default if a seed is ever missing.
+    /// fallback to the `SETTING_DEFS` seed default (opt-in `false`,
+    /// H2 2026-09 review) if a seed is ever missing.
     pub fn torrent_enabled(&self) -> bool {
-        self.get_typed(KEY_TORRENT_ENABLED).unwrap_or(true)
+        self.get_typed(KEY_TORRENT_ENABLED).unwrap_or(false)
     }
 
     /// Typed read accessor for this setting (`torrent.max_active`).
@@ -979,6 +980,15 @@ mod tests {
                 kek: None,
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn torrent_enabled_accessor_fallback_is_opt_in_false() {
+        // H2 (2026-09 review): the seed-fallback path (key missing from an
+        // unseeded cache) must agree with the seed default — an unseeded
+        // cache never implies torrent acquisition is on.
+        let cache = SettingsCache::new_with_map(dead_pool(), HashMap::new(), HashMap::new());
+        assert!(!cache.torrent_enabled());
     }
 
     #[tokio::test]
@@ -1448,7 +1458,7 @@ mod tests {
             .any(|e| e.starts_with("torrent.enabled: expected a boolean")));
         // everything was rejected → nothing changed
         assert_eq!(cache.get(KEY_SEARCH_MAX_LIMIT).unwrap(), 50);
-        assert_eq!(cache.get(KEY_TORRENT_ENABLED).unwrap(), true);
+        assert_eq!(cache.get(KEY_TORRENT_ENABLED).unwrap(), false);
     }
 
     #[tokio::test]

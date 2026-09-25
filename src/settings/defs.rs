@@ -160,6 +160,10 @@ pub const KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS: &str = "downloads.allow_private_
 
 // torrent.* — qBittorrent client + OPDS auto-update integration.
 /// `torrent.enabled` — master switch for torrent-based ZIM acquisition.
+/// Opt-in: default `false` (H2, 2026-09 review) — untrusted-content
+/// ingestion (OPDS auto-seed, digest-less direct downloads) stays off
+/// until the operator enables it. Existing deployments are flipped from
+/// the seed-era `true` by migration 018.
 pub const KEY_TORRENT_ENABLED: &str = "torrent.enabled";
 /// `torrent.url` — qBittorrent Web API base URL.
 pub const KEY_TORRENT_URL: &str = "torrent.url";
@@ -353,7 +357,10 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
         },
         SettingDef {
             key: KEY_TORRENT_ENABLED,
-            default: serde_json::json!(true),
+            // H2 (2026-09 review): opt-in default — default-on auto-ingestion
+            // from any configured OPDS feed was the untrusted-content
+            // cluster; upgraded deployments are flipped by migration 018.
+            default: serde_json::json!(false),
             json_type: JsonType::Bool,
             policy: SettingPolicy::default(),
         },
@@ -871,6 +878,19 @@ mod tests {
                 "accessor {key:?} wants {want:?}, SETTING_DEFS row says {got:?}"
             );
         }
+    }
+
+    #[test]
+    fn torrent_enabled_seed_default_is_opt_in_false() {
+        // H2 (2026-09 review): a fresh install must NOT auto-ingest from a
+        // configured OPDS feed until the operator enables acquisition —
+        // the seed default is the fresh-install half of that (the
+        // upgraded-deployment half is migration 018, pinned by
+        // tests/integration/migrations.rs).
+        assert_eq!(
+            default_settings().get(KEY_TORRENT_ENABLED),
+            Some(&serde_json::json!(false))
+        );
     }
 
     #[test]

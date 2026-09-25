@@ -80,6 +80,10 @@ pub(crate) const MIGRATIONS: &[(&str, &str)] = &[
         "017_embed_claim_index.sql",
         include_str!("../../migrations/017_embed_claim_index.sql"),
     ),
+    (
+        "018_torrent_enabled_opt_in.sql",
+        include_str!("../../migrations/018_torrent_enabled_opt_in.sql"),
+    ),
 ];
 
 /// Number of embedded migrations. The integration suite
