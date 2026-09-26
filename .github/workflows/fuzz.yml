@@ -11,6 +11,10 @@ on:
       - "Cargo.lock"
       - "src/torrent/opds.rs"
       - "src/zim/index.rs"
+      # Self-validation: an edit to this file is a deliberate change to the
+      # job itself, so it should run the job (a fix that only touched this
+      # file would otherwise wait for the next schedule/dispatch tick).
+      - ".github/workflows/fuzz.yml"
   schedule:
     - cron: "17 6 * * *"
   workflow_dispatch:
@@ -46,7 +50,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "nightly-2026-09-25" }
-      - run: cargo install cargo-fuzz --version 0.13 --locked
+      # cargo install --version wants FULL SemVer: a two-component "0.13"
+      # is a parse error ("unexpected end of input while parsing minor
+      # version number"). Pinned to the newest 0.13.x exactly (crates.io
+      # 0.13.2, 2026-06-09), like the nightly above; bump deliberately.
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
       # 45 s per target (the review's 30–60 s budget); each target's
       # committed seed corpus (fuzz/corpus/<target>/, see fuzz/README.md)
       # seeds the run.
