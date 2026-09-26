@@ -296,16 +296,19 @@ impl DownloadPoller {
             }
         }
 
-        // Index the new ZIM in the background.
+        // Index the new ZIM in the background, on the capped background
+        // pool (`db_bg`): a long COPY-holding reindex must not starve
+        // foreground search connections (db/db_bg split, src/startup.rs
+        // build_state; 2026-09-26 review fix).
         let zims = self.zims.clone();
-        let db = self.db.clone();
+        let db_bg = self.db_bg.clone();
         let name = dst
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .filter(|n| !n.is_empty());
         if let Some(name) = name {
             tokio::spawn(async move {
-                if let Err(e) = index::index_zims(&zims, &db, Some(&name)).await {
+                if let Err(e) = index::index_zims(&zims, &db_bg, Some(&name)).await {
                     tracing::error!("auto-index of {name} failed: {e}");
                 }
             });
@@ -318,6 +321,8 @@ impl DownloadPoller {
 
     pub(super) fn spawn_direct(&self, id: i32, url: &str, part: &Path) {
         let db = self.db.clone();
+        // Background pool for the finalize auto-index (row writes stay on `db`).
+        let db_bg = self.db_bg.clone();
         let http = match client_from_option(self.http.as_ref()) {
             Ok(c) => c.clone(),
             Err(e) => {
@@ -338,7 +343,9 @@ impl DownloadPoller {
         let part = part.to_path_buf();
         tracing::info!("direct download {id}: {}", crate::redact_url(&url));
         tokio::spawn(async move {
-            if let Err(e) = direct_download(&http, &db, &zims, &settings, id, &url, &part).await {
+            if let Err(e) =
+                direct_download(&http, &db, &db_bg, &zims, &settings, id, &url, &part).await
+            {
                 // Mark every failure, not just the early returns: otherwise a
                 // failed row stays `downloading` (with file_path set) and
                 // silently eats the direct_active budget until a process
@@ -406,6 +413,7 @@ mod tests {
         let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
         let settings = download_settings();
         let poller = super::super::DownloadPoller::new(
+            pool.clone(),
             pool.clone(),
             settings.clone(),
             zims.clone(),
@@ -580,6 +588,7 @@ mod tests {
         let settings = download_settings();
         let poller = super::super::DownloadPoller::new(
             pool.clone(),
+            pool.clone(),
             settings.clone(),
             zims.clone(),
             crate::torrent::QbitClientCache::new(),
@@ -719,6 +728,7 @@ mod tests {
         let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
         let settings = download_settings();
         let poller = super::super::DownloadPoller::new(
+            pool.clone(),
             pool.clone(),
             settings.clone(),
             zims.clone(),

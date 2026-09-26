@@ -97,7 +97,7 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
     // DELETE/INSERT cycle on the shared database that two concurrently-
     // starting instances must not interleave. The guards need only `Config`
     // (DSN + zim_dir), so they can come first.
-    let allow_multi = startup::multi_instance_allowed();
+    let allow_multi = zimservice::process::multi_instance_allowed();
     // m-7 partial opt-out: parsed from `ZIMSERVICE_ALLOW_MULTI_DB` (exact "1")
     // through `Config` at startup, like every other process concern.
     let allow_multi_db = !allow_multi && config.allow_multi_db;
@@ -197,6 +197,7 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
     let poller_handle = tokio::spawn(
         torrent::poller::DownloadPoller::new(
             state.db.clone(),
+            state.db_bg.clone(),
             state.settings.clone(),
             state.zims.clone(),
             state.torrent.clone(),

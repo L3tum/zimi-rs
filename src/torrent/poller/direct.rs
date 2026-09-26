@@ -462,9 +462,12 @@ async fn stream_part(
 /// and end-to-end by `stream_part_cancel_mid_stream_removes_part` (a raw-TCP
 /// server holding the body back — wiremock's delay covers the whole
 /// response, which would move the in-loop clock with it).
+// download context (http/db/db_bg) + per-row state (zims/settings/id/url/part)
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn direct_download(
     http: &reqwest::Client,
     db: &Pool,
+    db_bg: &Pool,
     zims: &Arc<ZimManager>,
     settings: &SettingsCache,
     id: i32,
@@ -559,7 +562,7 @@ pub(super) async fn direct_download(
 
     // Post-stream finalize (TEST-5 seam): cancel re-checks, verify, rename,
     // resync, guarded row update, auto-index.
-    finalize_direct_download(db, zims, id, part).await
+    finalize_direct_download(db, db_bg, zims, id, part).await
 }
 
 /// Discard `dst` — the install destination a just-finalized download wrote
@@ -622,7 +625,9 @@ pub(super) fn sha256_file(path: &Path) -> Result<String> {
 /// Post-stream finalize for a direct download (TEST-5 seam, extracted from
 /// [`direct_download`]): the cancel re-check before verify, the libzim
 /// verify, the cancel check before rename, the atomic rename + resync, the
-/// guarded `status = 'downloading'` row update, and the auto-index.
+/// guarded `status = 'downloading'` row update, and the auto-index (which
+/// runs on the capped background pool `db_bg` — see the call below;
+/// 2026-09-26 review fix).
 ///
 /// Content integrity (SEC): when the row carries a catalog digest claim
 /// (set by the OPDS queue from the feed's `hash`/`digest` attributes), the
@@ -640,6 +645,7 @@ pub(super) fn sha256_file(path: &Path) -> Result<String> {
 /// the `.part` for resume.
 async fn finalize_direct_download(
     db: &Pool,
+    db_bg: &Pool,
     zims: &Arc<ZimManager>,
     id: i32,
     part: &Path,
@@ -835,7 +841,9 @@ async fn finalize_direct_download(
         {
             tracing::error!("recording content digest for {name} failed: {e}");
         }
-        if let Err(e) = index::index_zims(zims, db, Some(&name)).await {
+        // Capped background pool: the reindex's long COPY must not starve
+        // foreground `db` checkouts (2026-09-26 review fix).
+        if let Err(e) = index::index_zims(zims, db_bg, Some(&name)).await {
             tracing::error!("auto-index of {name} failed: {e}");
         }
     }
@@ -1179,7 +1187,9 @@ mod tests {
         let part = tmp.path().join("utiny.zim.part");
         std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage utiny.zim as .part");
 
-        super::finalize_direct_download(&pool, &zims, id, &part)
+        // Tests share the one pool for db and db_bg (production wires the
+        // capped background pool — src/startup.rs).
+        super::finalize_direct_download(&pool, &pool, &zims, id, &part)
             .await
             .expect("finalize must succeed");
 
@@ -1278,7 +1288,7 @@ mod tests {
         let part = tmp.path().join("udigest.zim.part");
         std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage part");
 
-        super::finalize_direct_download(&pool, &zims, id, &part)
+        super::finalize_direct_download(&pool, &pool, &zims, id, &part)
             .await
             .expect("finalize must succeed");
 
@@ -1358,7 +1368,7 @@ mod tests {
         let sentinel = std::fs::read(&dst).expect("read sentinel");
         let measured = super::sha256_file(&part).expect("hash staged part");
 
-        super::finalize_direct_download(&pool, &zims, id, &part)
+        super::finalize_direct_download(&pool, &pool, &zims, id, &part)
             .await
             .expect("refusal is Ok (the row carries the reason)");
 
@@ -1436,7 +1446,7 @@ mod tests {
         let part = tmp.path().join("uclaimless.zim.part");
         std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage part");
 
-        super::finalize_direct_download(&pool, &zims, id, &part)
+        super::finalize_direct_download(&pool, &pool, &zims, id, &part)
             .await
             .expect("finalize must succeed");
 
@@ -1505,7 +1515,7 @@ mod tests {
         .unwrap();
         let part = dir.join(format!("{name}.zim.part"));
         std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage part");
-        super::finalize_direct_download(pool, zims, id, &part)
+        super::finalize_direct_download(pool, pool, zims, id, &part)
             .await
             .expect("finalize must succeed");
         id
@@ -1677,7 +1687,7 @@ mod tests {
         .await
         .unwrap();
 
-        super::finalize_direct_download(&pool, &zims, id, &part)
+        super::finalize_direct_download(&pool, &pool, &zims, id, &part)
             .await
             .expect("cancelled finalize still returns Ok");
 
@@ -1772,7 +1782,7 @@ mod tests {
         }
         let before = fingerprint(&a_file);
 
-        super::finalize_direct_download(&pool, &zims, b_id, &part)
+        super::finalize_direct_download(&pool, &pool, &zims, b_id, &part)
             .await
             .expect("finalize must succeed (a refusal is Ok)");
 

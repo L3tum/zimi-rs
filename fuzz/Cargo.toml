@@ -7,9 +7,9 @@ edition = "2021"
 # Standalone cargo-fuzz workspace: the EMPTY [workspace] table detaches this
 # crate from the repo-root package, so `cargo check` / `make all` at the root
 # never see it (and the libfuzzer harnesses never enter the normal build
-# graph). Fuzzing is NOT wired into CI (runner constraints — see the
-# `audit` job note in .github/workflows/ci.yml); run it locally per
-# fuzz/README.md.
+# graph). Fuzzing is gated by .github/workflows/fuzz.yml (paths + schedule,
+# low-frequency — see that file's notes; the ci.yml `audit` job points at
+# it); run it locally per fuzz/README.md for fast iteration.
 [workspace]
 
 [package.metadata]

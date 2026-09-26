@@ -22,6 +22,7 @@ use sqlx::postgres::PgConnection;
 use crate::access;
 use crate::config::Config;
 use crate::db;
+use crate::process;
 use crate::search::SearchEngine;
 use crate::settings::{
     SettingsCache, KEY_ACCESS_ADMIN_PASSWORD, KEY_TORRENT_ALLOW_PRIVATE_NETWORKS, KEY_TORRENT_URL,
@@ -401,9 +402,10 @@ pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result
     // whose freshness matters; one-shot CLI subcommands (mutating / read-only
     // / MCP) read the DB fresh and must not keep a background listener alive.
     //
-    // Deliberately NOT gated on `multi_instance_allowed()` (2026 project-wide
-    // review, D1): that env var describes *this* process's lock posture, not
-    // whether peers may write to this database. A default-mode deployment is
+    // Deliberately NOT gated on
+    // `crate::process::multi_instance_allowed()` (2026 project-wide review,
+    // D1): that env var describes *this* process's lock posture, not whether
+    // peers may write to this database. A default-mode deployment is
     // not write-protected by its own env — an opted-out peer (a second serve,
     // or a mutating CLI run with the opt-out) can write settings/catalog rows
     // while this server runs, and this listener is that server's only
@@ -636,39 +638,6 @@ pub struct MutatingGuard {
     lock_conn: PgConnection,
 }
 
-/// M1: whether this process started with the full single-instance opt-out
-/// (`ZIMSERVICE_ALLOW_MULTI_INSTANCE=1`) — the one place that reading of the
-/// env var lives so the guard sites, the `/health` flag, and the settings-
-/// divergence warnings all agree.
-///
-/// In that mode every instance keeps its own in-memory caches (settings,
-/// rate limiter, ZIM metadata); connected serve processes invalidate each
-/// other over `LISTEN`/`NOTIFY` (`crate::db::notify`), so the residual gap
-/// is narrow — a one-shot CLI instance (which runs no listener) or any
-/// process whose listener is offline stays stale until its own resync or
-/// restart. The callers use this to surface that residual divergence
-/// continuously instead of only via the one startup `tracing::warn!`.
-///
-/// This is the **single, deliberate** reader of
-/// `ZIMSERVICE_ALLOW_MULTI_INSTANCE`, kept outside `Config` on purpose: it
-/// must stay re-readable at **any point after process start** (startup
-/// guards, `/health`, the settings-divergence warnings), not just at
-/// `Config::load()` time. Note that `SettingsCache` (`src/settings/cache.rs`)
-/// calls this at construction and **snapshots the result once** — callers
-/// that need the live value must call this fn directly, not the cached copy.
-pub fn multi_instance_allowed() -> bool {
-    matches!(std::env::var("ZIMSERVICE_ALLOW_MULTI_INSTANCE"), Ok(v) if v == "1")
-}
-
-/// m-7 partial opt-out: live reader of `ZIMSERVICE_ALLOW_MULTI_DB` (exact
-/// "1" — the same parse [`crate::config::Config::load`] applies). Like
-/// [`multi_instance_allowed`], a deliberate env reader kept outside `Config`
-/// so `/health` can surface the process's degraded single-instance guarantee
-/// without a state field.
-pub fn multi_db_allowed() -> bool {
-    matches!(std::env::var("ZIMSERVICE_ALLOW_MULTI_DB"), Ok(v) if v == "1")
-}
-
 /// H1: acquire a [`MutatingGuard`] for a mutating subcommand (`index`,
 /// `embed`, `list --sync`), before any mutation of the shared database.
 ///
@@ -688,7 +657,7 @@ pub fn multi_db_allowed() -> bool {
 /// different-database deployment on a shared zim_dir never holds *this*
 /// database's lock and must not silence the refusal.
 pub async fn acquire_mutating_guard(config: &Config) -> anyhow::Result<Option<MutatingGuard>> {
-    if multi_instance_allowed() {
+    if process::multi_instance_allowed() {
         tracing::warn!(
             "ZIMSERVICE_ALLOW_MULTI_INSTANCE=1: this mutating command will run even \
              while a server holds this database's advisory lock — connected serves \
@@ -1863,24 +1832,6 @@ mod tests {
         // Dropping the connections closes the sockets, releasing any held lock.
         drop(verify);
         drop(server_conn);
-    }
-
-    /// M1: `multi_instance_allowed` mirrors the process env exactly.
-    /// Mutating the process env in a parallel test would race every other
-    /// test, so (like the DB-gated tests above) this asserts against the
-    /// env as found: the unset/non-`1` arm unconditionally, the `1` arm
-    /// only when a developer has exported the opt-out.
-    #[test]
-    fn multi_instance_allowed_mirrors_env() {
-        match std::env::var("ZIMSERVICE_ALLOW_MULTI_INSTANCE") {
-            Ok(v) if v == "1" => {
-                assert!(multi_instance_allowed(), "the `1` opt-out must be honored")
-            }
-            _ => assert!(
-                !multi_instance_allowed(),
-                "unset (or non-`1`) must mean single-instance mode"
-            ),
-        }
     }
 }
 

@@ -41,6 +41,15 @@
 # marker (on the call line or the line directly above it — identical
 # marker contract to check-raw-sql.sh, pinned by its self-test).
 #
+# Rule P5 (no settings/serve → startup references): src/settings/ and
+# src/serve/ must not reference `crate::startup::` (also the
+# `use crate::startup;` form). settings/ and serve/ are lower layers; startup
+# owns orchestration and depends on settings, so reaching into it from
+# either would invert the graph. The shared live env readers both layers
+# need (`multi_instance_allowed` / `multi_db_allowed`) live in the leaf
+# module `crate::process` instead (2026-10 project-wide review layering
+# fix). Outside pure comment lines.
+#
 # Exit status: 0 when all rules are clean, 1 when a violation is found in
 # any rule (a self-test failure also exits 1).
 
@@ -123,10 +132,25 @@ p4_violations() {
     done
 }
 
+# p5_violations ROOT → `crate::startup::` references (also the
+# `use crate::startup;` form) under src/settings/ and src/serve/. ROOT has
+# the same walk-root contract as p1_violations. settings/ and serve/ are
+# lower layers than startup (rule P5 — startup owns orchestration and
+# depends on settings, so these edges would invert the graph); the shared
+# live env readers both layers need live in the leaf module crate::process.
+p5_violations() {
+  (cd "$1" && grep -rnE 'crate::startup(::|;)' src/settings src/serve \
+    --include='*.rs' 2>/dev/null) |
+    while IFS=: read -r f l rest; do
+      is_comment "$rest" && continue
+      printf '%s:%s\n' "$f" "$l"
+    done
+}
+
 # --- self-test (pins one positive + the suppression exemptions per rule) --
 selftest_dir=$(mktemp -d)
 trap 'rm -rf "$selftest_dir"' EXIT
-mkdir -p "$selftest_dir/src/serve/handlers" "$selftest_dir/src/mcp"
+mkdir -p "$selftest_dir/src/serve/handlers" "$selftest_dir/src/mcp" "$selftest_dir/src/settings"
 {
   # P1: mcp → serve reference (must be reported)
   printf '%s\n' 'let x = crate::serve::state::AppState;'
@@ -136,7 +160,15 @@ mkdir -p "$selftest_dir/src/serve/handlers" "$selftest_dir/src/mcp"
 {
   # P1: serve → mcp reference (must be reported)
   printf '%s\n' 'let x = crate::mcp::run;'
+  # P5: serve → startup reference (must be reported)
+  printf '%s\n' 'let _ = crate::startup::acquire_mutating_guard(&cfg).await;'
+  # P5: startup reference in a comment line (must NOT be reported)
+  printf '%s\n' '// see crate::startup::acquire_mutating_guard for the guard contract'
 } > "$selftest_dir/src/serve/b.rs"
+{
+  # P5: settings → startup reference (must be reported)
+  printf '%s\n' 'let _ = crate::startup::multi_instance_allowed();'
+} > "$selftest_dir/src/settings/a.rs"
 {
   # P2: SQL string literal in a handler (must be reported)
   printf '%s\n' 'let q = "SELECT 1";'
@@ -172,14 +204,17 @@ got=$(
     p2_violations "$selftest_dir"
     p3_violations "$selftest_dir"
     p4_violations "$selftest_dir"
+    p5_violations "$selftest_dir"
   } | sort
 )
 want="src/mcp/a.rs:1
 src/mcp/e.rs:1
 src/serve/b.rs:1
+src/serve/b.rs:2
 src/serve/d.rs:1
 src/serve/handlers/c.rs:1
-src/serve/middleware.rs:1"
+src/serve/middleware.rs:1
+src/settings/a.rs:1"
 if [ "$got" != "$want" ]; then
   echo "boundary lint: SELF-TEST FAILED — detection drifted from its pinned" >&2
   echo "expected:" >&2
@@ -221,4 +256,12 @@ if [ -n "$v" ]; then
   exit 1
 fi
 
-echo "boundary lint: OK — self-test passed; presentation layers separated (mcp<->serve), no raw-SQL literals or pool creation in presentation layers, no db::raw::* call sites in serve-layer files outside handlers/"
+# --- rule P5 ----------------------------------------------------------------
+v=$(p5_violations .)
+if [ -n "$v" ]; then
+  echo "boundary lint: P5 — crate::startup:: reference under src/settings/ or src/serve/: settings/ and serve/ are lower layers — startup owns orchestration and depends on settings, so reaching into it inverts the graph; the shared live env readers both layers need live in the leaf module crate::process:" >&2
+  printf '%s\n' "$v" >&2
+  exit 1
+fi
+
+echo "boundary lint: OK — self-test passed; presentation layers separated (mcp<->serve), no raw-SQL literals or pool creation in presentation layers, no db::raw::* call sites in serve-layer files outside handlers/, no startup references from settings/ or serve/"

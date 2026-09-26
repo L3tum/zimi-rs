@@ -25,6 +25,8 @@ pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 /// Build the application router with all routes and middleware.
 pub fn build_router(state: AppState) -> Router {
+    // The web pages are the only assets this router serves; priming here = at serve startup.
+    handlers::web::prime_stamped_pages();
     // CORS is config-only by design (SETTING_DEFS: config_only=true). Changing
     // origins requires a restart — this is intentional, not a limitation.
     //

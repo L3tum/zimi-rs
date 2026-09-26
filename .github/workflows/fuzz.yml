@@ -1,0 +1,56 @@
+name: Fuzz
+on:
+  push:
+    branches: [master]
+    # Low-frequency gate, not every PR (see the runner notes below): only
+    # the surface the fuzz targets exercise — plus the fuzz workspace's
+    # own manifests — should trigger it.
+    paths:
+      - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/torrent/opds.rs"
+      - "src/zim/index.rs"
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+# Least-privilege GITHUB_TOKEN: every job here only reads the repository
+# (no job pushes, publishes, or uploads). Keep this block — the default
+# token otherwise carries write access to the repo. (Same note as ci.yml.)
+permissions:
+  contents: read
+# Why this workflow exists: attacker-influenced `.zim` archive parsing via
+# the third-party `zim` crate (src/zim/index.rs) and quick-xml OPDS Atom
+# feed parsing (src/torrent/opds.rs) are code-execution-adjacent surface
+# that RUSTSEC's advisory DB cannot see (the ci.yml audit job's note).
+# This is the CI gate for the `fuzz/` cargo-fuzz workspace (fuzz_zim +
+# fuzz_opds targets; see fuzz/README.md) — local runs stay the fast
+# iteration path between gate runs.
+# Runner notes (self-hosted, act-based):
+# - Why nightly: cargo-fuzz requires a nightly toolchain. The job pins
+#   nightly-2026-09-25 (verified to exist on static.rust-lang.org) for
+#   reproducibility. The repo pins 1.96.0 via rust-toolchain.toml; the
+#   per-job rustup default is set by the setup-rust composite action, so
+#   this job's nightly does not disturb the 1.96.0 default anywhere else.
+# - Why paths + schedule instead of every PR: low-frequency gate — the
+#   self-hosted act-based runner fleet makes per-PR nightly bootstrap
+#   costly. On this host the schedule trigger may be inert (act does not
+#   run scheduled workflows); the paths trigger above still fires on the
+#   push events that touch the fuzzed surface, and workflow_dispatch
+#   remains the manual escape hatch.
+# - No Postgres service: both targets are pure parse harnesses.
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-rust
+        with: { toolchain: "nightly-2026-09-25" }
+      - run: cargo install cargo-fuzz --version 0.13 --locked
+      # 45 s per target (the review's 30–60 s budget); each target's
+      # committed seed corpus (fuzz/corpus/<target>/, see fuzz/README.md)
+      # seeds the run.
+      - run: |
+          cd fuzz
+          cargo fuzz run fuzz_zim -- -max_total_time=45
+          cargo fuzz run fuzz_opds -- -max_total_time=45

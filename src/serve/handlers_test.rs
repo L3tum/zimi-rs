@@ -72,7 +72,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
         assert_eq!(
             v["multi_instance"],
-            crate::startup::multi_instance_allowed(),
+            crate::process::multi_instance_allowed(),
             "the /health flag must mirror the process-level opt-out"
         );
         // m-7: the partial opt-out is visible too (the full opt-out wins and
@@ -80,7 +80,7 @@ mod tests {
         // config.allow_multi_db`).
         assert_eq!(
             v["multi_db"],
-            !crate::startup::multi_instance_allowed() && crate::startup::multi_db_allowed(),
+            !crate::process::multi_instance_allowed() && crate::process::multi_db_allowed(),
             "the /health multi_db flag must mirror the partial opt-out"
         );
     }

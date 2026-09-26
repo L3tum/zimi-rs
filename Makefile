@@ -93,7 +93,9 @@ raw-sql-lint:
 # P3 no pool creation in presentation layers (pools are startup-owned,
 # passed via AppState), P4 no db::raw::* call sites in src/serve/ files
 # OUTSIDE handlers/ (extends raw-sql-lint's rule-2 scope to the remaining
-# serve-layer files). POSIX sh + grep only so it runs on the dev box and
+# serve-layer files), P5 no crate::startup:: references from src/settings/
+# or src/serve/ (the shared live env readers live in the leaf module
+# crate::process). POSIX sh + grep only so it runs on the dev box and
 # in CI alike.
 boundary-lint:
 	@sh scripts/check-boundaries.sh
@@ -149,14 +151,19 @@ test-strict:
 	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration)
 
 # Local mirror of the CI `test` job (.github/workflows/ci.yml): strict DB
-# (ZIMSERVICE_REQUIRE_DB=1), lib + bins + wiremock, then the integration
-# suite. Both halves run with the default parallel --test-threads: every
-# DB-gated test is serialized by DbExclusiveGuard (cross-process lockfile +
-# in-process slot), and the migration drift check runs in a dedicated temp
-# DB it drops.
+# (ZIMSERVICE_REQUIRE_DB=1), ONE `cargo test` invocation over lib + bins +
+# wiremock + integration — exactly CI's selection, including its
+# ZIMSERVICE_LOOP_TEST_BUDGET_SECS=300. The single invocation is the point:
+# it is what makes the parallel lib + integration PROCESSES contend for the
+# cross-process lockfile DbExclusiveGuard (src/testing.rs) exists to
+# serialize, and that contention must be exercised locally too — two
+# sequential half-runs never overlap, so a lockfile regression would pass
+# here and fail only in CI. As in CI, everything runs with the default
+# parallel --test-threads: every DB-gated test is serialized by
+# DbExclusiveGuard (cross-process lockfile + in-process slot), and the
+# migration drift check runs in a dedicated temp DB it drops.
 test-strict-ci:
-	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --lib --bins --test wiremock && \
-	    DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 $(CARGO) test --test integration)
+	$(call DB_WRAP,DATABASE_URL=$(DEV_DSN) ZIMSERVICE_REQUIRE_DB=1 ZIMSERVICE_LOOP_TEST_BUDGET_SECS=300 $(CARGO) test --lib --bins --test wiremock --test integration)
 
 # Criterion perf micro-benches (search + retrieval) against an EXISTING dev
 # Postgres. Unlike test-integration this does NOT boot the compose
@@ -334,7 +341,7 @@ help:
 	@echo "  make web-test     Behavioral unit tests for web UI helpers + page scripts (node --test, jsdom real-DOM harness)"
 	@echo "  make web-fmt      eslint --fix for the web UI (JS half of make fmt; needs npm install; skips if absent)"
 	@echo "  make web-lint     JS lint of web UI + tests/web via eslint (needs npm install; skips if absent)"
-	@echo "  make doc          Build docs"
+	@echo "  make doc          Build docs (--all-features, mirroring the CI docs gate)"
 	@echo "  make build        Build (debug)"
 	@echo "  make release      Build (optimized, LTO)"
 	@echo "  make install      Install $(BIN) to ~/.local/bin"
@@ -343,7 +350,7 @@ help:
 	@echo "  make clean        Remove target dir"
 
 doc:
-	$(CARGO) doc --no-deps
+	$(CARGO) doc --no-deps --all-features
 
 # ─── Build targets ──────────────────────────────────────────────────────
 build:

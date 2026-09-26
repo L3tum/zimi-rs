@@ -96,9 +96,10 @@ const ASSET_STAMP: &str = concat!("?v=", env!("CARGO_PKG_VERSION"));
 /// happens only at serve time.
 ///
 /// Caching: both the page body (`include_str!` constant) and the stamp are
-/// compile-time constants, so each handler memoizes its stamped body in a
-/// per-page [`std::sync::LazyLock`] (see `web_index` et al.); this rewrite
-/// runs exactly once per page for the life of the process.
+/// compile-time constants, so each page's stamped body is memoized in a
+/// module-level [`std::sync::LazyLock`] (`INDEX_STAMPED` et al.),
+/// force-initialized at serve startup by [`prime_stamped_pages`]; this
+/// rewrite runs exactly once per page for the life of the process.
 fn stamp_assets(page: &str) -> String {
     const ASSETS: [&str; 4] = ["/common.js", "/index.js", "/search.js", "/settings.js"];
     let mut out = page.to_string();
@@ -129,6 +130,38 @@ fn stamp_assets(page: &str) -> String {
         "stamp_assets: page matched no asset references — cache-busting silently disabled"
     );
     out
+}
+
+// The three page sources plus their stamped bodies, hoisted to module
+// level (2026-10 review) so the initialization can be forced at serve
+// startup (see [`prime_stamped_pages`]) instead of happening — and, on a
+// malformed page, panicking — on the first request to each page.
+const INDEX_PAGE: &str = include_str!("../../../web/index.html");
+const SEARCH_PAGE: &str = include_str!("../../../web/search.html");
+const SETTINGS_PAGE: &str = include_str!("../../../web/settings.html");
+
+/// Stamped body of the index page (see [`prime_stamped_pages`]).
+static INDEX_STAMPED: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| stamp_assets(INDEX_PAGE));
+
+/// Stamped body of the search page (see [`prime_stamped_pages`]).
+static SEARCH_STAMPED: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| stamp_assets(SEARCH_PAGE));
+
+/// Stamped body of the settings page (see [`prime_stamped_pages`]).
+static SETTINGS_STAMPED: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| stamp_assets(SETTINGS_PAGE));
+
+/// Force-initialize the three stamped-page statics above (each a
+/// [`std::sync::LazyLock`] over [`stamp_assets`]). Called once at router
+/// build (serve startup) so a malformed asset page trips the `stamp_assets`
+/// assert AT BOOT (fail-fast, loud) instead of panicking in the LazyLock
+/// initializer on the first real request to that page — the panic would
+/// reset the connection, and Rust's poison semantics would make every
+/// later request to that page fail too. Idempotent: LazyLock's
+/// `get_or_init` is safe to call repeatedly.
+pub(crate) fn prime_stamped_pages() {
+    let _ = (&*INDEX_STAMPED, &*SEARCH_STAMPED, &*SETTINGS_STAMPED);
 }
 
 /// Build a `text/html` response for an embedded page carrying the SEC L3
@@ -170,24 +203,30 @@ fn web_asset_response(content_type: &'static str, body: &'static str) -> Respons
 }
 
 /// Serve the embedded web UI index page (`web/index.html`).
+///
+/// Body: the module-level `INDEX_STAMPED` static (the embedded page run
+/// through `stamp_assets`), force-initialized at serve startup by
+/// `prime_stamped_pages` so a malformed page trips the `stamp_assets`
+/// assert at boot instead of panicking — and poisoning the static — on
+/// the first request.
 pub async fn web_index() -> Response {
-    const PAGE: &str = include_str!("../../../web/index.html");
-    static STAMPED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| stamp_assets(PAGE));
-    web_html_response(&STAMPED)
+    web_html_response(&INDEX_STAMPED)
 }
 
 /// Serve the embedded web UI search page (`web/search.html`).
+///
+/// Body: the module-level `SEARCH_STAMPED` static (see
+/// `prime_stamped_pages` for the boot-time initialization rationale).
 pub async fn web_search() -> Response {
-    const PAGE: &str = include_str!("../../../web/search.html");
-    static STAMPED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| stamp_assets(PAGE));
-    web_html_response(&STAMPED)
+    web_html_response(&SEARCH_STAMPED)
 }
 
 /// Serve the embedded web UI settings page (`web/settings.html`).
+///
+/// Body: the module-level `SETTINGS_STAMPED` static (see
+/// `prime_stamped_pages` for the boot-time initialization rationale).
 pub async fn web_settings() -> Response {
-    const PAGE: &str = include_str!("../../../web/settings.html");
-    static STAMPED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| stamp_assets(PAGE));
-    web_html_response(&STAMPED)
+    web_html_response(&SETTINGS_STAMPED)
 }
 
 /// Serve the embedded shared UI stylesheet (`web/style.css`). Mirrors the

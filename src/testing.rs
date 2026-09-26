@@ -25,13 +25,13 @@
 //! *not* the waiter deadline (those were conflated in one constant, which
 //! made a live but busy foreign binary — draining its whole DB-test queue
 //! in a couple of minutes — time out waiting processes after 2 minutes; see
-//! [`STALE_THRESHOLD`] vs [`HOLD_DEADLINE`]).
+//! `STALE_THRESHOLD` vs `HOLD_DEADLINE`).
 //!
 //! `DbExclusiveGuard::acquire()` **blocks** (rather than panicking) when
 //! another DB test — in this binary *or* another process — still holds the
 //! slot, so the suite is safe to run with the default parallel
 //! `--test-threads`. A holder (same or foreign pid) still holding the slot
-//! past [`HOLD_DEADLINE`] is wedged (a query on a half-open connection), and
+//! past `HOLD_DEADLINE` is wedged (a query on a half-open connection), and
 //! waiters then fail loud instead of hanging the suite silently (see the
 //! const's doc).
 //!
@@ -42,7 +42,7 @@
 //! holder in this very process (a parallel DB test in this binary holding
 //! the in-process slot) must not be treated as a foreign process: if the
 //! lockfile's recorded PID equals this process's PID, waiters keep polling,
-//! bounded by [`HOLD_DEADLINE`] — the in-process flag is released
+//! bounded by `HOLD_DEADLINE` — the in-process flag is released
 //! by the holder's `Drop`, so a bounded wait cannot deadlock anything that
 //! previously resolved; a same-pid holder past the deadline is treated as
 //! wedged and waiters fail loud (see the const's doc). The

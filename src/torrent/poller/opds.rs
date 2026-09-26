@@ -182,6 +182,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
         let poller = DownloadPoller::new(
+            pool.clone(),
             pool,
             settings,
             zims,

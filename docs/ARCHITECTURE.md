@@ -229,16 +229,19 @@ scheme):
   `/diagnostic` (`pool_read`) is the operator's pre-503 signal, and
   unsetting the env var reverts to the single-pool default;
 - a dedicated **background** pool on the primary URL, capped at 4
-  connections (`db_bg`, PERF-10): the auto-embed loop and the vector-index
-  builds check out from here, never from the primary pool, so a background
-  burst can never starve foreground search/API checkouts.
+  connections (`db_bg`, PERF-10): the auto-embed loop, the vector-index
+  builds, and the poller-triggered ZIM auto-index check out from here,
+  never from the primary pool, so a background burst can never starve
+  foreground search/API checkouts.
 
-The one writer that still shares the primary pool is the reindex `COPY`:
-the seam to route it through `db_bg` exists, and the documented trigger to
-act is observed reindex-related 503s (checkout waits are instrumented in
-`/diagnostic`). The 20-connection ceiling plus the 10 s acquire timeout (a
-fast 503 by design, mapped in `src/error.rs`) bound the blast radius in the
-meantime.
+The poller-triggered auto-index (the reindex `COPY` for freshly downloaded
+ZIMs) now runs on that background pool, so a long reindex can no longer
+starve foreground search/API checkouts (2026-09-26 review fix — the
+previously documented trigger, observed reindex-related 503s with checkout
+waits instrumented in `/diagnostic`, was acted on). The CLI `index` path
+still shares the primary pool — with no server foreground traffic in play,
+the 20-connection ceiling plus the 10 s acquire timeout (a fast 503 by
+design, mapped in `src/error.rs`) bound its blast radius.
 
 **Pure sqlx.** Application-table queries go through the `db::raw` helpers
 (`src/db/mod.rs`) against the pool (or transaction) they are given — no ORM,

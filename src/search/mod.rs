@@ -61,6 +61,22 @@ type SearchRow = (
 /// search path.
 const SEARCH_EMBED_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// THE production query-embed cache key format: `model|dimension|trimmed-query`
+/// (case is preserved — embedding models are case-sensitive). This is the
+/// single checkable place for the key format: `VectorEmbedArm::embed_query`
+/// builds the key through this fn, and the `cache_key_includes_model_and_dimension`
+/// test pins it directly, so a production-format change can no longer
+/// silently desync from the test (the old test asserted a *local copy* of the
+/// format string, not the production fn).
+///
+/// PERF-13: the cache key and the embed-client fingerprint both derive from
+/// the same per-request `SearchParamsSnapshot`, so they can't disagree across
+/// a concurrent settings write; centralising the key format here gives that
+/// invariant one checkable place.
+fn query_cache_key(model: &str, dimension: u32, query: &str) -> String {
+    format!("{model}|{dimension}|{}", query.trim())
+}
+
 /// Merge the three suggest branches into the final list, preserving the old
 /// single-query `ORDER BY CASE WHEN prefix THEN 0 ELSE 1 END, similarity
 /// DESC` semantics: prefix matches first, then the other branches, similarity
@@ -112,9 +128,16 @@ pub struct SearchEngine {
     query_embed_cache: Arc<std::sync::Mutex<QueryEmbedCache>>,
     /// Whether the `pg_trgm` extension is available, resolved once per engine
     /// and cached (`WI-37`). Uses a TTL-based cache (WI-5): when the cached
-    /// value is `false` (trgm unavailable), a background task re-probes every
-    /// 60 s so the arms recover when the extension is installed at runtime.
-    /// `Arc` so the `Clone` derive shares the cache across engine copies.
+    /// value is `false` (trgm unavailable), the next `ensure_trgm` call
+    /// re-probes after the 60 s TTL — a lazy re-probe, not a background task
+    /// of the engine's own (in the production binary a WI-5 task in
+    /// `main.rs` drives that call every 60 s while the cache holds `false`,
+    /// so the arms recover when the extension is installed at runtime
+    /// without a restart). Only probe OUTCOMES are ever cached: a probe
+    /// CHECKOUT failure is neither cached nor recorded (see `ensure_trgm`),
+    /// so a pool blip demotes the trgm arms for a single request, not the
+    /// 60 s TTL. `Arc` so the `Clone` derive shares the cache across engine
+    /// copies.
     trgm_ready: Arc<std::sync::Mutex<Option<(bool, std::time::Instant)>>>,
     /// Per-branch degradation tracker (WI-5): records failures so `/health`
     /// and search responses can surface silent capability loss.
@@ -184,17 +207,22 @@ impl SearchEngine {
 
     /// TTL for the trgm probe cache: 60 s when `false` (stale → re-probe),
     /// effectively infinite when `true` (no reason to re-probe a positive).
+    /// Applies to cached ABSENT outcomes only — a probe CHECKOUT failure is
+    /// never cached (see `ensure_trgm`).
     const TRGM_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Whether the `pg_trgm` extension is available, resolved with a
     /// TTL-based cache (WI-5). A `false` result is re-probed after 60 s so
     /// the trgm arms recover when the extension is installed at runtime. A
-    /// `true` result is cached permanently (no reason to re-probe).
+    /// `true` result is cached permanently (no reason to re-probe). A probe
+    /// CHECKOUT failure is neither cached nor recorded (see the slow path):
+    /// that `false` lasts one request — only a probe OUTCOME (absent → 60 s
+    /// re-probe / present → permanent) is cached.
     ///
-    /// Acquires a pool connection for the probe — use [`SearchEngine::ensure_trgm_on`] from
-    /// a code path that already holds a connection (the `search()`/`suggest()`
-    /// arms): a second nested checkout stalls the full `acquire_timeout` when
-    /// `DB_POOL_SIZE=1`.
+    /// Acquires a pool connection for the probe — taken BEFORE the
+    /// `search()`/`suggest()` arm fan-out (the arms then take their own
+    /// checkouts), so a pool blip soft-fails the trgm arms instead of
+    /// stalling a nested checkout at `DB_POOL_SIZE=1`.
     pub async fn ensure_trgm(&self) -> bool {
         if let Some(val) = self.trgm_cached_if_fresh() {
             return val;
@@ -202,26 +230,24 @@ impl SearchEngine {
         // Slow path: probe the DB on a checked-out connection
         // (`acquire_timed`: explicit checkout behind the /diagnostic
         // checkout-wait metric, Architecture M1).
-        let ok = match crate::db::pool::acquire_timed(&self.pool, "trgm_probe").await {
-            Ok(mut client) => self.trgm_probe(&mut *client).await,
-            Err(_) => false,
+        let probed = match crate::db::pool::acquire_timed(&self.pool, "trgm_probe").await {
+            Ok(mut client) => Some(self.trgm_probe(&mut *client).await),
+            // CHECKOUT failure (pool dead/exhausted): a POOL problem, not a
+            // missing extension — deliberately NOT cached (a single blip
+            // must not demote the trgm arms for the 60 s TTL) and NOT
+            // recorded as a `pg_trgm_probe` degradation failure (that
+            // signal means "extension absent"; the pool problem is already
+            // visible in the /diagnostic checkout-wait metric under the
+            // `trgm_probe` site). `false` for this request only: the
+            // contains/similarity arms deselect as if absent, and the
+            // always-selected anchor arm (search's FTS / suggest's prefix)
+            // still carries the dead-pool 503 corner.
+            Err(_) => None,
         };
-        self.trgm_store(ok)
-    }
-
-    /// [`SearchEngine::ensure_trgm`] for callers that already hold a pooled connection
-    /// (the `search()`/`suggest()` arms): probes **through** the passed
-    /// executor instead of taking a second checkout — at `DB_POOL_SIZE=1`
-    /// a nested `pool.acquire()` would stall the full `acquire_timeout`
-    /// (10 s) before soft-disabling the trgm arms.
-    pub async fn ensure_trgm_on<'e, E>(&self, executor: E) -> bool
-    where
-        E: Executor<'e, Database = sqlx::Postgres>,
-    {
-        if let Some(val) = self.trgm_cached_if_fresh() {
-            return val;
+        match probed {
+            Some(ok) => self.trgm_store(ok),
+            None => false,
         }
-        self.trgm_store(self.trgm_probe(executor).await)
     }
 
     /// The `pg_trgm` catalog probe on any executor. Raw SQL (catalog probe —
@@ -255,7 +281,10 @@ impl SearchEngine {
     }
 
     /// Record a probe outcome (a failure feeds the degradation tracker) and
-    /// refresh the cache with it.
+    /// refresh the cache with it. `false` here means EXTENSION ABSENT on a
+    /// healthy pool — a probe CHECKOUT failure never reaches this fn
+    /// (`ensure_trgm` handles it separately), so the `pg_trgm_probe`
+    /// degradation record is accurate.
     // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
     #[allow(clippy::expect_used)]
     fn trgm_store(&self, ok: bool) -> bool {
@@ -691,7 +720,9 @@ impl SearchEngine {
         };
         // WI-37: resolve the `pg_trgm` extension once (cached). A missing
         // extension (or a pool blip) soft-disables all three trgm arms; FTS
-        // always runs regardless.
+        // always runs regardless. (A pool-blip `false` is not cached — one
+        // request only, see `ensure_trgm`; an absent extension soft-disables
+        // for the 60 s TTL.)
         let trgm_ok = if run_trgm {
             self.ensure_trgm().await
         } else {
@@ -712,8 +743,12 @@ impl SearchEngine {
     /// The old single OR query (prefix OR contains OR similarity) was not
     /// index-friendly as a whole, so it runs as the same 3-query split as
     /// `search` (weight 1.0 keeps the raw-similarity score) and merges in
-    /// Rust with the old ORDER BY semantics. Branch failures degrade to an
-    /// empty contribution (a dead branch can't 500 the whole suggestion).
+    /// Rust with the old ORDER BY semantics. The three arms now run
+    /// CONCURRENTLY — each on its own pool checkout (the PERF-14 decision
+    /// record below) — so latency is RTT + max(arm), not 3×RTT + Σarms; branch
+    /// failures still degrade to an empty contribution (a dead branch can't
+    /// 500 the whole suggestion), and a pool that can't check out the anchor
+    /// arm hard-fails exactly as before.
     pub async fn suggest(
         &self,
         query: &str,
@@ -743,61 +778,153 @@ impl SearchEngine {
             debug_assert!(sq.placeholder_count() == sq.params.len());
         }
 
-        // H3: one pooled connection for all three arms (sequential on the
-        // single-in-flight client). `acquire_timed`: explicit checkout
-        // behind the /diagnostic checkout-wait metric (Architecture M1).
-        let mut client = match crate::db::pool::acquire_timed(&self.pool, "suggest").await {
-            Ok(c) => c,
-            Err(e) => return Err(e.into()),
-        };
-        // WI-37: resolve the `pg_trgm` extension once (cached). Suggest is a
-        // pure-trgm op, so a missing extension soft-disables every arm (the
-        // whole result is empty rather than a partial). Probed on the arm's
-        // own connection (no second pool checkout — see `ensure_trgm_on`).
-        let trgm_ok = self.ensure_trgm_on(&mut *client).await;
-        let r_prefix = if trgm_ok {
-            run_sql_on(
-                &mut *client,
+        // ── Concurrency design (PERF-14 decision record) ───────────────────
+        // (sequential-arm history: PERF-10 in `build_search_arms`;
+        // docs/perf-notes.md "Superseded decisions")
+        //
+        // 2026-09-26 decision (this code): PERF-10's rationale applies to
+        // suggest unchanged — Postgres is remote, so every arm seek pays a
+        // network RTT, yet suggest still ran its 3 trgm arms SEQUENTIALLY on
+        // ONE pooled connection (3×RTT + Σarms instead of RTT + max(arm)).
+        // Autocomplete is the hot path, so the selected arms now run
+        // CONCURRENTLY, exactly like `search()`'s: each text arm takes its
+        // OWN pool checkout, held only for its query's duration, and all
+        // three join in one `tokio::join!`. The trgm probe moves to the
+        // pre-fan-out `ensure_trgm` (own checkout, cached — exactly what
+        // `build_search_arms` does), replacing the old on-connection
+        // `ensure_trgm_on` probe.
+        //
+        // Preserved exactly:
+        // - Arm SQL text (same `trgm_*_sql` builders, same `ORDER BY score
+        //   DESC, a.id` shape as `search()`'s arms).
+        // - Merge/dedup semantics: `merge_suggest` re-sorts by score within
+        //   each group and dedups prefix-first, so the result is
+        //   order-independent with respect to arm completion order.
+        // - Per-arm soft-fail: an arm QUERY failure degrades that arm to
+        //   empty (`run_sql_on`) — one dead branch can't 500 the suggestion.
+        // - The hard-fail corner (decided below with the existing unit-pinned
+        //   `join_text_arms`): every SELECTED arm fails CHECKOUT → Err (a
+        //   dead/exhausted pool must never surface as a silent empty
+        //   result); any mix with ≥1 successful checkout → failed arms
+        //   degrade to empty.
+        //
+        // Anchor arm (the one deliberate difference vs the strict `search()`
+        // shape): `search()` carries its dead-pool hard-fail on the
+        // always-selected FTS arm, but suggest has no non-trgm arm. So the
+        // PREFIX arm — the one arm always built — is suggest's anchor: it is
+        // ALWAYS selected (always attempts a checkout), so a dead/exhausted
+        // pool still hard-fails (503), pinned by
+        // `suggest_dead_pool_returns_503`. When `pg_trgm` is merely missing
+        // (pool healthy), the prefix arm soft-fails to empty and
+        // contains/similarity are skipped → the same 200-empty result as
+        // before.
+        //
+        // Deliberate changes (small, documented):
+        // - Checkout count: up to 3 concurrent checkouts on the foreground
+        //   pool (default 20, `db_pool_size`), each held only for its query's
+        //   duration — the old code held one connection across all three
+        //   sequential arms. Each is recorded under its own label
+        //   (`suggest_prefix`, `suggest_contains`, `suggest_similarity`) in
+        //   the /diagnostic checkout-wait metric, so fan-out pressure is
+        //   observable per site (the old single `suggest` label is gone).
+        // - Saturated-pool partial results (new bounded mode): the old
+        //   single-connection shape returned either a FULL result or a
+        //   503 (the one checkout won or timed out); now a pool that can
+        //   serve the anchor checkout but not all three arms within the
+        //   ~10 s acquire timeout returns 200 with the arms that checked
+        //   out (typically prefix-only) after ~10 s. Bounded, observable
+        //   via the per-arm /diagnostic checkout-wait labels
+        //   (`suggest_*`), and deliberately kept at parity with
+        //   `search()`'s arm waits (one timeout policy per pool) — a
+        //   shorter per-arm wait is the follow-up if 10 s partial latency
+        //   on autocomplete is ever unacceptable.
+        // WI-37: resolve the `pg_trgm` extension once (cached), taken
+        // BEFORE the fan-out so the arms' selected state is known up front.
+        // A missing extension (or a pool blip) soft-disables the
+        // contains/similarity arms; the prefix anchor still runs (see above).
+        // (A pool-blip `false` is not cached — one request only, see
+        // `ensure_trgm`; an absent extension soft-disables for the 60 s TTL.)
+        let trgm_ok = self.ensure_trgm().await;
+
+        // Each text arm: own checkout → query → return-to-pool (the
+        // `search()` arm shape). A CHECKOUT failure is returned to the join
+        // below (which decides the hard-fail corner); an arm QUERY failure
+        // soft-fails to empty inside `run_sql_on`. `&str` site labels are
+        // unique per arm for the /diagnostic checkout-wait metric
+        // (Architecture M1).
+        let pool = &self.pool;
+        let degradation = &self.degradation;
+        // Anchor arm (ALWAYS selected — see the PERF-14 record): carries the
+        // dead-pool hard-fail corner the way `search()`'s FTS arm does.
+        let prefix_arm = async {
+            run_text_arm(
+                pool,
                 &sq_prefix,
                 "suggest prefix query",
-                &self.degradation,
+                "suggest_prefix",
                 "trgm_prefix",
+                degradation,
             )
             .await
-        } else {
-            Vec::new()
         };
-        let r_contains = match &sq_contains {
-            Some(sq) if trgm_ok => {
-                run_sql_on(
-                    &mut *client,
-                    sq,
-                    "suggest contains query",
-                    &self.degradation,
-                    "trgm_contains",
-                )
-                .await
+        // Contains arm — GIN trgm index (selected only when built AND the
+        // extension is live).
+        let contains_arm = async {
+            match sq_contains.as_ref().filter(|_| trgm_ok) {
+                Some(sq) => {
+                    run_text_arm(
+                        pool,
+                        sq,
+                        "suggest contains query",
+                        "suggest_contains",
+                        "trgm_contains",
+                        degradation,
+                    )
+                    .await
+                }
+                None => Ok(Vec::new()),
             }
-            _ => Vec::new(),
         };
-        let r_similarity = match &sq_similarity {
-            Some(sq) if trgm_ok => {
-                run_sql_on(
-                    &mut *client,
-                    sq,
-                    "suggest similarity query",
-                    &self.degradation,
-                    "trgm_similarity",
-                )
-                .await
+        // Similarity arm — GiST trgm index (selected only when built AND the
+        // extension is live).
+        let similarity_arm = async {
+            match sq_similarity.as_ref().filter(|_| trgm_ok) {
+                Some(sq) => {
+                    run_text_arm(
+                        pool,
+                        sq,
+                        "suggest similarity query",
+                        "suggest_similarity",
+                        "trgm_similarity",
+                        degradation,
+                    )
+                    .await
+                }
+                None => Ok(Vec::new()),
             }
-            _ => Vec::new(),
         };
 
-        let prefix: Vec<SearchResult> = r_prefix.iter().map(row_to_result).collect();
-        let others: Vec<SearchResult> = r_contains
+        let (prefix_r, contains_r, similarity_r) =
+            tokio::join!(prefix_arm, contains_arm, similarity_arm);
+
+        // Hard-fail corner: the existing unit-pinned `join_text_arms`
+        // (PERF-10 shape). The 4th slot is UNUSED — suggest has 3 arms, not
+        // 4 — and passes an unselected `Ok(empty)` so it can neither select
+        // nor error. The prefix arm is ALWAYS selected (`true`, not
+        // `trgm_ok`): it is the anchor that carries the dead-pool hard-fail
+        // (see the PERF-14 record), mirroring `search()`'s always-selected
+        // FTS arm.
+        let [prefix_rows, contains_rows, similarity_rows, _] = join_text_arms([
+            (true, prefix_r),
+            (sq_contains.is_some() && trgm_ok, contains_r),
+            (sq_similarity.is_some() && trgm_ok, similarity_r),
+            (false, Ok(Vec::new())),
+        ])?;
+
+        let prefix: Vec<SearchResult> = prefix_rows.iter().map(row_to_result).collect();
+        let others: Vec<SearchResult> = contains_rows
             .iter()
-            .chain(r_similarity.iter())
+            .chain(similarity_rows.iter())
             .map(row_to_result)
             .collect();
 
@@ -807,9 +934,10 @@ impl SearchEngine {
 
 /// One concurrent text arm: check out a pool connection, run the arm SQL,
 /// return it to the pool the moment the query finishes (H2: no connection
-/// is ever held across the embed). A CHECKOUT failure is returned to
-/// `search()` (which decides the hard-fail corner across the arm set); an
-/// arm QUERY failure soft-fails to empty inside [`run_sql_on`], as before.
+/// is ever held across the embed). A CHECKOUT failure is returned to the
+/// caller — `search()`/`suggest()` — (which decides the hard-fail corner
+/// across the arm set); an arm QUERY failure soft-fails to empty inside
+/// [`run_sql_on`], as before.
 async fn run_text_arm(
     pool: &Pool,
     sq: &SqlQuery,
@@ -1005,16 +1133,14 @@ impl<'a> VectorEmbedArm<'a> {
             Some(c) => c,
             None => return None,
         };
-        // Build the cache key: model|dimension|trimmed_query.
-        // Case is preserved (embedding models are typically case-sensitive).
         // PERF-13: model/dimension come from the shared search snapshot, so
         // the cache key can't disagree with the fingerprint (computed from
-        // the same snapshot) across a concurrent settings write.
-        let cache_key = format!(
-            "{}|{}|{}",
-            self.snap.embed_model,
+        // the same snapshot) across a concurrent settings write. The key
+        // format itself lives in `query_cache_key` (the one checkable place).
+        let cache_key = query_cache_key(
+            &self.snap.embed_model,
             self.snap.embed_dimension,
-            self.query.trim()
+            &self.query,
         );
         // Check the FIFO cache (short lock, no await while held).
         // LINT-3: intentional panic-on-poisoned-lock idiom.
@@ -1291,7 +1417,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_trgm_soft_fails_and_caches_on_dead_pool() {
+    async fn ensure_trgm_soft_fails_without_caching_on_dead_pool() {
+        // 2026-10 review follow-up (renamed from
+        // `ensure_trgm_soft_fails_and_caches_on_dead_pool`): a probe CHECKOUT
+        // failure is a POOL problem, not a missing extension — it must not
+        // be cached for the 60 s TTL nor recorded as a `pg_trgm_probe`
+        // failure (that signal means "extension absent").
         use crate::settings::{default_settings, SettingsCache};
         let pool = crate::testing::dead_pool();
         let settings = SettingsCache::new_with_map(
@@ -1301,47 +1432,31 @@ mod tests {
         );
         let engine =
             SearchEngine::new(pool, settings, crate::health::DegradationTracker::default());
-        // Dead pool → the extension probe fails → `false`, and the cache is
-        // set so a second call returns `false` without a second pool attempt.
+        // Dead pool → the probe CHECKOUT fails → `false` for this request
+        // only: nothing is cached, so every call re-probes.
         assert!(!engine.ensure_trgm().await);
         assert!(
-            engine.trgm_ready.lock().unwrap().is_some(),
-            "trgm cache must be set after the first (failed) probe"
+            engine.trgm_ready.lock().unwrap().is_none(),
+            "a failed probe checkout must not populate the trgm cache"
         );
         assert!(
             !engine.ensure_trgm().await,
-            "second call reuses the cached `false`"
+            "second call re-probes (no cached `false` to reuse)"
         );
-    }
-
-    #[tokio::test]
-    async fn ensure_trgm_on_probes_through_provided_executor() {
-        use crate::settings::{default_settings, SettingsCache};
-        // The search/suggest arms hold the ONLY pool connection they have
-        // (`DB_POOL_SIZE` may be 1): `ensure_trgm_on` must probe through the
-        // passed executor and never take a nested checkout (a nested
-        // `pool.acquire()` would stall the full acquire_timeout at size 1).
-        // The dead pool itself is used as the executor: `&PgPool` implements
-        // `Executor`, so this exercises the held-connection code path with
-        // no extra connection held at all.
-        let pool = crate::testing::dead_pool();
-        let settings = SettingsCache::new_with_map(
-            pool.clone(),
-            default_settings(),
-            std::collections::HashMap::new(),
-        );
-        let engine = SearchEngine::new(
-            pool.clone(),
-            settings,
-            crate::health::DegradationTracker::default(),
-        );
-        // Dead pool → probe fails → `false`; cache set, second call cached.
-        assert!(!engine.ensure_trgm_on(&pool).await);
+        // Degradation tracker: the only public read is `degraded_snapshot`
+        // (branches with ≥3 consecutive failures — no per-branch count
+        // getter exists). A probe checkout failure never reaches
+        // `trgm_store`, so no `pg_trgm_probe` entry may exist after three
+        // re-probing calls — and if a regression ever recorded each failed
+        // checkout (nothing caches now to suppress re-probes), this third
+        // call would be the one crossing the ≥3 threshold and surfacing it
+        // here.
+        let _ = engine.ensure_trgm().await;
+        let degraded = engine.degradation.degraded_snapshot();
         assert!(
-            engine.trgm_ready.lock().unwrap().is_some(),
-            "trgm cache must be set after the first (failed) probe"
+            !degraded.iter().any(|(branch, _)| branch == "pg_trgm_probe"),
+            "a probe CHECKOUT failure must not record a `pg_trgm_probe` failure"
         );
-        assert!(!engine.ensure_trgm_on(&pool).await);
     }
 
     #[test]
@@ -2002,17 +2117,33 @@ mod tests {
 
     #[test]
     fn cache_key_includes_model_and_dimension() {
-        // The key format is `{model}|{dimension}|{trimmed_query}`.
-        // Different model or dimension → different key → no false hits.
-        let mk = |model: &str, dim: u32, q: &str| format!("{model}|{dim}|{}", q.trim());
-        assert_eq!(mk("nomic", 768, "hello"), "nomic|768|hello");
-        assert_eq!(mk("bge-m3", 1024, "hello"), "bge-m3|1024|hello");
-        assert_ne!(mk("nomic", 768, "hello"), mk("nomic", 1024, "hello"));
-        assert_ne!(mk("nomic", 768, "hello"), mk("bge-m3", 768, "hello"));
+        // The PRODUCTION key format is `{model}|{dimension}|{trimmed_query}`
+        // (see `query_cache_key`). Different model or dimension → different
+        // key → no false hits. This pins the production fn directly (not a
+        // local copy of the format string).
+        assert_eq!(query_cache_key("nomic", 768, "hello"), "nomic|768|hello");
+        assert_eq!(
+            query_cache_key("bge-m3", 1024, "hello"),
+            "bge-m3|1024|hello"
+        );
+        assert_ne!(
+            query_cache_key("nomic", 768, "hello"),
+            query_cache_key("nomic", 1024, "hello")
+        );
+        assert_ne!(
+            query_cache_key("nomic", 768, "hello"),
+            query_cache_key("bge-m3", 768, "hello")
+        );
         // Whitespace is trimmed.
-        assert_eq!(mk("nomic", 768, "  hello  "), mk("nomic", 768, "hello"));
+        assert_eq!(
+            query_cache_key("nomic", 768, "  hello  "),
+            query_cache_key("nomic", 768, "hello")
+        );
         // Case is preserved (embedding models are case-sensitive).
-        assert_ne!(mk("nomic", 768, "Hello"), mk("nomic", 768, "hello"));
+        assert_ne!(
+            query_cache_key("nomic", 768, "Hello"),
+            query_cache_key("nomic", 768, "hello")
+        );
     }
 
     // ── PERF-10 (2026-09-18): concurrent-arm checkout failure corner ──────

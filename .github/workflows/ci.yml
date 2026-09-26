@@ -54,8 +54,10 @@ jobs:
       # raw-SQL string literals in presentation layers, P3 no pool creation
       # in presentation layers (pools are startup-owned, passed via
       # AppState), P4 no db::raw::* call sites in src/serve/ files OUTSIDE
-      # handlers/ (extends the raw-sql lint's rule-2 scope). POSIX sh, no
-      # dependencies.
+      # handlers/ (extends the raw-sql lint's rule-2 scope), P5 no
+      # crate::startup:: references from src/settings/ or src/serve/ (the
+      # shared live env readers live in the leaf module crate::process).
+      # POSIX sh, no dependencies.
       - run: make boundary-lint
       # web-check (JS syntax + CSS parse) and web-test both read
       # node_modules: the CSS half parses with css-tree (the sanctioned
@@ -142,13 +144,17 @@ jobs:
           DATABASE_URL=postgres://zimservice:zimservice@localhost:5433/zimservice \
           cargo test --lib --bins --test wiremock --test integration
   # Rustdoc gate: catch broken intra-doc links and doc build failures.
+  # `--all-features` also compiles the `testing` feature's docs (src/
+  # testing.rs), so a broken intra-doc link there can't stay latent: the
+  # 4 private-const links found in the 2026-10 project-wide review were
+  # green-local/red-CI-elsewhere exactly because this flag was missing.
   docs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0", components: "rust-docs" }
-      - run: cargo doc --no-deps
+      - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
   # DB regression gate (uninstrumented): the plain behavioral gate for all
@@ -242,11 +248,13 @@ jobs:
   # `cargo update` drift. The external `zim` 0.5 crate's robustness against
   # malformed archives (the most likely future code-execution-adjacent
   # risk; RUSTSEC can't see it) is tracked by the standalone `fuzz/`
-  # cargo-fuzz workspace (fuzz_zim + fuzz_opds targets — see fuzz/README.md);
-  # it is NOT yet a CI job (self-hosted runner constraints), so run it
-  # locally: `cargo +nightly fuzz run <target>`. The mirror has no
-  # rustsec/audit-check, so the equivalent runs inline — which is what the
-  # action did under the hood (install cargo-audit + clone advisory-db).
+  # cargo-fuzz workspace (fuzz_zim + fuzz_opds targets — see fuzz/README.md),
+  # now gated by the dedicated .github/workflows/fuzz.yml (paths + schedule;
+  # that file's notes explain why low-frequency). Local runs stay the fast
+  # iteration path between gate runs: `cargo +nightly fuzz run <target>`.
+  # The mirror has no rustsec/audit-check, so the equivalent runs inline —
+  # which is what the action did under the hood (install cargo-audit + clone
+  # advisory-db).
   audit:
     runs-on: ubuntu-latest
     steps:

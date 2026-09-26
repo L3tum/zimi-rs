@@ -37,6 +37,10 @@ pub mod health;
 pub mod mcp;
 /// Shared SSRF / network guards for outbound HTTP.
 pub mod netguard;
+/// Process-mode flags: live env readers for `ZIMSERVICE_ALLOW_MULTI_INSTANCE`
+/// / `ZIMSERVICE_ALLOW_MULTI_DB` (leaf module — see rule P5 in
+/// scripts/check-boundaries.sh).
+pub mod process;
 /// Multi-engine article search (FTS + trigram + pgvector) with score merge.
 pub mod search;
 /// HTTP serving: the axum router plus its middleware, handlers, and OpenAPI.

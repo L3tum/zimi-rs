@@ -251,7 +251,7 @@ impl SettingsCache {
             write_guard: tokio::sync::Mutex::new(()),
             type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
             // M1: the opt-out is a process startup decision — capture it now.
-            multi_instance: crate::startup::multi_instance_allowed(),
+            multi_instance: crate::process::multi_instance_allowed(),
             kek,
         });
 
@@ -301,7 +301,7 @@ impl SettingsCache {
                 type_mismatches: RwLock::new(std::collections::BTreeMap::new()),
                 // M1: same capture as `load` — the field is the process
                 // startup decision (see the struct doc).
-                multi_instance: crate::startup::multi_instance_allowed(),
+                multi_instance: crate::process::multi_instance_allowed(),
                 kek,
             }),
         }

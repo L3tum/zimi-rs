@@ -364,12 +364,12 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
             qbit_connected,
             // M1: process-level startup decision (env-var opt-out), so it is
             // read the same way `cmd_serve` reads it — no state field.
-            multi_instance: crate::startup::multi_instance_allowed(),
+            multi_instance: crate::process::multi_instance_allowed(),
             // m-7: the partial opt-out is visible too (the full opt-out wins
             // and reports `multi_instance` instead — mirroring `cmd_serve`'s
             // `!allow_multi && config.allow_multi_db`).
-            multi_db: !crate::startup::multi_instance_allowed()
-                && crate::startup::multi_db_allowed(),
+            multi_db: !crate::process::multi_instance_allowed()
+                && crate::process::multi_db_allowed(),
             degraded: state
                 .degradation
                 .degraded_snapshot()

@@ -27,6 +27,8 @@ Thumbs.db
 
 # Testing
 test-data/
+# local scratch (draft commit message, scratch crate work)
+tmp/
 
 # JS tooling (npm / eslint)
 node_modules/
