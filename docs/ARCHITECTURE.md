@@ -243,6 +243,25 @@ still shares the primary pool — with no server foreground traffic in play,
 the 20-connection ceiling plus the 10 s acquire timeout (a fast 503 by
 design, mapped in `src/error.rs`) bound its blast radius.
 
+**Search arm gate (fan-out backpressure).** A hybrid search checks out up
+to 5 pool connections concurrently (4 text arms + the vector ANN seek), so
+~4–5 concurrent searches can exhaust the 20-connection primary pool and
+later arms time out (10 s) into 503s with no backpressure. Each engine
+therefore owns a `Semaphore` sized to `pool_max − ARM_GATE_RESERVE` (2,
+floored at 1 — `arm_gate_capacity` in `src/search/mod.rs`); every arm takes
+a permit **before** its checkout and holds it only across the
+checkout+query span. Concurrent fan-outs now queue for pool capacity
+(bounded backpressure) instead of piling checkouts past the ceiling, and
+the reserve keeps non-search foreground work (`/health` db probe,
+`ensure_trgm`, `/snippet`, `/random`, settings reads) able to check out on
+the same pool (2026-10 review, High). The permit *acquire* is itself
+deadline-bounded (`ARM_GATE_ACQUIRE_TIMEOUT`, 10 s — mirrors the pool's
+own acquire timeout): without it the pre-gate queue would be unbounded
+under sustained search overload (a permit only frees when the in-gate
+checkout+query finishes), so an overloaded search now stalls at most
+~20 s in total and then 503s — fast, not indefinite (2026-10 quick
+review).
+
 **Pure sqlx.** Application-table queries go through the `db::raw` helpers
 (`src/db/mod.rs`) against the pool (or transaction) they are given — no ORM,
 no extra connections, the same TLS mode as everything else. The helper shapes (`execute`,

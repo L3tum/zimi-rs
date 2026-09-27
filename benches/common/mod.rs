@@ -259,6 +259,16 @@ pub async fn build_state(pool: &Pool, settings: &SettingsCache) -> Result<AppSta
         degradation: DegradationTracker::default(),
         build_probe: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         index_building: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Benches never pull `/diagnostic` and never run the auto-embed
+        // loop, so the snapshot stays at its "never probed" default
+        // (`at_unix: 0`) — same contract as `startup::build_state`.
+        vector_index_snapshot: std::sync::Arc::new(std::sync::Mutex::new(
+            zimservice::embed::VectorIndexSnapshot {
+                embedded_rows: 0,
+                index: zimservice::embed::VectorIndexState::Absent,
+                at_unix: 0,
+            },
+        )),
         // No cross-process invalidation listener for the bench: it only
         // matters for long-lived servers, and None is the no-DB path's
         // shape (see AppState::notify). The bench reads settings once at

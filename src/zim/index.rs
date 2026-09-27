@@ -1142,6 +1142,14 @@ async fn bulk_insert(
 
 /// Append `s` to `out`, escaping backslashes and control chars for Postgres
 /// COPY text format. In-place to avoid a per-line allocation in the hot path.
+///
+/// Every control char `< 0x20` is emitted as a **3-digit** octal escape
+/// (`\000`-`\037`) — pg_dump's `\\%03o` convention. The digit count is
+/// load-bearing: Postgres's COPY text parser consumes 1-3 octal digits
+/// *greedily*, so a NUL written as the 1-digit `\0` immediately before a
+/// data byte `0`-`7` would swallow that byte (`A\05` → `A` + 0x05) — silent
+/// corruption of untrusted ZIM content (the `path` column is part of the
+/// articles/qid_index PK, so a mangled path breaks lookups, not just text).
 fn escape_copy_text_into(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
@@ -1149,7 +1157,15 @@ fn escape_copy_text_into(out: &mut String, s: &str) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            '\0' => out.push_str("\\0"),
+            c if (c as u32) < 0x20 => {
+                // 3-digit octal (`\000`-`\037`), digit by digit so the hot
+                // path stays allocation-free (no `format!` per control char).
+                let b = c as u8;
+                out.push('\\');
+                out.push((b'0' + ((b >> 6) & 0x03)) as char);
+                out.push((b'0' + ((b >> 3) & 0x07)) as char);
+                out.push((b'0' + (b & 0x07)) as char);
+            }
             _ => out.push(c),
         }
     }
@@ -1623,12 +1639,94 @@ mod tests {
             ("tab\there", "tab\\there"),
             ("mixed\n\t\\end", "mixed\\n\\t\\\\end"),
             ("café résumé", "café résumé"),
-            ("nul\0byte", "nul\\0byte"),
+            // NUL is a 3-digit octal escape (`\\000`): Postgres's COPY text
+            // parser consumes 1-3 octal digits greedily, so the 1-digit
+            // `\\0` it used to emit would swallow a following data byte
+            // `0`-`7` (`A\\05` → `A` + 0x05) — silent corruption.
+            ("nul\x00byte", "nul\\000byte"),
+            ("A\x005", "A\\0005"),
+            ("x\x00123", "x\\000123"),
+            ("\x00\x00", "\\000\\000"),
+            ("\x01\x02", "\\001\\002"),
+            ("\x1f", "\\037"),
         ];
         for (input, expected) in cases {
             let mut out = String::new();
             escape_copy_text_into(&mut out, input);
             assert_eq!(out, expected, "input: {input:?}");
+        }
+    }
+
+    /// A miniature of Postgres's COPY text parser, scoped to the escape
+    /// classes `escape_copy_text_into` emits: named escapes (`\\n`, `\\r`,
+    /// `\\t`, `\\\\`) and **greedy** 1-3 digit octal escapes (after `\\`,
+    /// one-to-three consecutive `0`-`7` digits decode to one byte — the
+    /// exact consumption rule that made the old 1-digit `\\0` corrupt
+    /// `A\05` into `A` + 0x05).
+    fn parse_copy_octal_roundtrip(escaped: &str) -> Option<String> {
+        let bytes = escaped.as_bytes();
+        let mut out: Vec<u8> = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                match bytes[i + 1] {
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'\\' => out.push(b'\\'),
+                    d if d.is_ascii_digit() && d <= b'7' => {
+                        let mut val = 0u32;
+                        let mut j = i + 1;
+                        while j < bytes.len()
+                            && j - i < 4
+                            && bytes[j].is_ascii_digit()
+                            && bytes[j] <= b'7'
+                        {
+                            val = (val << 3) + u32::from(bytes[j] - b'0');
+                            j += 1;
+                        }
+                        out.push(val as u8);
+                        i = j;
+                        continue;
+                    }
+                    _ => out.push(b'\\'),
+                }
+                i += 2;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
+    /// Regression for the greedy-octal corruption: every control char must
+    /// come back byte-identical after a greedy 1-3 digit octal parse, i.e.
+    /// the emitted escape is always exactly 3 digits so the parser can never
+    /// swallow the following data byte. The NUL-adjacent-to-octal-digit
+    /// cases (`A\05`, `x\0123`) are the corrupting inputs.
+    #[test]
+    fn escape_copy_text_roundtrips_through_greedy_octal_parse() {
+        let inputs = [
+            "nul\x00byte",
+            "A\x005",
+            "x\x00123",
+            "\x00",
+            "\x007",
+            "\x00\x00",
+            "\x01\x02",
+            "\x1f",
+            "A\nB\tC\\D\\rE",
+            "/wikipedia/A\x005.html",
+        ];
+        for input in inputs {
+            let mut out = String::new();
+            escape_copy_text_into(&mut out, input);
+            assert_eq!(
+                parse_copy_octal_roundtrip(&out).as_deref(),
+                Some(input),
+                "greedy octal round-trip failed for {input:?} (escaped: {out:?})"
+            );
         }
     }
 

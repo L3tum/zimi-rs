@@ -91,6 +91,15 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn cmd_serve(config: Config) -> anyhow::Result<()> {
+    // Fail-closed die flag: the components that must fail the whole process
+    // (the advisory-lock liveness monitor, the LISTEN/NOTIFY listener's
+    // supervisor, the background-task supervisor) signal through this watch
+    // channel instead of `process::exit(1)`: the flag trips the graceful-
+    // shutdown arm below, `finalize_serve_shutdown` classifies the exit
+    // non-zero (fail-closed), and the guard drop at the end of this fn
+    // releases the lockfile cleanly — no `exit(1)` that skips guard drops.
+    let (task_died, mut died_rx) = tokio::sync::watch::channel(false);
+
     // M-1: acquire the single-instance guards **before** `build_state`.
     // `build_state` in `StartupMode::Serve` runs the startup resync, which
     // persists new ZIM rows and deletes rows for files missing on disk — a
@@ -108,9 +117,9 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
     } else if allow_multi_db {
         // m-7 partial opt-out: the per-zim_dir PID lock guard stays enforced;
         // only the per-database advisory lock is best-effort.
-        Some(startup::acquire_instance_guard_multi_db(&config).await?)
+        Some(startup::acquire_instance_guard_multi_db(&config, task_died.clone()).await?)
     } else {
-        match startup::acquire_instance_guard(&config).await? {
+        match startup::acquire_instance_guard(&config, task_died.clone()).await? {
             Some(g) => Some(g),
             None => {
                 anyhow::bail!(
@@ -129,6 +138,7 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
     let state = startup::build_state(
         &config,
         startup::StartupRequest::serve(guard.as_ref().is_some_and(|g| g.advisory_lock_held())),
+        Some(task_died.clone()),
     )
     .await?;
 
@@ -243,7 +253,6 @@ async fn cmd_serve(config: Config) -> anyhow::Result<()> {
     // Ownership: `wait_for_task_failure` consumes the four handles and, on
     // clean shutdown, hands back the still-alive ones via
     // `supervisor_handle.await` so the shutdown path can still abort them.
-    let (task_died, mut died_rx) = tokio::sync::watch::channel(false);
     let died_check = task_died.subscribe();
     let (sup_stop_tx, sup_stop_rx) = tokio::sync::watch::channel(false);
     let supervisor_handle = tokio::spawn({
@@ -366,7 +375,7 @@ async fn cmd_list(config: Config, sync: bool) -> anyhow::Result<()> {
 async fn cmd_status(config: Config) -> anyhow::Result<()> {
     // `status` reports the qBittorrent connection state in its output, so it
     // keeps the startup connect round-trip (`connect_torrent = true`).
-    let state = startup::build_state(&config, startup::StartupRequest::status()).await?;
+    let state = startup::build_state(&config, startup::StartupRequest::status(), None).await?;
     let zims = state.zims.list();
     let total_articles: i64 = zims.iter().map(|z| z.indexed_entries as i64).sum();
 
@@ -410,6 +419,7 @@ async fn cmd_index(config: Config, zim: Option<String>, all: bool) -> anyhow::Re
     let state = startup::build_state(
         &config,
         startup::StartupRequest::mutating(mutating_guard.is_some()),
+        None,
     )
     .await?;
 
@@ -422,7 +432,7 @@ async fn cmd_index(config: Config, zim: Option<String>, all: bool) -> anyhow::Re
 async fn cmd_mcp(config: Config) -> anyhow::Result<()> {
     // `connect_torrent = false` (ARCH minor #3): the stdio MCP session never
     // touches the qBittorrent client, so skip the startup login round-trip.
-    let state = startup::build_state(&config, startup::StartupRequest::mcp()).await?;
+    let state = startup::build_state(&config, startup::StartupRequest::mcp(), None).await?;
     let state = Arc::new(state);
 
     // DEC-2: In password mode, require MCP_AUTH_PASSWORD env var and verify
@@ -456,6 +466,7 @@ async fn cmd_embed(config: Config, zim: Option<String>) -> anyhow::Result<()> {
     let state = startup::build_state(
         &config,
         startup::StartupRequest::mutating(mutating_guard.is_some()),
+        None,
     )
     .await?;
 
@@ -493,6 +504,7 @@ async fn cmd_embed(config: Config, zim: Option<String>) -> anyhow::Result<()> {
             name,
             &state.build_probe,
             &state.index_building,
+            &state.vector_index_snapshot,
         )
         .await?;
         println!("Done: {name}");

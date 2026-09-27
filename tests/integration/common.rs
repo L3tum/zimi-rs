@@ -248,6 +248,15 @@ pub fn assemble_state(
         degradation: zimservice::health::DegradationTracker::default(),
         build_probe: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         index_building: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // `at_unix: 0` = "never probed" (same contract as `build_state`)
+        // — a test pulling `/diagnostic` pays the exact probe itself.
+        vector_index_snapshot: Arc::new(std::sync::Mutex::new(
+            zimservice::embed::VectorIndexSnapshot {
+                embedded_rows: 0,
+                index: zimservice::embed::VectorIndexState::Absent,
+                at_unix: 0,
+            },
+        )),
         notify: None,
     }
 }

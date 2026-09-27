@@ -61,13 +61,16 @@
 //!
 //! **Fail-closed supervision**: a listener task dying unexpectedly would
 //! silently degrade freshness across all peers with no signal — the same
-//! failure class the advisory-lock liveness monitor treats as fatal
-//! (`startup.rs`: log + `process::exit(1)`). Each listener task reports its
-//! death (a drop-guard, so panics are covered too); a supervisor that
-//! observes a death before the graceful-stop flag is set exits the process.
-//! Dropping the last [`crate::db::notify::NotifyListener`] handle sets the
-//! stop flag **before** aborting the tasks, so a clean shutdown never trips
-//! the supervisor.
+//! failure class the advisory-lock liveness monitor treats as fatal.
+//! Each listener task reports its death (a drop-guard, so panics are
+//! covered too); a supervisor that observes a death before the
+//! graceful-stop flag is set raises the process die flag (the `cmd_serve`
+//! `watch` channel) so the process exits **non-zero through the normal
+//! graceful-shutdown protocol** — clean lockfile release, `ServeFailure`
+//! classification — instead of a bare `process::exit(1)` that would skip
+//! guard drops. Dropping the last [`crate::db::notify::NotifyListener`]
+//! handle sets the stop flag **before** aborting the tasks, so a clean
+//! shutdown never trips the supervisor.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -310,28 +313,36 @@ async fn run_on_bumps(mut rx: tokio::sync::watch::Receiver<u64>, mut action: OnB
 /// database and cannot fail it — a listener that never connects degrades to
 /// the pre-LISTEN/NOTIFY staleness bounds (next local resync / restart) and
 /// reports `reconnecting` in `/diagnostic`.
+/// `died_tx` is the process die-flag sender (the `cmd_serve` graceful-
+/// shutdown channel): the supervisor raises it when a listener task dies
+/// unexpectedly, so the process exits non-zero through the normal shutdown
+/// protocol (see the module's "Fail-closed supervision" record).
 pub fn spawn_listener(
     database_url: &str,
     on_settings: OnBump,
     on_catalog: OnBump,
+    died_tx: tokio::sync::watch::Sender<bool>,
 ) -> NotifyListener {
     spawn_listener_as(
         database_url,
         on_settings,
         on_catalog,
         LISTENER_APPLICATION_NAME,
+        died_tx,
     )
 }
 
 /// [`spawn_listener`] with an explicit `application_name` for the dedicated
 /// session — the test seam: per-test unique tags let a test find and
 /// terminate the listener's backend in `pg_stat_activity` to exercise the
-/// reconnect path.
+/// reconnect path. `died_tx` is the process die-flag sender the supervisor
+/// raises on an unexpected worker death (see [`spawn_listener`]).
 pub(crate) fn spawn_listener_as(
     database_url: &str,
     on_settings: OnBump,
     on_catalog: OnBump,
     application_name: &str,
+    died_tx: tokio::sync::watch::Sender<bool>,
 ) -> NotifyListener {
     let status = Arc::new(NotifyStatus::default());
     // Bump-on-notify channels: the workers only signal, the subscribers own
@@ -375,7 +386,7 @@ pub(crate) fn spawn_listener_as(
         // The report senders in the spawned workers outlive this clone;
         // drop ours so the channel closes once every worker is dead.
         drop(supervisor_report);
-        supervise(report_rx, stop_rx).await;
+        supervise(report_rx, stop_rx, died_tx).await;
     });
 
     NotifyListener {
@@ -409,14 +420,18 @@ impl Drop for DeathReporter {
 }
 
 /// Fail-closed supervision (see the module docs): the first worker death
-/// observed **before** the graceful-stop flag is set exits the process,
-/// because a dead listener silently degrades cache freshness across all
-/// peers with no signal. After the stop flag is set, remaining reports are
+/// observed **before** the graceful-stop flag is set raises the process
+/// die flag (`died_tx` — the `cmd_serve` graceful-shutdown channel) and
+/// returns, because a dead listener silently degrades cache freshness
+/// across all peers with no signal; the process then exits non-zero through
+/// the normal shutdown protocol (clean lockfile release) instead of a bare
+/// `process::exit(1)`. After the stop flag is set, remaining reports are
 /// drained (the workers are being aborted by `NotifyListenerInner::drop`);
 /// the supervisor also exits when every report sender is gone.
 async fn supervise(
     mut report_rx: tokio::sync::mpsc::UnboundedReceiver<&'static str>,
     stop: tokio::sync::watch::Receiver<bool>,
+    died_tx: tokio::sync::watch::Sender<bool>,
 ) {
     while let Some(name) = report_rx.recv().await {
         if !*stop.borrow() {
@@ -424,10 +439,14 @@ async fn supervise(
                 task = name,
                 "cross-process invalidation listener task died unexpectedly — without it, \
                  peer instances' settings/catalog writes stay invisible until the next \
-                 local resync or restart (silent freshness degradation). Exiting to fail \
-                 closed (advisory-lock-monitor precedent)."
+                 local resync or restart (silent freshness degradation). Raising the \
+                 process die flag to fail closed (advisory-lock-monitor precedent)."
             );
-            std::process::exit(1);
+            // `send` fails only if the die-flag channel was already dropped
+            // (the process is tearing down); either way the supervisor
+            // exits — the flag (or the teardown) owns the shutdown.
+            let _ = died_tx.send(true);
+            return;
         }
         // Stop flag set: graceful shutdown in progress — drain the rest.
     }
@@ -686,7 +705,11 @@ mod tests {
                 }
             })
         });
-        let listener = spawn_listener_as(&url, on_settings, on_catalog, &app_name(tag));
+        // Test-side die flag: the tests never assert the fail-closed exit,
+        // so a throwaway channel is enough — a tripped supervisor here
+        // would just be invisible (the flag is read by no one).
+        let (died_tx, _died_rx) = tokio::sync::watch::channel(false);
+        let listener = spawn_listener_as(&url, on_settings, on_catalog, &app_name(tag), died_tx);
         Some((pool, dir, settings, zims, listener))
     }
 

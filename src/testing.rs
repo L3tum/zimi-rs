@@ -293,6 +293,16 @@ pub fn state_from_parts(
         degradation: crate::health::DegradationTracker::default(),
         build_probe: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         index_building: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // `at_unix: 0` = "never probed" (same contract as
+        // `build_state`): a test that pulls `/diagnostic` pays the exact
+        // probe itself, then reads the published snapshot.
+        vector_index_snapshot: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::embed::VectorIndexSnapshot {
+                embedded_rows: 0,
+                index: crate::embed::VectorIndexState::Absent,
+                at_unix: 0,
+            },
+        )),
         // Tests never run the cross-process invalidation listener (it is a
         // serve-only, long-lived concern — the DB-gated tests in `db::notify`
         // exercise it directly via `spawn_listener_as`).

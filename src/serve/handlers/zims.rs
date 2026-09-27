@@ -124,6 +124,12 @@ pub struct VectorIndexDiagnostic {
     /// a full sequential cosine scan over `embedded_rows` rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded: Option<String>,
+    /// Unix seconds when `embedded_rows`/`index` were last measured. The
+    /// auto-embed loop publishes the probe at most every 60 s, so this can
+    /// trail the pull time by up to `VECTOR_INDEX_SNAPSHOT_TTL` (5 min);
+    /// a pull that finds the snapshot stale pays the exact probe, so the
+    /// value is never older than the TTL.
+    pub count_at: u64,
 }
 
 /// One per-ZIM integrity row of `GET /diagnostic` →
@@ -385,6 +391,17 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     )
 }
 
+// LINT-3 (2026-10 review): deliberate panic — the poisoned-lock idiom
+// (a poison here means the publisher already panicked; surfacing it via a
+// 500 on this operator-pulled route is the right signal).
+#[allow(clippy::expect_used)]
+fn cached_vector_index_snapshot(state: &AppState) -> crate::embed::VectorIndexSnapshot {
+    *state
+        .vector_index_snapshot
+        .lock()
+        .expect("vector-index snapshot lock poisoned")
+}
+
 /// `GET /diagnostic` — operator-facing diagnostics (ARCH Major #3,
 /// Security High #2): settings keys whose stored value fails its
 /// `json_type` check (each silently running on its default), the shared
@@ -438,21 +455,55 @@ pub async fn diagnostic(
     // is set.
     let pool_read = state.db_read.as_ref().map(pool_health);
     let pool_bg = pool_health(&state.db_bg);
+
     // Architecture M1 (vector index): surface the degradation state — no
     // valid index at scale means every vector search is a brute-force
-    // sequential cosine scan. One extra `COUNT(*)` + catalog probe is fine
-    // here: this route is authenticated, operator-pulled, and off the hot
-    // path. On probe failure the field is omitted (the DB is unreachable —
-    // `/health`'s `db_connected` already reports that).
-    let vector_index = match crate::embed::vector_index_state(&state.db).await {
-        Ok((embedded_rows, index)) => Some(VectorIndexDiagnostic {
-            degraded: crate::embed::vector_index_degradation_note(embedded_rows, index),
-            embedded_rows,
-            index,
-        }),
-        Err(e) => {
-            tracing::warn!("vector index diagnostic probe failed: {e}");
-            None
+    // sequential cosine scan. 2026-10 review (Medium): the exact `COUNT(*)`
+    // was on EVERY pull; the auto-embed loop (60 s tick) and the
+    // pipeline-end build publish the probe to the shared snapshot, so
+    // prefer it while fresh (a pure in-memory read — no checkout) and only
+    // pay the exact probe when the snapshot is missing/stale (one bounded,
+    // operator-pulled checkout — the result is published to warm the cache).
+    // The snapshot's `embedded_rows` is the exact count on probe ticks and
+    // the `n_live_tup` stats estimate on the loop's catalog-only skip
+    // ticks (2026-10 quick review — zero steady-state exact probes); the
+    // degradation note only depends on the 10k-row threshold, so the two
+    // are observationally equivalent. On probe failure the field is
+    // omitted (the DB is unreachable — `/health`'s `db_connected` already
+    // reports that).
+    let vector_index = {
+        let now = crate::embed::now_unix_secs();
+        let snap = cached_vector_index_snapshot(&state);
+        if crate::embed::snapshot_is_fresh(&snap, now) {
+            Some(VectorIndexDiagnostic {
+                degraded: crate::embed::vector_index_degradation_note(
+                    snap.embedded_rows,
+                    snap.index,
+                ),
+                embedded_rows: snap.embedded_rows,
+                index: snap.index,
+                count_at: snap.at_unix,
+            })
+        } else {
+            match crate::embed::vector_index_state(&state.db).await {
+                Ok((embedded_rows, index)) => {
+                    crate::embed::publish_vector_index_snapshot(
+                        &state.vector_index_snapshot,
+                        embedded_rows,
+                        index,
+                    );
+                    Some(VectorIndexDiagnostic {
+                        degraded: crate::embed::vector_index_degradation_note(embedded_rows, index),
+                        embedded_rows,
+                        index,
+                        count_at: now,
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!("vector index diagnostic probe failed: {e}");
+                    None
+                }
+            }
         }
     };
     // Architecture M1 (checkout wait): pure atomic reads — no connection.

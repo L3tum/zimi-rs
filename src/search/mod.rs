@@ -61,6 +61,30 @@ type SearchRow = (
 /// search path.
 const SEARCH_EMBED_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Pool connections the arm gate keeps **outside** the search fan-out
+/// (2026-10 review, High — search fan-out exhausts the DB pool): non-search
+/// foreground work on the same pool (`/health` db probe, `ensure_trgm`,
+/// `/snippet`, `/random`, settings reads) must always find a connection,
+/// so the gate caps concurrent arm checkouts at `pool_max - ARM_GATE_RESERVE`.
+const ARM_GATE_RESERVE: u32 = 2;
+
+/// Backpressure capacity of the search arm gate: pool ceiling minus the
+/// non-search reserve, floored at 1 (a size-1 test pool still runs its arms,
+/// serially). Pure so the sizing is unit-pinned.
+fn arm_gate_capacity(pool_max: u32) -> usize {
+    pool_max.saturating_sub(ARM_GATE_RESERVE).max(1) as usize
+}
+
+/// Deadline for acquiring an arm-gate permit (2026-10 quick review 🟡):
+/// without it the queue *before* the gate is unbounded — a permit only
+/// frees when the in-gate checkout+query finishes, so under sustained
+/// search overload a request would stall indefinitely. With the deadline
+/// the worst-case stall is bounded (this timeout + the in-gate 10 s pool
+/// checkout) and then the request surfaces as a 503 exactly like a
+/// pool-exhausted search. Mirrors the pool's own 10 s acquire timeout so
+/// the total stall budget stays predictable.
+const ARM_GATE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// THE production query-embed cache key format: `model|dimension|trimmed-query`
 /// (case is preserved — embedding models are case-sensitive). This is the
 /// single checkable place for the key format: `VectorEmbedArm::embed_query`
@@ -142,6 +166,19 @@ pub struct SearchEngine {
     /// Per-branch degradation tracker (WI-5): records failures so `/health`
     /// and search responses can surface silent capability loss.
     degradation: crate::health::DegradationTracker,
+    /// Backpressure gate for the concurrent arm fan-out (2026-10 review,
+    /// High — the PERF-10 5-arm fan-out can exceed the pool ceiling under
+    /// concurrent search load: 4 text arms + 1 ANN seek per hybrid search ×
+    /// N searches > pool size → checkouts queue past the 10 s acquire
+    /// timeout → 503s). A `Semaphore` sized to `arm_gate_capacity(pool_max)`
+    /// (`pool_max - ARM_GATE_RESERVE`, floored at 1): each arm acquires one
+    /// permit **before** its checkout (deadline-bounded by
+    /// `ARM_GATE_ACQUIRE_TIMEOUT` — see there) and holds it only across the
+    /// checkout+query span (the same span the connection is held — H2), so
+    /// excess fan-out queues for capacity (backpressure) instead of
+    /// exhausting the pool. `Arc` so the `Clone` derive shares one gate
+    /// across engine copies — one gate per process, sized from the pool.
+    arm_gate: Arc<tokio::sync::Semaphore>,
 }
 
 /// One article match from the merged multi-engine result set (FTS/trigram/vector).
@@ -195,6 +232,12 @@ impl SearchEngine {
         settings: SettingsCache,
         degradation: crate::health::DegradationTracker,
     ) -> Self {
+        // Arm-gate capacity is derived from THIS pool's configured ceiling
+        // (`db_pool_size` clamped by `effective_pool_size`), so a smaller
+        // deployment (or a test pool) gets proportionally smaller fan-out
+        // backpressure without configuration. Read before the struct literal
+        // moves `pool` in.
+        let arm_gate_capacity = arm_gate_capacity(pool.options().get_max_connections());
         Self {
             pool,
             settings,
@@ -202,6 +245,7 @@ impl SearchEngine {
             query_embed_cache: Arc::new(std::sync::Mutex::new(QueryEmbedCache::default())),
             trgm_ready: Arc::new(std::sync::Mutex::new(None)),
             degradation,
+            arm_gate: Arc::new(tokio::sync::Semaphore::new(arm_gate_capacity)),
         }
     }
 
@@ -457,11 +501,14 @@ impl SearchEngine {
         // `run_sql_on`, as before. `&str` labels are unique per arm for the
         // /diagnostic checkout-wait metric (Architecture M1).
         let pool = &self.pool;
+        let arm_gate = &self.arm_gate;
         let degradation = &self.degradation;
         // Q0: full-text search
         let fts_arm = async {
             match fts_sq.as_ref() {
-                Some(sq) => run_text_arm(pool, sq, "FTS", "search_fts", "fts", degradation).await,
+                Some(sq) => {
+                    run_text_arm(pool, arm_gate, sq, "FTS", "search_fts", "fts", degradation).await
+                }
                 None => Ok(Vec::new()),
             }
         };
@@ -471,6 +518,7 @@ impl SearchEngine {
                 Some(sq) => {
                     run_text_arm(
                         pool,
+                        arm_gate,
                         sq,
                         "trgm prefix query",
                         "search_trgm_prefix",
@@ -488,6 +536,7 @@ impl SearchEngine {
                 Some(sq) => {
                     run_text_arm(
                         pool,
+                        arm_gate,
                         sq,
                         "trgm contains query",
                         "search_trgm_contains",
@@ -505,6 +554,7 @@ impl SearchEngine {
                 Some(sq) => {
                     run_text_arm(
                         pool,
+                        arm_gate,
                         sq,
                         "trgm similarity query",
                         "search_trgm_similarity",
@@ -692,6 +742,20 @@ impl SearchEngine {
         //   is recorded under its own label (`search_fts`, `search_trgm_*`,
         //   `search_vector_ann`) in the /diagnostic checkout-wait metric, so
         //   fan-out pressure is observable per site.
+        // - Arm gate backpressure (2026-10 review, High — fan-out exhausts
+        //   the pool): each arm (4 text arms + the ANN seek) takes a permit
+        //   from the engine's `arm_gate` — a `Semaphore` sized to
+        //   `pool_max - ARM_GATE_RESERVE`, floored at 1 (`arm_gate_capacity`) —
+        //   **before** its checkout, held only across the checkout+query span
+        //   (H2). Concurrent fan-outs therefore queue for pool capacity
+        //   (bounded backpressure) instead of piling checkouts past the
+        //   ceiling (N searches × 5 checkouts > pool size → 10 s acquire
+        //   timeouts → 503s). The gate is per engine instance (one per
+        //   process, sized from the pool at construction) and bounds
+        //   fan-out, not pool size; `ARM_GATE_RESERVE` keeps non-search
+        //   foreground work (the `/health` db probe, `ensure_trgm`,
+        //   `/snippet`, `/random`, settings reads) able to check out on the
+        //   same pool.
         // - trgm probe cadence unchanged: one probe per search when the
         //   in-process cache is cold (`ensure_trgm`, own checkout — taken
         //   before the fan-out so the arms' selected state is known up
@@ -853,12 +917,14 @@ impl SearchEngine {
         // unique per arm for the /diagnostic checkout-wait metric
         // (Architecture M1).
         let pool = &self.pool;
+        let arm_gate = &self.arm_gate;
         let degradation = &self.degradation;
         // Anchor arm (ALWAYS selected — see the PERF-14 record): carries the
         // dead-pool hard-fail corner the way `search()`'s FTS arm does.
         let prefix_arm = async {
             run_text_arm(
                 pool,
+                arm_gate,
                 &sq_prefix,
                 "suggest prefix query",
                 "suggest_prefix",
@@ -874,6 +940,7 @@ impl SearchEngine {
                 Some(sq) => {
                     run_text_arm(
                         pool,
+                        arm_gate,
                         sq,
                         "suggest contains query",
                         "suggest_contains",
@@ -892,6 +959,7 @@ impl SearchEngine {
                 Some(sq) => {
                     run_text_arm(
                         pool,
+                        arm_gate,
                         sq,
                         "suggest similarity query",
                         "suggest_similarity",
@@ -938,14 +1006,37 @@ impl SearchEngine {
 /// caller — `search()`/`suggest()` — (which decides the hard-fail corner
 /// across the arm set); an arm QUERY failure soft-fails to empty inside
 /// [`run_sql_on`], as before.
+///
+/// `gate` is the engine's arm backpressure gate (see `SearchEngine::arm_gate`):
+/// the permit is taken before the checkout and held only across the
+/// checkout+query span, so concurrent fan-outs queue for pool capacity
+/// instead of exhausting it. The acquire itself is deadline-bounded
+/// (`ARM_GATE_ACQUIRE_TIMEOUT`): on timeout the arm fails like a checkout
+/// failure, so an overloaded search 503s fast instead of stalling
+/// unboundedly in the pre-gate queue.
 async fn run_text_arm(
     pool: &Pool,
+    gate: &tokio::sync::Semaphore,
     sq: &SqlQuery,
     what: &str,
     site: &'static str,
     branch: &'static str,
     degradation: &crate::health::DegradationTracker,
 ) -> std::result::Result<Vec<SearchRow>, sqlx::Error> {
+    // Arm gate first: backpressure (a permit frees when the query below
+    // finishes and the connection returns to the pool). The acquire is
+    // deadline-bounded (`ARM_GATE_ACQUIRE_TIMEOUT`) — on timeout fail like
+    // a checkout failure so `join_text_arms` counts it and the request
+    // 503s fast under overload instead of stalling in the pre-gate queue.
+    let _permit = match tokio::time::timeout(ARM_GATE_ACQUIRE_TIMEOUT, gate.acquire()).await {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("arm gate permit wait exceeded {ARM_GATE_ACQUIRE_TIMEOUT:?}"),
+            )));
+        }
+    };
     // `acquire_timed`: explicit checkout behind the /diagnostic
     // checkout-wait metric (Architecture M1), one label per arm.
     let mut client = crate::db::pool::acquire_timed(pool, site).await?;
@@ -1104,6 +1195,25 @@ impl<'a> VectorEmbedArm<'a> {
             self.ann_weight,
         );
         debug_assert!(sq.placeholder_count() == sq.params.len());
+        // Arm gate (see `SearchEngine::arm_gate`): the ANN seek is the
+        // fifth concurrent checkout of a hybrid search — it takes a permit
+        // like the text arms so the fan-out cannot exhaust the pool.
+        // Deadline-bounded like the text arms: on timeout this arm
+        // soft-fails to empty, matching the arm's checkout-failure
+        // contract (warn + empty).
+        let _permit =
+            match tokio::time::timeout(ARM_GATE_ACQUIRE_TIMEOUT, self.engine.arm_gate.acquire())
+                .await
+            {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        "vector search skipped for this query: arm gate permit wait exceeded \
+                     {ARM_GATE_ACQUIRE_TIMEOUT:?} (search overload)"
+                    );
+                    return Vec::new();
+                }
+            };
         match crate::db::pool::acquire_timed(&self.engine.pool, "search_vector_ann").await {
             Ok(mut client) => {
                 run_sql_on(
@@ -2185,6 +2295,53 @@ mod tests {
         assert!(
             matches!(&surfaced, Err(e) if e.to_string().contains("first")),
             "first errored arm's error surfaces"
+        );
+    }
+
+    /// 2026-10 review (High — search fan-out exhausts the DB pool): the arm
+    /// gate capacity is `pool_max - ARM_GATE_RESERVE`, floored at 1. The
+    /// floor matters for the test-pool convention (`dead_pool`/`test_pool`
+    /// use small ceilings): a size-1 pool must still run its arms, serially.
+    #[test]
+    fn arm_gate_capacity_sizing() {
+        assert_eq!(
+            arm_gate_capacity(20),
+            18,
+            "default pool (20) → 18 arm permits, 2 reserved"
+        );
+        assert_eq!(arm_gate_capacity(100), 98, "pool ceiling (100) → 98");
+        assert_eq!(arm_gate_capacity(3), 1, "small pool (3) → 3 - 2 = 1");
+        assert_eq!(arm_gate_capacity(2), 1, "pool (2) → floored at 1");
+        assert_eq!(
+            arm_gate_capacity(1),
+            1,
+            "test pool (1) → floored at 1 — arms run serially"
+        );
+        assert_eq!(
+            arm_gate_capacity(0),
+            1,
+            "degenerate (0) → floored at 1, no underflow"
+        );
+    }
+
+    /// The engine's arm gate is sized from the pool it wraps: a size-1 pool
+    /// (`dead_pool` convention) yields exactly one permit — concurrent arms
+    /// on such a pool serialize instead of piling checkouts.
+    #[tokio::test]
+    async fn engine_arm_gate_is_sized_from_its_pool() {
+        use crate::settings::{default_settings, SettingsCache};
+        let pool = crate::testing::dead_pool(); // max_connections(1)
+        let settings = SettingsCache::new_with_map(
+            pool.clone(),
+            default_settings(),
+            std::collections::HashMap::new(),
+        );
+        let engine =
+            SearchEngine::new(pool, settings, crate::health::DegradationTracker::default());
+        assert_eq!(
+            engine.arm_gate.available_permits(),
+            arm_gate_capacity(1),
+            "gate sized from the pool's configured ceiling"
         );
     }
 }

@@ -20,7 +20,7 @@ pub const VECTOR_INDEX_MIN_ROWS: i64 = 1;
 /// Minimum number of embedded vectors before the background auto-embed loop
 /// considers building the partial vector index. Must stay in sync with the
 /// `min_rows` passed to [`maybe_build_vector_index`] from `auto_embed_loop`
-/// and the pre-filter in [`index_build_worth_probing`].
+/// and the pre-filter in [`index_build_prefilter`].
 pub(crate) const MIN_INDEX_BUILD_ROWS: i64 = 10_000;
 
 /// Upper bound on how long the auto-embed loop will *await* a spawned index
@@ -108,6 +108,83 @@ pub(crate) fn should_spawn_build(state: VectorIndexState, count: i64) -> bool {
     !matches!(state, VectorIndexState::Present) && count >= MIN_INDEX_BUILD_ROWS
 }
 
+/// Shared diagnostic snapshot of the `(embedded_rows, index_state)`
+/// probe (2026-10 review, Medium — `/diagnostic` ran the exact `COUNT(*)`
+/// on **every** pull). The auto-embed loop's 60 s tick and the
+/// pipeline-end build path ([`maybe_build_vector_index`]) publish here —
+/// the exact-probe result where the build decision can change, and a
+/// catalog-only estimate (`n_live_tup` + exact index state) on the
+/// loop's skip ticks — so `/diagnostic` reads a pure in-memory snapshot
+/// when it is fresh and only falls back to the exact probe (one bounded,
+/// operator-pulled checkout) when the snapshot is missing or older than
+/// [`VECTOR_INDEX_SNAPSHOT_TTL`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VectorIndexSnapshot {
+    /// `articles` rows with a non-NULL embedding at publish time — exact
+    /// when published from an exact probe (`vector_index_state`), the
+    /// `pg_stat_user_tables.n_live_tup` stats estimate (an upper bound on
+    /// the embedded subset) when published from the loop's catalog-only
+    /// skip ticks. The degradation note depends only on the 10k-row
+    /// threshold, so the estimate is observationally equivalent in every
+    /// case where it is published.
+    pub embedded_rows: i64,
+    /// Catalog state of `idx_articles_embedding` at publish time (always
+    /// exact — the catalog probe).
+    pub index: VectorIndexState,
+    /// Unix seconds when the snapshot was last published. `0` = never
+    /// published — the construction default, which makes the first
+    /// `/diagnostic` pull pay the exact probe itself (honest first read)
+    /// and then publish.
+    pub at_unix: u64,
+}
+
+/// How fresh `/diagnostic` considers a cached [`VectorIndexSnapshot`] before
+/// falling back to the exact probe. The auto-embed loop refreshes it on
+/// every 60 s tick — exact probe where the build decision can change,
+/// catalog-only estimate otherwise — so 5 minutes is generous while the
+/// degradation note (which only depends on the 10k-row threshold) cannot
+/// meaningfully change in that window.
+pub const VECTOR_INDEX_SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Current unix seconds (0 when the system clock is pre-epoch — never in
+/// practice).
+pub(crate) fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Freshness decision for a cached snapshot (see [`VECTOR_INDEX_SNAPSHOT_TTL`])
+/// — pure over `(snapshot age, now)` so it is unit-pinnable.
+pub(crate) fn snapshot_is_fresh(snap: &VectorIndexSnapshot, now_unix: u64) -> bool {
+    // `at_unix == 0` = never probed (the construction default) → always
+    // stale, so the first pull pays the exact probe itself.
+    snap.at_unix != 0
+        && now_unix.saturating_sub(snap.at_unix) <= VECTOR_INDEX_SNAPSHOT_TTL.as_secs()
+}
+
+/// Publish a successful probe to the shared diagnostic snapshot (see
+/// [`VectorIndexSnapshot`]). `embedded_rows` is exact from
+/// `vector_index_state` (the loop's `Probe` tick and
+/// `maybe_build_vector_index`) and the `n_live_tup` stats estimate from
+/// the loop's catalog-only skip ticks.
+// LINT-3 (2026-10 review): deliberate panic — the poisoned-lock idiom (a
+// poison here means a publisher already panicked; the snapshot is
+// best-effort diagnostics, so failing the publish is not recoverable).
+#[allow(clippy::expect_used)]
+pub(crate) fn publish_vector_index_snapshot(
+    cache: &std::sync::Mutex<VectorIndexSnapshot>,
+    embedded_rows: i64,
+    index: VectorIndexState,
+) {
+    *cache.lock().expect("vector-index snapshot lock poisoned") = VectorIndexSnapshot {
+        embedded_rows,
+        index,
+        at_unix: now_unix_secs(),
+    };
+}
+
 /// State of `idx_articles_embedding` in the catalog, three-valued (a
 /// failed/in-progress `CONCURRENTLY` build is `PresentInvalid`, not absent
 /// — see [`VectorIndexState`]).
@@ -149,7 +226,50 @@ pub async fn vector_index_state(pool: &Pool) -> Result<(i64, VectorIndexState)> 
     Ok((count, index_state(pool).await?))
 }
 
-/// Decide whether an exact [`vector_index_state`] count is worth running.
+/// Outcome of the loop-tick O(1) pre-filter (see [`index_build_prefilter`]).
+pub(crate) enum IndexBuildPrefilter {
+    /// The exact `COUNT(*)` is worth running (≥ threshold rows, no valid
+    /// index — or an invalid index whose count the build decision needs).
+    Probe,
+    /// The exact count is provably unnecessary, and the catalog already
+    /// knows enough to publish a snapshot: `estimate` is the
+    /// `pg_stat_user_tables.n_live_tup` stats estimate for `articles`
+    /// (an upper bound on the embedded subset) with the exact catalog
+    /// index state. The degradation note is identical to the exact
+    /// probe's in every skip case (`Present` ⇒ never degraded; below
+    /// threshold ⇒ count < 10k ⇒ never degraded), so publishing it keeps
+    /// `/diagnostic` fresh with zero steady-state exact probes.
+    Skip {
+        estimate: i64,
+        state: VectorIndexState,
+    },
+    /// A pre-filter probe failed — fail closed (skip the count) and
+    /// publish nothing (the index state is unknown).
+    SkipUnknown,
+}
+
+/// `articles` live-row estimate from `pg_stat_user_tables` — O(1) stats
+/// read, no table scan. `0` on any probe error: a low estimate only ever
+/// *defers* an exact count the filter cannot prove unnecessary (the
+/// post-batch build path still probes exactly), and a published `0` can
+/// only understate `embedded_rows` below the degradation threshold.
+pub(crate) async fn live_rows_estimate(pool: &Pool) -> i64 {
+    raw::fetch_scalar_optional(
+        pool,
+        "SELECT COALESCE(n_live_tup, 0) FROM pg_stat_user_tables WHERE relname = 'articles'",
+        |q| q,
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0)
+}
+
+/// Decide whether an exact [`vector_index_state`] count is worth running,
+/// and — when it is not — what catalog-only snapshot the loop should
+/// publish in its place (2026-10 quick review: steady state used to
+/// publish nothing, so `/diagnostic` paid one exact `COUNT(*)` per
+/// 5-min TTL per process).
 ///
 /// The recurring 60 s `auto_embed_loop` tick historically ran a full
 /// `COUNT(*) ... WHERE embedding IS NOT NULL` every tick, but that count
@@ -159,9 +279,11 @@ pub async fn vector_index_state(pool: &Pool) -> Result<(i64, VectorIndexState)> 
 ///
 /// - a valid `idx_articles_embedding` already exists → the decision is
 ///   permanently "no" (`should_spawn_build` never spawns for `Present`), so
-///   the count is skipped;
+///   the count is skipped — and the catalog knows the state, so a
+///   snapshot is published ([`IndexBuildPrefilter::Skip`]);
 /// - the whole `articles` table is below the build threshold → the embedded
-///   subset is too, so the count can't reach it and is skipped.
+///   subset is too, so the count can't reach it and is skipped — snapshot
+///   published likewise.
 ///
 /// `n_live_tup` is a stats estimate, and the embedded rows are a subset of
 /// the live rows, so an estimate at or above the threshold can only trigger
@@ -173,30 +295,29 @@ pub async fn vector_index_state(pool: &Pool) -> Result<(i64, VectorIndexState)> 
 /// `VECTOR_INDEX_MIN_ROWS` after each embed batch, exact count) still builds
 /// promptly, and the build itself is backoff-gated and idempotent — the
 /// stale-low tick can never block or mis-size a build. On any probe error the
-/// filter fails closed (skip the count); the loop retries next tick.
-pub(crate) async fn index_build_worth_probing(pool: &Pool) -> bool {
+/// filter fails closed ([`IndexBuildPrefilter::SkipUnknown`] — skip the
+/// count, publish nothing); the loop retries next tick.
+pub(crate) async fn index_build_prefilter(pool: &Pool) -> IndexBuildPrefilter {
     // (1) A valid index already exists → nothing to build, skip the count.
     // (PresentInvalid does NOT skip: the count is exactly what the build
-    // decision needs once the invalid entry is dropped.) On any probe error
-    // the filter fails closed (skip the count), as before.
-    let exists = match index_state(pool).await {
-        Ok(st) => matches!(st, VectorIndexState::Present),
-        Err(_) => true,
+    // decision needs once the invalid entry is dropped.)
+    let state = match index_state(pool).await {
+        Ok(st) => st,
+        Err(_) => return IndexBuildPrefilter::SkipUnknown,
     };
-    if exists {
-        return false;
+    if matches!(state, VectorIndexState::Present) {
+        return IndexBuildPrefilter::Skip {
+            estimate: live_rows_estimate(pool).await,
+            state,
+        };
     }
     // (2) Whole table below the build threshold → embedded subset is too.
-    let live: i64 = raw::fetch_scalar_optional(
-        pool,
-        "SELECT COALESCE(n_live_tup, 0) FROM pg_stat_user_tables WHERE relname = 'articles'",
-        |q| q,
-    )
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(0);
-    live >= MIN_INDEX_BUILD_ROWS
+    let estimate = live_rows_estimate(pool).await;
+    if estimate >= MIN_INDEX_BUILD_ROWS {
+        IndexBuildPrefilter::Probe
+    } else {
+        IndexBuildPrefilter::Skip { estimate, state }
+    }
 }
 
 /// Decide whether a vector index is needed (≥ `min_rows` embedded vectors,
@@ -235,6 +356,7 @@ pub async fn maybe_build_vector_index(
     min_rows: i64,
     probe: &std::sync::atomic::AtomicU64,
     in_flight: &std::sync::atomic::AtomicBool,
+    snapshot: &std::sync::Mutex<VectorIndexSnapshot>,
 ) -> bool {
     // The single CAS claim for the shared 10-minute backoff: a probe/build
     // attempt from *either* build path within the last 10 minutes skips the
@@ -246,7 +368,13 @@ pub async fn maybe_build_vector_index(
         return false;
     }
     let (count, state) = match vector_index_state(pool).await {
-        Ok(s) => s,
+        Ok(s) => {
+            // 2026-10 review (Medium): this is one of the two sites that pay
+            // the exact COUNT(*) — publish it so `/diagnostic` reads the
+            // shared snapshot instead of re-running the probe per pull.
+            publish_vector_index_snapshot(snapshot, s.0, s.1);
+            s
+        }
         Err(e) => {
             tracing::warn!("vector index state check failed: {e}");
             return false;
@@ -474,5 +602,55 @@ mod tests {
             assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
         }
         assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // ── 2026-10 review (Medium): /diagnostic snapshot freshness ──────────────
+
+    #[test]
+    fn snapshot_freshness_gates_on_ttl() {
+        let snap = VectorIndexSnapshot {
+            embedded_rows: 42,
+            index: VectorIndexState::Absent,
+            at_unix: 1_000,
+        };
+        // Fresh at the boundary: age == TTL is still fresh (the loop
+        // refreshes every 60 s, well inside the 5 min TTL).
+        assert!(
+            snapshot_is_fresh(&snap, 1_000 + VECTOR_INDEX_SNAPSHOT_TTL.as_secs()),
+            "age == TTL → fresh"
+        );
+        assert!(
+            !snapshot_is_fresh(&snap, 1_000 + VECTOR_INDEX_SNAPSHOT_TTL.as_secs() + 1),
+            "age == TTL + 1 s → stale (the pull pays the exact probe)"
+        );
+        // `at_unix: 0` (the construction default, “never probed”) is always
+        // stale — the first pull pays the exact probe itself.
+        let never = VectorIndexSnapshot {
+            embedded_rows: 0,
+            index: VectorIndexState::Absent,
+            at_unix: 0,
+        };
+        assert!(!snapshot_is_fresh(&never, 0), "never-probed at t=0 → stale");
+        assert!(
+            !snapshot_is_fresh(&never, u64::MAX),
+            "never-probed → stale forever"
+        );
+    }
+
+    #[test]
+    fn publish_updates_the_snapshot() {
+        let cache = std::sync::Mutex::new(VectorIndexSnapshot {
+            embedded_rows: 0,
+            index: VectorIndexState::Absent,
+            at_unix: 0,
+        });
+        publish_vector_index_snapshot(&cache, 123, VectorIndexState::Present);
+        let snap = *cache.lock().unwrap();
+        assert_eq!(snap.embedded_rows, 123);
+        assert_eq!(snap.index, VectorIndexState::Present);
+        assert!(
+            snap.at_unix >= 1_600_000_000,
+            "published with a real timestamp, got {snap:?}"
+        );
     }
 }

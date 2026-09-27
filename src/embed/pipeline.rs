@@ -184,6 +184,7 @@ pub async fn run_pipeline(
     zim_name: &str,
     probe: &std::sync::atomic::AtomicU64,
     in_flight: &std::sync::atomic::AtomicBool,
+    snapshot: &std::sync::Mutex<crate::embed::vector_index::VectorIndexSnapshot>,
 ) -> Result<()> {
     let Some(config) = EmbedConfig::from_settings(&settings) else {
         return Err(Error::Embedding("embedding not configured".into()));
@@ -378,7 +379,15 @@ pub async fn run_pipeline(
     // covers the common case without waiting for a full pipeline run. The
     // shared 10-minute backoff gate inside `maybe_build_vector_index`
     // bounds how often this probe + attempt runs (was: every 60 s tick).
-    maybe_build_vector_index(&pool, &settings, VECTOR_INDEX_MIN_ROWS, probe, in_flight).await;
+    maybe_build_vector_index(
+        &pool,
+        &settings,
+        VECTOR_INDEX_MIN_ROWS,
+        probe,
+        in_flight,
+        snapshot,
+    )
+    .await;
 
     Ok(())
 }
@@ -640,6 +649,13 @@ mod tests {
 
         let probe = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let in_flight = std::sync::atomic::AtomicBool::new(false);
+        // Diagnostic snapshot the pipeline-end build publishes to (the test
+        // never reads it — `/diagnostic`'s cache is covered elsewhere).
+        let snapshot = std::sync::Mutex::new(crate::embed::vector_index::VectorIndexSnapshot {
+            embedded_rows: 0,
+            index: crate::embed::VectorIndexState::Absent,
+            at_unix: 0,
+        });
 
         // Runs 1-3: each re-claims the 2 rows (the `embed_at` reset simulates
         // the 10-minute claim window elapsing); the mismatched count is
@@ -653,9 +669,16 @@ mod tests {
             )
             .await
             .unwrap();
-            run_pipeline(pool.clone(), settings.clone(), ZIM, &probe, &in_flight)
-                .await
-                .expect("a mismatched count is skipped (Ok), not an error");
+            run_pipeline(
+                pool.clone(),
+                settings.clone(),
+                ZIM,
+                &probe,
+                &in_flight,
+                &snapshot,
+            )
+            .await
+            .expect("a mismatched count is skipped (Ok), not an error");
             {
                 let m = EMBED_FAILS.lock().unwrap();
                 for id in &article_ids {
@@ -682,9 +705,16 @@ mod tests {
         )
         .await
         .unwrap();
-        run_pipeline(pool.clone(), settings.clone(), ZIM, &probe, &in_flight)
-            .await
-            .expect("an all-poison claim stops the pipeline with Ok");
+        run_pipeline(
+            pool.clone(),
+            settings.clone(),
+            ZIM,
+            &probe,
+            &in_flight,
+            &snapshot,
+        )
+        .await
+        .expect("an all-poison claim stops the pipeline with Ok");
         assert_eq!(
             server.received_requests().await.unwrap().len(),
             3,

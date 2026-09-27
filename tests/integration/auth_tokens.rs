@@ -17,19 +17,27 @@ use super::common::*;
 /// held for the whole test: dropping it completes `boot_server`'s
 /// graceful-shutdown future and stops the listener (see `boot_server`).
 async fn boot_two_level_server() -> (String, tokio::sync::oneshot::Sender<()>) {
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect_lazy("postgres://u:p@127.0.0.1:1/nodb")
-        .unwrap();
+    // 2026-10 review (High): the dead pool must have a SHORT acquire
+    // timeout — sqlx's default 30 s made every DB-touching request (and
+    // the legacy-upgrade `UPDATE settings`) wait out the full timeout,
+    // which burned ~5.5 min across these four tests and reintroduced the
+    // flake class that serve.rs fixed by pre-hashing passwords.
+    // `dead_pool()` is documented for exactly this (250 ms).
+    let pool = zimservice::testing::dead_pool();
     let mut map = zimservice::settings::default_settings();
     map.insert("access.mode".into(), serde_json::json!("password"));
+    // Pre-hashed (argon2id) credentials: a legacy-PLAINTEXT stored value
+    // triggers the transparent upgrade `UPDATE settings` on the first
+    // successful auth — a DB write that blocks on the dead pool. Storing
+    // the hash directly means no upgrade path fires at all (verify takes
+    // the argon2 branch, which never upgrades).
     map.insert(
         "access.admin_password".into(),
-        serde_json::json!("admin-secret-pw"),
+        serde_json::json!(zimservice::settings::hash_admin_password("admin-secret-pw")),
     );
     map.insert(
         "access.read_only_token".into(),
-        serde_json::json!("ro-secret-token"),
+        serde_json::json!(zimservice::settings::hash_admin_password("ro-secret-token")),
     );
     // Gate reads too, so allowlisted GETs actually exercise the token.
     map.insert(

@@ -210,7 +210,17 @@ impl StartupRequest {
 /// `acquire_mutating_guard` (held for the command's duration) and pass
 /// `advisory_lock_held = true`; read-only subcommands do the lightweight
 /// `pg_locks` check for the warning only.
-pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result<AppState> {
+///
+/// `died_tx`: the process die-flag sender (the `cmd_serve` graceful-shutdown
+/// channel) the LISTEN/NOTIFY listener's fail-closed supervisor signals
+/// through (see `db::notify`) — `Some` only for `serve` (the long-running
+/// process that must fail closed on a listener death); `None` for the
+/// one-shot subcommands, which spawn no listener.
+pub async fn build_state(
+    config: &Config,
+    req: StartupRequest,
+    died_tx: Option<tokio::sync::watch::Sender<bool>>,
+) -> anyhow::Result<AppState> {
     let StartupRequest {
         mode,
         advisory_lock_held,
@@ -420,6 +430,12 @@ pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result
     // resync has already converged the caches and the listener's
     // connect-resync is a no-op.
     let notify = if mode == StartupMode::Serve {
+        // `cmd_serve` is the only caller that carries the die-flag sender
+        // (`died_tx: Some(…)`); serve without it is a wiring bug — a
+        // listener death would have no fail-closed path — so fail loudly.
+        let died_tx = died_tx.ok_or_else(|| {
+            anyhow::anyhow!("internal: serve startup requires the task-die flag sender")
+        })?;
         // Composition-root invalidation wiring: `db::notify` is
         // domain-agnostic, so the per-bump domain actions are closures over
         // the caches built here (settings channel → full reload, catalog
@@ -469,6 +485,7 @@ pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result
             &config.database_url,
             on_settings,
             on_catalog,
+            died_tx,
         ))
     } else {
         None
@@ -488,6 +505,15 @@ pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result
         degradation,
         build_probe: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         index_building: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // `at_unix: 0` = “never probed”: the first `/diagnostic` pull finds
+        // the snapshot stale and pays the exact probe itself (honest first
+        // read), then publishes the result — until the auto-embed loop's
+        // 60 s tick takes over publishing.
+        vector_index_snapshot: Arc::new(std::sync::Mutex::new(crate::embed::VectorIndexSnapshot {
+            embedded_rows: 0,
+            index: crate::embed::VectorIndexState::Absent,
+            at_unix: 0,
+        })),
         notify,
     })
 }
@@ -507,11 +533,13 @@ pub async fn build_state(config: &Config, req: StartupRequest) -> anyhow::Result
 /// restart, network partition), which silently releases the advisory lock
 /// and would let a second `serve` against the same database start undetected.
 /// The monitor task **owns** the dedicated connection and probes it on an
-/// interval (`SELECT 1`); on a failed probe it logs and exits the process
-/// (fail-closed), because a running server whose uniqueness guarantee has
+/// interval (`SELECT 1`); on a failed probe it logs and raises the process
+/// die flag (the `cmd_serve` graceful-shutdown channel — fail-closed through
+/// the normal shutdown protocol: non-zero exit with a clean lockfile
+/// release), because a running server whose uniqueness guarantee has
 /// silently evaporated must not keep serving. A graceful drop aborts the
 /// monitor task first, which closes the connection (releasing the lock)
-/// before any further probe — no spurious exit on shutdown. Monitoring is
+/// before any further probe — no spurious die flag on shutdown. Monitoring is
 /// skipped when no advisory lock is held (`ZIMSERVICE_ALLOW_MULTI_DB`'s
 /// `None` arm: there is no connection, and hence no lock, to lose).
 pub struct SingleInstanceGuard {
@@ -753,23 +781,30 @@ async fn detect_advisory_lock_loss(
 /// H1: spawn the detached liveness monitor for an acquired advisory lock.
 /// The monitor task **owns** the dedicated connection (probing it on an
 /// interval); fail-closed action: when that connection dies mid-run the
-/// process exits (1), because a second `serve` on the same database could
-/// otherwise start against a silently-released lock. Graceful shutdown
-/// aborts the task first (which closes the connection), so the monitor never
-/// fires on shutdown. Returns the monitor handle so the guard can abort it
-/// on drop.
-fn spawn_advisory_lock_monitor(conn: PgConnection) -> tokio::task::JoinHandle<()> {
+/// process die flag is raised (`died_tx` — the `cmd_serve` graceful-shutdown
+/// channel), so the process exits non-zero through the normal shutdown
+/// protocol (clean lockfile release) — a second `serve` on the same database
+/// must not start against a silently-released lock. Graceful shutdown aborts
+/// the task first (which closes the connection), so the monitor never fires
+/// on shutdown. Returns the monitor handle so the guard can abort it on drop.
+fn spawn_advisory_lock_monitor(
+    conn: PgConnection,
+    died_tx: tokio::sync::watch::Sender<bool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // The production callback logs and exits(1) on a real loss, so the
-        // detector only returns after the fail-closed action already ran
-        // inside the callback.
+        // The production callback logs and raises the die flag on a real
+        // loss, so the detector only returns after the fail-closed action
+        // already ran inside the callback.
         detect_advisory_lock_loss(conn, |reason| {
             tracing::error!(
                 reason = %reason,
                 "single-instance advisory lock lost mid-run — another `serve` on \
-                 this database could now start undetected. Exiting to fail closed."
+                 this database could now start undetected. Raising the process die \
+                 flag to fail closed."
             );
-            std::process::exit(1);
+            // `send` fails only if the die-flag channel was already dropped
+            // (the process is tearing down); the shutdown owns the exit.
+            let _ = died_tx.send(true);
         })
         .await;
     })
@@ -893,9 +928,12 @@ fn pid_lock_holder_is_zimservice(pid: u32) -> bool {
 /// Acquire the single-instance guards (advisory lock + PID lock). Returns `None`
 /// if the advisory lock could not be acquired (another instance holds it),
 /// or `Some(Err)` on fatal failures (PID lock already held by a live process,
-/// I/O errors).
+/// I/O errors). `died_tx` is the process die-flag sender (the `cmd_serve`
+/// graceful-shutdown channel) the lock-liveness monitor raises on a mid-run
+/// lock-connection death (fail-closed; see `spawn_advisory_lock_monitor`).
 pub async fn acquire_instance_guard(
     config: &Config,
+    died_tx: tokio::sync::watch::Sender<bool>,
 ) -> anyhow::Result<Option<SingleInstanceGuard>> {
     let advisory = try_acquire_advisory_lock(config).await?;
     let Some(conn) = advisory else {
@@ -918,7 +956,7 @@ pub async fn acquire_instance_guard(
     // H1: watch the lock connection for a mid-run death (Postgres restart /
     // network drop silently releases the advisory lock). The monitor owns
     // the connection; the guard keeps its handle to abort it on Drop.
-    let monitor_task = spawn_advisory_lock_monitor(conn);
+    let monitor_task = spawn_advisory_lock_monitor(conn, died_tx);
 
     Ok(Some(SingleInstanceGuard {
         lock_task: Some(monitor_task),
@@ -932,8 +970,11 @@ pub async fn acquire_instance_guard(
 /// holds it we warn and proceed, so *different*-database deployments can
 /// share a `zim_dir` — the scenario the full `ZIMSERVICE_ALLOW_MULTI_INSTANCE`
 /// opt-out previously covered only by disabling **all** guards.
+/// `died_tx` is the process die-flag sender the lock-liveness monitor raises
+/// on a mid-run lock-connection death (see [`acquire_instance_guard`]).
 pub async fn acquire_instance_guard_multi_db(
     config: &Config,
+    died_tx: tokio::sync::watch::Sender<bool>,
 ) -> anyhow::Result<SingleInstanceGuard> {
     match try_acquire_advisory_lock(config).await? {
         Some(conn) => {
@@ -948,7 +989,7 @@ pub async fn acquire_instance_guard_multi_db(
             // H1: the lock is held, so it is monitored for a mid-run loss
             // exactly as in the default path (the opt-out's `None` arm holds
             // no lock and spawns no monitor).
-            let monitor_task = spawn_advisory_lock_monitor(conn);
+            let monitor_task = spawn_advisory_lock_monitor(conn, died_tx);
             Ok(SingleInstanceGuard {
                 lock_task: Some(monitor_task),
                 lock_path: Some(lock_path),
@@ -1707,7 +1748,9 @@ mod tests {
             zim_dir: tmp.path().to_path_buf(),
             ..Config::default()
         };
-        let result = acquire_instance_guard(&config)
+        // Test-side die flag: the refusal path never spawns the monitor.
+        let (died_tx, _died_rx) = tokio::sync::watch::channel(false);
+        let result = acquire_instance_guard(&config, died_tx)
             .await
             .expect("acquire_instance_guard must not error when the lock is held");
         assert!(
@@ -1797,7 +1840,9 @@ mod tests {
 
         // 3) While the guard holds the lock, a concurrently-starting `serve`
         //    must be refused (serialization in the other direction).
-        let result = acquire_instance_guard(&config)
+        // Test-side die flag: the refusal path never spawns the monitor.
+        let (died_tx, _died_rx) = tokio::sync::watch::channel(false);
+        let result = acquire_instance_guard(&config, died_tx)
             .await
             .expect("acquire_instance_guard must not error while the guard holds the lock");
         assert!(
@@ -1912,9 +1957,12 @@ pub enum ServeFailure {
     /// `axum::serve` returned a low-level error (not just Ctrl-C). Cleanup
     /// has already completed; the error is surfaced to the operator.
     Serve(std::io::Error),
-    /// The supervisor observed a background task finish early (panic or
-    /// early return) — the download→verify→index pipeline is broken,
-    /// so the process must exit non-zero (H2).
+    /// A critical background component failed — the task supervisor (a
+    /// serve task panicked or returned early), the advisory-lock liveness
+    /// monitor, or the LISTEN/NOTIFY listener supervisor (all three raise
+    /// the shared die flag; see `cmd_serve`). The download→verify→index
+    /// pipeline is broken, so the process must exit non-zero (H2) —
+    /// through the shutdown protocol, never a bare `process::exit`.
     BackgroundTaskDied,
 }
 
@@ -1925,9 +1973,9 @@ impl std::fmt::Display for ServeFailure {
             // it in sync with the `cmd_serve` mapping (which formats it
             // verbatim into the `anyhow` error).
             Self::Serve(e) => write!(f, "server error: {e}"),
-            Self::BackgroundTaskDied => {
-                f.write_str("background task died (see log above); exiting non-zero")
-            }
+            Self::BackgroundTaskDied => f.write_str(
+                "a critical background component failed (see log above); exiting non-zero",
+            ),
         }
     }
 }

@@ -79,6 +79,14 @@ pub struct AppState {
     /// cleared on completion, failure, or cancellation. `/health` surfaces
     /// it as `index.building` — a multi-hour build is otherwise invisible.
     pub index_building: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared vector-index diagnostic snapshot (2026-10 review, Medium —
+    /// `/diagnostic` ran the exact `COUNT(*)` on every pull): the auto-embed
+    /// loop tick and the pipeline-end build publish the exact-probe result
+    /// here (`embed::vector_index::publish_vector_index_snapshot`), so
+    /// `/diagnostic` reads pure in-memory state when fresh and only pays the
+    /// exact probe when the snapshot is missing or stale
+    /// (`embed::vector_index::VECTOR_INDEX_SNAPSHOT_TTL`).
+    pub vector_index_snapshot: std::sync::Arc<std::sync::Mutex<crate::embed::VectorIndexSnapshot>>,
     /// Cross-process cache-invalidation listener (LISTEN/NOTIFY, `db::notify`):
     /// holds the spawned subscriber tasks and reports their liveness for
     /// `/diagnostic`. Cloning `AppState` shares the handle; the listener stops
