@@ -134,7 +134,7 @@ jobs:
           HOST=127.0.0.1 \
           PORT=8877 \
           ACCESS_MODE=open \
-          target/release/zimservice &
+          target/release/zimservice serve &
           SERVER_PID=$!
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:8877/health >/dev/null 2>&1; then

@@ -10,8 +10,10 @@
 //
 // Requires a running zimservice instance:
 //   CI: the `web-browser-smoke` job (`.github/workflows/ci.yml`).
-//   Local: start the server on 127.0.0.1:8877 (open mode, loopback) or set
-//   ZIMSERVICE_BASE_URL, then `make web-browser-test`.
+//   Local: start `zimservice serve` on 127.0.0.1:8877 (open mode, loopback),
+//   then:
+//     ZIMSERVICE_BASE_URL=http://127.0.0.1:8877 \
+//       npx playwright test --config tests/web/playwright.config.mjs
 
 import { test, expect } from '@playwright/test';
 
