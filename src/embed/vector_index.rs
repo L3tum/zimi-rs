@@ -117,7 +117,13 @@ pub(crate) fn should_spawn_build(state: VectorIndexState, count: i64) -> bool {
 /// loop's skip ticks — so `/diagnostic` reads a pure in-memory snapshot
 /// when it is fresh and only falls back to the exact probe (one bounded,
 /// operator-pulled checkout) when the snapshot is missing or older than
-/// [`VECTOR_INDEX_SNAPSHOT_TTL`].
+/// `VECTOR_INDEX_SNAPSHOT_TTL`.
+///
+/// H2 (2026-10 review): `VECTOR_INDEX_SNAPSHOT_TTL` is deliberately NOT
+/// re-exported from `crate::embed` — it is an implementation constant of
+/// this module, so the reference is plain code text, not an intra-doc
+/// link (linking from a re-exported item to a non-re-exported one is an
+/// unresolved-link warning under `RUSTDOCFLAGS="-D warnings"`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VectorIndexSnapshot {
     /// `articles` rows with a non-NULL embedding at publish time — exact
@@ -183,6 +189,74 @@ pub(crate) fn publish_vector_index_snapshot(
         index,
         at_unix: now_unix_secs(),
     };
+}
+
+/// The `/diagnostic` vector-index probe result (M-diag, 2026-10 review):
+/// the embedded row count, the catalog state, the degradation note, and the
+/// measurement time. The serve-layer DTO (`serve::diagnostics::
+/// VectorIndexDiagnostic`) is a direct mapping of this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorIndexDiagnosis {
+    /// `articles` rows with a non-NULL embedding.
+    pub embedded_rows: i64,
+    /// Catalog state of `idx_articles_embedding`.
+    pub index: VectorIndexState,
+    /// The degradation note (≥ 10k embedded rows, no valid index), if any.
+    pub degraded: Option<String>,
+    /// Unix seconds when `embedded_rows`/`index` were last measured.
+    pub count_at: u64,
+}
+
+/// The `/diagnostic` vector-index probe with the fresh/stale snapshot
+/// policy (M-diag, 2026-10 review — moved out of the `zims` handler so the
+/// policy lives next to the snapshot it governs): reads the in-memory
+/// snapshot published by the auto-embed loop while it is fresh (within
+/// `VECTOR_INDEX_SNAPSHOT_TTL` — a pure in-memory read, zero checkouts)
+/// and only pays the exact catalog probe when the snapshot is missing or
+/// stale (one bounded, operator-pulled checkout; the result is published
+/// to warm the cache). The snapshot's `embedded_rows` is the exact count on
+/// probe ticks and the `n_live_tup` stats estimate on the loop's
+/// catalog-only skip ticks — the degradation note only depends on the
+/// 10k-row threshold, so the two are observationally equivalent.
+///
+/// Returns `None` (with a warn) when the exact probe itself fails — the DB
+/// is unreachable, which `/health`'s `db_connected` already reports.
+// LINT-3 (2026-10 review): deliberate panic — the poisoned-lock idiom
+// (a poison here means a publisher already panicked; the snapshot is
+// best-effort diagnostics, so failing the read is not recoverable).
+#[allow(clippy::expect_used)]
+pub async fn vector_index_diagnostic(
+    cache: &std::sync::Mutex<VectorIndexSnapshot>,
+    pool: &Pool,
+) -> Option<VectorIndexDiagnosis> {
+    let now = now_unix_secs();
+    // Read the snapshot under the lock; the guard is dropped before any
+    // await (RwLock/Mutex guards are !Send).
+    let snap = *cache.lock().expect("vector-index snapshot lock poisoned");
+    if snapshot_is_fresh(&snap, now) {
+        return Some(VectorIndexDiagnosis {
+            embedded_rows: snap.embedded_rows,
+            index: snap.index,
+            degraded: vector_index_degradation_note(snap.embedded_rows, snap.index),
+            count_at: snap.at_unix,
+        });
+    }
+    // Stale/missing → exact probe (one bounded, operator-pulled checkout).
+    match vector_index_state(pool).await {
+        Ok((embedded_rows, index)) => {
+            publish_vector_index_snapshot(cache, embedded_rows, index);
+            Some(VectorIndexDiagnosis {
+                embedded_rows,
+                index,
+                degraded: vector_index_degradation_note(embedded_rows, index),
+                count_at: now,
+            })
+        }
+        Err(e) => {
+            tracing::warn!("vector index diagnostic probe failed: {e}");
+            None
+        }
+    }
 }
 
 /// State of `idx_articles_embedding` in the catalog, three-valued (a
@@ -652,5 +726,55 @@ mod tests {
             snap.at_unix >= 1_600_000_000,
             "published with a real timestamp, got {snap:?}"
         );
+    }
+
+    // ── vector_index_diagnostic (M-diag, 2026-10 review) ─────────────────
+
+    /// Fresh snapshot → served from memory: a DEAD pool proves no checkout
+    /// was attempted (a probe attempt would return `None`).
+    #[tokio::test]
+    async fn diagnostic_fresh_snapshot_served_from_memory() {
+        let cache = std::sync::Mutex::new(VectorIndexSnapshot {
+            embedded_rows: 12_000,
+            index: VectorIndexState::Absent,
+            at_unix: now_unix_secs(),
+        });
+        let pool = crate::testing::dead_pool();
+        let d = vector_index_diagnostic(&cache, &pool)
+            .await
+            .expect("fresh snapshot → Some without a probe");
+        assert_eq!(d.embedded_rows, 12_000);
+        assert_eq!(d.index, VectorIndexState::Absent);
+        assert!(
+            d.degraded.is_some(),
+            "≥10k rows + absent index → degradation note"
+        );
+    }
+
+    /// Stale snapshot + unreachable DB → the exact probe fails → `None`
+    /// (the `/diagnostic` field is omitted; `/health` reports the DB).
+    #[tokio::test]
+    async fn diagnostic_stale_snapshot_dead_pool_is_none() {
+        let cache = std::sync::Mutex::new(VectorIndexSnapshot {
+            embedded_rows: 5,
+            index: VectorIndexState::Present,
+            at_unix: now_unix_secs() - (VECTOR_INDEX_SNAPSHOT_TTL.as_secs() + 1),
+        });
+        let pool = crate::testing::dead_pool();
+        assert!(vector_index_diagnostic(&cache, &pool).await.is_none());
+    }
+
+    /// Below the 10k threshold (or with a valid index) → no degradation
+    /// note, even when served from a fresh snapshot.
+    #[tokio::test]
+    async fn diagnostic_no_degradation_below_threshold() {
+        let cache = std::sync::Mutex::new(VectorIndexSnapshot {
+            embedded_rows: 9_999,
+            index: VectorIndexState::Absent,
+            at_unix: now_unix_secs(),
+        });
+        let pool = crate::testing::dead_pool();
+        let d = vector_index_diagnostic(&cache, &pool).await.unwrap();
+        assert!(d.degraded.is_none(), "9_999 < 10k threshold → no note");
     }
 }

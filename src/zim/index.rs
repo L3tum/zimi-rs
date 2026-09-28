@@ -477,7 +477,8 @@ async fn index_body(
             // (a resumed run onto a swapped-in file would be a silent mixed
             // corpus).
             tracing::info!(
-                "checkpoint for '{}' does not match (mtime / entry count / first-entry key) — starting fresh",
+                "checkpoint for '{}' does not match (mtime / entry count / \
+                 first-entry key) — starting fresh",
                 meta.name
             );
             0

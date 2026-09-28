@@ -312,6 +312,62 @@ impl ZimManager {
             .collect()
     }
 
+    /// ZIM names only. Slim list variants (PERF, 2026-10 review): internal
+    /// callers that need only a field subset pay for that subset, not a full
+    /// `ZimMeta` clone per ZIM (each carries several `String`s +
+    /// `Option<String>`s). The API list endpoint (`/api/v1/zims`) and the
+    /// MCP source list keep [`list`](Self::list) — they need the full rows. Same
+    /// read-lock idiom as [`list`](Self::list) / [`summary`](Self::summary).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub fn list_names(&self) -> Vec<String> {
+        self.cache
+            .read()
+            .expect("zim cache lock poisoned")
+            .values()
+            .map(|z| z.name.clone())
+            .collect()
+    }
+
+    /// `(db row id, name)` pairs — the shape the id-map builders need
+    /// (`id` is `None` for a stub not yet persisted).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub fn list_id_names(&self) -> Vec<(Option<i32>, String)> {
+        self.cache
+            .read()
+            .expect("zim cache lock poisoned")
+            .values()
+            .map(|z| (z.id, z.name.clone()))
+            .collect()
+    }
+
+    /// `(name, catalog date)` pairs — the shape the OPDS update check needs.
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub fn list_name_dates(&self) -> Vec<(String, Option<String>)> {
+        self.cache
+            .read()
+            .expect("zim cache lock poisoned")
+            .values()
+            .map(|z| (z.name.clone(), z.date.clone()))
+            .collect()
+    }
+
+    /// Names of the embed-enabled ZIMs only (the `embed` subcommand's target
+    /// list when no explicit name is given).
+    // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
+    #[allow(clippy::expect_used)]
+    pub fn list_embed_enabled_names(&self) -> Vec<String> {
+        self.cache
+            .read()
+            .expect("zim cache lock poisoned")
+            .values()
+            .filter(|z| z.embed_enabled)
+            .map(|z| z.name.clone())
+            .collect()
+    }
+
     /// Count of ZIMs and total indexed articles, computed under a single read
     /// lock without cloning the metadata `Vec` (used by `/health`).
     // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.

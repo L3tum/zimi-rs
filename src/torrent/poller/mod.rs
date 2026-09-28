@@ -24,7 +24,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -105,7 +105,7 @@ pub struct DownloadPoller {
     pub(crate) db: Pool,
     /// Background (small, capped) pool — poller-triggered ZIM reindexing
     /// runs on it so a long COPY-holding reindex can't starve foreground
-    /// search connections (the db/db_bg split in src/startup.rs build_state /
+    /// search connections (the db/db_bg split in src/startup/mod.rs `build_state` /
     /// ARCHITECTURE.md "Persistence layer"). Short row writes deliberately
     /// stay on `db` (2026-09-26 review fix).
     pub(crate) db_bg: Pool,
@@ -121,9 +121,6 @@ pub struct DownloadPoller {
     torrent_username: String,
     torrent_password: String,
     http: Option<reqwest::Client>,
-    /// Cooperative shutdown for [`run`](Self::run): set via
-    /// [`cancel`](Self::cancel) and polled between ticks.
-    stopping: Arc<AtomicBool>,
     /// Bounded-retry requeue guard, keyed by row id: the last transient
     /// error message, its consecutive count, and the pass on which the row
     /// was last observed as an error row ([`GuardEntry`]). Replaced (count
@@ -190,26 +187,9 @@ impl DownloadPoller {
             torrent_username,
             torrent_password,
             http,
-            stopping: Arc::new(AtomicBool::new(false)),
             last_error: Arc::new(std::sync::Mutex::new(HashMap::new())),
             requeue_passes: AtomicU64::new(0),
         }
-    }
-
-    /// Request a cooperative stop: [`run`](Self::run) breaks out of its loop
-    /// at the next between-ticks poll. No tokio-util `CancellationToken`
-    /// — a process-lifetime flag is all the run loop needs.
-    // No production caller yet — main.rs aborts the task on shutdown
-    // instead; the `run_stops_on_cancel_between_ticks` test exercises the
-    // cooperative-stop path.
-    #[allow(dead_code)]
-    pub(crate) fn cancel(&self) {
-        self.stopping.store(true, Ordering::SeqCst);
-    }
-
-    /// Whether [`cancel`](Self::cancel) has been called.
-    fn cancelled(&self) -> bool {
-        self.stopping.load(Ordering::SeqCst)
     }
 
     /// Resolve the effective qBittorrent client for this cycle (ARCH M3).
@@ -310,10 +290,19 @@ impl DownloadPoller {
         false
     }
 
-    /// Runs until the process exits.
+    /// Runs until the task is aborted.
+    ///
+    /// **Shutdown model (D1, 2026-10 review):** there is no cooperative
+    /// cancel flag — task *abort* is the shutdown model for background
+    /// tasks. `main.rs` spawns the poller, supervises its `JoinHandle`
+    /// (`wait_for_task_failure`), and the serve-shutdown path aborts the
+    /// still-alive handles (`finalize_serve_shutdown`); `run` simply runs
+    /// until the process exits. (The former `stopping` flag + `cancel()`
+    /// had zero production callers — the abort path was always the one in
+    /// use — so they were deleted.)
     pub async fn run(self) {
         // Master switch (H2, 2026-09 review): a disabled poller must not
-        // establish a qB session — `startup.rs`'s initial-connect gate
+        // establish a qB session — `startup::`'s initial-connect gate
         // mirrors this, and without it the first tick's `resolve_torrent`
         // reconnects anyway (the cache is empty at startup). Read live, not
         // latched: the per-cycle gates in `tick()`/`opds_check()` re-read
@@ -343,12 +332,6 @@ impl DownloadPoller {
                 if let Err(e) = self.opds_check().await {
                     tracing::debug!("OPDS update check failed: {e}");
                 }
-            }
-            // Poll for cancellation between ticks (no tokio::select! — keep
-            // the loop shape simple; granularity = tick time).
-            if self.cancelled() {
-                tracing::info!("poller cancelled, stopping");
-                break;
             }
             sleep(Duration::from_secs(self.settings.torrent_poll_secs())).await;
         }

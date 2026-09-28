@@ -99,16 +99,17 @@ pub struct AppState {
 
 impl AppState {
     /// The pool foreground READ checkouts should use: the read replica
-    /// (`DATABASE_URL_READ`) when enabled, else the primary pool. This is
-    /// the single routing point for the read-replica finding — handlers
-    /// and the article-read DB fallback call this instead of naming
-    /// `self.db`, so a future second read tier changes in one place.
+    /// (`DATABASE_URL_READ`) when enabled, else the primary pool. Routes
+    /// through the single shared helper `db::pool::read_or_primary` (M-2,
+    /// 2026-10 review) — the same helper `startup::build_state` uses for
+    /// the search engine's pool — so the read-or-primary choice is encoded
+    /// exactly once, and a future second read tier changes in one place.
     ///
     /// Note: the search engine does not call this — it holds its own pool
     /// (`SearchEngine::pool`), which `startup::build_state` wires to the
-    /// same read-or-primary choice at construction.
+    /// same read-or-primary choice at construction (via the same helper).
     pub fn db_read_or_primary(&self) -> &db::Pool {
-        self.db_read.as_ref().unwrap_or(&self.db)
+        db::pool::read_or_primary(self.db_read.as_ref(), &self.db)
     }
 
     /// Snapshot of the invalidation listener for `/diagnostic` (`None` when

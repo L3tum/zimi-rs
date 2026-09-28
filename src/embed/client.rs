@@ -84,6 +84,14 @@ impl EmbedConfig {
 /// client) serving a pathological payload.
 const MAX_EMBED_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Bounded in-request chunk concurrency (PERF, 2026-10 review): the chunk
+/// HTTP requests of one `embed()` call used to be awaited sequentially; they
+/// now run concurrently under this cap, with results reassembled in chunk
+/// order. A documented const, not a setting: the operator-facing
+/// `embedding.max_concurrency` bounds pipeline-level batch fan-out; this
+/// bounds the *intra-request* chunk fan-out at a fixed modest level.
+const EMBED_CHUNK_CONCURRENCY: usize = 4;
+
 /// OpenAI-compatible embeddings client.
 #[derive(Clone)]
 pub struct EmbedClient {
@@ -132,66 +140,134 @@ impl EmbedClient {
     }
 
     /// Generate embeddings for a batch of texts.
+    ///
+    /// The texts are split into `batch_size` chunks and the chunk requests
+    /// are issued concurrently under `EMBED_CHUNK_CONCURRENCY` (PERF,
+    /// 2026-10 review); results are reassembled by chunk index, so the
+    /// `i`-th returned vector is the embedding of `texts[i]` — the same
+    /// order guarantee the old sequential loop had. Every size-budget /
+    /// index-validation / error semantic is unchanged (per-chunk, in
+    /// `embed_chunk`); the first failing chunk aborts the rest.
     pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let mut all_embeddings = Vec::new();
-
-        for chunk in texts.chunks(self.config.batch_size) {
-            let mut req = self
-                .http
-                .post(format!(
-                    "{}/embeddings",
-                    self.config.endpoint.trim_end_matches('/')
-                ))
-                .json(&EmbedRequest {
-                    model: self.config.model.clone(),
-                    input: chunk.to_vec(),
-                });
-
-            if !self.config.api_key.is_empty() {
-                req = req.bearer_auth(&self.config.api_key);
+        let n_chunks = texts.chunks(self.config.batch_size).count();
+        if n_chunks == 0 {
+            return Ok(Vec::new());
+        }
+        let mut slots: Vec<Option<Vec<Vec<f32>>>> = vec![None; n_chunks];
+        let mut set = tokio::task::JoinSet::new();
+        for (i, chunk) in texts.chunks(self.config.batch_size).enumerate() {
+            if set.len() >= EMBED_CHUNK_CONCURRENCY {
+                // Drain the oldest in-flight chunk before starting the next
+                // (bounded fan-out, FIFO-ish) — same shape as the auto-embed
+                // pipeline fan-out.
+                let (idx, res) = match set.join_next().await {
+                    Some(Ok(x)) => x,
+                    Some(Err(e)) => {
+                        set.abort_all();
+                        return Err(Error::Embedding(format!("embed chunk task panicked: {e}")));
+                    }
+                    None => unreachable!("set is non-empty under the len() guard"),
+                };
+                match res {
+                    Ok(v) => slots[idx] = Some(v),
+                    Err(e) => {
+                        set.abort_all();
+                        return Err(e);
+                    }
+                }
             }
-
-            let resp: EmbedResponse = {
-                let resp = req.send().await.map_err(Error::Http)?;
-                // Non-2xx → `Error::Http` carrying the status (the pre-cap
-                // `.json()` behaved this way via reqwest's decode path).
-                let resp = resp.error_for_status().map_err(Error::Http)?;
-                // Size budget: a `Content-Length` over the cap is rejected
-                // before reading (the common case — providers send it);
-                // the post-read check below covers chunked/lying bodies.
-                let over_cl = resp
-                    .headers()
-                    .get(reqwest::header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .is_some_and(|cl| cl > MAX_EMBED_RESPONSE_BYTES);
-                if over_cl {
-                    return Err(Error::Embedding(format!(
-                        "embedding endpoint response exceeds the {MAX_EMBED_RESPONSE_BYTES}-byte \
-                         body budget (Content-Length)"
-                    )));
+            let client = self.clone();
+            let input = chunk.to_vec();
+            set.spawn(async move { (i, client.embed_chunk(&input).await) });
+        }
+        while let Some(item) = set.join_next().await {
+            let (idx, res) = match item {
+                Ok(x) => x,
+                Err(e) => {
+                    set.abort_all();
+                    return Err(Error::Embedding(format!("embed chunk task panicked: {e}")));
                 }
-                let body = resp.bytes().await.map_err(Error::Http)?;
-                if (body.len() as u64) > MAX_EMBED_RESPONSE_BYTES {
-                    return Err(Error::Embedding(format!(
-                        "embedding endpoint response is {} bytes \
-                         (budget {MAX_EMBED_RESPONSE_BYTES})",
-                        body.len()
-                    )));
-                }
-                serde_json::from_slice(&body)?
             };
+            match res {
+                Ok(v) => slots[idx] = Some(v),
+                Err(e) => {
+                    set.abort_all();
+                    return Err(e);
+                }
+            }
+        }
+        let mut all_embeddings = Vec::new();
+        for s in slots {
+            // Every chunk was spawned exactly once and stored on completion,
+            // so no slot is None here.
+            // LINT-3 (2026-10 review): documented invariant — each chunk is
+            // spawned exactly once and its slot is filled on completion
+            // (errors abort the whole `embed` before this loop).
+            #[allow(clippy::expect_used)]
+            let v = s.expect("chunk slot filled");
+            all_embeddings.extend(v);
+        }
+        Ok(all_embeddings)
+    }
 
-            // Sort by index to maintain order
-            let mut data = resp.data;
-            data.sort_by_key(|d| d.index);
-            // Reject duplicate/gap/out-of-range indices before extending — a
-            // misaligned batch would attach the wrong vector to an article.
-            check_embed_indices(&data)?;
-            all_embeddings.extend(data.into_iter().map(|d| d.embedding));
+    /// One chunk request (extracted for the bounded concurrent chunk
+    /// fan-out in [`embed`]): POST the chunk's texts, enforce the
+    /// response-size budget, and validate the echoed index set. Returns the
+    /// vectors in input order (sorted by the provider's `index` field).
+    async fn embed_chunk(&self, chunk: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut req = self
+            .http
+            .post(format!(
+                "{}/embeddings",
+                self.config.endpoint.trim_end_matches('/')
+            ))
+            .json(&EmbedRequest {
+                model: self.config.model.clone(),
+                input: chunk.to_vec(),
+            });
+
+        if !self.config.api_key.is_empty() {
+            req = req.bearer_auth(&self.config.api_key);
         }
 
-        Ok(all_embeddings)
+        let resp: EmbedResponse = {
+            let resp = req.send().await.map_err(Error::Http)?;
+            // Non-2xx → `Error::Http` carrying the status (the pre-cap
+            // `.json()` behaved this way via reqwest's decode path).
+            let resp = resp.error_for_status().map_err(Error::Http)?;
+            // Size budget: a `Content-Length` over the cap is rejected
+            // before reading (the common case — providers send it);
+            // the post-read check below covers chunked/lying bodies.
+            let over_cl = resp
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some_and(|cl| cl > MAX_EMBED_RESPONSE_BYTES);
+            if over_cl {
+                return Err(Error::Embedding(format!(
+                    "embedding endpoint response exceeds the {MAX_EMBED_RESPONSE_BYTES}-byte \
+                     body budget (Content-Length)"
+                )));
+            }
+            let body = resp.bytes().await.map_err(Error::Http)?;
+            if (body.len() as u64) > MAX_EMBED_RESPONSE_BYTES {
+                return Err(Error::Embedding(format!(
+                    "embedding endpoint response is {} bytes \
+                     (budget {MAX_EMBED_RESPONSE_BYTES})",
+                    body.len()
+                )));
+            }
+            serde_json::from_slice(&body)?
+        };
+
+        // Sort by index to maintain order
+        let mut data = resp.data;
+        data.sort_by_key(|d| d.index);
+        // Reject duplicate/gap/out-of-range indices before extending — a
+        // misaligned batch would attach the wrong vector to an article.
+        check_embed_indices(&data)?;
+        Ok(data.into_iter().map(|d| d.embedding).collect())
     }
 }
 

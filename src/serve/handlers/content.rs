@@ -54,6 +54,12 @@ pub struct ReadQuery {
 /// the source visible; the `RAW_CONTENT_CSP` attached to every `/w`
 /// response (see `web::raw_content_security_headers`) is the defense-in-
 /// depth backstop.
+///
+/// The XSLT types are included (F4, 2026-10 review): a directly-navigated
+/// XSL document can run `xsl:script` in engines that process XSL, and no
+/// header combination closes that (CSP framing controls cannot reach
+/// top-frame execution) — serving the XSLT entry as `text/plain`
+/// neutralizes it the same way as the classic script MIMEs.
 fn is_script_executing_mime(mime: &str) -> bool {
     matches!(
         mime,
@@ -66,6 +72,8 @@ fn is_script_executing_mime(mime: &str) -> bool {
             | "text/jscript"
             | "application/x-jscript"
             | "text/typescript"
+            | "application/xslt+xml"
+            | "text/xsl"
     )
 }
 

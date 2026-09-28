@@ -2,7 +2,7 @@
 //! load/reload, env-locked write validation, and the typed accessors.
 //! Cross-process invalidation (LISTEN/NOTIFY,
 //! `crate::db::notify`) drives `reload()` from the composition-root
-//! closure in `startup.rs`. The admin-auth surface (token-verify KDF call
+//! closure in `startup::`. The admin-auth surface (token-verify KDF call
 //! sites, legacy upgrade) lives in `auth_service` (`SettingsAuth`, Arch M2
 //! 2026-09 review); the two token-verify caches, the in-memory secret
 //! stores, the type-mismatch record, and the read redaction rules live in
@@ -21,8 +21,7 @@ use super::defs::{
     apply_env_snapshot, def, default_settings, default_value, is_security_sensitive, known_keys,
     normalize_embedding_endpoint, sync_config_values, type_mismatch, ACCESS_MODE_OPEN,
     KEY_ACCESS_MODE, KEY_ACCESS_REQUIRE_AUTH_FOR_READS, KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS,
-    KEY_EMBEDDING_ENABLED, KEY_EMBEDDING_ENDPOINT, KEY_TORRENT_ALLOW_PRIVATE_NETWORKS,
-    KEY_TORRENT_ENABLED, KEY_TORRENT_MAX_ACTIVE, KEY_TORRENT_OPDS_URL, KEY_TORRENT_URL,
+    KEY_EMBEDDING_ENABLED, KEY_EMBEDDING_ENDPOINT, KEY_TORRENT_ENABLED, KEY_TORRENT_MAX_ACTIVE,
 };
 use super::encrypt;
 use super::tokens::{redacted_entry, snapshot_type_mismatches, warn_type_mismatches};
@@ -316,7 +315,7 @@ impl SettingsCache {
     /// either direction: a reload that read the table before the update's
     /// commit applies its swap before the update's cache insert (and vice
     /// versa). Callers: [`Self::load`] (pre-traffic, at startup) and the
-    /// composition-root invalidation closure in `startup.rs` (a
+    /// composition-root invalidation closure in `startup::` (a
     /// `zimservice_settings` notification from a peer instance; see
     /// `crate::db::notify`).
     // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
@@ -602,43 +601,33 @@ impl SettingsCache {
                 }
                 // SSRF guard: validate URL-typed settings at write time,
                 // honoring the same per-integration private-network opt-in
-                // the runtime gates read at connect/fetch time. Fail-closed:
-                // an absent or mistyped flag keeps private networks off.
-                if matches!(
-                    key.as_str(),
-                    KEY_EMBEDDING_ENDPOINT | KEY_TORRENT_URL | KEY_TORRENT_OPDS_URL
-                ) {
+                // the runtime gates read at connect/fetch time. The policy
+                // lives on the `SETTING_DEFS` row (`SettingPolicy::url`,
+                // M-3, 2026-10 review) — no `matches!` on key strings, no
+                // per-key match arms here. Fail-closed: an absent or
+                // mistyped flag keeps private networks off.
+                if let Some(url_policy) = def(key).and_then(|d| d.policy.url) {
                     if let Some(url_str) = value.as_str() {
                         if !url_str.is_empty() {
                             // Effective flag = the value pending in this
                             // batch (if the paired flag key is also being
                             // saved) else the current cache value — a PUT
-                            // can enable the opt-in and set the LAN endpoint
-                            // in one save.
-                            let allow_private = match key.as_str() {
-                                // `connect_qbit` (SEC M-1) gates the qB
-                                // endpoint on `torrent.allow_private_networks`.
-                                KEY_TORRENT_URL => effective_private_flag(
-                                    updates.get(KEY_TORRENT_ALLOW_PRIVATE_NETWORKS),
-                                    self.get_typed(KEY_TORRENT_ALLOW_PRIVATE_NETWORKS)
-                                        .unwrap_or(false),
+                            // can enable the opt-in and set the LAN
+                            // endpoint in one save. `None` flag key = the
+                            // integration pins private networks off at
+                            // runtime (the embed client), so the check
+                            // runs with the flag off.
+                            let allow_private = match url_policy.private_network_flag {
+                                Some(flag_key) => effective_private_flag(
+                                    updates.get(flag_key),
+                                    self.get_typed(flag_key).unwrap_or(false),
                                 ),
-                                // `validate_download_url` gates the catalog on
-                                // `downloads.allow_private_networks`.
-                                KEY_TORRENT_OPDS_URL => effective_private_flag(
-                                    updates.get(KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS),
-                                    self.get_typed(KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS)
-                                        .unwrap_or(false),
-                                ),
-                                // The embed client pins allow_private=false
-                                // at runtime (src/embed/mod.rs), so write time
-                                // must agree.
-                                _ => false,
+                                None => false,
                             };
                             if let Err(e) = crate::netguard::assert_host_not_blocked(
                                 url_str,
                                 allow_private,
-                                /* allow_loopback */ true,
+                                url_policy.allow_loopback,
                             ) {
                                 errors.push(format!("{key}: {e}"));
                                 continue;
@@ -949,10 +938,11 @@ mod tests {
 
     use crate::settings::auth::{TOKEN_CACHE_MAX, TOKEN_CACHE_TTL, TOKEN_NEGATIVE_TTL};
     use crate::settings::defs::{
-        KEY_ACCESS_READ_ONLY_TOKEN, KEY_EMBEDDING_API_KEY, KEY_EMBEDDING_DIMENSION,
-        KEY_EMBEDDING_TIMEOUT_SECS, KEY_GENERAL_CORS_ORIGINS, KEY_GENERAL_HOST,
-        KEY_GENERAL_LOG_LEVEL, KEY_GENERAL_PORT, KEY_GENERAL_ZIM_DIR, KEY_SEARCH_FTS_WEIGHT,
-        KEY_SEARCH_MAX_LIMIT, KEY_TORRENT_PASSWORD, KEY_TORRENT_URL, KEY_TORRENT_USERNAME,
+        KEY_ACCESS_READ_ONLY_TOKEN, KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS, KEY_EMBEDDING_API_KEY,
+        KEY_EMBEDDING_DIMENSION, KEY_EMBEDDING_TIMEOUT_SECS, KEY_GENERAL_CORS_ORIGINS,
+        KEY_GENERAL_HOST, KEY_GENERAL_LOG_LEVEL, KEY_GENERAL_PORT, KEY_GENERAL_ZIM_DIR,
+        KEY_SEARCH_FTS_WEIGHT, KEY_SEARCH_MAX_LIMIT, KEY_TORRENT_ALLOW_PRIVATE_NETWORKS,
+        KEY_TORRENT_OPDS_URL, KEY_TORRENT_PASSWORD, KEY_TORRENT_URL, KEY_TORRENT_USERNAME,
         SETTING_DEFS,
     };
     use crate::testing::dead_pool;

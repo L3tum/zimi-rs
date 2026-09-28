@@ -198,7 +198,7 @@ mod qbit_configured {
         let _ = std::fs::create_dir_all(&dir);
         let zims = crate::zim::ZimManager::new(dir, crate::testing::dead_pool());
         // Tests pass one pool for both db and db_bg; production wires
-        // db_bg to the capped background pool (src/startup.rs).
+        // db_bg to the capped background pool (src/startup/mod.rs).
         super::super::DownloadPoller::new(
             crate::testing::dead_pool(),
             crate::testing::dead_pool(),
@@ -754,8 +754,8 @@ pub(crate) mod download {
         );
         raw::fetch_scalar_optional(
             &mut *c,
-            "INSERT INTO downloads (name, url, hash, status, progress, ratio, num_seeds, 
-                 updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 
+            "INSERT INTO downloads (name, url, hash, status, progress, ratio, num_seeds,
+                 updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7,
                  now()) RETURNING id",
             |q| {
                 q.bind(name)
@@ -917,7 +917,7 @@ pub(crate) mod download {
                     i64,
                 ) = raw::fetch_optional(
                     &mut *c,
-                    "SELECT progress, speed_bps, eta_secs, ratio, up_speed_bps, 
+                    "SELECT progress, speed_bps, eta_secs, ratio, up_speed_bps,
                             num_seeds FROM downloads WHERE id = $1",
                     |q| q.bind(id),
                 )
@@ -967,7 +967,7 @@ pub(crate) mod download {
                 );
                 let (prog, speed, eta, ratio, up, seeds): StatsTuple = raw::fetch_optional(
                     &mut *c,
-                    "SELECT progress, speed_bps, eta_secs, ratio, up_speed_bps, 
+                    "SELECT progress, speed_bps, eta_secs, ratio, up_speed_bps,
                             num_seeds FROM downloads WHERE id = $1",
                     |q| q.bind(id),
                 )
@@ -1096,7 +1096,7 @@ pub(crate) mod download {
                     Option<i64>,
                 ) = raw::fetch_optional(
                     &mut *c,
-                    "SELECT status, ratio, up_speed_bps, num_seeds, 
+                    "SELECT status, ratio, up_speed_bps, num_seeds,
                             speed_bps FROM downloads WHERE id = $1",
                     |q| q.bind(id),
                 )
@@ -1266,8 +1266,8 @@ pub(crate) mod download {
                 );
                 let (status, error, age_secs): (String, Option<String>, i64) = raw::fetch_optional(
                     &mut *c,
-                    "SELECT status, error, 
-                             EXTRACT(EPOCH FROM (now() - updated_at))::bigint 
+                    "SELECT status, error,
+                             EXTRACT(EPOCH FROM (now() - updated_at))::bigint
                              FROM downloads WHERE id = $1",
                     |q| q.bind(id),
                 )
@@ -1720,40 +1720,6 @@ pub(crate) mod download {
         )
         .await;
         let _ = tmp;
-    }
-
-    /// After `cancel()`, `run` must exit at the next between-ticks
-    /// poll — even when every DB and qB call fails (dead pool + dead qB
-    /// port). DB-less: no live Postgres is needed because the cancel check
-    /// runs regardless of tick success.
-    #[tokio::test]
-    async fn run_stops_on_cancel_between_ticks() {
-        // Dead pool (lazy build — no connection is attempted here): any
-        // acquire fails against the dead port. `dead_pool()` carries a
-        // short `acquire_timeout` — sqlx's 30 s default would otherwise
-        // hold the first (reconcile/tick) DB op well past the 10 s cancel
-        // deadline below.
-        let pool = crate::testing::dead_pool();
-        let tmp = tempfile::tempdir().unwrap();
-        let zims = crate::zim::ZimManager::new(tmp.path().to_path_buf(), pool.clone());
-        // Dead qB port: connection-refused is instant, so `resolve_torrent`
-        // fails fast instead of hanging the run loop.
-        let poller = super::super::DownloadPoller::new(
-            pool.clone(),
-            pool,
-            download_settings(),
-            zims,
-            crate::torrent::QbitClientCache::new(),
-            Some("http://127.0.0.1:1/qb".into()),
-            "user".into(),
-            "pass".into(),
-        );
-        poller.cancel();
-        let finished = tokio::time::timeout(std::time::Duration::from_secs(10), poller.run()).await;
-        assert!(
-            finished.is_ok(),
-            "run() must stop at the between-ticks cancel poll"
-        );
     }
 
     /// A row that moved to `cancelled` between claim and tick
@@ -2644,7 +2610,7 @@ mod reconcile {
         .await;
         let id: i32 = raw::fetch_scalar_optional(
             &mut *c,
-            "INSERT INTO downloads (name, url, hash, status, progress, updated_at) 
+            "INSERT INTO downloads (name, url, hash, status, progress, updated_at)
                  VALUES ($1, $2, NULL, 'seeding', 1.0, now()) RETURNING id",
             |q| q.bind("reconcile_own.zim").bind("magnet:?xt=urn:btih:own"),
         )

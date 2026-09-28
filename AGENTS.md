@@ -160,7 +160,6 @@ owner decision):
   of >=/8 (v4) or >=/56 (v6) fatal, like the all-zero CIDR already is.
 - At-rest secret encryption stays opt-in via `SECURITY_KEY` (keep the
   startup warning prominent).
-- `torrent.enabled` defaults to true — consider defaulting it to false.
 
 **Rate-limiter ownership pointer.** The service-wide single token bucket is
 a documented non-goal (docs/ARCHITECTURE.md "Per-client rate limiting";

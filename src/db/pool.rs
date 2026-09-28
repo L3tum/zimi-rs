@@ -156,6 +156,57 @@ pub(crate) fn connect_options(dsn: &str, tls_mode: TlsMode) -> Result<PgConnectO
     Ok(opts.ssl_mode(ssl_mode_for(tls_mode, dsn)))
 }
 
+/// The pool foreground READ checkouts should use (M-2, 2026-10 review):
+/// the read replica when one is configured, else the primary pool. This is
+/// the SINGLE routing point for the read-replica choice — both
+/// `AppState::db_read_or_primary` (per-request handler reads) and
+/// `startup::build_state` (the search engine's owned pool) call through
+/// here, so the read-or-primary decision is encoded exactly once.
+pub fn read_or_primary<'a>(read: Option<&'a Pool>, primary: &'a Pool) -> &'a Pool {
+    read.unwrap_or(primary)
+}
+
+/// Pool saturation snapshot — pure synchronous reads of sqlx's atomic pool
+/// state (Architecture M1; M-diag, 2026-10 review moved this out of the
+/// `zims` handler module into the pool boundary). No connection is opened,
+/// so this is safe on a dead/unreachable pool and costs nothing on the hot
+/// path. The `/diagnostic` DTO (`serve::diagnostics::PoolHealth`) is a
+/// direct mapping of this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolSaturation {
+    /// Active connections (checked-out + idle); `Pool::size()`.
+    pub size: u32,
+    /// Idle (not in use) connections; `Pool::num_idle()`.
+    pub idle: u32,
+    /// Configured maximum connection count (`PoolOptions::get_max_connections`).
+    pub max_size: u32,
+    /// `size - idle` — connections currently held by in-flight queries.
+    pub checked_out: u32,
+}
+
+impl PoolSaturation {
+    /// The pre-503 saturation signal: the pool is at its ceiling with zero
+    /// idle connections, so further acquires queue and then time out
+    /// (10 s acquire timeout → 503).
+    pub fn saturated(&self) -> bool {
+        self.checked_out == self.max_size && self.idle == 0 && self.max_size > 0
+    }
+}
+
+/// Read a pool's saturation state (pure synchronous sqlx reads; see
+/// [`PoolSaturation`]).
+pub fn pool_saturation(pool: &Pool) -> PoolSaturation {
+    let size = pool.size();
+    let idle = pool.num_idle() as u32;
+    let max_size = pool.options().get_max_connections();
+    PoolSaturation {
+        size,
+        idle,
+        max_size,
+        checked_out: size.saturating_sub(idle),
+    }
+}
+
 /// Create a Postgres connection pool from config, with automatic TLS
 /// negotiation based on the DATABASE_URL scheme and sslmode parameter.
 /// `effective_pool_size` clamps the size to at least 1 so a misconfigured
@@ -518,6 +569,65 @@ mod tests {
     // Pool construction is now async and connection-backed, so the old
     // deadpool `build()` regression test no longer applies; the 10 s acquire
     // timeout is covered by the DB-gated tests.
+
+    // ── pool_saturation (M-diag, 2026-10 review) ─────────────────────────
+
+    /// `pool_saturation` on an unreachable pool: pure reads, no connection
+    /// opened, and the invariants hold at rest (`checked_out == size -
+    /// idle`, not saturated).
+    #[test]
+    fn pool_saturation_dead_pool_at_rest() {
+        let pool = crate::testing::dead_pool();
+        let s = pool_saturation(&pool);
+        assert_eq!(s.size, 0, "no connections on a dead pool");
+        assert_eq!(s.idle, 0);
+        assert_eq!(s.checked_out, 0);
+        assert_eq!(s.max_size, 1, "dead_pool configures max_connections(1)");
+        assert!(!s.saturated(), "an empty pool is not saturated");
+    }
+
+    /// `pool_saturation` on a live pool: the invariant
+    /// `checked_out == size - idle` holds, and holding an explicit checkout
+    /// bumps `checked_out` (the pre-503 signal the `/diagnostic` `pool`
+    /// field is built from).
+    #[tokio::test]
+    async fn pool_saturation_live_pool_checked_out() {
+        // DB gate (src/testing.rs): counted skip, strict-mode hard-fail.
+        let Some((pool, _db_gate)) = crate::testing::test_pool().await else {
+            return;
+        };
+        let s = pool_saturation(&pool);
+        assert!(s.max_size > 0, "live pool has a size ceiling");
+        assert_eq!(s.checked_out, s.size.saturating_sub(s.idle));
+        // Hold a checkout: `checked_out` must rise by exactly one while it
+        // is held, then fall back on drop.
+        let conn = pool.acquire().await.expect("live pool acquires");
+        let s2 = pool_saturation(&pool);
+        assert_eq!(
+            s2.checked_out,
+            s.checked_out + 1,
+            "a held checkout is counted"
+        );
+        assert!(s2.checked_out + s2.idle == s2.size);
+        // Dropping the connection returns it to the pool ASYNCHRONOUSLY (the
+        // pool's maintenance task reaps the dropped slot), so the counters
+        // can lag a few ms behind the `drop` — poll for the return with a
+        // generous timeout instead of asserting on an immediate re-read
+        // (an immediate read is a race, not a measurement).
+        drop(conn);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let s3 = pool_saturation(&pool);
+            if s3.checked_out == s.checked_out {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "checkout not returned to the pool within 5 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 
     // ── read-replica + background pool builders (PERF-10 / read-replica
     //    finding) ──────────────────────────────────────────────────────

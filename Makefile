@@ -349,8 +349,11 @@ help:
 	@echo "  make run          Run $(BIN) serve (debug build first)"
 	@echo "  make clean        Remove target dir"
 
+# Rustdoc with warnings denied (the doc target's CI parity: a broken intra-doc
+# link or a doc build warning is a build break — the same RUSTDOCFLAGS
+# convention as the CI docs gate, mirrored locally).
 doc:
-	$(CARGO) doc --no-deps --all-features
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps --all-features
 
 # ─── Build targets ──────────────────────────────────────────────────────
 build:

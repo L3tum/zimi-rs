@@ -259,10 +259,10 @@ pub async fn put_zim_settings(
 
 /// Map ZIM names to their DB ids, validating that every name exists.
 fn zim_names_to_ids(state: &AppState, names: &[String]) -> crate::error::Result<Vec<i32>> {
-    let zims = state.zims.list();
-    let by_name: HashMap<&str, i32> = zims
+    let id_names = state.zims.list_id_names();
+    let by_name: HashMap<&str, i32> = id_names
         .iter()
-        .filter_map(|z| z.id.map(|id| (z.name.as_str(), id)))
+        .filter_map(|(id, name)| id.map(|id| (name.as_str(), id)))
         .collect();
     names
         .iter()
@@ -275,14 +275,15 @@ fn zim_names_to_ids(state: &AppState, names: &[String]) -> crate::error::Result<
         .collect()
 }
 
-/// Build the ZIM id → name map once per request (the ZIM list is cloned a
-/// single time instead of once per collection row).
+/// Build the ZIM id → name map once per request (the ZIM list is read a
+/// single time instead of once per collection row; the slim
+/// `list_id_names` variant keeps it from cloning full rows).
 fn zim_id_to_name_map(state: &AppState) -> HashMap<i32, String> {
     state
         .zims
-        .list()
-        .iter()
-        .filter_map(|z| z.id.map(|id| (id, z.name.clone())))
+        .list_id_names()
+        .into_iter()
+        .filter_map(|(id, name)| id.map(|id| (id, name)))
         .collect()
 }
 

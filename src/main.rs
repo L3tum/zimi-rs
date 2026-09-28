@@ -348,7 +348,7 @@ async fn cmd_list(config: Config, sync: bool) -> anyhow::Result<()> {
     // lock so a concurrently-starting `serve` is serialized out).
     let found = startup::populate_zims(&zims, sync).await?;
 
-    if found.is_empty() && zims.list().is_empty() {
+    if found.is_empty() && zims.list_names().is_empty() {
         println!("No ZIM files found in {}", config.zim_dir.display());
         return Ok(());
     }
@@ -482,13 +482,7 @@ async fn cmd_embed(config: Config, zim: Option<String>) -> anyhow::Result<()> {
             }
             vec![name.clone()]
         }
-        None => state
-            .zims
-            .list()
-            .into_iter()
-            .filter(|z| z.embed_enabled)
-            .map(|z| z.name)
-            .collect(),
+        None => state.zims.list_embed_enabled_names(),
     };
 
     if targets.is_empty() {
@@ -547,7 +541,7 @@ mod tests {
 
     // NOTE: the old `serve_should_refuse` unit tests have been removed — the
     // refusal logic is now in `cmd_serve` + `startup::acquire_instance_guard`.
-    // The behavior is exercised in `src/startup.rs`'s `tests` module:
+    // The behavior is exercised in `src/startup/mod.rs`'s `tests` module:
     // `smoke_single_instance_refusal` (DB-gated: a held advisory lock makes
     // `acquire_instance_guard` return `Ok(None)`) plus the PID lock unit tests
     // (`pid_lock_live_own_pid_is_refused`, `pid_lock_stale_dead_pid_is_stolen`,

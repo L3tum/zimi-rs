@@ -127,11 +127,7 @@ pub async fn auto_embed_loop(state: Arc<crate::AppState>, tick: Duration) {
             continue;
         }
         // Reap a completed in-flight build handle so the slot is free again.
-        if let Some(ref h) = in_flight {
-            if h.is_finished() {
-                in_flight = None;
-            }
-        }
+        reap_completed_build(&mut in_flight);
         // P3: if there is nothing to embed, skip the `vector_index_state` DB
         // check entirely for this tick (and the pipeline below) — no embeddable
         // ZIM means no new vectors, so there is no point querying the index.
@@ -146,111 +142,7 @@ pub async fn auto_embed_loop(state: Arc<crate::AppState>, tick: Duration) {
         // Early vector-index build (non-blocking): once ≥ 10k vectors
         // exist and no valid index is present, build it CONCURRENTLY in the
         // background so search stays live. Backoff: at most one build per 10 min.
-        {
-            // M1: the expensive `COUNT(*) ... WHERE embedding IS NOT NULL`
-            // (vector_index_state) only runs on ticks where the index-build
-            // decision can actually change. The O(1) pre-filter proves the
-            // exact count is unnecessary — and would decide "don't build" —
-            // whenever a valid index already exists, or the whole `articles`
-            // table is below the build threshold (so the embedded subset is
-            // too). This drops the recurring 60 s full-table count from
-            // every tick except the rare window where ≥ 10k rows exist with
-            // no index yet. 2026-10 quick review: the skip cases now
-            // publish a catalog-only snapshot (n_live_tup estimate + exact
-            // index state) so `/diagnostic` stays fresh with zero
-            // steady-state exact probes.
-            match index_build_prefilter(&state.db_bg).await {
-                IndexBuildPrefilter::Probe => {
-                    // 2026-10 review (Medium): this tick is one of the two
-                    // sites that pay the exact COUNT(*) — publish the
-                    // result so `/diagnostic` reads the shared snapshot
-                    // instead of re-running the probe per pull. A probe
-                    // failure fails closed (assume a valid index exists →
-                    // don't build), as before, and is NOT published (the
-                    // last successful probe remains the snapshot).
-                    let (count, st) = match vector_index_state(&state.db_bg).await {
-                        Ok(s) => {
-                            publish_vector_index_snapshot(&state.vector_index_snapshot, s.0, s.1);
-                            s
-                        }
-                        Err(_) => (0, VectorIndexState::Present),
-                    };
-                    // Read-only backoff check (pure atomic load, no CAS
-                    // stamp): the loop only *pre-filters* here so the
-                    // recurring 60 s tick does no work while in backoff.
-                    // It must NOT claim the shared slot — the actual claim
-                    // is the single CAS inside `maybe_build_vector_index`
-                    // below, which is what the spawn funnels through.
-                    // Claiming here would stamp the slot a microsecond
-                    // before the spawn, so the spawn's own claim would
-                    // always fail and the 10k early build would never run.
-                    if !build_probe_claimed_recently(&state.build_probe)
-                        && should_spawn_build(st, count)
-                        && in_flight.is_none()
-                    {
-                        let db = state.db_bg.clone();
-                        let settings = state.settings.clone();
-                        let probe = state.build_probe.clone();
-                        let index_building = state.index_building.clone();
-                        let snapshot = state.vector_index_snapshot.clone();
-                        in_flight = Some(tokio::spawn(async move {
-                            // A hung `CREATE INDEX CONCURRENTLY` (e.g. waiting
-                            // on a lock held by a long-running query) must not
-                            // pin the in-flight slot forever — the loop would
-                            // never spawn again until a process restart. The
-                            // await is bounded; on timeout we warn (the build
-                            // may still be running in the background on its
-                            // pooled connection) and let the slot free so a
-                            // later tick can retry — the IF NOT EXISTS /
-                            // drop-invalid logic in `maybe_build_vector_index`
-                            // makes a retry safe. Bound: 1 hour — a concurrent
-                            // build on a multi-million-row table can be slow,
-                            // and we don't want to give up on a legitimate one.
-                            if tokio::time::timeout(
-                                Duration::from_secs(INDEX_BUILD_TIMEOUT_SECS),
-                                maybe_build_vector_index(
-                                    &db,
-                                    &settings,
-                                    MIN_INDEX_BUILD_ROWS,
-                                    &probe,
-                                    &index_building,
-                                    &snapshot,
-                                ),
-                            )
-                            .await
-                            .is_err()
-                            {
-                                tracing::warn!(
-                                    "vector index build await timed out after {}s — the build \
-                                     may still be running in the background; the in-flight \
-                                     slot is released and a later tick will retry",
-                                    INDEX_BUILD_TIMEOUT_SECS
-                                );
-                            }
-                        }));
-                    }
-                }
-                // 2026-10 quick review: steady state (a valid index is
-                // present) and sub-threshold ticks skip the exact count —
-                // publish the catalog-only snapshot (n_live_tup estimate +
-                // exact index state) so `/diagnostic` stays fresh without
-                // any steady-state exact probe. The degradation note is
-                // identical to the exact probe's in both skip cases.
-                IndexBuildPrefilter::Skip {
-                    estimate,
-                    state: index_state,
-                } => {
-                    publish_vector_index_snapshot(
-                        &state.vector_index_snapshot,
-                        estimate,
-                        index_state,
-                    );
-                }
-                // A pre-filter probe failed: skip the count (fail closed)
-                // and keep the last published snapshot.
-                IndexBuildPrefilter::SkipUnknown => {}
-            }
-        }
+        maybe_early_build_index(&state, &mut in_flight).await;
         // P3 (2026-09 review): pipelines for distinct ZIMs are disjoint row
         // sets, so run them with bounded concurrency (2) instead of strictly
         // sequentially — the initial backfill (many ZIMs, no vectors) is
@@ -259,59 +151,196 @@ pub async fn auto_embed_loop(state: Arc<crate::AppState>, tick: Duration) {
         // the per-pipeline post-run index build funnels through the shared
         // `build_probe` CAS + `index_building` flag, which already
         // de-duplicates concurrent build attempts.
-        const EMBED_CONCURRENCY: usize = 2;
-        let mut set = tokio::task::JoinSet::new();
-        for name in zims {
-            if set.len() >= EMBED_CONCURRENCY {
-                // Block on the oldest in-flight pipeline before starting the
-                // next one (bounded fan-out, FIFO-ish drain).
-                // LINT-3 (2026-09 sweep): checked invariant — the set is
-                // non-empty under the `set.len()` guard — grandfathered
-                // expect_used.
-                #[allow(clippy::expect_used)]
-                {
-                    let outcome = set
-                        .join_next()
-                        .await
-                        .expect("join_next before set is empty");
-                    match outcome {
-                        Ok((done, Err(e))) => {
-                            tracing::error!("auto-embed failed for '{done}': {e}")
-                        }
-                        Ok((done, Ok(()))) => {
-                            let _ = done;
-                        }
-                        Err(je) => tracing::error!("auto-embed task panicked: {je}"),
-                    }
-                }
-            }
-            tracing::info!("auto-embedding ZIM '{name}'");
-            let db = state.db_bg.clone();
-            let settings = state.settings.clone();
-            let build_probe = state.build_probe.clone();
-            let index_building = state.index_building.clone();
-            let snapshot = state.vector_index_snapshot.clone();
-            set.spawn(async move {
-                let r = run_pipeline(
-                    db,
-                    settings,
-                    &name,
-                    &build_probe,
-                    &index_building,
-                    &snapshot,
-                )
-                .await;
-                (name, r)
-            });
+        run_embed_pipelines(&state, zims).await;
+    }
+}
+
+/// M5 phase (2026-10 review): reap a completed in-flight index-build handle
+/// so the single `in_flight` slot is free for the next spawn — the loop
+/// tracks at most one concurrent build, and a finished handle must not pin
+/// the slot (which would block every later early-build until a restart).
+fn reap_completed_build(in_flight: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(ref h) = *in_flight {
+        if h.is_finished() {
+            *in_flight = None;
         }
-        while let Some(outcome) = set.join_next().await {
-            match outcome {
-                Ok((done, Err(e))) => tracing::error!("auto-embed failed for '{done}': {e}"),
-                Ok((done, Ok(()))) => {
-                    let _ = done;
+    }
+}
+
+/// M5 phase (2026-10 review): the tick's early vector-index build decision.
+/// Runs the O(1) [`index_build_prefilter`] and, only when it says *probe*,
+/// the exact `vector_index_state` COUNT — publishing the shared
+/// `/diagnostic` snapshot in every arm — then spawns the non-blocking build
+/// when the backoff, the row threshold, and the in-flight slot all allow it.
+/// Steady state (a valid index present) and sub-threshold ticks skip the
+/// exact count entirely and publish the catalog-only snapshot.
+async fn maybe_early_build_index(
+    state: &Arc<crate::AppState>,
+    in_flight: &mut Option<tokio::task::JoinHandle<()>>,
+) {
+    // M1: the expensive `COUNT(*) ... WHERE embedding IS NOT NULL`
+    // (vector_index_state) only runs on ticks where the index-build
+    // decision can actually change. The O(1) pre-filter proves the
+    // exact count is unnecessary — and would decide "don't build" —
+    // whenever a valid index already exists, or the whole `articles`
+    // table is below the build threshold (so the embedded subset is
+    // too). This drops the recurring 60 s full-table count from
+    // every tick except the rare window where ≥ 10k rows exist with
+    // no index yet. 2026-10 quick review: the skip cases now
+    // publish a catalog-only snapshot (n_live_tup estimate + exact
+    // index state) so `/diagnostic` stays fresh with zero
+    // steady-state exact probes.
+    match index_build_prefilter(&state.db_bg).await {
+        IndexBuildPrefilter::Probe => {
+            // 2026-10 review (Medium): this tick is one of the two
+            // sites that pay the exact COUNT(*) — publish the
+            // result so `/diagnostic` reads the shared snapshot
+            // instead of re-running the probe per pull. A probe
+            // failure fails closed (assume a valid index exists →
+            // don't build), as before, and is NOT published (the
+            // last successful probe remains the snapshot).
+            let (count, st) = match vector_index_state(&state.db_bg).await {
+                Ok(s) => {
+                    publish_vector_index_snapshot(&state.vector_index_snapshot, s.0, s.1);
+                    s
                 }
-                Err(je) => tracing::error!("auto-embed task panicked: {je}"),
+                Err(_) => (0, VectorIndexState::Present),
+            };
+            // Read-only backoff check (pure atomic load, no CAS
+            // stamp): the loop only *pre-filters* here so the
+            // recurring 60 s tick does no work while in backoff.
+            // It must NOT claim the shared slot — the actual claim
+            // is the single CAS inside `maybe_build_vector_index`
+            // below, which is what the spawn funnels through.
+            // Claiming here would stamp the slot a microsecond
+            // before the spawn, so the spawn's own claim would
+            // always fail and the 10k early build would never run.
+            if !build_probe_claimed_recently(&state.build_probe)
+                && should_spawn_build(st, count)
+                && in_flight.is_none()
+            {
+                let db = state.db_bg.clone();
+                let settings = state.settings.clone();
+                let probe = state.build_probe.clone();
+                let index_building = state.index_building.clone();
+                let snapshot = state.vector_index_snapshot.clone();
+                *in_flight = Some(tokio::spawn(async move {
+                    // A hung `CREATE INDEX CONCURRENTLY` (e.g. waiting
+                    // on a lock held by a long-running query) must not
+                    // pin the in-flight slot forever — the loop would
+                    // never spawn again until a process restart. The
+                    // await is bounded; on timeout we warn (the build
+                    // may still be running in the background on its
+                    // pooled connection) and let the slot free so a
+                    // later tick can retry — the IF NOT EXISTS /
+                    // drop-invalid logic in `maybe_build_vector_index`
+                    // makes a retry safe. Bound: 1 hour — a concurrent
+                    // build on a multi-million-row table can be slow,
+                    // and we don't want to give up on a legitimate one.
+                    if tokio::time::timeout(
+                        Duration::from_secs(INDEX_BUILD_TIMEOUT_SECS),
+                        maybe_build_vector_index(
+                            &db,
+                            &settings,
+                            MIN_INDEX_BUILD_ROWS,
+                            &probe,
+                            &index_building,
+                            &snapshot,
+                        ),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!(
+                            "vector index build await timed out after {}s — the build \
+                                     may still be running in the background; the in-flight \
+                                     slot is released and a later tick will retry",
+                            INDEX_BUILD_TIMEOUT_SECS
+                        );
+                    }
+                }));
             }
+        }
+        // 2026-10 quick review: steady state (a valid index is
+        // present) and sub-threshold ticks skip the exact count —
+        // publish the catalog-only snapshot (n_live_tup estimate +
+        // exact index state) so `/diagnostic` stays fresh without
+        // any steady-state exact probe. The degradation note is
+        // identical to the exact probe's in both skip cases.
+        IndexBuildPrefilter::Skip {
+            estimate,
+            state: index_state,
+        } => {
+            publish_vector_index_snapshot(&state.vector_index_snapshot, estimate, index_state);
+        }
+        // A pre-filter probe failed: skip the count (fail closed)
+        // and keep the last published snapshot.
+        IndexBuildPrefilter::SkipUnknown => {}
+    }
+}
+
+/// M5 phase (2026-10 review): run this tick's per-ZIM embedding pipelines
+/// with bounded concurrency (2). Pipelines for distinct ZIMs are disjoint
+/// row sets (P3, 2026-09 review), so fan-out beats strictly sequential
+/// execution — the initial backfill (many ZIMs, no vectors) is otherwise
+/// wall-clock-bound on the slowest single pipeline. Steady state (one ZIM
+/// left with work) still runs exactly one pipeline; the per-pipeline
+/// post-run index build funnels through the shared `build_probe` CAS +
+/// `index_building` flag, which already de-duplicates concurrent build
+/// attempts.
+async fn run_embed_pipelines(state: &Arc<crate::AppState>, zims: Vec<String>) {
+    const EMBED_CONCURRENCY: usize = 2;
+    let mut set = tokio::task::JoinSet::new();
+    for name in zims {
+        if set.len() >= EMBED_CONCURRENCY {
+            // Block on the oldest in-flight pipeline before starting the
+            // next one (bounded fan-out, FIFO-ish drain).
+            // LINT-3 (2026-09 sweep): checked invariant — the set is
+            // non-empty under the `set.len()` guard — grandfathered
+            // expect_used.
+            #[allow(clippy::expect_used)]
+            {
+                let outcome = set
+                    .join_next()
+                    .await
+                    .expect("join_next before set is empty");
+                match outcome {
+                    Ok((done, Err(e))) => {
+                        tracing::error!("auto-embed failed for '{done}': {e}")
+                    }
+                    Ok((done, Ok(()))) => {
+                        let _ = done;
+                    }
+                    Err(je) => tracing::error!("auto-embed task panicked: {je}"),
+                }
+            }
+        }
+        tracing::info!("auto-embedding ZIM '{name}'");
+        let db = state.db_bg.clone();
+        let settings = state.settings.clone();
+        let build_probe = state.build_probe.clone();
+        let index_building = state.index_building.clone();
+        let snapshot = state.vector_index_snapshot.clone();
+        set.spawn(async move {
+            let r = run_pipeline(
+                db,
+                settings,
+                &name,
+                &build_probe,
+                &index_building,
+                &snapshot,
+            )
+            .await;
+            (name, r)
+        });
+    }
+    while let Some(outcome) = set.join_next().await {
+        match outcome {
+            Ok((done, Err(e))) => tracing::error!("auto-embed failed for '{done}': {e}"),
+            Ok((done, Ok(()))) => {
+                let _ = done;
+            }
+            Err(je) => tracing::error!("auto-embed task panicked: {je}"),
         }
     }
 }

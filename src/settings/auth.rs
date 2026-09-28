@@ -41,29 +41,54 @@ pub const TOKEN_CACHE_MAX: usize = 256;
 /// work; the verify itself runs **after** releasing the lock so a slow hash
 /// never serializes concurrent cache lookups — read lock for lookups, write
 /// lock for `record`/`clear`, never held across an `.await`).
-#[derive(Default)]
+///
+/// The two TTLs are construction-injected ([`VerifiedTokenCache::with_ttl`])
+/// so unit tests can exercise expiry with millisecond budgets; the
+/// production TTLs are the [`Default`] ([`TOKEN_CACHE_TTL`] /
+/// [`TOKEN_NEGATIVE_TTL`]).
 pub struct VerifiedTokenCache {
     /// Successful verifies. `pub(crate)` so the `settings` token-cache tests
     /// can seed/expiry the entries directly (white-box).
     pub(crate) entries: HashMap<String, Instant>,
     /// Failed verifies (shorter TTL) — a repeated wrong token skips the KDF.
     pub(crate) negatives: HashMap<String, Instant>,
+    /// Positive-entry TTL (fresh while `elapsed < ttl`).
+    positive_ttl: Duration,
+    /// Negative-entry TTL (fresh while `elapsed < ttl`).
+    negative_ttl: Duration,
+}
+
+impl Default for VerifiedTokenCache {
+    fn default() -> Self {
+        Self::with_ttl(TOKEN_CACHE_TTL, TOKEN_NEGATIVE_TTL)
+    }
 }
 
 impl VerifiedTokenCache {
-    /// True if `token` verified within the TTL. Refreshes nothing — callers
-    /// re-verify on expiry.
+    /// Constructor with the two TTLs injected (the test seam; [`Default`]
+    /// uses the production [`TOKEN_CACHE_TTL`] / [`TOKEN_NEGATIVE_TTL`]).
+    pub fn with_ttl(positive_ttl: Duration, negative_ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            negatives: HashMap::new(),
+            positive_ttl,
+            negative_ttl,
+        }
+    }
+
+    /// True if `token` verified within the cache's positive TTL. Refreshes
+    /// nothing — callers re-verify on expiry.
     pub fn is_fresh(&self, token: &str) -> bool {
         self.entries
             .get(token)
-            .is_some_and(|at| at.elapsed() < TOKEN_CACHE_TTL)
+            .is_some_and(|at| at.elapsed() < self.positive_ttl)
     }
 
-    /// True if `token` failed within the negative TTL.
+    /// True if `token` failed within the cache's negative TTL.
     pub fn is_negative_fresh(&self, token: &str) -> bool {
         self.negatives
             .get(token)
-            .is_some_and(|at| at.elapsed() < TOKEN_NEGATIVE_TTL)
+            .is_some_and(|at| at.elapsed() < self.negative_ttl)
     }
 
     /// Record a verify, routing it to the positive or negative map and
@@ -307,6 +332,153 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    // ── verified-token cache (TTL seam) ────────────────────────────────────
+
+    #[test]
+    fn default_uses_production_ttls() {
+        // White-box: the production (Default) TTLs are the documented
+        // constants — a silent edit to `TOKEN_CACHE_TTL`/`TOKEN_NEGATIVE_TTL`
+        // is a behavior change and must show up here.
+        let cache = VerifiedTokenCache::default();
+        assert_eq!(cache.positive_ttl, TOKEN_CACHE_TTL);
+        assert_eq!(cache.negative_ttl, TOKEN_NEGATIVE_TTL);
+    }
+
+    #[test]
+    fn positive_entry_is_fresh_then_expires_with_injected_ttl() {
+        // The TTL seam: a 1 ms positive TTL makes expiry observable without
+        // a 60 s test. Fresh at record, expired after the TTL — the exact
+        // window the production cache enforces at [`TOKEN_CACHE_TTL`].
+        let mut cache =
+            VerifiedTokenCache::with_ttl(Duration::from_millis(1), Duration::from_millis(1));
+        cache.record("tok", true);
+        assert!(cache.is_fresh("tok"), "a just-recorded entry is fresh");
+        cache.record("tok2", true);
+        assert!(cache.is_fresh("tok2"));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            !cache.is_fresh("tok"),
+            "the positive entry expired after the TTL"
+        );
+        assert!(!cache.is_fresh("tok2"));
+    }
+
+    #[test]
+    fn negative_entry_is_fresh_then_expires_with_injected_ttl() {
+        // Same seam on the negative side: the production window
+        // ([`TOKEN_NEGATIVE_TTL`]) is compressed to 1 ms. A rejected token
+        // suppresses KDF re-runs only while the negative entry is fresh.
+        let mut cache =
+            VerifiedTokenCache::with_ttl(Duration::from_millis(1), Duration::from_millis(1));
+        cache.record("bad", false);
+        assert!(
+            cache.is_negative_fresh("bad"),
+            "a just-recorded rejection is fresh"
+        );
+        assert!(
+            !cache.is_fresh("bad"),
+            "a rejection is not a positive entry"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            !cache.is_negative_fresh("bad"),
+            "the negative entry expired after the TTL"
+        );
+    }
+
+    #[test]
+    fn ttl_seams_are_independent() {
+        // The two TTLs are separate dials: a long positive window beside a
+        // short negative one must not bleed into each other.
+        let mut cache =
+            VerifiedTokenCache::with_ttl(Duration::from_secs(60), Duration::from_millis(1));
+        cache.record("good", true);
+        cache.record("bad", false);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(
+            cache.is_fresh("good"),
+            "the positive TTL is untouched by the negative one"
+        );
+        assert!(
+            !cache.is_negative_fresh("bad"),
+            "the negative TTL expired on its own"
+        );
+    }
+
+    #[test]
+    fn refresh_keeps_entry_fresh_within_ttl() {
+        // A re-record of an existing token restarts its freshness window
+        // (the production behavior: repeat traffic keeps the entry alive —
+        // the window runs from the LAST record, since `record` stamps
+        // `Instant::now()` on every hit).
+        let mut cache =
+            VerifiedTokenCache::with_ttl(Duration::from_millis(20), Duration::from_millis(20));
+        cache.record("tok", true);
+        std::thread::sleep(Duration::from_millis(10));
+        cache.record("tok", true); // refresh at t=10 ms
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            cache.is_fresh("tok"),
+            "refreshed entry is fresh again at t=20 ms"
+        );
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(
+            !cache.is_fresh("tok"),
+            "expired at t=35 ms (refresh + 20 ms TTL)"
+        );
+    }
+
+    #[test]
+    fn clear_empties_both_maps() {
+        let mut cache =
+            VerifiedTokenCache::with_ttl(Duration::from_secs(60), Duration::from_secs(60));
+        cache.record("a", true);
+        cache.record("b", false);
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert!(cache.is_empty());
+        assert!(!cache.is_fresh("a"));
+        assert!(!cache.is_negative_fresh("b"));
+    }
+
+    #[test]
+    fn eviction_respects_per_map_cap() {
+        // Each map is capped independently at `TOKEN_CACHE_MAX`: filling the
+        // positive map to the cap evicts the oldest positive entry on the
+        // next positive record, while negatives are untouched (and vice
+        // versa — the per-map cap is the SEC-M2 burst bound).
+        let mut cache =
+            VerifiedTokenCache::with_ttl(Duration::from_secs(60), Duration::from_secs(60));
+        for i in 0..TOKEN_CACHE_MAX {
+            cache.record(&format!("pos-{i}"), true);
+        }
+        assert_eq!(cache.entries.len(), TOKEN_CACHE_MAX);
+        // Oldest positive entry gets a distinctly older timestamp so the
+        // `min_by_key` eviction target is unambiguous.
+        cache.entries.insert(
+            "pos-0".to_string(),
+            Instant::now() - Duration::from_secs(10),
+        );
+        cache.record("pos-new", true);
+        assert_eq!(
+            cache.entries.len(),
+            TOKEN_CACHE_MAX,
+            "cap holds after eviction"
+        );
+        assert!(
+            !cache.entries.contains_key("pos-0"),
+            "the oldest entry was evicted"
+        );
+        assert!(cache.entries.contains_key("pos-new"));
+        // The negative map is capped separately: it can grow to its own cap
+        // alongside a full positive map.
+        for i in 0..TOKEN_CACHE_MAX {
+            cache.record(&format!("neg-{i}"), false);
+        }
+        assert_eq!(cache.negatives.len(), TOKEN_CACHE_MAX);
+        assert_eq!(cache.entries.len(), TOKEN_CACHE_MAX);
+    }
 
     // ── constant_time_eq ───────────────────────────────────────────────────
 

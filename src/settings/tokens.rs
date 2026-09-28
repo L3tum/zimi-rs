@@ -267,3 +267,152 @@ pub(super) fn redacted_entry(
     }
     entry
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// A `SettingsCache` backed by an in-memory map over a dead pool (the
+    /// token caches are pure memory — the pool is never touched on the
+    /// paths exercised here).
+    fn fresh_cache() -> SettingsCache {
+        SettingsCache::new_with_map(
+            crate::testing::dead_pool(),
+            super::super::defs::default_settings(),
+            HashMap::new(),
+        )
+    }
+
+    /// Acquire the cache's write lock on a background thread (holding its
+    /// own `Arc` to the same `SettingsInner`) and panic while holding it,
+    /// so the lock is poisoned; wait until the poison lands.
+    /// `ro` selects the read-only-token cache (`false` = the admin cache).
+    fn poison_cache(inner: &Arc<SettingsInner>, ro: bool) {
+        let worker = Arc::clone(inner);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let lock = if ro {
+                &worker.ro_token_cache
+            } else {
+                &worker.token_cache
+            };
+            let _guard = lock.write().expect("write lock");
+            tx.send(()).ok();
+            // Panic while the guard is still held → the lock is poisoned.
+            std::thread::sleep(Duration::from_millis(10));
+            panic!("poison the token cache");
+        });
+        rx.recv().expect("lock acquired");
+        let is_poisoned = || {
+            if ro {
+                inner.ro_token_cache.is_poisoned()
+            } else {
+                inner.token_cache.is_poisoned()
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !is_poisoned() {
+            assert!(Instant::now() < deadline, "lock never became poisoned");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn cache_read_guard_reads_what_cache_write_recorded() {
+        // The two wrappers are two flavors of ONE lock: a record made
+        // through the write-flavor helper (the `token_record` path) must
+        // be visible through the read-flavor helper (the `token_is_fresh`
+        // path) — no second, divergent cache.
+        let cache = fresh_cache();
+        cache.inner.token_record("tok", true);
+        let guard = cache.inner.cache_read(&cache.inner.token_cache, "token");
+        assert!(guard.is_fresh("tok"));
+        assert!(cache.inner.token_is_fresh("tok"));
+        assert!(!cache.inner.token_is_negative_fresh("tok"));
+    }
+
+    #[test]
+    fn cache_write_guard_records_into_the_same_map() {
+        // Direct write-flavor guard use records into the very map the
+        // read-flavor accessors read from.
+        let cache = fresh_cache();
+        cache
+            .inner
+            .cache_write(&cache.inner.token_cache, "token")
+            .record("bad", false);
+        assert!(cache.inner.token_is_negative_fresh("bad"));
+        assert!(!cache.inner.token_is_fresh("bad"));
+    }
+
+    #[test]
+    fn the_two_caches_are_independent() {
+        // The admin-token cache and the read-only-token cache are separate
+        // maps behind separate locks: recording in one never surfaces in
+        // the other.
+        let cache = fresh_cache();
+        cache.inner.token_record("tok", true);
+        cache.inner.ro_token_record("tok", true);
+        assert!(cache.inner.token_is_fresh("tok"));
+        assert!(cache.inner.ro_token_is_fresh("tok"));
+        cache.inner.token_invalidate_all();
+        assert!(!cache.inner.token_is_fresh("tok"));
+        assert!(
+            cache.inner.ro_token_is_fresh("tok"),
+            "ro cache untouched by admin invalidation"
+        );
+    }
+
+    #[test]
+    fn poisoned_token_cache_panics_with_the_token_name() {
+        // LINT-3 grandfathered expect: a poisoned lock must panic with the
+        // PER-CACHE message ("token …"), not a generic one — the `name`
+        // argument is what makes the two caches distinguishable in a
+        // backtrace.
+        let cache = fresh_cache();
+        poison_cache(&cache.inner, false);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.inner.token_is_fresh("x")
+        }));
+        let msg = res
+            .err()
+            .and_then(|payload| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("token cache rwlock poisoned"),
+            "the panic message must name the cache, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn poisoned_ro_cache_panics_with_the_read_only_name() {
+        // The read-only flavor's message names "read-only token" — the
+        // exact string the production call sites pass.
+        let cache = fresh_cache();
+        poison_cache(&cache.inner, true);
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.inner.ro_token_is_fresh("x")
+        }));
+        let msg = res
+            .err()
+            .and_then(|payload| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("read-only token cache rwlock poisoned"),
+            "the panic message must name the read-only cache, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unpoisoned_caches_do_not_panic() {
+        // The happy path: healthy locks hand out guards without panicking
+        // (guards the expect against over-eager poison detection).
+        let cache = fresh_cache();
+        cache.inner.token_record("a", true);
+        cache.inner.ro_token_record("b", false);
+        assert!(cache.inner.token_is_fresh("a"));
+        assert!(cache.inner.ro_token_is_negative_fresh("b"));
+    }
+}

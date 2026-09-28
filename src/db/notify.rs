@@ -16,12 +16,12 @@
 //! - [`crate::db::notify::SETTINGS_CHANNEL`] — settings rows changed
 //!   (`SettingsCache::update`, the seed in `SettingsCache::reload`, and the
 //!   lazy admin-password upgrade in `settings::auth_service`). Consumer: the
-//!   `on_settings` closure wired at the composition root (`startup.rs`) —
+//!   `on_settings` closure wired at the composition root (`startup::`) —
 //!   a full `SettingsCache::reload()` re-read of the whole map.
 //! - [`crate::db::notify::CATALOG_CHANNEL`] — the ZIM catalog changed
 //!   (install finalize in the download poller, the startup/directory
 //!   `resync` persist). Consumer: the `on_catalog` closure wired at the
-//!   composition root (`startup.rs`) — `ZimManager::resync()` (re-scan +
+//!   composition root (`startup::`) — `ZimManager::resync()` (re-scan +
 //!   reconcile + persist; idempotent).
 //!
 //! **Listener topology**: the listener runs on a **dedicated max-1 pool** —
@@ -111,6 +111,41 @@ fn next_backoff(current: Duration) -> Duration {
         MAX_BACKOFF
     } else {
         doubled
+    }
+}
+
+/// The `listen_loop` (re)connect pacing state: the current backoff delay
+/// plus the two rules that move it — `advance()` doubles toward the cap
+/// after each failed attempt, `reset()` restores the initial delay on any
+/// successful (re)connect (and on every delivered notification, so a
+/// healthy session never carries an escalated schedule into a later
+/// outage). Held as a struct (rather than a bare `Duration` with the reset
+/// sites scattered through `listen_loop`) so the schedule shape — doubling,
+/// the cap, and the reset arm — is one unit-testable unit.
+struct ReconnectBackoff {
+    current: Duration,
+}
+
+impl ReconnectBackoff {
+    /// The initial schedule (the first (re)connect attempt waits 1s).
+    fn new() -> Self {
+        Self {
+            current: INITIAL_BACKOFF,
+        }
+    }
+
+    /// The reset arm: a successful (re)connect (or a delivered notification)
+    /// restores the initial delay, discarding any escalated schedule.
+    fn reset(&mut self) {
+        self.current = INITIAL_BACKOFF;
+    }
+
+    /// The delay for the next (re)connect attempt; advances the schedule
+    /// toward the next failure (doubled, capped — see `next_backoff`).
+    fn advance(&mut self) -> Duration {
+        let sleep = self.current;
+        self.current = next_backoff(self.current);
+        sleep
     }
 }
 
@@ -285,7 +320,7 @@ impl NotifyListener {
 }
 
 /// Per-bump invalidation action. The persistence layer is domain-agnostic:
-/// the composition root (`startup.rs`) wires these to the domain caches —
+/// the composition root (`startup::`) wires these to the domain caches —
 /// the settings channel drives a `SettingsCache::reload()`, the catalog
 /// channel a `ZimManager::resync()`. One call per coalesced bump: the watch
 /// channel collapses a burst of notifications into a single call, which is
@@ -462,7 +497,7 @@ async fn listen_loop(
     catalog_tx: tokio::sync::watch::Sender<u64>,
     application_name: String,
 ) {
-    let mut backoff = INITIAL_BACKOFF;
+    let mut backoff = ReconnectBackoff::new();
     // Running notification counters — the watch channels carry only a
     // monotonic "something happened" bump (watch coalesces; subscribers
     // reload everything, so the exact count never matters to them).
@@ -473,7 +508,7 @@ async fn listen_loop(
         match connect_listener(&url, &application_name).await {
             Ok(mut listener) => {
                 status.mark_connected();
-                backoff = INITIAL_BACKOFF;
+                backoff.reset();
                 // (Re)connect = missed-notification recovery (module docs):
                 // every (re)connect triggers a full resync of both caches.
                 status.note_resync();
@@ -508,7 +543,7 @@ async fn listen_loop(
                                     );
                                 }
                             }
-                            backoff = INITIAL_BACKOFF;
+                            backoff.reset();
                         }
                         Ok(None) => {
                             // The session dropped and `PgListener` already
@@ -522,7 +557,7 @@ async fn listen_loop(
                             catalog_bump += 1;
                             let _ = settings_tx.send_replace(settings_bump);
                             let _ = catalog_tx.send_replace(catalog_bump);
-                            backoff = INITIAL_BACKOFF;
+                            backoff.reset();
                         }
                         Err(e) => {
                             // Even the eager reconnect failed — full
@@ -544,8 +579,8 @@ async fn listen_loop(
         }
         // The inner loop only exits on a session failure, so this sleep
         // paces the (re)connect attempts: 1s, 2s, 4s, … capped at 30s.
-        tokio::time::sleep(backoff).await;
-        backoff = next_backoff(backoff);
+        let sleep = backoff.advance();
+        tokio::time::sleep(sleep).await;
     }
 }
 
@@ -670,7 +705,7 @@ mod tests {
             .expect("settings load");
         let zims = ZimManager::new(dir.path().to_path_buf(), pool.clone());
         // Test-side stand-in for the composition-root wiring in
-        // `startup.rs`: closures over the real caches, reproducing the
+        // `startup::`: closures over the real caches, reproducing the
         // production per-notification behavior and log lines exactly.
         let settings_sub = settings.clone();
         let on_settings: OnBump = Box::new(move |bump| {
@@ -735,6 +770,43 @@ mod tests {
         }
         assert_eq!(
             seen,
+            [1u8, 2, 4, 8, 16, 30, 30]
+                .iter()
+                .map(|s| Duration::from_secs(*s as u64))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The reset arm of the (re)connect pacing: a successful (re)connect —
+    /// or a delivered notification — restores the initial delay, so a
+    /// session that escalated the schedule (repeated failed attempts) starts
+    /// its next outage streak back at 1s, not at the 30s cap.
+    #[test]
+    fn backoff_reset_arm_restores_initial_delay() {
+        let mut b = ReconnectBackoff::new();
+        // Escalate to the cap: 1s, 2s, 4s, 8s, 16s, 30s, 30s.
+        assert_eq!(b.advance(), Duration::from_secs(1));
+        assert_eq!(b.advance(), Duration::from_secs(2));
+        assert_eq!(b.advance(), Duration::from_secs(4));
+        assert_eq!(b.advance(), Duration::from_secs(8));
+        assert_eq!(b.advance(), Duration::from_secs(16));
+        assert_eq!(b.advance(), Duration::from_secs(30));
+        assert_eq!(b.advance(), Duration::from_secs(30));
+        // The reset arm: the next failed attempt waits 1s again.
+        b.reset();
+        assert_eq!(b.advance(), Duration::from_secs(1));
+        assert_eq!(b.advance(), Duration::from_secs(2));
+    }
+
+    /// The schedule shape from a cold start (what `listen_loop`'s first
+    /// (re)connect streak pays): the doubling + cap sequence, exactly the
+    /// documented 1s → 30s-cap pacing.
+    #[test]
+    fn backoff_schedule_from_cold_start() {
+        let mut b = ReconnectBackoff::new();
+        let schedule: Vec<Duration> = (0..7).map(|_| b.advance()).collect();
+        assert_eq!(
+            schedule,
             [1u8, 2, 4, 8, 16, 30, 30]
                 .iter()
                 .map(|s| Duration::from_secs(*s as u64))

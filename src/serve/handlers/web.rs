@@ -58,8 +58,14 @@ pub const RAW_CONTENT_CSP: &str =
 /// `script-src 'none'` reaches `xsl:script` is engine-dependent, and
 /// `X-Frame-Options` (a framing control) cannot contain top-frame
 /// execution at all — so no header combination closes this the way the
-/// `content_type_for` script-MIME rewrite does. Rare ZIM content; accepted
-/// residual risk (2026-09 review F4).
+/// Closed by the `content_type_for` script-MIME rewrite.
+///
+/// Also deliberately not in this set: the XSLT types (`application/xslt+xml`,
+/// `text/xsl`) — they are covered by the *other* control instead: the ZIM
+/// content rewrite serves script-executing MIMEs, XSLT included (F4, 2026-10
+/// review), as `text/plain`, so a directly-navigated XSL document never
+/// reaches the browser as XSL. The framing set above therefore stays
+/// HTML-only; the XSLT hazard is neutralized at the content layer.
 fn is_browser_html(content_type: &str) -> bool {
     let ct = content_type.split(';').next().unwrap_or("").trim();
     ct == "text/html" || ct == "application/xhtml+xml" || ct == "image/svg+xml"

@@ -13,10 +13,12 @@
 //! end; a killed run leaves it behind (clearly named, and dropped by the
 //! next run).
 //!
-//! The corpus shares its word list / probe / batch with
-//! `tests/integration/trgm_plan.rs` (one definition in
-//! `zimservice::testing::trgm_corpus` — M2, 2026-09 review; the same 40-word
-//! grid, 10,000 rows instead of 100,000 so a bench run stays in minutes):
+//! The corpus (word list / probe / batch + the 10k seed) is the shared
+//! single definition in `tests/common/corpus10k.rs` — the same 40-word grid
+//! as `tests/integration/trgm_plan.rs` (one definition in
+//! `zimservice::testing::trgm_corpus`; 10,000 rows instead of 100,000 so a
+//! bench run stays in minutes), included textually here because a bench
+//! target cannot `mod` tests/ code (see that file's docs):
 //! - `path`:   `A/bench_00000` … `A/bench_09999`
 //! - `title`:  `"{w1} {w2} {w3} entry {i}"` with `w1 = WORDS[i % 40]`,
 //!   `w2 = WORDS[(i / 40) % 40]`, `w3 = WORDS[(i / 1600) % 40]` — the
@@ -66,20 +68,20 @@ use zimservice::search::{SearchEngine, SearchParams};
 use zimservice::settings::SettingsCache;
 // Single definition in zimservice::testing::trgm_corpus — M2, 2026-09 review
 // (`pub` so `common::PROBE` stays reachable from benches/search.rs).
-pub use zimservice::testing::trgm_corpus::{EMBED_BATCH, PROBE, WORDS};
+pub use zimservice::testing::trgm_corpus::PROBE;
 use zimservice::torrent::QbitClientCache;
-use zimservice::zim::index::UPSERT_ARTICLES_FROM_STAGING_SQL;
 use zimservice::zim::ZimManager;
 use zimservice::AppState;
 
-/// The fixture ZIM name — the benches' only standing DB footprint (besides
-/// the `tiny` row [`build_state`] upserts for the committed
-/// `tests/fixtures/tiny.zim`).
-pub const FIXTURE_ZIM: &str = "bench_fixture";
-
-/// Article count in the fixture. 10k keeps a full bench run in minutes;
-/// `tests/integration/trgm_plan.rs` proves the same corpus shape at 100k.
-pub const ROWS: usize = 10_000;
+// The 10k fixture builder is the shared single definition in
+// `tests/common/corpus10k.rs` (a bench target cannot `mod` tests/ code —
+// the textual `include!` is the seam; see that file's docs). The `pub use`
+// keeps `common::FIXTURE_ZIM` / `common::ROWS` reachable from the bench
+// targets (search.rs, retrieval.rs) and `seed_fixture` from `setup()`.
+mod corpus10k {
+    include!("../../tests/common/corpus10k.rs");
+}
+pub use corpus10k::{seed_fixture, FIXTURE_ZIM, ROWS};
 
 /// The committed one-article ZIM the retrieval benches serve (its
 /// `main.html` is 207 bytes — the /w range bench slices against that).
@@ -294,170 +296,4 @@ async fn connect_pool(url: &str) -> Result<Pool, sqlx::Error> {
         .acquire_timeout(Duration::from_secs(10))
         .connect(url)
         .await
-}
-
-/// Read the live `articles.embedding` column dimension from the catalog.
-/// `atttypmod` is used as-is (AGENTS.md: no `vector_dims()` translation —
-/// the benches must bind what the column actually stores). A plain
-/// `vector` column (no dimension, `atttypmod = -1`) is a hard setup
-/// failure — the one-hot seeding has nothing to bind against.
-async fn probe_embed_dim(pool: &Pool) -> Result<i32, String> {
-    let dim: i32 = raw::fetch_scalar_optional::<i32, _, _>(
-        pool,
-        "SELECT atttypmod FROM pg_attribute \
-         WHERE attrelid = 'articles'::regclass AND attname = 'embedding'",
-        |q| q,
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "articles.embedding column missing".to_string())?;
-    if dim <= 0 {
-        return Err(format!(
-            "articles.embedding has no fixed dimension (atttypmod={dim}) — \
-             one-hot seeding needs a vector(N) column"
-        ));
-    }
-    Ok(dim)
-}
-
-/// Seed (idempotently) the `bench_fixture` ZIM, 10k deterministic articles,
-/// and batch one-hot embeddings. Returns the fixture zims id and the live
-/// embedding dimension.
-async fn seed_fixture(pool: &Pool) -> Result<(i32, i32), String> {
-    // Idempotent drop (the cascade covers the previous fixture's articles).
-    raw::execute(pool, "DELETE FROM zims WHERE name = $1", |q| {
-        q.bind(FIXTURE_ZIM)
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-
-    // Fresh zims row. `file_path` points nowhere: search never opens it,
-    // and the retrieval benches open only `tiny`.
-    let zim_id: i32 = raw::fetch_scalar_optional(
-        pool,
-        "INSERT INTO zims (name, display_title, file_path, file_size, file_mtime, \
-                 index_status, indexed_entries, article_count) \
-         VALUES ($1, $2, $1, 0, now(), 'ready', $3, $3) RETURNING id",
-        |q| q.bind(FIXTURE_ZIM).bind("Bench Fixture").bind(ROWS as i64),
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "fixture zims INSERT returned no id".to_string())?;
-
-    // Bulk-load ROWS articles: COPY into `articles_staging` (one ~3 MB
-    // payload, not 10k INSERTs) through the production staging path, then
-    // the production upsert (`search_vector` built in Postgres by the exact
-    // production tsvector expression).
-    {
-        let mut client = pool.acquire().await.map_err(|e| e.to_string())?;
-        let mut copy = client
-            .copy_in_raw(
-                "COPY articles_staging (path, title, content_preview, snippet, language, \
-                 namespace, zim_id) FROM STDIN WITH (FORMAT text)",
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut buf = String::with_capacity(ROWS * 320);
-        for i in 0..ROWS {
-            let w1 = WORDS[i % 40];
-            let w2 = WORDS[(i / 40) % 40];
-            let w3 = WORDS[(i / 1600) % 40];
-            let path = format!("A/bench_{i:05}");
-            let title = format!("{w1} {w2} {w3} entry {i}");
-            // ~300 chars of deterministic body text (weight-B in the
-            // production tsvector expression; the probe words repeat so FTS
-            // ranking has real signal).
-            let preview = format!(
-                "{w1} {w2} {w3} entry {i} body text. The {w2} beside the {w3} repeats for \
-                 full-text matching and ranking. "
-            );
-            let snippet = format!("Snippet of {w1} {w2} {w3} entry {i}.");
-            copy_escape(&mut buf, &path);
-            buf.push('\t');
-            copy_escape(&mut buf, &title);
-            buf.push('\t');
-            copy_escape(&mut buf, &preview);
-            buf.push('\t');
-            copy_escape(&mut buf, &snippet);
-            buf.push_str("\ten\tC\t");
-            buf.push_str(&zim_id.to_string());
-            buf.push('\n');
-        }
-        copy.send(buf.as_bytes()).await.map_err(|e| e.to_string())?;
-        copy.finish().await.map_err(|e| e.to_string())?;
-        // Drop the client so the COPY connection returns to the pool before
-        // the upsert takes its own checkout.
-        drop(client);
-    }
-
-    raw::execute(pool, UPSERT_ARTICLES_FROM_STAGING_SQL, |q| q.bind(zim_id))
-        .await
-        .map_err(|e| e.to_string())?;
-    raw::execute(
-        pool,
-        "DELETE FROM articles_staging WHERE zim_id = $1",
-        |q| q.bind(zim_id),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-
-    // Deterministic embeddings: each EMBED_BATCH-row batch shares one
-    // one-hot vector at the batch's index (0..4) — the ANN probe
-    // (one-hot at coordinate 2) then has ~1800 distance-0 rows and the
-    // HNSW index real rows to seek. Every 10th row (global `id % 10 = 0`)
-    // is left NULL: the embed-claim bench's mid-embed tail (~1000 rows).
-    let dim = probe_embed_dim(pool).await?;
-    let (min_id, max_id): (i64, i64) = raw::fetch_optional::<(i64, i64), _, _>(
-        pool,
-        "SELECT min(id), max(id) FROM articles WHERE zim_id = $1",
-        |q| q.bind(zim_id),
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "no fixture articles after upsert".to_string())?;
-
-    let mut v = vec!["0"; dim as usize];
-    for (batch, start) in (min_id..=max_id).step_by(EMBED_BATCH).enumerate() {
-        let end = (start + EMBED_BATCH as i64 - 1).min(max_id);
-        v.fill("0");
-        v[batch % dim as usize] = "1";
-        // RAW-OK: bench-only fixture seeding — dynamic dimension +
-        // per-batch one-hot literal; no production equivalent.
-        raw::execute(
-            pool,
-            "UPDATE articles SET embedding = $1::vector WHERE zim_id = $2 \
-              AND id BETWEEN $3 AND $4 AND id % 10 <> 0",
-            |q| {
-                q.bind(format!("[{}]", v.join(",")))
-                    .bind(zim_id)
-                    .bind(start)
-                    .bind(end)
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    }
-
-    // Fresh planner statistics for the new 10k-row corpus (the shared dev
-    // DB otherwise plans against whatever the last test run left).
-    raw::execute(pool, "ANALYZE articles", |q| q)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok((zim_id, dim))
-}
-
-/// Append `s` to `buf`, escaping backslashes/tabs/newlines/CRs for the
-/// COPY text format (the fixture text never contains them, but the escape
-/// keeps the payload honest if the corpus shape changes).
-fn copy_escape(buf: &mut String, s: &str) {
-    for c in s.chars() {
-        match c {
-            '\\' => buf.push_str("\\\\"),
-            '\t' => buf.push_str("\\t"),
-            '\n' => buf.push_str("\\n"),
-            '\r' => buf.push_str("\\r"),
-            c => buf.push(c),
-        }
-    }
 }

@@ -298,7 +298,7 @@ impl DownloadPoller {
 
         // Index the new ZIM in the background, on the capped background
         // pool (`db_bg`): a long COPY-holding reindex must not starve
-        // foreground search connections (db/db_bg split, src/startup.rs
+        // foreground search connections (db/db_bg split, src/startup/mod.rs
         // build_state; 2026-09-26 review fix).
         let zims = self.zims.clone();
         let db_bg = self.db_bg.clone();

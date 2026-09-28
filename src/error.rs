@@ -52,7 +52,7 @@ pub enum Error {
     /// error would put it in logs). A startup `SettingsCache::load`
     /// failure aborts the process (fail-closed); a mid-run
     /// NOTIFY-driven reload failure is swallowed by the composition-root
-    /// invalidation closure in `startup.rs` into an error-level log and the
+    /// invalidation closure in `startup::` into an error-level log and the
     /// instance keeps serving its current in-memory values until restarted
     /// (no exit, no 500). If it ever surfaced to a
     /// client instead, the catch-all in `status_and_message` would

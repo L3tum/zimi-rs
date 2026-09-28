@@ -1651,4 +1651,142 @@ mod tests {
             "a 2048-byte url must pass the length guard (dead pool → 503 expected)"
         );
     }
+
+    // ── /diagnostic shape (M-diag, 2026-10 review) ─────────────────────────
+
+    /// `/diagnostic` response shape on an authenticated pull: every
+    /// always-present additive field is there, `settings_mismatches` is
+    /// omitted when empty, `pool_read` is omitted without a configured
+    /// replica, and the DB-probe fields (`vector_index`,
+    /// `content_integrity`) are omitted when the DB is unreachable (the
+    /// dead-pool test state) — the probe failures must not 500 the pull.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn diagnostic_response_shape() {
+        let mut values = crate::settings::default_settings();
+        // `access.mode = "password"` is required — in open mode nobody can
+        // authenticate, so `/diagnostic` would 401 (see `password_state`).
+        values.insert(KEY_ACCESS_MODE.into(), serde_json::json!("password"));
+        values.insert(KEY_ACCESS_ADMIN_PASSWORD.into(), serde_json::json!("pw"));
+        let app = build_router(crate::testing::test_state_with_settings(values));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/diagnostic")
+                    .header("Authorization", "Bearer pw")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        // Always-present fields.
+        assert!(v.get("version").is_some(), "version present");
+        let pool = v.get("pool").expect("pool present");
+        for f in ["size", "idle", "max_size", "checked_out"] {
+            assert!(pool.get(f).is_some(), "pool.{f} present");
+        }
+        assert!(v.get("pool_bg").is_some(), "pool_bg present");
+        let cw = v.get("checkout_wait").expect("checkout_wait present");
+        for f in ["count", "max_us", "avg_us"] {
+            assert!(cw.get(f).is_some(), "checkout_wait.{f} present");
+        }
+        assert!(
+            v.get("query_embed_cache_entries").is_some(),
+            "query_embed_cache_entries present"
+        );
+        // Omitted-when-empty / absent fields.
+        assert!(
+            v.get("settings_mismatches").is_none(),
+            "settings_mismatches omitted when empty"
+        );
+        assert!(
+            v.get("pool_read").is_none(),
+            "pool_read omitted (no replica)"
+        );
+        assert!(
+            v.get("vector_index").is_none(),
+            "vector_index omitted on an unreachable DB"
+        );
+        assert!(
+            v.get("content_integrity").is_none(),
+            "content_integrity omitted on an unreachable DB"
+        );
+    }
+
+    /// `/diagnostic` is admin-gated: without a valid token it is a 401 with
+    /// the standard error envelope (never the diagnostic payload).
+    #[tokio::test]
+    async fn diagnostic_requires_admin_token() {
+        let mut values = crate::settings::default_settings();
+        values.insert(KEY_ACCESS_ADMIN_PASSWORD.into(), serde_json::json!("pw"));
+        let app = build_router(crate::testing::test_state_with_settings(values));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/diagnostic")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert!(v.get("pool").is_none(), "no payload on 401");
+    }
+
+    // ── /list redaction (WP3.7) ───────────────────────────────────────────
+
+    /// `/list` redacts the server-local `file_path` for unauthenticated
+    /// callers and shows it to authenticated ones (WP3.7 — the pure
+    /// redaction mapping that the M-diag extraction left in zims.rs).
+    #[tokio::test]
+    async fn list_zims_redacts_file_path_for_unauthenticated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("demo.zim"), b"fake-zim-bytes").unwrap();
+        let zims =
+            crate::zim::ZimManager::new(dir.path().to_path_buf(), crate::testing::dead_pool());
+        zims.scan().await.unwrap();
+
+        let mut values = crate::settings::default_settings();
+        // `access.mode = "password"` is required — in open mode the extractor
+        // is always unauthenticated, so the authenticated branch (real
+        // `file_path`) could never be exercised.
+        values.insert(KEY_ACCESS_MODE.into(), serde_json::json!("password"));
+        values.insert(KEY_ACCESS_ADMIN_PASSWORD.into(), serde_json::json!("pw"));
+        let mut state = crate::testing::test_state_with_settings(values);
+        state.zims = zims;
+        let app = build_router(state.clone());
+
+        // Unauthenticated → `file_path` redacted, other fields intact.
+        let resp = app
+            .oneshot(Request::builder().uri("/list").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        let row = &v["zims"][0];
+        assert_eq!(row["name"], "demo");
+        assert_eq!(row["file_path"], "[redacted]");
+
+        // Authenticated → the real server-local path.
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/list")
+                    .header("Authorization", "Bearer pw")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(
+            v["zims"][0]["file_path"],
+            dir.path().join("demo.zim").display().to_string()
+        );
+    }
 }

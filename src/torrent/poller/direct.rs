@@ -1188,7 +1188,7 @@ mod tests {
         std::fs::copy("tests/fixtures/tiny.zim", &part).expect("stage utiny.zim as .part");
 
         // Tests share the one pool for db and db_bg (production wires the
-        // capped background pool — src/startup.rs).
+        // capped background pool — src/startup/mod.rs).
         super::finalize_direct_download(&pool, &pool, &zims, id, &part)
             .await
             .expect("finalize must succeed");

@@ -18,6 +18,11 @@ fn content_type_for_never_advertises_script_mimes() {
         "text/jscript",
         "application/x-jscript",
         "text/typescript",
+        // F4 (2026-10 review): the XSLT types join the rewrite set — a
+        // directly-navigated XSL document can run `xsl:script`, and no
+        // header combination closes top-frame execution.
+        "application/xslt+xml",
+        "text/xsl",
     ] {
         assert_eq!(
             content_type_for(&zim::MimeType::Type(mime.to_string())),

@@ -226,134 +226,175 @@ pub async fn run_pipeline(
     let sem = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
     let mut tasks: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
 
-    loop {
-        // Backpressure: block until fewer than max_concurrency batches are
-        // in flight, so the API is not hammered past the configured cap.
-        let permit = sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::Embedding("embed pipeline cancelled".into()))?;
+    // PERF (2026-10 review): claim up to `batch_size * max_concurrency` rows
+    // in ONE round-trip per pass, then split into per-`batch_size` tasks —
+    // the old loop paid one claim round-trip per batch (N/`batch_size`
+    // round-trips for N rows). FIFO is preserved: the claim's `ORDER BY id`
+    // makes the consecutive sub-batches exactly the batches the sequential
+    // claim loop would have produced, batch after batch.
+    //
+    // Trade-off (2026-10 review polish): `claim_limit` is operator-
+    // configurable with no upper bound — both factors are admin `Int`
+    // settings (`embedding.batch_size`, `embedding.max_concurrency`). A
+    // crash mid-claim now leaves up to `claim_limit` rows stamped
+    // `embed_at` (vs `batch_size` before the super-batch), held until the
+    // 10-min staleness window lets a retry pick them up. Bounded, not
+    // attacker-controlled — accepted as the price of one round-trip per
+    // pass; a sane operator keeps the product in the low thousands.
+    let claim_limit: i64 = batch_size * max_concurrency as i64;
 
-        // Claim the next batch atomically: stamping `embed_at` prevents two
-        // claims from picking up the same rows (double-embedding). A batch
-        // whose writer crashed is retried once older than the staleness
-        // window; successfully embedded rows have embedding IS NOT NULL and
-        // are never re-claimed.
+    loop {
+        // Claim the next super-batch atomically: stamping `embed_at`
+        // prevents two claims from picking up the same rows
+        // (double-embedding). A batch whose writer crashed is retried once
+        // older than the staleness window; successfully embedded rows have
+        // embedding IS NOT NULL and are never re-claimed.
         //
         // `CLAIM_EMBED_BATCH_SQL`: the inner `SELECT` is `ORDER BY id` —
         // deterministic FIFO (the oldest rows are claimed first, batch after
         // batch); see the const's doc for the 2026-09-18 decision.
-        let mut rows: Vec<(i64, String)> = raw::fetch_all(&pool, CLAIM_EMBED_BATCH_SQL, |q| {
-            q.bind(zim_name).bind(batch_size)
+        let claimed_rows: Vec<(i64, String)> = raw::fetch_all(&pool, CLAIM_EMBED_BATCH_SQL, |q| {
+            q.bind(zim_name).bind(claim_limit)
         })
         .await?;
 
-        if rows.is_empty() {
-            drop(permit);
+        if claimed_rows.is_empty() {
             break;
         }
 
-        // W6.5: drop poison rows (failed `POISON_FAIL_MAX`+ times) so they stop
-        // being re-claimed forever. If every claimed row is poison there is
-        // nothing left to embed — drop the permit and stop.
-        {
-            let claimed: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
-            let kept = match filter_poisoned_ids(&claimed) {
-                Some(k) => k,
-                None => {
-                    drop(permit);
-                    break;
-                }
+        // Split the claimed super-batch into per-`batch_size` FIFO sub-batches
+        // and spawn each under the in-flight cap.
+        let mut any_spawned = false;
+        for sub in claimed_rows.chunks(batch_size as usize) {
+            let claimed: Vec<i64> = sub.iter().map(|(id, _)| *id).collect();
+            // W6.5: drop poison rows (failed `POISON_FAIL_MAX`+ times) so they
+            // stop being re-claimed forever. An all-poison sub-batch is
+            // skipped (its rows stay stamped and age out of the claim window
+            // like any other abandoned claim); the loop stops only when the
+            // whole super-batch spawned nothing.
+            let Some(kept) = filter_poisoned_ids(&claimed) else {
+                continue;
             };
             let kept_set: std::collections::HashSet<i64> = kept.iter().copied().collect();
-            rows.retain(|(id, _)| kept_set.contains(id));
-        }
-
-        let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
-        let texts: Vec<String> = rows.iter().map(|(_, t)| t.clone()).collect();
-
-        // In-flight work = HTTP embed + bulk UPDATE, held under the permit
-        // (released when the task ends).
-        let c = client.clone();
-        let p = pool.clone();
-        let m = model.clone();
-        let z = zim_name.to_string();
-        tasks.push(tokio::spawn(async move {
-            let _permit = permit;
-            let embeddings = match c.embed(&texts).await {
-                Ok(e) => e,
-                Err(e) => {
-                    // W6.5: this batch failed (e.g. the endpoint 500s) — bump
-                    // each row's poison counter; a row that fails
-                    // `POISON_FAIL_MAX`+ times is dropped from future claims.
-                    record_batch_failure(&ids);
-                    tracing::error!("embed batch failed (zim: {z}): {e}");
-                    return Err(e);
-                }
-            };
-
-            // Guard: the API must return exactly one vector per input text.
-            // A mismatch would mis-zip the vectors below — skip this batch
-            // (its rows stay NULL and are retried next cycle).
-            if let Err(e) = store_guard(ids.len(), embeddings.len()) {
-                // (R1, 2026-09 review): a persistently mismatched count must
-                // converge to the W6.5 poison drop like any other repeated
-                // batch failure — bump each row's poison counter (as the
-                // sibling `embed` Err arm does) so `filter_poisoned_ids`
-                // stops re-claiming the rows after `POISON_FAIL_MAX` cycles
-                // instead of re-sending them forever.
-                record_batch_failure(&ids);
-                tracing::error!("{e} (zim: {z}); skipping this batch, rows retry next cycle");
-                return Ok(());
+            let rows: Vec<(i64, String)> = sub
+                .iter()
+                .filter(|(id, _)| kept_set.contains(id))
+                .cloned()
+                .collect();
+            if rows.is_empty() {
+                continue;
             }
+            any_spawned = true;
 
-            // Store in Postgres — one bulk UPDATE per batch.
-            // Raw SQL: the bulk `UPDATE … FROM (VALUES …)` form; `v.vec`
-            // binds as text and is cast to `vector` exactly as before.
-            // An empty id list would render a bare `VALUES ` clause (a
-            // syntax error), so `bulk_update_sql` returns `None` and the batch
-            // is skipped instead.
-            let n = ids.len();
-            let vec_strs: Vec<String> = embeddings.iter().map(|e| format_vector(e)).collect();
-            let sql = match bulk_update_sql(&ids) {
-                Some(sql) => sql,
-                None => {
-                    // Defensive / unreachable in production: the claim loop
-                    // `break`s (dropping the permit) as soon as an entire batch
-                    // is poisoned, so `ids` can never be empty here today. Kept
-                    // only to guard against a future reordering that reaches
-                    // this spawn with an empty id list.
-                    tracing::debug!(
-                        "skipping batch write: no ids survived the poison filter (zim: {z})"
-                    );
+            // Backpressure: block until fewer than max_concurrency batches
+            // are in flight, so the API is not hammered past the configured
+            // cap. (The old loop acquired the permit before claiming; the
+            // in-flight cap is the same, one claim round-trip cheaper.)
+            let permit = sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| Error::Embedding("embed pipeline cancelled".into()))?;
+
+            let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+            let texts: Vec<String> = rows.iter().map(|(_, t)| t.clone()).collect();
+
+            // In-flight work = HTTP embed + bulk UPDATE, held under the
+            // permit (released when the task ends).
+            let c = client.clone();
+            let p = pool.clone();
+            let m = model.clone();
+            let z = zim_name.to_string();
+            tasks.push(tokio::spawn(async move {
+                let _permit = permit;
+                let embeddings = match c.embed(&texts).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        // W6.5: this batch failed (e.g. the endpoint 500s) —
+                        // bump each row's poison counter; a row that fails
+                        // `POISON_FAIL_MAX`+ times is dropped from future
+                        // claims.
+                        record_batch_failure(&ids);
+                        tracing::error!("embed batch failed (zim: {z}): {e}");
+                        return Err(e);
+                    }
+                };
+
+                // Guard: the API must return exactly one vector per input
+                // text. A mismatch would mis-zip the vectors below — skip
+                // this batch (its rows stay NULL and are retried next cycle).
+                if let Err(e) = store_guard(ids.len(), embeddings.len()) {
+                    // (R1, 2026-09 review): a persistently mismatched count
+                    // must converge to the W6.5 poison drop like any other
+                    // repeated batch failure — bump each row's poison counter
+                    // (as the sibling `embed` Err arm does) so
+                    // `filter_poisoned_ids` stops re-claiming the rows after
+                    // `POISON_FAIL_MAX` cycles instead of re-sending them
+                    // forever.
+                    record_batch_failure(&ids);
+                    tracing::error!("{e} (zim: {z}); skipping this batch, rows retry next cycle");
                     return Ok(());
                 }
-            };
-            match raw::execute(&p, &sql, |q| {
-                let mut q = q;
-                for s in &vec_strs {
-                    q = q.bind(s);
+
+                // Store in Postgres — one bulk UPDATE per batch.
+                // Raw SQL: the bulk `UPDATE … FROM (VALUES …)` form; `v.vec`
+                // binds as text and is cast to `vector` exactly as before.
+                // An empty id list would render a bare `VALUES ` clause (a
+                // syntax error), so `bulk_update_sql` returns `None` and the
+                // batch is skipped instead.
+                let n = ids.len();
+                let vec_strs: Vec<String> = embeddings.iter().map(|e| format_vector(e)).collect();
+                let sql = match bulk_update_sql(&ids) {
+                    Some(sql) => sql,
+                    None => {
+                        // Defensive / unreachable in production: an all-poison
+                        // sub-batch is skipped above, so `ids` can never be
+                        // empty here today. Kept only to guard against a
+                        // future reordering that reaches this spawn with an
+                        // empty id list.
+                        tracing::debug!(
+                            "skipping batch write: no ids survived the poison filter (zim: {z})"
+                        );
+                        return Ok(());
+                    }
+                };
+                match raw::execute(&p, &sql, |q| {
+                    let mut q = q;
+                    for s in &vec_strs {
+                        q = q.bind(s);
+                    }
+                    q.bind(&m)
+                })
+                .await
+                {
+                    Ok(_) => {
+                        // W6.5: success — clear these rows' poison counters.
+                        record_batch_success(&ids);
+                        tracing::debug!("embedded batch of {} (zim: {})", n, z);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // W6.5: the write failed — bump the poison counter so
+                        // a persistently-failing row is eventually dropped.
+                        record_batch_failure(&ids);
+                        tracing::error!("embed batch write failed (zim: {z}): {e}");
+                        Err(e)
+                    }
                 }
-                q.bind(&m)
-            })
-            .await
-            {
-                Ok(_) => {
-                    // W6.5: success — clear these rows' poison counters.
-                    record_batch_success(&ids);
-                    tracing::debug!("embedded batch of {} (zim: {})", n, z);
-                    Ok(())
-                }
-                Err(e) => {
-                    // W6.5: the write failed — bump the poison counter so a
-                    // persistently-failing row is eventually dropped.
-                    record_batch_failure(&ids);
-                    tracing::error!("embed batch write failed (zim: {z}): {e}");
-                    Err(e)
-                }
-            }
-        }));
+            }));
+        }
+
+        // Whole super-batch was poison (nothing spawned): stop — the old loop
+        // dropped its permit and broke in the same situation.
+        if !any_spawned {
+            break;
+        }
+        // A short claim means no more un-embedded rows are claimable right
+        // now — stop (saves the old loop's final empty-claim round-trip;
+        // newly ingested rows are picked up by the next pipeline run).
+        if (claimed_rows.len() as i64) < claim_limit {
+            break;
+        }
     }
 
     // Drain the in-flight tasks; surface the first error, if any.
@@ -393,7 +434,6 @@ pub async fn run_pipeline(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -407,6 +447,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn store_guard_mismatch_err() {
         // Fewer vectors than texts (the exact mismatch the pipeline must skip
         // rather than mis-zip).
@@ -427,6 +468,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn bulk_update_sql_shape() {
         assert_eq!(
             bulk_update_sql(&[7]).unwrap(),
@@ -470,6 +512,7 @@ mod tests {
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn record_batch_failure_and_success() {
         let _g = EMBED_TESTS_LOCK.lock().expect("embed tests lock poisoned");
         // The 500-endpoint loop test (DB-gated) also mutates `EMBED_FAILS`
@@ -494,6 +537,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn poison_filter_drops_rows_at_max() {
         let _g = EMBED_TESTS_LOCK.lock().expect("embed tests lock poisoned");
         let _g = crate::testing::DbExclusiveGuard::acquire();
@@ -520,6 +564,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn poison_fail_open_above_cap() {
         let _g = EMBED_TESTS_LOCK.lock().expect("embed tests lock poisoned");
         let _g = crate::testing::DbExclusiveGuard::acquire();
@@ -560,6 +605,7 @@ mod tests {
     // to hold across `.await` (unlike a std `MutexGuard`, which would trip
     // `clippy::await_holding_lock`).
     #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
     async fn count_mismatch_converges_to_poison_drop() {
         // DB gate (src/testing.rs): counted skip, strict-mode hard-fail.
         // The guard serializes this test against the in-process `EMBED_FAILS`

@@ -396,7 +396,15 @@ fn parse_date_tag(s: &str) -> Option<(u32, u32)> {
         [y, m, d] if y.len() == 4 && m.len() == 2 && d.len() == 2 => {
             Some((y.parse().ok()?, m.parse().ok()?))
         }
-        [y] if y.len() == 6 => Some((y[..4].parse().ok()?, y[4..].parse().ok()?)),
+        // H1 (2026-10 review): the byte slices below are only safe on
+        // ASCII — a 6-BYTE multi-byte tail (e.g. `é中a` = 2+3+1 bytes)
+        // puts byte 4 mid-character, and `y[..4]` would panic the OPDS
+        // poller → fail-closed supervisor → recurring whole-process DoS.
+        // The guard makes the arm ASCII-digit-only; the other arms use
+        // `.parse()`, which is safe on any `&str`.
+        [y] if y.len() == 6 && y.bytes().all(|b| b.is_ascii_digit()) => {
+            Some((y[..4].parse().ok()?, y[4..].parse().ok()?))
+        }
         _ => None,
     }
 }
@@ -557,11 +565,8 @@ pub async fn check_updates(
     zims: &ZimManager,
 ) -> Result<Vec<OpdsUpdate>> {
     let entries = fetch_catalog(settings, opds_url).await?;
-    let local: Vec<(String, Option<String>)> = zims
-        .list()
-        .iter()
-        .map(|m| (m.name.clone(), m.date.clone()))
-        .collect();
+    // Slim `(name, date)` projection — the update check needs no other field.
+    let local: Vec<(String, Option<String>)> = zims.list_name_dates();
     Ok(find_updates(&entries, &local))
 }
 
@@ -660,6 +665,29 @@ mod tests {
         assert_eq!(
             base_and_version("openstreetmap_us_2024x"),
             ("openstreetmap_us_2024x".to_string(), None)
+        );
+    }
+
+    /// H1 (2026-10 review): a 6-BYTE multi-byte tail (e.g. `é中a` = 2+3+1
+    /// bytes) used to hit the `y[..4]` / `y[4..]` byte slices mid-character
+    /// and panic the OPDS poller. The arm is now ASCII-digit-only, so the
+    /// tail is not a date tag: no panic, `None` version, name unchanged.
+    #[test]
+    fn base_and_version_multibyte_six_byte_tail_does_not_panic() {
+        // 6 bytes, 3 chars — byte 4 is mid-`中`.
+        assert_eq!(base_and_version("foo_é中a"), ("foo_é中a".to_string(), None));
+        // The valid forms must still parse (regression guard on the guard).
+        assert_eq!(
+            base_and_version("foo_202406"),
+            ("foo".to_string(), Some((2024, 6)))
+        );
+        assert_eq!(
+            base_and_version("foo_2024-06"),
+            ("foo".to_string(), Some((2024, 6)))
+        );
+        assert_eq!(
+            base_and_version("foo_2024-06-01"),
+            ("foo".to_string(), Some((2024, 6)))
         );
     }
 

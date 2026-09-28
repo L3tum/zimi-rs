@@ -3,6 +3,10 @@
 //! `build_router(state)` assembles the route tree (auth middleware, rate
 //! limiting, JSON/HTML handlers, and the OpenAPI spec) from a shared
 //! `AppState`.
+/// `/diagnostic` response shapes + collector (M-diag, 2026-10 review):
+/// the operator-facing introspection payload and its probe collection,
+/// kept out of the `zims` handler module.
+pub mod diagnostics;
 /// HTTP route handlers: ZIMs, search, content, settings, downloads, and the embedded Web UI.
 pub mod handlers;
 #[cfg(test)]

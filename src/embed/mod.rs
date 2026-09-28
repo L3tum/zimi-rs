@@ -30,12 +30,6 @@ pub use client::{format_vector, EmbedClient, EmbedConfig};
 pub use column::ensure_vector_dimension;
 pub use pipeline::{run_pipeline, CLAIM_EMBED_BATCH_SQL};
 pub use vector_index::{
-    index_state, maybe_build_vector_index, vector_index_state, VectorIndexSnapshot,
-    VectorIndexState, VECTOR_INDEX_MIN_ROWS,
+    index_state, maybe_build_vector_index, vector_index_diagnostic, vector_index_state,
+    VectorIndexDiagnosis, VectorIndexSnapshot, VectorIndexState, VECTOR_INDEX_MIN_ROWS,
 };
-// /diagnostic degradation note: crate-internal (serve handler), not part of
-// the public embed surface.
-pub(crate) use vector_index::vector_index_degradation_note;
-// /diagnostic snapshot freshness + publishing: crate-internal (serve
-// handler + the embed build paths), not part of the public embed surface.
-pub(crate) use vector_index::{now_unix_secs, publish_vector_index_snapshot, snapshot_is_fresh};

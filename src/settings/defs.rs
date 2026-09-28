@@ -33,6 +33,17 @@
 //! | `security_sensitive` | Auth / SSRF / secret-bearing keys  | Unauth writes rejected (403)  |
 //! | `secret`             | Real value never in API output     | Set values become "***"       |
 //! | `topology`           | Redacted for unauth callers (S6)   | Unauth reads see "[redacted]" |
+//! | `url`                | URL-typed setting (M-3, 2026-10)  | SSRF validation via [`UrlPolicy`] |
+//!
+//! The `url` column (M-3, 2026-10 review) is the write-time SSRF policy for
+//! URL-typed settings: `Some(UrlPolicy { private_network_flag, allow_loopback })`
+//! marks the key as a URL that `SettingsCache::update` validates through
+//! `netguard::assert_host_not_blocked` before storing — `private_network_flag`
+//! names the paired opt-in setting (`None` = the integration pins private
+//! networks off at runtime, so the check runs with the flag off). The three
+//! URL rows (`embedding.endpoint`, `torrent.url`, `torrent.opds_url`) are the
+//! only `Some` entries; the policy used to be a hand-maintained `matches!`
+//! on those key strings inside `update`.
 
 use std::collections::HashMap;
 
@@ -75,6 +86,25 @@ pub enum JsonType {
     Bool,
 }
 
+/// Per-integration write-time SSRF policy for URL-typed settings (M-3,
+/// 2026-10 review): how `SettingsCache::update` validates a URL value
+/// before it is stored — the private-network opt-in flag key that gates it
+/// (if any), and whether loopback addresses are admitted. Lives on the
+/// [`SETTING_DEFS`] row (via [`SettingPolicy::url`]) so the validation
+/// policy is declared once per setting, next to every other policy flag,
+/// instead of a hand-maintained `matches!` on key strings in `update`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UrlPolicy {
+    /// The settings key whose value gates private-network access for this
+    /// URL (e.g. `torrent.allow_private_networks`), or `None` when the
+    /// integration pins private networks OFF at runtime (the embed client)
+    /// — write time must agree, so `None` validates with the flag off.
+    pub private_network_flag: Option<&'static str>,
+    /// Loopback addresses are admitted (local Ollama / qBittorrent / OPDS
+    /// catalogs on 127.0.0.1).
+    pub allow_loopback: bool,
+}
+
 /// Per-setting policy flags. Every policy a setting can carry is a flag on the
 /// [`SETTING_DEFS`] row — the single source of truth for settings policy
 /// (previously scattered across 8 hand-maintained lists).
@@ -100,6 +130,11 @@ pub struct SettingPolicy {
     /// if changed (server already bound, ZIM dir already opened, logger already
     /// configured). Stored for reference but rejected on API update (D1b).
     pub config_only: bool,
+    /// Write-time SSRF policy for URL-typed settings (M-3, 2026-10 review):
+    /// `Some` marks the setting as a URL that `update` validates against
+    /// the network guards before storing; `None` (the default) means the
+    /// value is not a URL. See [`UrlPolicy`].
+    pub url: Option<UrlPolicy>,
 }
 
 /// One row of [`SETTING_DEFS`]: key, seed default, expected JSON type, policy.
@@ -372,6 +407,12 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
                 security_sensitive: true,
                 env_locked: true,
                 topology: true,
+                // `connect_qbit` (SEC M-1) gates the qB endpoint on
+                // `torrent.allow_private_networks`.
+                url: Some(UrlPolicy {
+                    private_network_flag: Some(KEY_TORRENT_ALLOW_PRIVATE_NETWORKS),
+                    allow_loopback: true,
+                }),
                 ..Default::default()
             },
         },
@@ -465,6 +506,12 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             json_type: JsonType::Str,
             policy: SettingPolicy {
                 security_sensitive: true,
+                // `validate_download_url` gates the catalog on
+                // `downloads.allow_private_networks`.
+                url: Some(UrlPolicy {
+                    private_network_flag: Some(KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS),
+                    allow_loopback: true,
+                }),
                 ..Default::default()
             },
         },
@@ -494,6 +541,13 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
                 security_sensitive: true,
                 env_locked: true,
                 topology: true,
+                // The embed client pins allow_private=false at runtime
+                // (src/embed/client.rs), so write time must agree: the
+                // flag key is `None` = validate with private networks off.
+                url: Some(UrlPolicy {
+                    private_network_flag: None,
+                    allow_loopback: true,
+                }),
                 ..Default::default()
             },
         },

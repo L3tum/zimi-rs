@@ -678,12 +678,13 @@ async fn tool_list_collections(state: &AppState) -> Value {
         Err(e) => return tool_error(e.to_string()),
     };
     // Resolve ZIM ids → names via the in-memory registry (same pattern as
-    // the HTTP handler `zim_id_to_name_map` in serve/handlers/settings.rs).
+    // the HTTP handler `zim_id_to_name_map` in serve/handlers/settings.rs;
+    // the slim `list_id_names` variant keeps this from cloning full rows).
     let id_to_name: HashMap<i32, String> = state
         .zims
-        .list()
-        .iter()
-        .filter_map(|z| z.id.map(|id| (id, z.name.clone())))
+        .list_id_names()
+        .into_iter()
+        .filter_map(|(id, name)| id.map(|id| (id, name)))
         .collect();
     let collections: Vec<Value> = rows
         .iter()
