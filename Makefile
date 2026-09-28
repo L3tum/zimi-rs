@@ -312,15 +312,15 @@ web-fmt:
 	./node_modules/.bin/eslint --fix web/common.js web/index.js web/search.js web/settings.js \
 	  web/check-css.mjs)
 
-# Full pre-merge check suite: type-check, format check, lint, full test run,
-# and the web UI checks (syntax, unit tests, eslint).
-all: check fmt-check clippy raw-sql-lint boundary-lint test web-check web-test web-lint
+# Full pre-merge check suite: type-check, format check, lint, rustdoc gate,
+# full test run, and the web UI checks (syntax, unit tests, eslint).
+all: check fmt-check clippy doc raw-sql-lint boundary-lint test web-check web-test web-lint
 
 help:
 	@echo "zimservice — make targets"
 	@echo ""
 	@echo "  make              Default: runs 'make check' (cargo check). Use 'make all' for the full gate"
-	@echo "  make all          Full quality gate: check + fmt-check + clippy + test + web-check + web-test + web-lint"
+	@echo "  make all          Full quality gate: check + fmt-check + clippy + doc + test + web-check + web-test + web-lint"
 	@echo "  make check        cargo check (pre-commit)"
 	@echo "  make fmt          Format Rust (cargo fmt) + JS (eslint --fix; see web-fmt)"
 	@echo "  make fmt-check    Check formatting (CI)"
