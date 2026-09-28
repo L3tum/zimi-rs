@@ -46,6 +46,31 @@ pub(crate) fn store_guard(len_ids: usize, len_vecs: usize) -> Result<()> {
     Ok(())
 }
 
+/// 2026-10 review fix (overflow): hard cap on the per-pass claim
+/// super-batch. `batch_size × max_concurrency` is both factors an `Int`
+/// setting (range-validated at write time, `src/settings/defs.rs`), but a
+/// value can still arrive out of range (env-seeded snapshot, a pre-fix DB
+/// row, a future writer) — in checked arithmetic the product is then
+/// capped here rather than wrapped: a wrapped-negative `LIMIT` is rejected
+/// by Postgres (breaking the pipeline for every ZIM), and an uncapped
+/// positive product would claim the ZIM's entire un-embedded backlog into
+/// one in-memory `Vec`. 100 000 rows × ≤ ~600 B of text ≈ 60 MB worst
+/// case: above any write-validated product an operator would want
+/// (sane pairs keep it in the low thousands), far below a memory-DoS.
+pub(crate) const EMBED_CLAIM_LIMIT_CAP: i64 = 100_000;
+
+/// Pure: the per-pass claim super-batch size — `batch_size ×
+/// max_concurrency` in checked arithmetic, capped at
+/// [`EMBED_CLAIM_LIMIT_CAP`] (see its doc for the overflow/memory
+/// rationale). Extracted so the overflow/degeneration branches are
+/// unit-testable without a DB.
+pub(crate) fn claim_limit_for(batch_size: i64, max_concurrency: i64) -> i64 {
+    batch_size
+        .checked_mul(max_concurrency)
+        .unwrap_or(EMBED_CLAIM_LIMIT_CAP)
+        .min(EMBED_CLAIM_LIMIT_CAP)
+}
+
 /// Pure: render the bulk `UPDATE … FROM (VALUES …)` statement for an
 /// embed batch — `ids[i]` is embedded as a literal, the vector literals
 /// are positional placeholders `$1..$n`, and `${n+1}` is the embed-model
@@ -233,15 +258,18 @@ pub async fn run_pipeline(
     // makes the consecutive sub-batches exactly the batches the sequential
     // claim loop would have produced, batch after batch.
     //
-    // Trade-off (2026-10 review polish): `claim_limit` is operator-
-    // configurable with no upper bound — both factors are admin `Int`
-    // settings (`embedding.batch_size`, `embedding.max_concurrency`). A
-    // crash mid-claim now leaves up to `claim_limit` rows stamped
+    // 2026-10 review fix (overflow): `claim_limit` is the product of two
+    // operator `Int` settings (`embedding.batch_size`,
+    // `embedding.max_concurrency`) — both range-validated at write time
+    // (`src/settings/defs.rs`), and computed checked + capped here
+    // (`claim_limit_for`) so any out-of-range value (env-seeded, pre-fix
+    // DB row) degrades to the cap instead of wrapping `i64` into a
+    // Postgres-rejected negative `LIMIT`. Trade-off (2026-10 review
+    // polish): a crash mid-claim leaves up to `claim_limit` rows stamped
     // `embed_at` (vs `batch_size` before the super-batch), held until the
-    // 10-min staleness window lets a retry pick them up. Bounded, not
-    // attacker-controlled — accepted as the price of one round-trip per
-    // pass; a sane operator keeps the product in the low thousands.
-    let claim_limit: i64 = batch_size * max_concurrency as i64;
+    // 10-min staleness window lets a retry pick them up; the cap bounds
+    // that worst case at `EMBED_CLAIM_LIMIT_CAP` rows.
+    let claim_limit = claim_limit_for(batch_size, max_concurrency as i64);
 
     loop {
         // Claim the next super-batch atomically: stamping `embed_at`
@@ -480,6 +508,41 @@ mod tests {
             "UPDATE articles a SET embedding = v.vec::vector, embed_model = $4, embed_at = now() \
              FROM (VALUES (7, $1), (8, $2), (9, $3)) AS v(id, vec) WHERE a.id = v.id"
         );
+    }
+
+    // ── claim_limit_for (2026-10 review fix: i64 overflow → pipeline DoS) ──
+
+    #[test]
+    fn claim_limit_for_is_the_plain_product_in_range() {
+        assert_eq!(claim_limit_for(64, 4), 256);
+        assert_eq!(claim_limit_for(1_000, 10), 10_000);
+    }
+
+    #[test]
+    fn claim_limit_for_caps_the_write_validated_corner() {
+        // 10 000 × 10 000 is the product of the two write-time range
+        // corners (`1..=10_000` each) — the cap, not the 100 000 000-row
+        // claim, is what the pipeline may take in one pass.
+        assert_eq!(claim_limit_for(10_000, 10_000), EMBED_CLAIM_LIMIT_CAP);
+    }
+
+    #[test]
+    fn claim_limit_for_never_wraps_negative() {
+        // Out-of-range values (env-seeded snapshot, pre-fix DB row): the
+        // `i64` overflow must degrade to the cap — a wrapped-negative
+        // `LIMIT` is rejected by Postgres and broke the pipeline for every
+        // ZIM (the 2026-10 review's blocking item).
+        assert_eq!(claim_limit_for(i64::MAX, 2), EMBED_CLAIM_LIMIT_CAP);
+        assert_eq!(claim_limit_for(10_000, i64::MAX), EMBED_CLAIM_LIMIT_CAP);
+        assert_eq!(claim_limit_for(i64::MIN, i64::MIN), EMBED_CLAIM_LIMIT_CAP);
+    }
+
+    #[test]
+    fn claim_limit_for_degenerate_factors() {
+        // The callers floor both factors at 1 (`config.batch_size.max(1)`);
+        // pin the arithmetic for the degenerate inputs anyway.
+        assert_eq!(claim_limit_for(0, 64), 0);
+        assert_eq!(claim_limit_for(1, 1), 1);
     }
 
     // ── dimension fail-fast error (FIX: model dim change poisons all ZIMs) ─

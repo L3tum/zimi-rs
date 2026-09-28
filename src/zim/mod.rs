@@ -229,9 +229,9 @@ impl ZimMeta {
 }
 
 /// Compute a strong ETag from a file's `mtime` (ms since epoch) and `size`
-/// (W6.1). Extracted so `ZimManager::file_etag` and the blocking raw-content
-/// read share the exact tag format — a format drift between the two would 304
-/// a stale entry after an in-place replace.
+/// (W6.1). Shared by the blocking raw-content read (and its 304 logic) —
+/// a format drift between ETag producers would 304 a stale entry after an
+/// in-place replace, so the format lives in exactly one place.
 pub(crate) fn etag_from_metadata(md: &std::fs::Metadata) -> Option<String> {
     let mtime_ms = md
         .modified()
@@ -413,20 +413,6 @@ impl ZimManager {
             .read()
             .expect("zim cache lock poisoned")
             .contains_key(name)
-    }
-
-    /// Strong ETag for the ZIM file: `"{mtime_ms}-{size}"` — the same
-    /// (mtime, size) pair `open_zim` trusts as its file-change signal. File-level,
-    /// so a matching tag implies every entry is byte-identical, and it is
-    /// computable without reading any entry. Uses a **fresh** stat per request
-    /// (not the `CachedZim` snapshot, whose `STAT_TTL_MS` could serve stale 304s
-    /// after an in-place replace). `None` if the ZIM is unknown or the stat
-    /// fails (i.e. not cacheable).
-    #[cfg(test)]
-    pub fn file_etag(&self, name: &str) -> Option<String> {
-        let meta = self.get(name)?;
-        let md = std::fs::metadata(Path::new(&meta.file_path)).ok()?;
-        etag_from_metadata(&md)
     }
 
     /// Persist ZIM metadata to the database (upsert).
@@ -1317,38 +1303,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_etag_reports_mtime_and_size() {
+    async fn etag_from_metadata_reports_mtime_and_size() {
         let dir = temp_dir("etag");
         write_zim(&dir, "x", 5);
         let m = manager(&dir);
         m.scan().await.unwrap();
-        let etag = m.file_etag("x").expect("etag for a present ZIM");
+        let meta = m.get("x").expect("meta for a present ZIM");
+        let md = std::fs::metadata(&meta.file_path).unwrap();
+        let etag = etag_from_metadata(&md).expect("etag for a present ZIM");
         assert!(
             etag.ends_with("-5\""),
             "etag must carry the 5-byte size: {etag}"
         );
         assert!(etag.starts_with('"'), "strong tag is quoted: {etag}");
-        assert_eq!(m.file_etag("missing"), None, "unknown ZIM → no etag");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn etag_from_metadata_matches_file_etag() {
-        // W6.1: the extracted `etag_from_metadata` must produce a byte-identical
-        // tag to `file_etag` for the same file — a format drift between the two
-        // would 304 a stale entry after an in-place replace.
-        let dir = temp_dir("etag2");
-        write_zim(&dir, "x", 5);
-        let m = manager(&dir);
-        m.scan().await.unwrap();
-        let meta = m.get("x").expect("meta");
-        let md = std::fs::metadata(meta.file_path).unwrap();
-        let from_meta = etag_from_metadata(&md).expect("etag from metadata");
-        let via_accessor = m.file_etag("x").expect("etag via file_etag");
-        assert_eq!(
-            from_meta, via_accessor,
-            "etag_from_metadata must match file_etag"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

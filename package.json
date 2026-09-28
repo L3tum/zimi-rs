@@ -4,10 +4,12 @@
   "type": "module",
   "scripts": {
     "lint": "eslint web/common.js web/index.js web/search.js web/settings.js web/check-css.mjs tests/web/*.mjs",
-    "test": "node --test tests/web/*.test.mjs"
+    "test": "node --test tests/web/*.test.mjs",
+    "browser-test": "playwright test --config tests/web/playwright.config.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9",
+    "@playwright/test": "^1.52.0",
     "css-tree": "^3.2.1",
     "eslint": "^9",
     "globals": "^16",

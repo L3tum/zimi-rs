@@ -59,6 +59,15 @@ type SearchRow = (
 /// its own longer client-level timeout (`embedding.timeout_secs`, default 60 s)
 /// via `EmbedConfig` — this constant applies only to the per-query call on the
 /// search path.
+/// `suggest` default limit (MCP↔HTTP contract, 2026-10 review): the MCP
+/// tool schema and the HTTP `GET /suggest` OpenAPI description both
+/// advertise these two constants — the pure-data contract test
+/// (`src/mcp/mod.rs` `mcp_tool_schema_matches_http_handler_constants`)
+/// pins the MCP side against them so the two front ends can't drift.
+pub(crate) const SUGGEST_DEFAULT_LIMIT: usize = 10;
+/// `suggest` max limit (see [`SUGGEST_DEFAULT_LIMIT`]).
+pub(crate) const SUGGEST_MAX_LIMIT: usize = 20;
+
 const SEARCH_EMBED_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Pool connections the arm gate keeps **outside** the search fan-out
@@ -819,7 +828,9 @@ impl SearchEngine {
         zim_filter: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<SearchResult>> {
-        let limit = limit.unwrap_or(10).min(20);
+        let limit = limit
+            .unwrap_or(SUGGEST_DEFAULT_LIMIT)
+            .min(SUGGEST_MAX_LIMIT);
         let query_lower = query.to_lowercase();
         // N3: read the trgm threshold from the same single-pass search
         // snapshot `search()` uses, so the two code paths can't disagree

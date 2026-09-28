@@ -47,6 +47,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::search::SearchParams;
+use crate::settings::KEY_SEARCH_DEFAULT_LIMIT;
 use crate::AppState;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
@@ -283,7 +284,17 @@ async fn dispatch(state: &AppState, method: &str, params: &Value) -> Result<Valu
 }
 
 /// Get the list of available tools.
+///
+/// The advertised parameter defaults are formatted from the same constants
+/// / settings seed the HTTP front end is bounded by (`content::
+/// DEFAULT_READ_MAX_LENGTH`, `search::SUGGEST_*`, the `search.default_limit`
+/// seed) — the MCP↔HTTP contract test
+/// (`mcp_tool_schema_matches_http_handler_constants`) pins them so the two
+/// surfaces can't drift in parameter caps/defaults (2026-10 review, Arch).
 fn tool_definitions() -> Value {
+    let search_default_limit = crate::settings::default_value(KEY_SEARCH_DEFAULT_LIMIT)
+        .as_u64()
+        .unwrap_or(10);
     json!([
         {
             "name": "search",
@@ -300,7 +311,10 @@ fn tool_definitions() -> Value {
                         "description": "Engine: fts (full-text), trgm (fuzzy/prefix), vector \
                         (semantic), or hybrid (default)"
                     },
-                    "limit": { "type": "integer", "description": "Max results (default 10)" }
+                    "limit": {
+                        "type": "integer",
+                        "description": format!("Max results (default {search_default_limit})")
+                    }
                 },
                 "required": ["query"]
             }
@@ -313,8 +327,13 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "zim": { "type": "string", "description": "ZIM name" },
                     "path": { "type": "string", "description": "Article path" },
-                    "max_length": { "type": "integer", "description": "Max characters (default \
-                    8000)" }
+                    "max_length": {
+                        "type": "integer",
+                        "description": format!(
+                            "Max characters (default {})",
+                            crate::content::DEFAULT_READ_MAX_LENGTH
+                        )
+                    }
                 },
                 "required": ["zim", "path"]
             }
@@ -327,7 +346,14 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "query": { "type": "string" },
                     "zim": { "type": "string" },
-                    "limit": { "type": "integer" }
+                    "limit": {
+                        "type": "integer",
+                        "description": format!(
+                            "Max suggestions (default {} max {})",
+                            crate::search::SUGGEST_DEFAULT_LIMIT,
+                            crate::search::SUGGEST_MAX_LIMIT
+                        )
+                    }
                 },
                 "required": ["query"]
             }
@@ -509,11 +535,13 @@ async fn tool_read(state: &AppState, args: &Value) -> Result<Value, (i32, String
     let path = req_str(args, "path")?;
     // `read_article_payload` clamps `max_length` at `content::MAX_READ_BYTES`
     // (shared cap — the HTTP `GET /read` handler is bounded by the same
-    // constant, so the two front ends stay in parity).
+    // constant, so the two front ends stay in parity). The default is the
+    // shared `content::DEFAULT_READ_MAX_LENGTH` constant (not a local
+    // literal) so the MCP↔HTTP contract test can pin it.
     let max_len = args
         .get("max_length")
         .and_then(|l| l.as_u64())
-        .unwrap_or(8000) as usize;
+        .unwrap_or(crate::content::DEFAULT_READ_MAX_LENGTH as u64) as usize;
     match crate::content::read_article_payload(state, &zim, &path, max_len).await {
         Ok(payload) => Ok(tool_result(&json!({
             "title": payload.title,
@@ -710,6 +738,88 @@ async fn tool_list_collections(state: &AppState) -> Value {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+    use utoipa::OpenApi;
+
+    // ── MCP↔HTTP contract (2026-10 review, Architecture) ────────────────
+
+    /// The MCP tool schema's advertised parameter defaults must equal the
+    /// constants / settings seed the HTTP front end is bounded by. The
+    /// boundary lint stops structural drift between the two surfaces; this
+    /// pure-data test stops SEMANTIC drift (a parameter cap/default that
+    /// agrees structurally but diverges in value) — e.g. the MCP `read`
+    /// tool used to hardcode `8000` while the HTTP `GET /read` handler is
+    /// bounded by `content::DEFAULT_READ_MAX_LENGTH`.
+    #[test]
+    fn mcp_tool_schema_matches_http_handler_constants() {
+        let tools = tool_definitions();
+        let by_name: HashMap<String, Value> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| (t["name"].as_str().unwrap().to_string(), t.clone()))
+            .collect();
+
+        // read.max_length ↔ `content::DEFAULT_READ_MAX_LENGTH` (the shared
+        // constant the HTTP `GET /read` handler defaults to).
+        let mcp_read = by_name["read"]["inputSchema"]["properties"]["max_length"]["description"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            mcp_read,
+            format!(
+                "Max characters (default {})",
+                crate::content::DEFAULT_READ_MAX_LENGTH
+            ),
+            "MCP read.max_length default drifted from content::DEFAULT_READ_MAX_LENGTH"
+        );
+
+        // suggest.limit ↔ `search::SUGGEST_*` (the constants the shared
+        // `suggest()` clamps with — the HTTP `GET /suggest` is the same path).
+        let mcp_suggest = by_name["suggest"]["inputSchema"]["properties"]["limit"]["description"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            mcp_suggest,
+            format!(
+                "Max suggestions (default {} max {})",
+                crate::search::SUGGEST_DEFAULT_LIMIT,
+                crate::search::SUGGEST_MAX_LIMIT
+            ),
+            "MCP suggest.limit drifted from search::SUGGEST_*"
+        );
+
+        // search.limit ↔ the `search.default_limit` settings seed (the HTTP
+        // `GET /search` default — same seed value).
+        let mcp_search = by_name["search"]["inputSchema"]["properties"]["limit"]["description"]
+            .as_str()
+            .unwrap();
+        let seed_default = crate::settings::default_value(KEY_SEARCH_DEFAULT_LIMIT)
+            .as_u64()
+            .unwrap_or(10);
+        assert_eq!(
+            mcp_search,
+            format!("Max results (default {seed_default})"),
+            "MCP search.limit drifted from the search.default_limit seed"
+        );
+
+        // Cross-surface: the HTTP OpenAPI advertises the same read default.
+        let http = serde_json::to_value(crate::serve::openapi::ApiDoc::openapi())
+            .expect("OpenAPI serializes");
+        let http_read_desc = http["paths"]["/read"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "max_length")
+            .and_then(|p| p["description"].as_str())
+            .expect("HTTP /read max_length parameter present");
+        assert!(
+            http_read_desc.contains(&format!(
+                "default {}",
+                crate::content::DEFAULT_READ_MAX_LENGTH
+            )),
+            "HTTP /read max_length description drifted: {http_read_desc}"
+        );
+    }
 
     fn test_state() -> Arc<AppState> {
         Arc::new(crate::testing::test_state())

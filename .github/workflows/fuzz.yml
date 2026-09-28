@@ -55,10 +55,13 @@ jobs:
       # version number"). Pinned to the newest 0.13.x exactly (crates.io
       # 0.13.2, 2026-06-09), like the nightly above; bump deliberately.
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
-      # 45 s per target (the review's 30–60 s budget); each target's
-      # committed seed corpus (fuzz/corpus/<target>/, see fuzz/README.md)
-      # seeds the run.
+      # 120 s per target (raised from 45 s — 2026-10 review: the 45 s gate
+      # was thin for the code-execution-adjacent parse surface it guards);
+      # each target's committed seed corpus (fuzz/corpus/<target>/, see
+      # fuzz/README.md) seeds the run. The `schedule` trigger may be inert
+      # on the act-based runners, so the per-push budget is the reliable
+      # gate — keep it above the 2026-09 30–60 s floor.
       - run: |
           cd fuzz
-          cargo fuzz run fuzz_zim -- -max_total_time=45
-          cargo fuzz run fuzz_opds -- -max_total_time=45
+          cargo fuzz run fuzz_zim -- -max_total_time=120
+          cargo fuzz run fuzz_opds -- -max_total_time=120

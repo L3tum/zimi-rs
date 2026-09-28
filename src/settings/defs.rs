@@ -137,7 +137,8 @@ pub struct SettingPolicy {
     pub url: Option<UrlPolicy>,
 }
 
-/// One row of [`SETTING_DEFS`]: key, seed default, expected JSON type, policy.
+/// One row of [`SETTING_DEFS`]: key, seed default, expected JSON type,
+/// optional `Int` range, policy.
 #[derive(Clone, Debug)]
 pub struct SettingDef {
     /// The settings key string (one of the `KEY_` constants).
@@ -146,6 +147,14 @@ pub struct SettingDef {
     pub default: serde_json::Value,
     /// Expected JSON type for the stored value (write-time type-checking).
     pub json_type: JsonType,
+    /// Optional closed range a stored `Int` value must fall in — enforced at
+    /// write time by [`type_mismatch`] (2026-10 review fix: the embedding
+    /// pipeline's `batch_size × max_concurrency` product overflowed `i64`
+    /// on an out-of-range `embedding.max_concurrency`; a value outside its
+    /// downstream bounds must be rejected at the write, not wrapped by an
+    /// `as` narrowing or clamped silently at the use site). `None` = no
+    /// range beyond the type check.
+    pub int_range: Option<std::ops::RangeInclusive<i64>>,
     /// Policy flags for this setting.
     pub policy: SettingPolicy,
 }
@@ -283,6 +292,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_GENERAL_ZIM_DIR,
             default: serde_json::json!("/zims"),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 env_locked: true,
                 // S6: an absolute server path — leak topology to
@@ -297,6 +307,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_GENERAL_HOST,
             default: serde_json::json!("127.0.0.1"),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 env_locked: true,
                 config_only: true,
@@ -307,6 +318,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_GENERAL_PORT,
             default: serde_json::json!(8899),
             json_type: JsonType::Int,
+            int_range: None,
             policy: SettingPolicy {
                 env_locked: true,
                 config_only: true,
@@ -317,6 +329,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_GENERAL_LOG_LEVEL,
             default: serde_json::json!("info"),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 config_only: true,
                 ..Default::default()
@@ -326,6 +339,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_GENERAL_CORS_ORIGINS,
             default: serde_json::json!(""),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 config_only: true,
                 ..Default::default()
@@ -335,36 +349,42 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_SEARCH_FTS_WEIGHT,
             default: serde_json::json!(0.6),
             json_type: JsonType::Num,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_SEARCH_TRGM_WEIGHT,
             default: serde_json::json!(0.4),
             json_type: JsonType::Num,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_SEARCH_VECTOR_WEIGHT,
             default: serde_json::json!(0.5),
             json_type: JsonType::Num,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_SEARCH_TRGM_THRESHOLD,
             default: serde_json::json!(0.3),
             json_type: JsonType::Num,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_SEARCH_DEFAULT_LIMIT,
             default: serde_json::json!(10),
             json_type: JsonType::Int,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_SEARCH_MAX_LIMIT,
             default: serde_json::json!(50),
             json_type: JsonType::Int,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         // SEC M2: the download size cap is a resource-control knob — a
@@ -376,6 +396,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_DOWNLOADS_MAX_BYTES,
             default: serde_json::json!(DEFAULT_MAX_BYTES),
             json_type: JsonType::Int,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 ..Default::default()
@@ -385,6 +406,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_DOWNLOADS_ALLOW_PRIVATE_NETWORKS,
             default: serde_json::json!(false),
             json_type: JsonType::Bool,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 ..Default::default()
@@ -397,12 +419,14 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             // cluster; upgraded deployments are flipped by migration 018.
             default: serde_json::json!(false),
             json_type: JsonType::Bool,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_TORRENT_URL,
             default: serde_json::json!(""),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 env_locked: true,
@@ -420,6 +444,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_TORRENT_USERNAME,
             default: serde_json::json!(""),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 env_locked: true,
@@ -431,6 +456,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_TORRENT_PASSWORD,
             default: serde_json::json!(""),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 env_locked: true,
@@ -450,6 +476,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_TORRENT_ALLOW_PRIVATE_NETWORKS,
             default: serde_json::json!(false),
             json_type: JsonType::Bool,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 ..Default::default()
@@ -459,6 +486,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_TORRENT_SAVE_PATH,
             default: serde_json::json!("/downloads"),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 ..Default::default()
@@ -468,42 +496,49 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_TORRENT_CATEGORY,
             default: serde_json::json!("zimservice"),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_TORRENT_MAX_ACTIVE,
             default: serde_json::json!(4),
             json_type: JsonType::Int,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_TORRENT_POLL_SECS,
             default: serde_json::json!(5),
             json_type: JsonType::Int,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_TORRENT_FILE_STRATEGY,
             default: serde_json::json!("hardlink"),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_TORRENT_SEED_RATIO,
             default: serde_json::json!(2.0),
             json_type: JsonType::Num,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_TORRENT_KEEP_COMPLETED,
             default: serde_json::json!(true),
             json_type: JsonType::Bool,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_TORRENT_OPDS_URL,
             default: serde_json::json!("https://opds.kiwix.com/opds_catalog"),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 // `validate_download_url` gates the catalog on
@@ -519,6 +554,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_TORRENT_AUTO_UPDATE,
             default: serde_json::json!(false),
             json_type: JsonType::Bool,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 ..Default::default()
@@ -528,6 +564,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_EMBEDDING_ENABLED,
             default: serde_json::json!(false),
             json_type: JsonType::Bool,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 ..Default::default()
@@ -537,6 +574,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_EMBEDDING_ENDPOINT,
             default: serde_json::json!("http://localhost:11434/v1"),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 env_locked: true,
@@ -555,6 +593,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_EMBEDDING_API_KEY,
             default: serde_json::json!(""),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 env_locked: true,
@@ -566,6 +605,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_EMBEDDING_MODEL,
             default: serde_json::json!(EMBED_DEFAULT_MODEL),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 env_locked: true,
@@ -576,6 +616,11 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_EMBEDDING_DIMENSION,
             default: serde_json::json!(EMBED_DEFAULT_DIMENSION),
             json_type: JsonType::Int,
+            // 2026-10 review fix: same no-range-check gap as the pipeline
+            // factors — a poisoned dimension would only be rejected by
+            // pgvector at write time, so bound it at the write (pgvector's
+            // own hard max is 16 000 dimensions).
+            int_range: Some(1..=16_000),
             policy: SettingPolicy {
                 security_sensitive: true,
                 env_locked: true,
@@ -586,6 +631,10 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_EMBEDDING_BATCH_SIZE,
             default: serde_json::json!(64),
             json_type: JsonType::Int,
+            // 2026-10 review fix: write-time range for the pipeline's
+            // `batch_size × max_concurrency` claim product (see
+            // `EMBED_CLAIM_LIMIT_CAP` in `src/embed/pipeline.rs`).
+            int_range: Some(1..=10_000),
             policy: SettingPolicy {
                 security_sensitive: true,
                 ..Default::default()
@@ -595,12 +644,21 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_EMBEDDING_MAX_CONCURRENCY,
             default: serde_json::json!(4),
             json_type: JsonType::Int,
+            // 2026-10 review fix: the open-mode-writable factor of the
+            // pipeline's claim product — an unauthenticated write of a
+            // huge value wrapped `claim_limit` into a Postgres-rejected
+            // negative `LIMIT` (embedding-pipeline DoS). Bounded here at
+            // the write, checked + capped again at the use site.
+            int_range: Some(1..=10_000),
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_EMBEDDING_TIMEOUT_SECS,
             default: serde_json::json!(60),
             json_type: JsonType::Int,
+            // 2026-10 review fix: same no-range-check gap — bound the
+            // per-request timeout at a sensible operator ceiling.
+            int_range: Some(1..=3_600),
             policy: SettingPolicy {
                 security_sensitive: true,
                 ..Default::default()
@@ -610,12 +668,14 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_EMBEDDING_HNSW_THRESHOLD,
             default: serde_json::json!(EMBED_DEFAULT_HNSW_THRESHOLD),
             json_type: JsonType::Int,
+            int_range: None,
             policy: SettingPolicy::default(),
         },
         SettingDef {
             key: KEY_ACCESS_MODE,
             default: serde_json::json!(ACCESS_MODE_OPEN),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 env_locked: true,
                 api_immutable: true,
@@ -626,6 +686,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_ACCESS_RATE_LIMIT_RPS,
             default: serde_json::json!(100),
             json_type: JsonType::Int,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 ..Default::default()
@@ -635,6 +696,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_ACCESS_RATE_LIMIT_BURST,
             default: serde_json::json!(200),
             json_type: JsonType::Int,
+            int_range: None,
             policy: SettingPolicy {
                 security_sensitive: true,
                 ..Default::default()
@@ -644,6 +706,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_ACCESS_ADMIN_PASSWORD,
             default: serde_json::json!(""),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 env_locked: true,
                 secret: true,
@@ -655,6 +718,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_ACCESS_READ_ONLY_TOKEN,
             default: serde_json::json!(""),
             json_type: JsonType::Str,
+            int_range: None,
             // Mirrors `access.admin_password` exactly: env-seeded + env-
             // locked + secret + API-immutable. (No `security_sensitive` —
             // like admin_password, the `api_immutable` arm rejects writes
@@ -671,6 +735,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_ACCESS_REQUIRE_AUTH_FOR_READS,
             default: serde_json::json!(false),
             json_type: JsonType::Bool,
+            int_range: None,
             policy: SettingPolicy {
                 // M-1: env-backed (`REQUIRE_AUTH_FOR_READS`) so an explicit
                 // operator value is re-applied on every reload and locks the
@@ -686,6 +751,7 @@ pub static SETTING_DEFS: std::sync::LazyLock<[SettingDef; 43]> = std::sync::Lazy
             key: KEY_GENERAL_TRUSTED_PROXY_CIDRS,
             default: serde_json::json!(""),
             json_type: JsonType::Str,
+            int_range: None,
             policy: SettingPolicy {
                 config_only: true,
                 ..Default::default()
@@ -771,29 +837,42 @@ pub(crate) fn normalize_embedding_endpoint(value: &str) -> String {
 }
 
 /// Check a setting value against its expected JSON type (the `json_type`
-/// column of [`SETTING_DEFS`]; `None` = unknown key or no mismatch).
+/// column of [`SETTING_DEFS`]; `None` = unknown key or no mismatch) and,
+/// for `Int` rows with a declared `int_range`, against that range (the
+/// 2026-10 review fix: out-of-range values must be rejected at the write,
+/// before they can reach a downstream `as` narrowing or a checked
+/// arithmetic cap).
 pub(crate) fn type_mismatch(key: &str, value: &serde_json::Value) -> Option<String> {
-    let expected = def(key)?.json_type;
+    let def = def(key)?;
+    let expected = def.json_type;
     let ok = match expected {
         JsonType::Str => value.is_string(),
         JsonType::Int => value.is_i64() || value.is_u64(),
         JsonType::Num => value.is_number(),
         JsonType::Bool => value.is_boolean(),
     };
-    if ok {
-        None
-    } else {
+    if !ok {
         let want = match expected {
             JsonType::Str => "a string",
             JsonType::Int => "an integer",
             JsonType::Num => "a number",
             JsonType::Bool => "a boolean",
         };
-        Some(format!(
+        return Some(format!(
             "{key}: expected {want}, got {}",
             value_type_name(value)
-        ))
+        ));
     }
+    // Range gate (declared rows only): a `u64` beyond `i64::MAX` passed the
+    // type check above but has no `i64` form — it is outside every declared
+    // range (all of which end far below `i64::MAX`), so reject it too.
+    if let Some(range) = &def.int_range {
+        let in_range = value.as_i64().is_some_and(|n| range.contains(&n));
+        if !in_range {
+            return Some(format!("{key}: out of range — must be in {range:?}"));
+        }
+    }
+    None
 }
 
 fn value_type_name(v: &serde_json::Value) -> &'static str {
@@ -1254,5 +1333,87 @@ mod tests {
             None,
             "unknown key must not be force-parsed"
         );
+    }
+
+    // ── 2026-10 review fix: write-time `Int` range validation ──────────────
+
+    #[test]
+    fn int_range_rejects_out_of_range_embedding_values() {
+        // In-range values pass (including the corners).
+        assert!(type_mismatch(KEY_EMBEDDING_BATCH_SIZE, &serde_json::json!(1)).is_none());
+        assert!(type_mismatch(KEY_EMBEDDING_BATCH_SIZE, &serde_json::json!(10_000)).is_none());
+        assert!(type_mismatch(KEY_EMBEDDING_MAX_CONCURRENCY, &serde_json::json!(4)).is_none());
+        assert!(type_mismatch(KEY_EMBEDDING_MAX_CONCURRENCY, &serde_json::json!(10_000)).is_none());
+        assert!(type_mismatch(KEY_EMBEDDING_DIMENSION, &serde_json::json!(768)).is_none());
+        assert!(type_mismatch(KEY_EMBEDDING_DIMENSION, &serde_json::json!(16_000)).is_none());
+        assert!(type_mismatch(KEY_EMBEDDING_TIMEOUT_SECS, &serde_json::json!(60)).is_none());
+        assert!(type_mismatch(KEY_EMBEDDING_TIMEOUT_SECS, &serde_json::json!(3_600)).is_none());
+        // Out of range: below the floor.
+        assert!(type_mismatch(KEY_EMBEDDING_BATCH_SIZE, &serde_json::json!(0)).is_some());
+        assert!(type_mismatch(KEY_EMBEDDING_MAX_CONCURRENCY, &serde_json::json!(0)).is_some());
+        assert!(type_mismatch(KEY_EMBEDDING_DIMENSION, &serde_json::json!(0)).is_some());
+        assert!(type_mismatch(KEY_EMBEDDING_TIMEOUT_SECS, &serde_json::json!(0)).is_some());
+        // Out of range: above the ceiling (the overflow trigger).
+        assert!(type_mismatch(KEY_EMBEDDING_BATCH_SIZE, &serde_json::json!(10_001)).is_some());
+        assert!(type_mismatch(KEY_EMBEDDING_MAX_CONCURRENCY, &serde_json::json!(10_001)).is_some());
+        assert!(type_mismatch(KEY_EMBEDDING_DIMENSION, &serde_json::json!(16_001)).is_some());
+        assert!(type_mismatch(KEY_EMBEDDING_TIMEOUT_SECS, &serde_json::json!(3_601)).is_some());
+    }
+
+    #[test]
+    fn int_range_rejects_u64_beyond_i64_max() {
+        // A `u64` beyond `i64::MAX` passes the `Int` type check but has no
+        // `i64` form — it must be rejected by the range gate, not smuggled
+        // through to a downstream `as i64` narrowing (the original overflow).
+        assert!(
+            type_mismatch(KEY_EMBEDDING_MAX_CONCURRENCY, &serde_json::json!(u64::MAX)).is_some()
+        );
+        assert!(type_mismatch(
+            KEY_EMBEDDING_BATCH_SIZE,
+            &serde_json::json!(i64::MAX as u64 + 1)
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn int_range_message_names_the_key_and_range() {
+        let msg = type_mismatch(KEY_EMBEDDING_MAX_CONCURRENCY, &serde_json::json!(i64::MAX))
+            .expect("out of range");
+        assert!(
+            msg.starts_with("embedding.max_concurrency: out of range"),
+            "msg: {msg}"
+        );
+        assert!(msg.contains("1..=10000"), "msg: {msg}");
+    }
+
+    #[test]
+    fn int_range_does_not_affect_unranged_int_keys() {
+        // `None` rows keep accepting any `i64`/`u64` (no behavior change for
+        // the many `Int` settings with no downstream arithmetic).
+        assert!(
+            type_mismatch(KEY_EMBEDDING_HNSW_THRESHOLD, &serde_json::json!(i64::MAX)).is_none()
+        );
+        assert!(type_mismatch(KEY_GENERAL_PORT, &serde_json::json!(i64::MIN)).is_none());
+        assert!(type_mismatch(KEY_TORRENT_MAX_ACTIVE, &serde_json::json!(u64::MAX)).is_none());
+    }
+
+    #[test]
+    fn int_range_defaults_are_within_their_ranges() {
+        // The seed defaults must pass their own range gate — a default
+        // outside its range would reject the seed on first load.
+        for key in [
+            KEY_EMBEDDING_BATCH_SIZE,
+            KEY_EMBEDDING_MAX_CONCURRENCY,
+            KEY_EMBEDDING_DIMENSION,
+            KEY_EMBEDDING_TIMEOUT_SECS,
+        ] {
+            let d = def(key).expect("tabled key");
+            let Some(range) = &d.int_range else {
+                panic!("range declared");
+            };
+            let v = default_value(key);
+            let in_range = v.as_i64().is_some_and(|n| range.contains(&n));
+            assert!(in_range, "default {v} for {key} outside {range:?}");
+        }
     }
 }

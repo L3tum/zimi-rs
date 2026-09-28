@@ -25,6 +25,8 @@ permissions:
 #   msrv-db=5433, coverage=5434, docker=5435 (bench=5436 in bench.yml) —
 #   because parallel jobs share the host network and would collide on a
 #   common port (a losing postgres can never bind and never goes healthy).
+#   web-browser-smoke uses 5437 for its postgres and 8877 for the app under
+#   test.
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -92,6 +94,58 @@ jobs:
       - run: make web-lint
         env:
           ZIMSERVICE_WEB_CHECK_STRICT: "1"
+  # Real-browser (Playwright, headless Chromium) smoke for the web UI.
+  # Exercises the library and search pages against a LIVE zimservice
+  # process — the layer the jsdom suite (web-lint job) and the HTTP
+  # wiremock tests cannot cover (2026-10 review, Tests: no real-browser
+  # coverage). Host-network runner (note at top): postgres on its own real
+  # port (5437), app on 127.0.0.1:8877. Open mode on a loopback bind is
+  # allowed by the boot policy, so no auth env is needed.
+  web-browser-smoke:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
+        env:
+          POSTGRES_USER: zimservice
+          POSTGRES_PASSWORD: zimservice
+          POSTGRES_DB: zimservice
+          # Host-network runner (note at top): this job's real port.
+          PGPORT: "5437"
+        ports: ["5437:5437"]
+        options: >-
+          --health-cmd "pg_isready -U zimservice -p 5437"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: 22 }
+      - uses: ./.github/actions/setup-rust
+        with: { toolchain: "1.96.0" }
+      - run: npm install --no-audit --no-fund
+      # Chromium + its system libs; fall back to the bare browser download
+      # if the runner can't apt (system deps may already be present).
+      - run: npx playwright install --with-deps chromium || npx playwright install chromium
+      - run: cargo build --release --bin zimservice
+      - run: |
+          ZIM_DIR=$(mktemp -d) \
+          DATABASE_URL=postgres://zimservice:zimservice@localhost:5437/zimservice \
+          ZIMSERVICE_REQUIRE_DB=1 \
+          HOST=127.0.0.1 \
+          PORT=8877 \
+          ACCESS_MODE=open \
+          target/release/zimservice &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8877/health >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8877/health
+          ZIMSERVICE_BASE_URL=http://127.0.0.1:8877 \
+            npx playwright test --config tests/web/playwright.config.mjs
+          kill "$SERVER_PID" 2>/dev/null || true
   # MSRV gate: fail CI if the code silently requires a newer toolchain than
   # the declared `rust-version` (1.94). Runs the DB-less unit tests (not just
   # `cargo check`) so a runtime/toolchain dependency is caught too.
@@ -226,6 +280,16 @@ jobs:
       # integration suite, with ZIMSERVICE_REQUIRE_DB=1 turning DB-gated skips
       # into hard failures so poller DB writes, run_pipeline, and the whole
       # integration suite all count toward the floor.
+      # No branch-coverage gate on purpose (2026-11 review follow-up): Rust
+      # 1.96's `-C instrument-coverage` emits zero branch regions (verified
+      # with a minimal if/match probe program: `llvm-cov export` reports
+      # `totals.branches.count = 0`), and cargo-llvm-cov has no
+      # `--fail-under-branches` option to gate on anyway. The line floor is
+      # the ratchet; the review's motivating case (an unexercised branch
+      # inside a line-covered function — the wrapped `i64` product in
+      # run_pipeline) is pinned by checked arithmetic in src/embed/pipeline.rs
+      # plus the overflow unit tests there. Revisit if rustc starts emitting
+      # branch regions.
       # `--bins` matters: the binary's DB-gated startup smoke tests
       # (single-instance refusal + the mutating guard's refuse/acquire/release,
       # src/startup.rs) run against a real Postgres. They are schema-free
@@ -357,6 +421,29 @@ jobs:
             exit 1
           fi
           echo "e2e: authenticated /list returned 200"
+          # 2026-10 review (Tests): one authenticated SEARCH assertion — the
+          # e2e was list-only, so the search path (query parsing, settings
+          # snapshot, the three search arms against an empty DB) had no
+          # image-level coverage. An empty-DB search must return 200 with a
+          # JSON body (results: []), not a 500 from a missing extension or
+          # a mis-applied M-1 gate.
+          body=$(curl -s -w ' %{http_code}' \
+            -H "Authorization: Bearer e2e-ci-password" \
+            "http://127.0.0.1:8899/search?q=zimservice" || true)
+          code=${body##* }
+          if [ "$code" != "200" ]; then
+            echo "e2e: authenticated /search returned ${code:-none} (want 200): $body" >&2
+            docker logs zimservice-e2e
+            exit 1
+          fi
+          case "$body" in
+            *results*) echo "e2e: authenticated /search returned 200 with a results body" ;;
+            *)
+              echo "e2e: authenticated /search body lacked a results field: $body" >&2
+              docker logs zimservice-e2e
+              exit 1
+              ;;
+          esac
       # Always tear the container down (success or failure) — see the
       # cleanup note above the run step.
       - if: always()

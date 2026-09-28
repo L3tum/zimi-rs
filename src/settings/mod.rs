@@ -25,6 +25,7 @@ mod tokens;
 pub use auth::{hash_admin_password, is_legacy_password, verify_admin_password};
 pub use auth_service::SettingsAuth;
 pub use cache::SettingsCache;
+pub(crate) use defs::default_value;
 pub use defs::{
     def, default_settings, is_security_sensitive, known_keys, require_reads_startup_default,
     JsonType, SettingDef, SettingPolicy, UrlPolicy, ACCESS_MODE_OPEN, ACCESS_MODE_PASSWORD,
