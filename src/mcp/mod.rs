@@ -738,7 +738,6 @@ async fn tool_list_collections(state: &AppState) -> Value {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
-    use utoipa::OpenApi;
 
     // ── MCP↔HTTP contract (2026-10 review, Architecture) ────────────────
 
@@ -748,7 +747,12 @@ mod tests {
     /// pure-data test stops SEMANTIC drift (a parameter cap/default that
     /// agrees structurally but diverges in value) — e.g. the MCP `read`
     /// tool used to hardcode `8000` while the HTTP `GET /read` handler is
-    /// bounded by `content::DEFAULT_READ_MAX_LENGTH`.
+    /// bounded by `content::DEFAULT_READ_MAX_LENGTH`. The HTTP OpenAPI
+    /// description side of the cross-surface invariant is pinned in
+    /// `serve::openapi` (`read_max_length_param_advertises_shared_default`) —
+    /// the boundary lint forbids `src/mcp` → `crate::serve` references, test
+    /// code included, so both surfaces are pinned against the shared leaf
+    /// constant from their own layer.
     #[test]
     fn mcp_tool_schema_matches_http_handler_constants() {
         let tools = tool_definitions();
@@ -800,24 +804,6 @@ mod tests {
             mcp_search,
             format!("Max results (default {seed_default})"),
             "MCP search.limit drifted from the search.default_limit seed"
-        );
-
-        // Cross-surface: the HTTP OpenAPI advertises the same read default.
-        let http = serde_json::to_value(crate::serve::openapi::ApiDoc::openapi())
-            .expect("OpenAPI serializes");
-        let http_read_desc = http["paths"]["/read"]["get"]["parameters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["name"] == "max_length")
-            .and_then(|p| p["description"].as_str())
-            .expect("HTTP /read max_length parameter present");
-        assert!(
-            http_read_desc.contains(&format!(
-                "default {}",
-                crate::content::DEFAULT_READ_MAX_LENGTH
-            )),
-            "HTTP /read max_length description drifted: {http_read_desc}"
         );
     }
 

@@ -275,6 +275,35 @@ mod tests {
         assert!(mut_req.is_array());
     }
 
+    /// Cross-surface pin, HTTP side (the MCP side is
+    /// `mcp::mcp_tool_schema_matches_http_handler_constants`): the OpenAPI
+    /// `GET /read` `max_length` description must advertise the same default
+    /// the handler is bounded by — `content::DEFAULT_READ_MAX_LENGTH` (the
+    /// description literal in `handlers::content::read_article` is a
+    /// hardcoded `8000`; this pin is what keeps it tracking the constant).
+    /// Both surfaces are pinned against the shared leaf constant from their
+    /// own layer because the boundary lint forbids `src/mcp` →
+    /// `crate::serve` references, test code included (2026-10 review fix).
+    #[test]
+    fn read_max_length_param_advertises_shared_default() {
+        let json = serde_json::to_value(ApiDoc::openapi()).expect("spec serializes");
+        let params = json["paths"]["/read"]["get"]["parameters"]
+            .as_array()
+            .expect("read has parameters");
+        let desc = params
+            .iter()
+            .find(|p| p["name"] == "max_length")
+            .and_then(|p| p["description"].as_str())
+            .expect("HTTP /read max_length parameter present");
+        assert!(
+            desc.contains(&format!(
+                "default {}",
+                crate::content::DEFAULT_READ_MAX_LENGTH
+            )),
+            "HTTP /read max_length description drifted: {desc}"
+        );
+    }
+
     /// Mirrors `examples/dump_spec.rs` (the `cargo run --example dump_spec >
     /// openapi.json` path) so that exact code path is exercised in the suite,
     /// not only compile-checked: build the doc, pretty-serialize it, and

@@ -148,7 +148,7 @@ pub struct SettingDef {
     /// Expected JSON type for the stored value (write-time type-checking).
     pub json_type: JsonType,
     /// Optional closed range a stored `Int` value must fall in — enforced at
-    /// write time by [`type_mismatch`] (2026-10 review fix: the embedding
+    /// write time by `type_mismatch` (2026-10 review fix: the embedding
     /// pipeline's `batch_size × max_concurrency` product overflowed `i64`
     /// on an out-of-range `embedding.max_concurrency`; a value outside its
     /// downstream bounds must be rejected at the write, not wrapped by an
