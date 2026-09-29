@@ -1,0 +1,159 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  release:
+    types:
+      - published
+
+# Least-privilege GITHUB_TOKEN: no job here needs write access (the
+# forgejo publish branch authenticates with the PACKAGE_TOKEN secret, not
+# GITHUB_TOKEN). If this repo is ever mirrored to GitHub and the gchr
+# branch below starts firing, that branch pushes with GITHUB_TOKEN and
+# will need `packages: write` — bump the token then.
+permissions:
+  contents: read
+
+# Runner notes (self-hosted, act-based — same conventions as ci.yml):
+# - Host-network runner with a fixed postgres port per job: 5432-5437 are
+#   taken (ci.yml test/msrv-db/coverage/docker/web-browser-smoke, bench.yml
+#   bench=5436), so this job uses 5438.
+# - The e2e container is named `zimservice-e2e-release` (ci.yml's docker
+#   job uses `zimservice-e2e`): the runner is persistent, so a shared name
+#   would collide on `docker run` after a previous run.
+# - The cross-repo `uses:` (l3tum/reusable-workflows) resolves to workflow
+#   YAML fetched from github.com — not an action Docker image — so the
+#   data.forgejo.org mirror 404 note in ci.yml (actions/* only) does not
+#   apply; the fleet's github.com egress (cf. the audit job's advisory-db
+#   clone) covers it.
+# - The forgejo publish branch reads repo VARS `INTERNAL_DOCKER_REGISTRY`
+#   and `INTERNAL_DOCKER_USERNAME` plus the `PACKAGE_TOKEN` secret —
+#   configure them in this repo's Forgejo settings (same as doc-worker's
+#   fleet).
+
+jobs:
+  # Release gate: build the exact image that gets published and boot it
+  # against a real Postgres (adapted from ci.yml's `docker` job — the
+  # image-level gate is what a release tag needs; the cargo
+  # unit/integration/lint gates run in ci.yml on master push). Runs on
+  # every trigger of this workflow so a release is never gated on a green
+  # we didn't measure.
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16   # stock postgres:16 lacks the `vector` extension migration 001 creates
+        env:
+          POSTGRES_USER: zimservice
+          POSTGRES_PASSWORD: zimservice
+          POSTGRES_DB: zimservice
+          # Host-network runner (note at top): this job's real port.
+          PGPORT: "5438"
+        ports: ["5438:5438"]
+        options: >-
+          --health-cmd "pg_isready -U zimservice -p 5438"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t zimservice:release .
+      # e2e: `--network host` puts the app in the host network, where its
+      # 0.0.0.0:8899 bind is reachable at 127.0.0.1 and the postgres
+      # service is at localhost:5438 (its real port — the host-network
+      # runner ignores `ports:` mappings; see the note at the top).
+      # `HOST=0.0.0.0` + `ACCESS_MODE=password` is the only startup
+      # combination allowed on a non-loopback bind (open mode is refused
+      # at boot — the Threat model). `ZIMSERVICE_REQUIRE_DB=1` turns a
+      # misrouted DATABASE_URL into a hard boot failure.
+      - run: |
+          docker rm -f zimservice-e2e-release >/dev/null 2>&1 || true
+          docker run -d --name zimservice-e2e-release --network host \
+            -e DATABASE_URL=postgres://zimservice:zimservice@localhost:5438/zimservice \
+            -e ZIMSERVICE_REQUIRE_DB=1 \
+            -e HOST=0.0.0.0 \
+            -e ACCESS_MODE=password \
+            -e AUTH_PASSWORD=e2e-release-password \
+            zimservice:release
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8899/health >/dev/null 2>&1; then
+              echo "release-e2e: /health is green"
+              break
+            fi
+            sleep 2
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8899/health || true)
+          if [ "$code" != "200" ]; then
+            echo "release-e2e: /health never went green (last status: ${code:-none})" >&2
+            docker logs zimservice-e2e-release
+            exit 1
+          fi
+          # M-1 read gate: unauthenticated GET /list must be rejected
+          # (401 for no credential, 403 for a valid-but-unscoped one).
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8899/list || true)
+          case "$code" in
+            401|403)
+              echo "release-e2e: unauthenticated /list rejected as required ($code)"
+              ;;
+            *)
+              echo "release-e2e: unauthenticated /list returned ${code:-none} (want 401/403 — the M-1 read gate)" >&2
+              docker logs zimservice-e2e-release
+              exit 1
+              ;;
+          esac
+          # Happy path: authenticated GET /list (admin password as Bearer)
+          # must return 200.
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer e2e-release-password" http://127.0.0.1:8899/list || true)
+          if [ "$code" != "200" ]; then
+            echo "release-e2e: authenticated /list returned ${code:-none} (want 200)" >&2
+            docker logs zimservice-e2e-release
+            exit 1
+          fi
+      # Always tear the container down (success or failure) — persistent
+      # runner, see the note at the top.
+      - if: always()
+        run: docker rm -f zimservice-e2e-release >/dev/null 2>&1 || true
+
+  # Push only on a published release — identical gate to doc-worker's.
+  should-push:
+    runs-on: ubuntu-latest
+    outputs:
+      should_push: ${{ steps.push_check.outputs.should_push }}
+    steps:
+      - id: push_check
+        run: |
+          if [ "${{github.event_name}}" = "release" ] && [ "${{github.event.action}}" = "published" ]; then
+            echo "should_push=true"
+            echo "should_push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_push=false"
+            echo "should_push=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Single-variant binary: one publish job. doc-worker splits cpu/cuda via
+  # RELEASE_TAG overrides; here the tag comes from the release ref
+  # (github.ref_name) and PUSH_LATEST defaults to true, so both <tag> and
+  # :latest are pushed.
+  # Deviation from doc-worker: the job is gated on should_push instead of
+  # passing PUSH=false for a build-only pass — the test job above already
+  # builds and boots the image on every trigger, so a second no-push
+  # build on master/PR would only burn contended-runner time.
+  publish-forgejo:
+    needs: [test, should-push]
+    if: github.server_url != 'https://github.com' && needs.should-push.outputs.should_push == 'true'
+    uses: l3tum/reusable-workflows/.github/workflows/publish-forgejo.yml@main
+    with:
+      PUSH: ${{ needs.should-push.outputs.should_push }}
+    secrets:
+      PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+
+  # GitHub-mirror branch (kept for symmetry with doc-worker; this fleet's
+  # server_url is forgejo.mortimer.website, so only the forgejo branch
+  # above fires).
+  publish-gchr:
+    needs: [test, should-push]
+    if: github.server_url == 'https://github.com' && needs.should-push.outputs.should_push == 'true'
+    uses: l3tum/reusable-workflows/.github/workflows/publish-gchr.yml@main
+    with:
+      PUSH: ${{ needs.should-push.outputs.should_push }}
