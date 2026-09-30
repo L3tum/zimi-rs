@@ -31,11 +31,17 @@ permissions:
 # fuzz_opds targets; see fuzz/README.md) — local runs stay the fast
 # iteration path between gate runs.
 # Runner notes (self-hosted, act-based):
-# - Why nightly: cargo-fuzz requires a nightly toolchain. The job pins
-#   nightly-2026-09-25 (verified to exist on static.rust-lang.org) for
-#   reproducibility. The repo pins 1.96.0 via rust-toolchain.toml; the
-#   per-job rustup default is set by the setup-rust composite action, so
-#   this job's nightly does not disturb the 1.96.0 default anywhere else.
+# - Why nightly: cargo-fuzz requires a nightly toolchain (the harnesses
+#   build with -Zsanitizer=address, a nightly-only rustc flag). The job
+#   pins nightly-2026-09-25 (verified to exist on static.rust-lang.org)
+#   for reproducibility. The repo root pins 1.96.0 via rust-toolchain.toml,
+#   and rustup's toolchain-file resolution outranks `rustup default`
+#   (the setup-rust step sets the default — that alone would lose to the
+#   root file), so the job instead exports RUSTUP_TOOLCHAIN: the
+#   highest-priority override, same pattern as the msrv jobs in ci.yml.
+#   It covers both the outer `cargo fuzz` and the inner `cargo build`
+#   cargo-fuzz spawns, and it does not disturb the 1.96.0 default
+#   anywhere else.
 # - Why paths + schedule instead of every PR: low-frequency gate — the
 #   self-hosted act-based runner fleet makes per-PR nightly bootstrap
 #   costly. On this host the schedule trigger may be inert (act does not
@@ -46,6 +52,15 @@ permissions:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
+    # cargo-fuzz builds the harnesses with -Zsanitizer=address (nightly-
+    # only). The repo-root rust-toolchain.toml (1.96.0) outranks the
+    # `rustup default` the setup-rust step sets, so plain `cargo` here
+    # would resolve 1.96.0 and fail on the -Z flags; RUSTUP_TOOLCHAIN
+    # outranks the toolchain file (same pattern as the msrv jobs in
+    # ci.yml), on the outer `cargo fuzz` and the inner `cargo build`
+    # cargo-fuzz spawns alike.
+    env:
+      RUSTUP_TOOLCHAIN: "nightly-2026-09-25"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
