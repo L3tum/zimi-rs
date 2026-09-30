@@ -407,26 +407,36 @@ mod tests {
     }
 
     #[test]
-    fn refresh_keeps_entry_fresh_within_ttl() {
+    fn refresh_restarts_freshness_window() {
         // A re-record of an existing token restarts its freshness window
         // (the production behavior: repeat traffic keeps the entry alive —
         // the window runs from the LAST record, since `record` stamps
         // `Instant::now()` on every hit).
+        //
+        // Every assert runs in the "sleep outlived the TTL" direction:
+        // under CI load a real sleep only ever runs LONG, so "stale after
+        // sleeping past the TTL" is robust, while "still fresh after a
+        // sleep" is not — the original t=20 ms fresh assert needed a 10 ms
+        // sleep to land under the 20 ms TTL, and a contended coverage
+        // runner stretched it past the TTL. The re-record assert below has
+        // no sleep at all (timing-independent), and `record` re-stamps
+        // unconditionally — fresh or not — so a re-record after expiry
+        // exercises the same path as a mid-window refresh.
         let mut cache =
             VerifiedTokenCache::with_ttl(Duration::from_millis(20), Duration::from_millis(20));
         cache.record("tok", true);
-        std::thread::sleep(Duration::from_millis(10));
-        cache.record("tok", true); // refresh at t=10 ms
-        std::thread::sleep(Duration::from_millis(10));
-        assert!(
-            cache.is_fresh("tok"),
-            "refreshed entry is fresh again at t=20 ms"
-        );
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(60));
         assert!(
             !cache.is_fresh("tok"),
-            "expired at t=35 ms (refresh + 20 ms TTL)"
+            "expired at t=60 ms (record + 20 ms TTL)"
         );
+        cache.record("tok", true); // refresh: re-stamp the existing entry
+        assert!(
+            cache.is_fresh("tok"),
+            "re-record restarts the freshness window (the original stamp is past TTL)"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!cache.is_fresh("tok"), "expired 20 ms after the refresh");
     }
 
     #[test]
