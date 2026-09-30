@@ -107,6 +107,29 @@ on the local server, so only a superuser can create it. In a reset/provision
 script that recreates the role, use `ALTER ROLE zimservice SUPERUSER;` (or
 `CREATE ROLE zimservice LOGIN SUPERUSER PASSWORD 'zimservice';`).
 
+## CI convention: postgres runs on a private per-job network — never a host port
+
+The self-hosted act runner puts **job containers on the host network**, where
+the `services:` block's `ports:` mappings are a no-op and service hostnames
+don't resolve. The old scheme (one fixed real port per job, 5432-5438) caused
+port collisions as jobs were added, and the two 8899 e2e apps (ci.yml `docker`
+job vs release.yml, both on master push) could collide across workflows.
+
+**Convention (2026-11):** every DB-backed CI job boots its own throwaway
+pgvector container on a **private per-job docker network** via
+`./.github/actions/ci-postgres` (bring-up, after `actions/checkout`) and adds
+`./.github/actions/ci-postgres-teardown` as an `if: always()` step. Postgres
+listens on **5432 inside the container** (no host port — nothing can collide);
+the job reaches it at the bridge IP the action exports as `$ZIM_PG_IP`
+(`postgres://zimservice:zimservice@$ZIM_PG_IP:5432/zimservice`). The e2e app
+containers (ci.yml `docker`, release.yml `test`) **join the same network**
+(`--network "$ZIM_PG_NET"`) and are reached at their own bridge IP — no host
+port for the app either. When adding a new DB-backed job, use these two
+actions — do NOT revive a `services:` block or a `PGPORT`/`ports:` host-port
+scheme. Residual host port: 8877 (web-browser-smoke's in-job app process;
+it is a bare process inside the host-network job, not a container). See the
+runner note at the top of `.github/workflows/ci.yml` for the full rationale.
+
 ## Gotcha: trailing whitespace is load-bearing — never bulk-strip it
 
 Several multi-line Rust string literals use the `\` line-continuation form

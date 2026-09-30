@@ -1,0 +1,20 @@
+# Tears down the container + network created by ./.github/actions/ci-postgres
+# (reads ZIM_PG / ZIM_PG_NET from the job env that action exported).
+#
+# Run as an `if: always()` step so a failed job never leaks a live postgres
+# (the runner is persistent — a leaked container would outlive the job the
+# way the e2e apps used to). ci-postgres exports ZIM_PG / ZIM_PG_NET before
+# it touches docker, so even a FAILED bring-up is reaped here. It no-ops
+# only when the job never reached the bring-up step itself (nothing was
+# created), so it is safe to place unconditionally.
+name: ci-postgres-teardown
+runs:
+  using: composite
+  steps:
+    - name: Teardown postgres (always)
+      shell: bash
+      run: |
+        if [ -n "${ZIM_PG:-}" ]; then
+          docker rm -f "$ZIM_PG" >/dev/null 2>&1 || true
+          docker network rm "${ZIM_PG_NET:-}" >/dev/null 2>&1 || true
+        fi
