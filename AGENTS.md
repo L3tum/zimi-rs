@@ -107,28 +107,59 @@ on the local server, so only a superuser can create it. In a reset/provision
 script that recreates the role, use `ALTER ROLE zimservice SUPERUSER;` (or
 `CREATE ROLE zimservice LOGIN SUPERUSER PASSWORD 'zimservice';`).
 
-## CI convention: postgres runs on a private per-job network — never a host port
+## Runner: job containers ride the runner's per-job network (not the host network)
 
-The self-hosted act runner puts **job containers on the host network**, where
-the `services:` block's `ports:` mappings are a no-op and service hostnames
-don't resolve. The old scheme (one fixed real port per job, 5432-5438) caused
-port collisions as jobs were added, and the two 8899 e2e apps (ci.yml `docker`
-job vs release.yml, both on master push) could collide across workflows.
+The runner config's `container.network` is empty ("" — the runner's
+documented default). Then for every job the runner creates a **fresh private
+docker network** and puts the job container **and** any `services:`
+containers on it together: service hostnames resolve, `ports:` mappings are
+unneeded, and the whole network is torn down with the job.
 
-**Convention (2026-11):** every DB-backed CI job boots its own throwaway
-pgvector container on a **private per-job docker network** via
-`./.github/actions/ci-postgres` (bring-up, after `actions/checkout`) and adds
-`./.github/actions/ci-postgres-teardown` as an `if: always()` step. Postgres
-listens on **5432 inside the container** (no host port — nothing can collide);
-the job reaches it at the bridge IP the action exports as `$ZIM_PG_IP`
-(`postgres://zimservice:zimservice@$ZIM_PG_IP:5432/zimservice`). The e2e app
-containers (ci.yml `docker`, release.yml `test`) **join the same network**
-(`--network "$ZIM_PG_NET"`) and are reached at their own bridge IP — no host
-port for the app either. When adding a new DB-backed job, use these two
-actions — do NOT revive a `services:` block or a `PGPORT`/`ports:` host-port
-scheme. Residual host port: 8877 (web-browser-smoke's in-job app process;
-it is a bare process inside the host-network job, not a container). See the
-runner note at the top of `.github/workflows/ci.yml` for the full rationale.
+History (why this matters): with `container.network: bridge` (the static
+shared bridge) services couldn't join the job's network at all, and host-
+published ports were unreachable from inside the job (`127.0.0.1` there is
+the container's own loopback) — that configuration "didn't work at all".
+With `container.network: host` everything became reachable (the job
+container *is* the host's network namespace), but every job in every repo
+then shared the host's ports: the old one-fixed-port-per-job postgres scheme
+(5432-5438) collided as jobs were added, and the two 8899 e2e apps (ci.yml
+`docker` job vs release.yml) could collide across workflows.
+
+Cross-step env files: while job containers rode the **host** network,
+`$GITHUB_ENV` writes did NOT propagate between steps (2026-11, observed with
+the old cross-step ci-postgres actions — `ZIM_PG*` came out empty in consumer
+steps). With the per-job network (""), BOTH `$GITHUB_ENV` and `$FORGEJO_ENV`
+propagate (verified by the 2026-11 probe workflow). The CI postgres design
+below does not rely on either.
+
+## CI convention: DB jobs declare postgres as a runner `services:` entry — never a host port
+
+**Convention (2026-11, runner-native):** every DB-backed CI job declares
+postgres as a `services:` entry — image `pgvector/pgvector:pg16`, env
+`POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` = `zimservice`, and **no
+`ports:`** (the service sits on the job's own private per-job network, see
+above). The job reaches it by the name `postgres`
+(`postgres://zimservice:zimservice@postgres:5432/zimservice`) and waits for
+readiness with a `/dev/tcp/postgres/5432` poll (30×1s). The runner owns
+bring-up, the network, and teardown.
+
+The e2e app containers (ci.yml `docker`, release.yml `test`) are `docker
+run` onto the **job's own per-job network** — discovered by matching the
+job's own IP against `docker network inspect` (`{{.IPv4Address}}` is
+CIDR-suffixed, e.g. `172.20.0.3/16`) — so they reach `postgres` by name;
+the job reaches the app by **container name** (user-defined-network DNS).
+The app's `0.0.0.0:8899` bind then lives on the per-job bridge only: no
+host port for the app either, so the two 8899 apps can no longer collide.
+web-browser-smoke's app is a bare process in the job container on
+`127.0.0.1:8877` (the container's own loopback): zero collision surface.
+
+The `zimservice` role is a **superuser** in that image (the entrypoint makes
+`POSTGRES_USER` one) — required, because the migrations' `CREATE EXTENSION
+vector` needs a superuser (pgvector's `vector` extension is `trusted =
+false`). When adding a new DB-backed job, declare the service exactly this
+way — do NOT revive a host-port/`ports:` scheme or a manual `docker
+network`/`docker run` postgres circus. Full rationale: the runner note at
+the top of `.github/workflows/ci.yml`.
 
 ## Gotcha: trailing whitespace is load-bearing — never bulk-strip it
 

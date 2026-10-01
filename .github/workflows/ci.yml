@@ -18,27 +18,29 @@ permissions:
 # - The actions/* @v7 steps (checkout, setup-node) run on the runner's
 #   Node 24 (the @v4 series ran on node20). The act-latest runner image
 #   ships Node 24, so this holds today; revisit if the image changes.
-# - The runner's JOB containers ride the host network (act-based runner
-#   config), so anything a job binds is bound on the HOST — and services
-#   inherit the host network too, where `ports:` mappings are a no-op and
-#   service hostnames don't resolve. The old scheme (one fixed real port
-#   per job — test=5432, msrv-db=5433, coverage=5434, docker=5435,
-#   web-browser-smoke=5437, bench=5436, release=5438) collided as jobs were
-#   added: a losing postgres can never bind and never goes healthy, and the
-#   two 8899 e2e apps (docker job vs release.yml, both on master push) could
-#   collide across workflows.
-#   Postgres now NEVER takes a host port: each job boots its own throwaway
-#   pgvector container on a PRIVATE per-job docker network
-#   (.github/actions/ci-postgres) — 5432 inside the container, reached from
-#   the job at the bridge IP ($ZIM_PG_IP), torn down in an `if: always()`
-#   step (.github/actions/ci-postgres-teardown). No host port => no
-#   cross-job or host-service collision, by construction. The e2e app
-#   containers (docker job, release.yml) join the same private network and
-#   are reached at their own bridge IP, so the two 8899 apps no longer share
-#   a host port either.
-#   Residual host port: 8877 (web-browser-smoke's in-job app process — it is
-#   a bare process inside the host-network job, 127.0.0.1-only; collides
-#   only with a concurrent ci.yml run or a leaked process from a killed run).
+# - The runner creates a fresh PRIVATE docker network per job (runner
+#   config `container.network: ""`) and puts the job container AND any
+#   `services:` containers on it together — so service hostnames resolve,
+#   `ports:` are unnecessary, and the runner tears the whole thing down
+#   with the job. (History: with `container.network: bridge` the services
+#   couldn't join the job's network at all and host-published ports were
+#   unreachable from inside the job; with `: host` every job in every repo
+#   shared the host's ports — the old one-fixed-port-per-job scheme
+#   (test=5432, msrv-db=5433, coverage=5434, docker=5435, web-browser-
+#   smoke=5437, bench=5436, release=5438) collided as jobs were added, and
+#   the two 8899 e2e apps (docker job vs release.yml, both on master push)
+#   could collide across workflows. Full history: AGENTS.md.)
+#   Postgres therefore NEVER takes a host port: each DB-backed job declares
+#   it as a `services:` entry (image pgvector/pgvector:pg16, POSTGRES_USER/
+#   PASSWORD/DB = zimservice, NO `ports:`) and reaches it by the name
+#   `postgres` (5432 inside the container), waiting with a /dev/tcp
+#   readiness poll. The e2e app containers (docker job, release.yml) are
+#   docker-run onto the JOB'S OWN per-job network (discovered by matching
+#   the job's own IP in `docker network inspect`) so they reach `postgres`
+#   by name, and the job reaches them by container name (user-defined-
+#   network DNS) — no host port for the app either. web-browser-smoke's
+#   127.0.0.1:8877 app process is bare inside the job container (the
+#   container's own loopback — not a host port): zero collision surface.
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -110,30 +112,45 @@ jobs:
   # Exercises the library and search pages against a LIVE zimservice
   # process — the layer the jsdom suite (web-lint job) and the HTTP
   # wiremock tests cannot cover (2026-10 review, Tests: no real-browser
-  # coverage). Postgres on a private per-job network (note at top —
-  # $ZIM_PG_IP); the app is a bare in-job process on 127.0.0.1:8877, the
-  # one residual host port (job containers ride the host network). Open
-  # mode on a loopback bind is allowed by the boot policy, so no auth env is
-  # needed.
+  # coverage). Postgres is the runner-managed `services:` entry (note at
+  # top); the app is a bare in-job process on 127.0.0.1:8877 (the job
+  # container's own loopback — not a host port, so no collision surface).
+  # Open mode on a loopback bind is allowed by the boot policy, so no auth
+  # env is needed.
   web-browser-smoke:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: zimservice
+          POSTGRES_PASSWORD: zimservice
+          POSTGRES_DB: zimservice
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with: { node-version: 22 }
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0" }
-      # Private per-job postgres (note at top): 5432 inside the container,
-      # reached at the bridge IP — no host port.
-      - uses: ./.github/actions/ci-postgres
       - run: npm install --no-audit --no-fund
       # Chromium + its system libs; fall back to the bare browser download
       # if the runner can't apt (system deps may already be present).
       - run: npx playwright install --with-deps chromium || npx playwright install chromium
       - run: cargo build --release --bin zimservice
       - run: |
+          set -euo pipefail
+          # Postgres: the runner-managed service on this job's per-job
+          # network (note at top) — wait for it by name.
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null \
+            || { echo "web-browser-smoke: postgres:5432 never opened" >&2; exit 1; }
           ZIM_DIR=$(mktemp -d) \
-          DATABASE_URL=postgres://zimservice:zimservice@$ZIM_PG_IP:5432/zimservice \
+          DATABASE_URL=postgres://zimservice:zimservice@postgres:5432/zimservice \
           ZIMSERVICE_REQUIRE_DB=1 \
           HOST=127.0.0.1 \
           PORT=8877 \
@@ -150,9 +167,6 @@ jobs:
           ZIMSERVICE_BASE_URL=http://127.0.0.1:8877 \
             npx playwright test --config tests/web/playwright.config.mjs
           kill "$SERVER_PID" 2>/dev/null || true
-      # Private-network postgres (ci-postgres action) — always.
-      - if: always()
-        uses: ./.github/actions/ci-postgres-teardown
   # MSRV gate: fail CI if the code silently requires a newer toolchain than
   # the declared `rust-version` (1.94). Runs the DB-less unit tests (not just
   # `cargo check`) so a runtime/toolchain dependency is caught too.
@@ -175,6 +189,13 @@ jobs:
   # through. Runs the same DB-backed selection as `test`, but pinned to 1.94.
   msrv-db:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: zimservice
+          POSTGRES_PASSWORD: zimservice
+          POSTGRES_DB: zimservice
     # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml (1.96.0) — see `msrv`.
     env:
       RUSTUP_TOOLCHAIN: "1.94"
@@ -186,16 +207,21 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.94" }
-      # Private per-job postgres (note at top): 5432 inside the container,
-      # reached at the bridge IP — no host port.
-      - uses: ./.github/actions/ci-postgres
+      # Postgres: the runner-managed service on this job's per-job network
+      # (note at top) — wait for it by name, then run the DB-backed suite.
       - run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null \
+            || { echo "msrv-db: postgres:5432 never opened" >&2; exit 1; }
           ZIMSERVICE_REQUIRE_DB=1 \
-          DATABASE_URL=postgres://zimservice:zimservice@$ZIM_PG_IP:5432/zimservice \
+          DATABASE_URL=postgres://zimservice:zimservice@postgres:5432/zimservice \
           cargo test --lib --bins --test wiremock --test integration
-      # Private-network postgres (ci-postgres action) — always.
-      - if: always()
-        uses: ./.github/actions/ci-postgres-teardown
   # Rustdoc gate: catch broken intra-doc links and doc build failures.
   # `--all-features` also compiles the `testing` feature's docs (src/
   # testing.rs), so a broken intra-doc link there can't stay latent: the
@@ -217,6 +243,13 @@ jobs:
   # failure there must not vacate DB-backed regression coverage.
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: zimservice
+          POSTGRES_PASSWORD: zimservice
+          POSTGRES_DB: zimservice
     env:
       # Contended runner (parallel DB jobs + cold compiles): extra wall-clock
       # for the real-clock loop tests (`loop_wait_budget`, src/embed/
@@ -226,18 +259,30 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0" }
-      # Private per-job postgres (note at top): 5432 inside the container,
-      # reached at the bridge IP — no host port.
-      - uses: ./.github/actions/ci-postgres
+      # Postgres: the runner-managed service on this job's per-job network
+      # (note at top) — wait for it by name, then run the DB-backed suite.
       - run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null \
+            || { echo "test: postgres:5432 never opened" >&2; exit 1; }
           ZIMSERVICE_REQUIRE_DB=1 \
-          DATABASE_URL=postgres://zimservice:zimservice@$ZIM_PG_IP:5432/zimservice \
+          DATABASE_URL=postgres://zimservice:zimservice@postgres:5432/zimservice \
           cargo test --lib --bins --test wiremock --test integration
-      # Private-network postgres (ci-postgres action) — always.
-      - if: always()
-        uses: ./.github/actions/ci-postgres-teardown
   coverage:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: zimservice
+          POSTGRES_PASSWORD: zimservice
+          POSTGRES_DB: zimservice
     env:
       # Contended runner (parallel DB jobs + cold compiles): extra wall-clock
       # for the real-clock loop tests (`loop_wait_budget`, src/embed/
@@ -247,9 +292,6 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0", components: "llvm-tools-preview" }
-      # Private per-job postgres (note at top): 5432 inside the container,
-      # reached at the bridge IP — no host port.
-      - uses: ./.github/actions/ci-postgres
       # The mirror has no taiki-e/install-action — build the same tool from
       # crates.io (llvm-tools-preview, above, is its runtime dependency).
       - run: cargo install cargo-llvm-cov
@@ -283,14 +325,22 @@ jobs:
       # Raise the floor in .github/coverage_floor.txt after a DB-backed run to
       # lock in the gain — the job fails if measured coverage drops below it,
       # so the floor can only effectively rise.
+      # Postgres: the runner-managed service on this job's per-job network
+      # (note at top) — wait for it by name, then run the instrumented suite.
       - run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null \
+            || { echo "coverage: postgres:5432 never opened" >&2; exit 1; }
           ZIMSERVICE_REQUIRE_DB=1 \
-          DATABASE_URL=postgres://zimservice:zimservice@$ZIM_PG_IP:5432/zimservice \
+          DATABASE_URL=postgres://zimservice:zimservice@postgres:5432/zimservice \
           cargo llvm-cov --lib --bins --test wiremock --test integration \
             --fail-under-lines "$(cat .github/coverage_floor.txt)"
-      # Private-network postgres (ci-postgres action) — always.
-      - if: always()
-        uses: ./.github/actions/ci-postgres-teardown
   # RUSTSEC audit (2026-09 review, Sec): fail CI on known-vulnerable
   # dependencies — `cargo audit` reads `Cargo.lock` only. The lock file was
   # inspected clean in the review; this pins that against future
@@ -322,28 +372,32 @@ jobs:
   # bind/auth startup refusal) that compiles fine.
   docker:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: zimservice
+          POSTGRES_PASSWORD: zimservice
+          POSTGRES_DB: zimservice
     steps:
       - uses: actions/checkout@v7
-      # Private per-job postgres (note at top) — the e2e app below JOINS this
-      # job's network and reaches the database at $ZIM_PG_IP, so neither the
-      # database nor the app takes a host port.
-      - uses: ./.github/actions/ci-postgres
       - run: docker build -t zimservice:ci .
-      # e2e: the app JOINS this job's private network (the ci-postgres
-      # action's $ZIM_PG_NET) instead of the host network — its 0.0.0.0:8899
-      # bind then lives on the bridge, reached from the job at the app's own
-      # bridge IP ($APP_IP), so NO host port is taken at all (the old
-      # host-network bind collided with release.yml's e2e app on 8899
-      # whenever the two workflows overlapped). Postgres is at
-      # $ZIM_PG_IP:5432 on the same network (no host port either).
+      # e2e: postgres is the runner-managed `services:` entry on this job's
+      # per-job network (note at top — no host port anywhere). The app
+      # container is docker-run onto that SAME network (discovered by
+      # matching the job's own IP) so it reaches `postgres` by name, and
+      # the job reaches the app by container name — so the app's 0.0.0.0:
+      # 8899 bind lives on the per-job bridge only, NO host port is taken
+      # at all (the old host-network bind collided with release.yml's e2e
+      # app on 8899 whenever the two workflows overlapped). The trap reaps
+      # the app container on any exit; the runner reaps the service.
       # `HOST=0.0.0.0` + `ACCESS_MODE=password` is the only
       # startup combination allowed on a non-loopback bind (open mode is
       # refused at boot — the Threat model). `ZIMSERVICE_REQUIRE_DB=1` turns a misrouted
       # DATABASE_URL into a hard boot failure instead of a limp serve.
       # The runner is persistent (self-hosted): a previous
       # run's container outlives this job, so clean up first (exited
-      # container -> `docker run` name Conflict)
-      # and again in the `always()` step below so green runs don't leak.
+      # container -> `docker run` name Conflict); the trap reaps on any exit.
       # The health poll is unauthenticated on purpose: `/health` is public
       # by design (README threat model — version/counts/liveness, "treat as
       # not confidential") and is exempt from the fail-closed 503, the rate
@@ -360,30 +414,56 @@ jobs:
       # -w '%{http_code}'` with `|| true` so a transport failure (000/
       # empty) falls into the failure branch instead of tripping set -e.
       - run: |
+          set -euo pipefail
+          # Postgres: the runner-managed service on this job's per-job
+          # network (note at top) — wait for it by name.
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null \
+            || { echo "e2e: postgres:5432 never opened" >&2; exit 1; }
+          # The app container must sit on THIS job's own per-job network to
+          # reach `postgres` by name: the network that lists a container at
+          # the job's own IP (docker reports CIDR-suffixed addresses).
+          myip="$(hostname -i 2>/dev/null | awk '{print $1}')"
+          [ -n "$myip" ] || { echo "e2e: cannot determine the job container's IP" >&2; exit 1; }
+          mynet=""
+          for net in $(docker network ls -q); do
+            entries="$(docker network inspect -f '{{range .Containers}}{{.Name}}={{.IPv4Address}} {{end}}' "$net")"
+            case " ${entries}" in
+              *"=${myip}/"*) mynet="$net" ;;
+            esac
+          done
+          [ -n "$mynet" ] || { echo "e2e: no network lists a container at ${myip}" >&2; docker network ls; exit 1; }
+          echo "e2e: app container will join the job network '${mynet}'"
+          trap 'docker rm -f zimservice-e2e >/dev/null 2>&1 || true' EXIT
           docker rm -f zimservice-e2e >/dev/null 2>&1 || true
-          docker run -d --name zimservice-e2e --network "$ZIM_PG_NET" \
-            -e DATABASE_URL=postgres://zimservice:zimservice@$ZIM_PG_IP:5432/zimservice \
+          docker run -d --name zimservice-e2e --network "$mynet" \
+            -e DATABASE_URL=postgres://zimservice:zimservice@postgres:5432/zimservice \
             -e ZIMSERVICE_REQUIRE_DB=1 \
             -e HOST=0.0.0.0 \
             -e ACCESS_MODE=password \
             -e AUTH_PASSWORD=e2e-ci-password \
             zimservice:ci
-          APP_IP="$(docker inspect -f '{{range $n, $net := .NetworkSettings.Networks}}{{$net.IPAddress}} {{end}}' zimservice-e2e | tr -d '[:space:]')"
-          [ -n "$APP_IP" ] || { echo "e2e: zimservice-e2e has no bridge IP" >&2; docker logs zimservice-e2e; exit 1; }
+          # The job reaches the app by CONTAINER NAME (user-defined-network
+          # DNS on the job's per-job network) — no host port.
           for i in $(seq 1 30); do
-            if curl -fsS "http://$APP_IP:8899/health" >/dev/null 2>&1; then
+            if curl -fsS "http://zimservice-e2e:8899/health" >/dev/null 2>&1; then
               echo "e2e: /health is green"
               break
             fi
             sleep 2
           done
-          code=$(curl -s -o /dev/null -w '%{http_code}' "http://$APP_IP:8899/health" || true)
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://zimservice-e2e:8899/health" || true)
           if [ "$code" != "200" ]; then
             echo "e2e: /health never went green (last status: ${code:-none})" >&2
             docker logs zimservice-e2e
             exit 1
           fi
-          code=$(curl -s -o /dev/null -w '%{http_code}' "http://$APP_IP:8899/list" || true)
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://zimservice-e2e:8899/list" || true)
           case "$code" in
             401|403)
               echo "e2e: unauthenticated /list rejected as required ($code)"
@@ -395,7 +475,7 @@ jobs:
               ;;
           esac
           code=$(curl -s -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer e2e-ci-password" "http://$APP_IP:8899/list" || true)
+            -H "Authorization: Bearer e2e-ci-password" "http://zimservice-e2e:8899/list" || true)
           if [ "$code" != "200" ]; then
             echo "e2e: authenticated /list returned ${code:-none} (want 200)" >&2
             docker logs zimservice-e2e
@@ -410,7 +490,7 @@ jobs:
           # a mis-applied M-1 gate.
           body=$(curl -s -w ' %{http_code}' \
             -H "Authorization: Bearer e2e-ci-password" \
-            "http://$APP_IP:8899/search?q=zimservice" || true)
+            "http://zimservice-e2e:8899/search?q=zimservice" || true)
           code=${body##* }
           if [ "$code" != "200" ]; then
             echo "e2e: authenticated /search returned ${code:-none} (want 200): $body" >&2
@@ -425,13 +505,6 @@ jobs:
               exit 1
               ;;
           esac
-      # Always tear the container down (success or failure) — see the
-      # cleanup note above the run step.
-      - if: always()
-        run: docker rm -f zimservice-e2e >/dev/null 2>&1 || true
-      # Private-network postgres (ci-postgres action) — always.
-      - if: always()
-        uses: ./.github/actions/ci-postgres-teardown
   # Cross-platform smoke (macOS/Windows): removed — this runner fleet is
   # Linux-only (no macos-latest/windows-latest labels exist to schedule on).
   # Re-add a matrix job here if non-Linux runners appear.
