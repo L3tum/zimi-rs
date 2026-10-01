@@ -170,7 +170,7 @@ jobs:
             entries="$(docker network inspect -f '{{range .Containers}}{{.Name}}={{.IPv4Address}} {{end}}' "$net")"
             echo "network ${net}: ${entries}"
             case " ${entries}" in
-              *"=${myip} "*) mynet="$net" ;;
+              *"=${myip}/"*) mynet="$net" ;;
             esac
           done
           [ -n "$mynet" ] || { echo "PROBE FAIL: no network lists a container at ${myip} (the job's own network?)"; exit 1; }
