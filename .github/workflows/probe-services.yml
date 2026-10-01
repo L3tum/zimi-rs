@@ -11,8 +11,9 @@
 #      container (only possible on the runner-created per-job network).
 #   2. postgres:5432 accepts TCP via bash /dev/tcp — the exact readiness
 #      check the migrated CI jobs will use.
-#   3. The Postgres wire handshake succeeds with zimservice/zimservice
-#      (proves the POSTGRES_* env reached the service container).
+#   3. The Postgres wire handshake gets an auth-request 'R' for
+#      user/database zimservice (the role only exists if the POSTGRES_*
+#      env reached the service container).
 #   4. The job container is NOT on the host network anymore (egress
 #      source IP should be a private bridge address, not host LAN).
 #   5. The docker socket is still available (the e2e jobs' docker
@@ -21,16 +22,18 @@
 #   6. Outbound internet from the job container (crates.io, etc.).
 #   7. Whether cross-step env files propagate: both $GITHUB_ENV (legacy)
 #      and $FORGEJO_ENV (the documented Forgejo name) are written and read
-#      back. Known: GITHUB_ENV writes did not propagate on this runner;
-#      FORGEJO_ENV may be the mechanism that actually works. Informational
-#      — the new CI design does not rely on either.
+#      back. (On this runner, GITHUB_ENV writes stopped propagating while
+#      job containers ran on the host network; both names are re-tested
+#      here after the network change.) Informational — the new CI design
+#      does not rely on either.
 #
 # Expected log on success:
 #   hostname resolves; "port open on attempt N";
-#   "wire probe: server answered 'R' (0x52)";
+#   "wire probe: server answered 'R' (0x52)" (auth request = role
+#   'zimservice' exists = POSTGRES_* env reached the service container);
 #   "VERDICT: egress via private bridge IP — per-job network (good)";
 #   docker ps lists containers (incl. the postgres service);
-#   "data.forgejo.org -> HTTP 200";
+#   "data.forgejo.org -> HTTP 200/30x";
 #   ZIM_PROBE_VAR_GH / ZIM_PROBE_VAR_FJ each either show their value or
 #   "<unset — ... did not propagate>" (see the read-back step).
 
@@ -88,13 +91,16 @@ jobs:
           if command -v node >/dev/null 2>&1; then
             node - <<'EOF' || echo "wire probe failed (see above)"
           const net = require('net');
-          const u = Buffer.from('zimservice\x00');
-          const d = Buffer.from('zimservice\x00');
-          const pkt = Buffer.alloc(4 + 4 + u.length + d.length + 1);
+          // Startup message: len, protocol v3, then "user\0<user>\0" "database\0<db>\0" \0
+          const kv = Buffer.concat([
+            Buffer.from('user\0zimservice\0'),
+            Buffer.from('database\0zimservice\0'),
+            Buffer.from([0]),
+          ]);
+          const pkt = Buffer.alloc(4 + 4 + kv.length);
           pkt.writeUInt32BE(pkt.length, 0);
           pkt.writeUInt32BE(196608, 4);
-          u.copy(pkt, 8);
-          d.copy(pkt, 8 + u.length);
+          kv.copy(pkt, 8);
           const s = new net.Socket();
           s.setTimeout(5000);
           s.on('timeout', () => { console.log('wire probe: TIMEOUT'); process.exit(1); });
@@ -104,7 +110,7 @@ jobs:
             const t = String.fromCharCode(b[0]);
             let extra = '';
             if (t === 'E') extra = ' — ' + b.toString('utf8', 1, 160).replace(/\0/g, ' ');
-            console.log(`wire probe: server answered '${t}' (0x${b[0].toString(16)}) — ${t === 'R' ? 'auth request; postmaster alive, user/db accepted' : 'unexpected message type'}${extra}`);
+            console.log(`wire probe: server answered '${t}' (0x${b[0].toString(16)}) — ${t === 'R' ? 'auth request: role zimservice exists (POSTGRES_* env reached the service container)' : 'not an auth request; if the E payload above says the role does not exist, the POSTGRES_* env did NOT reach the service container'}${extra}`);
             process.exit(0);
           });
           EOF
@@ -113,18 +119,18 @@ jobs:
           fi
 
           echo "=== 4. job container networking (host vs per-job network) ==="
-          ip -o -4 addr show 2>/dev/null || hostname -i || true
-          srcip=$(ip route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' || true)
-          echo "egress source IP: ${srcip:-unknown}"
-          case "${srcip:-}" in
-            "")
-              echo "VERDICT: could not determine egress IP (missing 'ip' tool?) — inspect the addr output above"
+          ip -o -4 addr show 2>/dev/null || true
+          cip="$(hostname -i 2>/dev/null | awk '{print $1}')"
+          echo "container IP: ${cip:-unknown}"
+          case "${cip:-}" in
+            172.*|10.*)
+              echo "VERDICT: job container on private bridge network (${cip}) — per-job network (good)"
               ;;
             192.168.*)
-              echo "VERDICT: egress via 192.168.x — looks like HOST network (container.network still non-empty, or label is ':host')"
+              echo "VERDICT: job container on ${cip} — looks like the host LAN (HOST network: container.network still non-empty, or label is ':host')"
               ;;
             *)
-              echo "VERDICT: egress via private bridge IP — per-job network (good)"
+              echo "VERDICT: could not determine container IP — inspect the addr output above"
               ;;
           esac
 
