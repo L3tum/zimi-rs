@@ -26,14 +26,23 @@
 #      job containers ran on the host network; both names are re-tested
 #      here after the network change.) Informational — the new CI design
 #      does not rely on either.
+#   8. e2e pattern: a container docker-run FROM THE JOB onto the runner's
+#      per-job network (a) is reachable by the job by container name and
+#      (b) resolves the `postgres` service by name — the exact topology
+#      the e2e app containers need.
+#   9. Via the shared docker socket: the `zimservice` role is a SUPERUSER
+#      and `CREATE EXTENSION vector` succeeds in the runner-managed service
+#      container (CI migrations require it — pgvector is trusted=false).
 #
 # Expected log on success:
 #   hostname resolves; "port open on attempt N";
 #   "wire probe: server answered 'R' (0x52)" (auth request = role
 #   'zimservice' exists = POSTGRES_* env reached the service container);
-#   "VERDICT: egress via private bridge IP — per-job network (good)";
+#   "VERDICT: job container on private bridge network (172.x.x.x) — per-job network (good)";
 #   docker ps lists containers (incl. the postgres service);
 #   "data.forgejo.org -> HTTP 200/30x";
+#   "job's per-job network: ..."; "job reaches the joined container by name: OK";
+#   "zimservice rolsuper=t"; "vector ext 0.x"; "probe-attach: ALL OK";
 #   ZIM_PROBE_VAR_GH / ZIM_PROBE_VAR_FJ each either show their value or
 #   "<unset — ... did not propagate>" (see the read-back step).
 
@@ -144,6 +153,75 @@ jobs:
 
           echo "=== 6. outbound internet ==="
           curl -fsS -o /dev/null -w 'data.forgejo.org -> HTTP %{http_code}\n' https://data.forgejo.org/ || echo "outbound check failed"
+
+      # e2e pattern: a container docker-run FROM THE JOB onto the runner's
+      # per-job network (the e2e app containers do exactly this), plus the
+      # superuser/pgvector check inside the runner-managed service container.
+      - name: "Probe: attach a container to the job network (e2e pattern)"
+        run: |
+          set -euo pipefail
+
+          echo "=== 7. e2e pattern: join the job's per-job network ==="
+          myip="$(hostname -i 2>/dev/null | awk '{print $1}')"
+          echo "job hostname: $(hostname), job IP: ${myip:-unknown}"
+          [ -n "${myip:-}" ] || { echo "PROBE FAIL: cannot determine the job container's IP"; exit 1; }
+          mynet=""
+          for net in $(docker network ls -q); do
+            entries="$(docker network inspect -f '{{range .Containers}}{{.Name}}={{.IPv4Address}} {{end}}' "$net")"
+            echo "network ${net}: ${entries}"
+            case " ${entries}" in
+              *"=${myip} "*) mynet="$net" ;;
+            esac
+          done
+          [ -n "$mynet" ] || { echo "PROBE FAIL: no network lists a container at ${myip} (the job's own network?)"; exit 1; }
+          echo "job's per-job network: ${mynet}"
+
+          # A second container (pgvector image standing in for the e2e app)
+          # JOINS that network.
+          docker rm -f zimci-app-probe >/dev/null 2>&1 || true
+          docker run -d --name zimci-app-probe --network "$mynet" \
+            -e POSTGRES_USER=probeapp -e POSTGRES_PASSWORD=probeapp -e POSTGRES_DB=probeapp \
+            pgvector/pgvector:pg16
+          trap 'docker rm -f zimci-app-probe >/dev/null 2>&1 || true' EXIT
+          up=0
+          for i in $(seq 1 30); do
+            if docker exec zimci-app-probe pg_isready -q -U probeapp; then
+              up=1
+              break
+            fi
+            sleep 1
+          done
+          [ "$up" = 1 ] || { echo "PROBE FAIL: joined container never became ready"; docker logs zimci-app-probe; exit 1; }
+          echo "joined container is up"
+
+          # The joined container must resolve the runner-managed service by NAME.
+          docker exec zimci-app-probe getent hosts postgres \
+            || { echo "PROBE FAIL: 'postgres' does not resolve from a container that joined ${mynet}"; exit 1; }
+
+          # The job must reach the joined container by NAME (user-defined-network DNS).
+          if (exec 3<>/dev/tcp/zimci-app-probe/5432) 2>/dev/null; then
+            echo "job reaches the joined container by name: OK"
+          else
+            echo "PROBE FAIL: job cannot reach 'zimci-app-probe:5432' by name"
+            exit 1
+          fi
+
+          echo "=== 8. service container via the shared docker socket (superuser + pgvector) ==="
+          # Find the postgres service container on the job network: the only
+          # container that answers local psql as user zimservice.
+          svc=""
+          for c in $(docker network inspect -f '{{range .Containers}}{{.Name}} {{end}}' "$mynet" | tr ' ' '\n'); do
+            if [ -n "$c" ] && [ "$c" != "zimci-app-probe" ] && docker exec "$c" psql -U zimservice -tAc "SELECT 1" >/dev/null 2>&1; then
+              svc="$c"
+              break
+            fi
+          done
+          [ -n "$svc" ] || { echo "PROBE FAIL: no container on ${mynet} answered psql as zimservice"; exit 1; }
+          echo "service container: ${svc}"
+          docker exec "$svc" psql -U zimservice -tAc "SELECT 'zimservice rolsuper=' || rolsuper FROM pg_roles WHERE rolname='zimservice'"
+          docker exec "$svc" psql -U zimservice -qc "CREATE EXTENSION IF NOT EXISTS vector"
+          docker exec "$svc" psql -U zimservice -tAc "SELECT 'vector ext ' || extversion FROM pg_extension WHERE extname='vector'"
+          echo "probe-attach: ALL OK"
 
       # Env-file diagnostic (read back what the write step put in both files)
       - name: "Env-file read back"
