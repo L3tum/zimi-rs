@@ -1,0 +1,146 @@
+# Probe: does the runner's per-job network + `services:` mechanism work?
+#
+# ONE-SHOT diagnostic. Delete this file after the CI migration is done.
+#
+# Run this AFTER setting `container.network: ""` in the runner's
+# config.yaml (and restarting the daemon), BEFORE migrating the real
+# CI jobs. Trigger: Forgejo UI -> repo -> Actions -> "Probe runner services".
+#
+# What it proves, in order:
+#   1. The `postgres` service hostname resolves from inside the job
+#      container (only possible on the runner-created per-job network).
+#   2. postgres:5432 accepts TCP via bash /dev/tcp — the exact readiness
+#      check the migrated CI jobs will use.
+#   3. The Postgres wire handshake succeeds with zimservice/zimservice
+#      (proves the POSTGRES_* env reached the service container).
+#   4. The job container is NOT on the host network anymore (egress
+#      source IP should be a private bridge address, not host LAN).
+#   5. The docker socket is still available (the e2e jobs' docker
+#      build/run need it — i.e. the docker_host automount survived the
+#      network change).
+#   6. Outbound internet from the job container (crates.io, etc.).
+#   7. Whether cross-step env files propagate: both $GITHUB_ENV (legacy)
+#      and $FORGEJO_ENV (the documented Forgejo name) are written and read
+#      back. Known: GITHUB_ENV writes did not propagate on this runner;
+#      FORGEJO_ENV may be the mechanism that actually works. Informational
+#      — the new CI design does not rely on either.
+#
+# Expected log on success:
+#   hostname resolves; "port open on attempt N";
+#   "wire probe: server answered 'R' (0x52)";
+#   "VERDICT: egress via private bridge IP — per-job network (good)";
+#   docker ps lists containers (incl. the postgres service);
+#   "data.forgejo.org -> HTTP 200";
+#   ZIM_PROBE_VAR_GH / ZIM_PROBE_VAR_FJ each either show their value or
+#   "<unset — ... did not propagate>" (see the read-back step).
+
+on: workflow_dispatch
+name: "Probe runner services"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: zimservice
+          POSTGRES_PASSWORD: zimservice
+          POSTGRES_DB: zimservice
+    steps:
+      # Env-file diagnostic (write here, read back in the last step).
+      # Tests BOTH the legacy GITHUB_ENV and the documented FORGEJO_ENV name.
+      - name: "Env-file write (GITHUB_ENV + FORGEJO_ENV)"
+        run: |
+          if [ -n "${GITHUB_ENV:-}" ]; then
+            echo 'ZIM_PROBE_VAR_GH=hello-via-github-env' >> "$GITHUB_ENV"
+          else
+            echo "GITHUB_ENV not set by runner"
+          fi
+          if [ -n "${FORGEJO_ENV:-}" ]; then
+            echo 'ZIM_PROBE_VAR_FJ=hello-via-forgejo-env' >> "$FORGEJO_ENV"
+          else
+            echo "FORGEJO_ENV not set by runner"
+          fi
+          echo "GITHUB_ENV=${GITHUB_ENV:-<unset>}"
+          echo "FORGEJO_ENV=${FORGEJO_ENV:-<unset>}"
+
+      - name: "Probe: services, network, docker, outbound"
+        run: |
+          set -euo pipefail
+
+          echo "=== 1. service hostname resolution ==="
+          getent hosts postgres || { echo "PROBE FAIL: 'postgres' does not resolve"; exit 1; }
+
+          echo "=== 2. TCP readiness (bash /dev/tcp) ==="
+          ok=0
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null; then
+              ok=1
+              echo "port open on attempt $i"
+              break
+            fi
+            sleep 1
+          done
+          [ "$ok" = 1 ] || { echo "PROBE FAIL: postgres:5432 never opened"; exit 1; }
+
+          echo "=== 3. postgres wire handshake (node, if present) ==="
+          if command -v node >/dev/null 2>&1; then
+            node - <<'EOF' || echo "wire probe failed (see above)"
+          const net = require('net');
+          const u = Buffer.from('zimservice\x00');
+          const d = Buffer.from('zimservice\x00');
+          const pkt = Buffer.alloc(4 + 4 + u.length + d.length + 1);
+          pkt.writeUInt32BE(pkt.length, 0);
+          pkt.writeUInt32BE(196608, 4);
+          u.copy(pkt, 8);
+          d.copy(pkt, 8 + u.length);
+          const s = new net.Socket();
+          s.setTimeout(5000);
+          s.on('timeout', () => { console.log('wire probe: TIMEOUT'); process.exit(1); });
+          s.on('error', e => { console.log('wire probe ERROR:', e.message); process.exit(1); });
+          s.connect(5432, 'postgres', () => s.write(pkt));
+          s.once('data', b => {
+            const t = String.fromCharCode(b[0]);
+            let extra = '';
+            if (t === 'E') extra = ' — ' + b.toString('utf8', 1, 160).replace(/\0/g, ' ');
+            console.log(`wire probe: server answered '${t}' (0x${b[0].toString(16)}) — ${t === 'R' ? 'auth request; postmaster alive, user/db accepted' : 'unexpected message type'}${extra}`);
+            process.exit(0);
+          });
+          EOF
+          else
+            echo "node not in image — skipping wire probe (TCP check above still stands)"
+          fi
+
+          echo "=== 4. job container networking (host vs per-job network) ==="
+          ip -o -4 addr show 2>/dev/null || hostname -i || true
+          srcip=$(ip route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' || true)
+          echo "egress source IP: ${srcip:-unknown}"
+          case "${srcip:-}" in
+            "")
+              echo "VERDICT: could not determine egress IP (missing 'ip' tool?) — inspect the addr output above"
+              ;;
+            192.168.*)
+              echo "VERDICT: egress via 192.168.x — looks like HOST network (container.network still non-empty, or label is ':host')"
+              ;;
+            *)
+              echo "VERDICT: egress via private bridge IP — per-job network (good)"
+              ;;
+          esac
+
+          echo "=== 5. docker socket (needed by the e2e jobs) ==="
+          if command -v docker >/dev/null 2>&1; then
+            docker ps --format '{{.Names}}' 2>/dev/null || echo "docker CLI present but daemon not reachable"
+            echo "(the postgres service container should appear in that list if the socket is shared)"
+          else
+            echo "no docker CLI in the job image"
+          fi
+
+          echo "=== 6. outbound internet ==="
+          curl -fsS -o /dev/null -w 'data.forgejo.org -> HTTP %{http_code}\n' https://data.forgejo.org/ || echo "outbound check failed"
+
+      # Env-file diagnostic (read back what the write step put in both files)
+      - name: "Env-file read back"
+        run: |
+          echo "ZIM_PROBE_VAR_GH='${ZIM_PROBE_VAR_GH:-<unset — GITHUB_ENV write did not propagate>}'"
+          echo "ZIM_PROBE_VAR_FJ='${ZIM_PROBE_VAR_FJ:-<unset — FORGEJO_ENV write did not propagate>}'"
