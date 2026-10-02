@@ -57,13 +57,13 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
         env:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
           POSTGRES_DB: zimservice
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0" }
       # Postgres: the runner-managed service on this job's per-job network
@@ -116,7 +116,7 @@ jobs:
       # it is the persistent record the trend comparison is read from.
       - name: Upload criterion data (persistent per-run record)
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: criterion-data
           path: target/criterion

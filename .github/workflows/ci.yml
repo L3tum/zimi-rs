@@ -45,7 +45,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Pinned toolchain (1.96.0): keeps the rustdoc/clippy gates deterministic —
       # a moving `stable` once made the docs gate flaky. Bump deliberately; the
       # MSRV job below still guards 1.94. rust-toolchain.toml pins the same
@@ -81,7 +81,7 @@ jobs:
       # document — so the install comes first. Strict because the targets
       # skip silently without node/their dependency; CI always has node,
       # so a missing node/css-tree/jsdom must fail the gate, not pass it.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with: { node-version: 22 }
       - run: npm install --no-audit --no-fund
       - run: make web-check
@@ -101,8 +101,8 @@ jobs:
   web-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with: { node-version: 22 }
       - run: npm install --no-audit --no-fund
       - run: make web-lint
@@ -121,14 +121,14 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
         env:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
           POSTGRES_DB: zimservice
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with: { node-version: 22 }
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0" }
@@ -179,7 +179,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "1.94"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.94" }
       - run: cargo test --lib --bins --test wiremock
@@ -191,7 +191,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
         env:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
@@ -204,7 +204,7 @@ jobs:
       # auto_loop.rs). Only the failure path stretches; green is unaffected.
       ZIMSERVICE_LOOP_TEST_BUDGET_SECS: "300"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.94" }
       # Postgres: the runner-managed service on this job's per-job network
@@ -230,7 +230,7 @@ jobs:
   docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0", components: "rust-docs" }
       - run: cargo doc --no-deps --all-features
@@ -245,7 +245,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
         env:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
@@ -256,7 +256,7 @@ jobs:
       # auto_loop.rs). Only the failure path stretches; green is unaffected.
       ZIMSERVICE_LOOP_TEST_BUDGET_SECS: "300"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0" }
       # Postgres: the runner-managed service on this job's per-job network
@@ -278,7 +278,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
         env:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
@@ -289,7 +289,7 @@ jobs:
       # auto_loop.rs). Only the failure path stretches; green is unaffected.
       ZIMSERVICE_LOOP_TEST_BUDGET_SECS: "300"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0", components: "llvm-tools-preview" }
       # The mirror has no taiki-e/install-action — build the same tool from
@@ -357,7 +357,7 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0" }
       - run: |
@@ -374,13 +374,13 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
         env:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
           POSTGRES_DB: zimservice
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: docker build -t zimservice:ci .
       # e2e: postgres is the runner-managed `services:` entry on this job's
       # per-job network (note at top — no host port anywhere). The app
