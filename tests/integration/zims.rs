@@ -13,6 +13,89 @@ type DownloadStatsRow = (
     chrono::DateTime<chrono::Utc>,
 );
 
+// ── Stub-gap regression: fresh/wiped `zims` table + files on disk ──────────
+// `populate_zims` (the production startup order) runs `scan()` BEFORE
+// `resync()`, and `scan()` pre-populates the cache with id-less stubs. Before
+// the fix, a `resync()` over an unchanged disk early-outed as "no change"
+// against those stubs and `persist_to_db` — the only production INSERT into
+// `zims` — never ran: the library served id-less stubs forever (0 entries,
+// empty search, an empty auto-embed worklist).
+#[tokio::test]
+async fn resync_persists_unpersisted_stubs_fresh_db() {
+    let (pool, _db_gate) = match pool_or_skip().await {
+        Some(p) => p,
+        None => return,
+    };
+    run_migrations(&pool).await.expect("migrations");
+
+    const ZIM: &str = "__itest_stubpersist__";
+    let tmp = std::env::temp_dir().join(format!(
+        "zimservice-stubpersist-itest-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp fixture dir");
+    std::fs::copy(
+        std::path::Path::new(FIXTURES_DIR).join("tiny.zim"),
+        tmp.join(format!("{ZIM}.zim")),
+    )
+    .expect("copy fixture ZIM");
+
+    // Wipe the row: simulate a fresh (or wiped) `zims` table.
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+        .await
+        .unwrap();
+
+    let zims = ZimManager::new(tmp.clone(), pool.clone());
+    // The production startup order (populate_zims): scan() pre-populates
+    // id-less stubs, load_from_db() finds nothing for our wiped name…
+    zims.scan().await.expect("scan");
+    zims.load_from_db().await.expect("load_from_db");
+    assert_eq!(
+        zims.get(ZIM).unwrap().id,
+        None,
+        "precondition: the cache holds an unpersisted stub"
+    );
+
+    // …and resync() must still persist the stub (the pre-fix no-op).
+    let report = zims
+        .resync()
+        .await
+        .expect("resync must persist stubs, not no-op");
+    assert!(
+        report.iter().any(|r| r.starts_with(ZIM)),
+        "resync report must list the persisted stub: {report:?}"
+    );
+
+    // The row exists and the cache carries the DB id back.
+    let id: Option<i32> = zimservice::db::raw::fetch_scalar_optional(
+        &pool,
+        "SELECT id FROM zims WHERE name = $1",
+        |q| q.bind(ZIM),
+    )
+    .await
+    .unwrap();
+    assert!(id.is_some(), "the zims row must exist after resync");
+    assert_eq!(
+        zims.get(ZIM).unwrap().id,
+        id,
+        "the cache must carry the persisted id"
+    );
+
+    // A second resync with an unchanged disk + persisted rows is a no-op
+    // (no re-persist, empty report) — pins the once-per-file upsert.
+    let report2 = zims.resync().await.expect("second resync");
+    assert!(
+        report2.is_empty(),
+        "second resync must be a no-op: {report2:?}"
+    );
+
+    zimservice::db::raw::execute(&pool, "DELETE FROM zims WHERE name = $1", |q| q.bind(ZIM))
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 // ── T7: DB-backed MCP happy paths ─────────────────────────────────────────
 // All nine tools driven against the seeded fixture ZIM, asserting the
 // success envelope shape and a non-empty result. Skipped when DB

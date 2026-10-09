@@ -845,6 +845,10 @@ impl ZimManager {
     /// - New files are added (status `pending`) and persisted.
     /// - Files whose size changed refresh metadata, drop any cached open handle,
     ///   and reset indexing state to `pending` (the old index is stale).
+    /// - Cache entries that never reached the DB (`id == None` — e.g. after a
+    ///   fresh or wiped `zims` table, where `scan()` pre-populated the cache
+    ///   before any row existed) are persisted, so a disk-populated library
+    ///   self-heals into the database instead of serving id-less stubs forever.
     ///
     /// Returns a human-readable report of what changed (empty when up to date).
     // LINT-3 (2026-09 sweep): intentional panic-on-poisoned-lock idiom — grandfathered expect_used.
@@ -892,6 +896,10 @@ impl ZimManager {
         // allocation was the cost (len+spot-check is NOT equivalent: it would
         // miss same-count/size in-place replaces, exactly what resync catches).
         // Scoped block so the non-`Send` read guard is dropped before any await.
+        // The snapshot itself is written only AFTER the DB writes below are
+        // durable: a tick that fails mid-persist leaves the snapshot stale, so
+        // the next 10 s tick retries reconcile + persist for the still-
+        // unpersisted stubs instead of early-outing over them forever.
         let snapshot_changed = {
             let guard = self
                 .scan_snapshot
@@ -899,18 +907,46 @@ impl ZimManager {
                 .expect("scan-snapshot lock poisoned");
             *guard != current_snapshot
         };
-        if snapshot_changed {
-            *self
-                .scan_snapshot
-                .write()
-                .expect("scan-snapshot lock poisoned") = current_snapshot;
-        } else {
+        if !snapshot_changed {
             return Ok(Vec::new());
         }
 
         let (added, removed, changed) = self.reconcile(&scan);
 
-        if added.is_empty() && removed.is_empty() && changed.is_empty() {
+        // The stub gap: `scan()` pre-populates the cache at startup, and
+        // `persist_to_db` is the ONLY production INSERT into `zims` — so a
+        // cached entry with `id == None` is a file that never reached the DB.
+        // Left alone, a fresh (or wiped) `zims` table with files on disk is a
+        // permanent no-op: `reconcile` sees every file matching its stub and
+        // reports no added/removed/changed, the rows are never created, and
+        // everything downstream of the table (search, the auto-embed worklist,
+        // `zimservice index`) stays empty. Collect those names for the persist
+        // pass; `persist_to_db` is an upsert and writes the returned id back
+        // into the cache, so each file is persisted exactly once. Names
+        // already in `added`/`changed` (fresh stubs are id-less too) are
+        // excluded to keep the persist loop duplicate-free.
+        let diffed: std::collections::HashSet<&str> = added
+            .iter()
+            .map(String::as_str)
+            .chain(changed.iter().map(String::as_str))
+            .collect();
+        let unpersisted: Vec<String> = {
+            let cache = self.cache.read().expect("zim cache lock poisoned");
+            cache
+                .values()
+                .filter(|z| z.id.is_none() && !diffed.contains(z.name.as_str()))
+                .map(|z| z.name.clone())
+                .collect()
+        };
+
+        if added.is_empty() && removed.is_empty() && changed.is_empty() && unpersisted.is_empty() {
+            // Fully converged tick: record the snapshot so the next tick
+            // early-outs. (No DB writes occurred, so nothing can fail here.
+            //)
+            *self
+                .scan_snapshot
+                .write()
+                .expect("scan-snapshot lock poisoned") = current_snapshot;
             return Ok(Vec::new());
         }
 
@@ -932,11 +968,16 @@ impl ZimManager {
 
         // Use a HashSet for O(1) lookups instead of O(n) Vec::contains
         let added_set: std::collections::HashSet<&str> = added.iter().map(String::as_str).collect();
-        for name in added.iter().chain(changed.iter()) {
+        let changed_set: std::collections::HashSet<&str> =
+            changed.iter().map(String::as_str).collect();
+        for name in added.iter().chain(changed.iter()).chain(unpersisted.iter()) {
             let kind = if added_set.contains(name.as_str()) {
                 "added"
-            } else {
+            } else if changed_set.contains(name.as_str()) {
                 "changed"
+            } else {
+                // An unpersisted stub: unchanged on disk, but NEW TO THE DB.
+                "added"
             };
             // Force the next open to re-mmap the (new) file.
             self.open_handles
@@ -966,6 +1007,17 @@ impl ZimManager {
                 tracing::warn!("failed to fire catalog invalidation notification: {e}");
             }
         }
+
+        // The snapshot write is deferred to here — after the DELETE / upsert
+        // statements above are durable (autocommit). On success this is
+        // observationally identical to writing it before reconcile (a file
+        // landing on disk during the persist is picked up one tick late at
+        // worst); on a failed persist it is what makes the next tick retry
+        // instead of early-outing. See the comment at the snapshot compare.
+        *self
+            .scan_snapshot
+            .write()
+            .expect("scan-snapshot lock poisoned") = current_snapshot;
 
         Ok(report)
     }
@@ -1214,9 +1266,14 @@ mod tests {
         let m = manager(&dir);
         write_zim(&dir, "alpha", 100);
         m.reconcile(&found(&dir)); // populate cache only
+                                   // An id-less cache entry is an UNPERSISTED stub — resync must persist
+                                   // it (the stub-gap fix; see resync_unpersisted_stub_attempts_persist).
+                                   // Simulate the DB row existing (persist_to_db writes the id back) so
+                                   // this test isolates the converged no-op: with nothing new on disk
+                                   // and everything persisted, the resync must not touch the DB (which
+                                   // would fail: the pool is unroutable) and report no changes.
+        m.cache.write().unwrap().get_mut("alpha").unwrap().id = Some(1);
 
-        // A resync with nothing new must not touch the DB (which would fail:
-        // the pool is unroutable) and report no changes.
         let report = m.resync().await.unwrap();
         assert!(report.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1231,9 +1288,13 @@ mod tests {
         let m = manager(&dir);
         write_zim(&dir, "alpha", 100);
         m.reconcile(&found(&dir)); // seed the in-memory cache
+                                   // Mark the entry persisted (id set): an id-less stub would make the
+                                   // FIRST resync attempt the (failing) persist — the stub-gap behavior
+                                   // pinned by resync_unpersisted_stub_attempts_persist.
+        m.cache.write().unwrap().get_mut("alpha").unwrap().id = Some(1);
 
-        // First resync: populates the snapshot; reconcile finds no DB diff,
-        // so no DB writes occur.
+        // First resync: populates the snapshot; reconcile finds no diff and
+        // no unpersisted stub, so no DB writes occur.
         let r1 = m.resync().await.unwrap();
         // Second / third: snapshot matches → early-out, guaranteed no-ops.
         let r2 = m.resync().await.unwrap();
@@ -1242,6 +1303,30 @@ mod tests {
         assert!(r1.is_empty(), "first resync should report nothing: {r1:?}");
         assert!(r2.is_empty(), "second resync should be a no-op: {r2:?}");
         assert!(r3.is_empty(), "third resync should be a no-op: {r3:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stub-gap fix, observed at the resync boundary: a cache entry that
+    /// never reached the DB (`id == None` — what `scan()` pre-populates at
+    /// startup against a fresh or wiped `zims` table) must NOT be treated as
+    /// "no change". Resync must attempt the persist; with the unroutable
+    /// dead pool that attempt fails, which proves the DB path is reached
+    /// (the pre-fix code returned a silent `Ok(vec![])` here). The row-level
+    /// outcome (row created, id written back, second resync a no-op) is
+    /// covered by the integration test
+    /// `resync_persists_unpersisted_stubs_fresh_db`.
+    #[tokio::test]
+    async fn resync_unpersisted_stub_attempts_persist() {
+        let dir = temp_dir("stubpersist");
+        let m = manager(&dir);
+        write_zim(&dir, "alpha", 100);
+        m.reconcile(&found(&dir)); // stub with id = None (never persisted)
+
+        let res = m.resync().await;
+        assert!(
+            res.is_err(),
+            "an unpersisted stub must reach the persist path (dead pool ⇒ error)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
