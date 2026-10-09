@@ -1237,7 +1237,7 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "application/css"
+            "text/css; charset=utf-8"
         );
         let text = body_text(resp).await;
         // Must be the real stylesheet, not an empty/placeholder body: it

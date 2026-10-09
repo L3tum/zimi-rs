@@ -9,8 +9,12 @@ use axum::response::Response;
 /// `<script>` blocks, so `'unsafe-inline'` and per-script `sha256-` hashes
 /// are unnecessary (the `pages_have_no_inline_scripts` test guards that).
 /// Inline *styles* keep `'unsafe-inline'` (no script-execution surface).
-const WEB_CSP: &str =
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'";
+/// `img-src 'self' data:` admits the pages' inline SVG favicons — each page
+/// uses a data-URI `<link rel="icon">` (a compile-time constant); without an
+/// explicit `img-src` the favicon would fall back to `default-src 'self'` and
+/// be blocked with a CSP violation on every page load.
+const WEB_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+    img-src 'self' data:; connect-src 'self'";
 
 /// Shared security headers for the embedded Web UI (SEC L3): refuse framing
 /// (`X-Frame-Options: DENY`), referrer leakage (`Referrer-Policy:
@@ -239,8 +243,16 @@ pub async fn web_settings() -> Response {
 /// embedded JS files: SEC L3 security headers + immutable caching (the
 /// `?v=` stamp applied by `stamp_assets` to each page's `<link>` busts
 /// stale caches across deploys).
+///
+/// Content type is `text/css` (with an explicit UTF-8 charset, per the IANA
+/// registration): it is the registered CSS media type, and browsers with
+/// strict MIME checking refuse to apply stylesheets served as unregistered
+/// types like `application/css` (console error + an unstyled UI).
 pub async fn web_style_css() -> Response {
-    web_asset_response("application/css", include_str!("../../../web/style.css"))
+    web_asset_response(
+        "text/css; charset=utf-8",
+        include_str!("../../../web/style.css"),
+    )
 }
 
 /// Serve the embedded shared UI script (`web/common.js`).
@@ -391,13 +403,15 @@ mod tests {
     #[tokio::test]
     async fn web_style_css_has_content_type_cache_and_security_headers() {
         // The shared stylesheet mirrors the JS files: its own content-type +
-        // immutable caching, plus the shared security headers.
+        // immutable caching, plus the shared security headers. The type must
+        // be the registered CSS type `text/css` (strict-MIME-checking
+        // browsers reject `application/css` stylesheets outright).
         let resp = web_style_css().await;
         assert_eq!(
             resp.headers()
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok()),
-            Some("application/css")
+            Some("text/css; charset=utf-8")
         );
         assert_eq!(
             resp.headers()

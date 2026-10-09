@@ -480,9 +480,10 @@ data-URI images keep rendering.
 
 The embedded Web UI pages (`/`, `/search.html`, `/settings.html` + their
 `web/*.js` scripts) set their own baseline: `Content-Security-Policy`
-(`default-src 'self'; script-src 'self'` — all scripts are external embedded
-files, no inline `<script>` blocks, so no `'unsafe-inline'` or `sha256-`
-hashes are needed; the `pages_have_no_inline_scripts` unit test guards that),
+(`default-src 'self'; script-src 'self'; img-src 'self' data:` — all scripts
+are external embedded files, no inline `<script>` blocks, so no
+`'unsafe-inline'` or `sha256-` hashes are needed; `img-src data:` admits the
+inline SVG favicon; the `pages_have_no_inline_scripts` unit test guards that),
 `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`.
 
 ### ZIM content trust boundary
