@@ -18,11 +18,10 @@ on:
   schedule:
     - cron: "17 6 * * *"
   workflow_dispatch:
-# Least-privilege GITHUB_TOKEN: every job here only reads the repository
-# (no job pushes, publishes, or uploads). Keep this block — the default
-# token otherwise carries write access to the repo. (Same note as ci.yml.)
-permissions:
-  contents: read
+# Token scope: every job here only reads the repository (no job pushes,
+# publishes, or uploads). The `permissions:` key is not supported by Forgejo
+# (it warns), so this is enforced by the runner's server-side token scope —
+# keep it read-only there. (Same note as ci.yml.)
 # Why this workflow exists: attacker-influenced `.zim` archive parsing via
 # the third-party `zim` crate (src/zim/index.rs) and quick-xml OPDS Atom
 # feed parsing (src/torrent/opds.rs) are code-execution-adjacent surface

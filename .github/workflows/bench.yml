@@ -40,12 +40,10 @@ on:
   # Manual run (Actions → Bench → Run workflow) to validate or re-sample.
   workflow_dispatch:
 
-# Least-privilege GITHUB_TOKEN: read the repo + write artifacts only
-# (the criterion-data upload). The default token otherwise carries write
-# access to the repo.
-permissions:
-  contents: read
-  actions: write
+# Token scope: the job needs to read the repo and write artifacts (the
+# criterion-data upload). The `permissions:` key is not supported by Forgejo
+# (it warns), so the artifact-upload scope must be granted on the runner's
+# server-side token.
 
 # Runner notes: actions/* @v7 (checkout, upload-artifact) run on the
 # runner's Node 24; the Rust toolchain comes from the repo-local

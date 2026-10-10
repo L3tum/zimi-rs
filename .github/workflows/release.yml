@@ -8,13 +8,12 @@ on:
     types:
       - published
 
-# Least-privilege GITHUB_TOKEN: no job here needs write access (the
-# forgejo publish branch authenticates with the PACKAGE_TOKEN secret, not
-# GITHUB_TOKEN). If this repo is ever mirrored to GitHub and the gchr
-# branch below starts firing, that branch pushes with GITHUB_TOKEN and
-# will need `packages: write` — bump the token then.
-permissions:
-  contents: read
+# Token scope: no job here needs write access (the forgejo publish branch
+# authenticates with the PACKAGE_TOKEN secret, not GITHUB_TOKEN). The
+# `permissions:` key is not supported by Forgejo (it warns), so scope is set
+# server-side. If this repo is ever mirrored to GitHub and the gchr branch
+# below starts firing, that branch pushes with GITHUB_TOKEN and will need a
+# workflow-level `permissions:` block with `packages: write` there.
 
 # Runner notes (self-hosted, act-based — same conventions as ci.yml):
 # - Same runner-native postgres scheme as ci.yml (see that file's note):

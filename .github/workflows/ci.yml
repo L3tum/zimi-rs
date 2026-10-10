@@ -3,11 +3,11 @@ on:
   push:
     branches: [master]
   pull_request:
-# Least-privilege GITHUB_TOKEN: every job here only reads the repository
-# (no job pushes, publishes, or uploads). Keep this block — the default
-# token otherwise carries write access to the repo.
-permissions:
-  contents: read
+# Token scope: every job here only reads the repository (no job pushes,
+# publishes, or uploads). The workflow-level `permissions:` key that would
+# pin this is NOT supported by Forgejo (it warns), so the least-privilege
+# intent is enforced server-side — keep the runner's workflow token at
+# read-only scope there.
 # Runner notes (self-hosted, act-based):
 # - The runner resolves `uses:` from the data.forgejo.org mirror, which
 #   serves only `actions/*`; third-party actions (dtolnay/rust-toolchain,
