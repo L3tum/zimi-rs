@@ -62,7 +62,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "nightly-2026-09-25"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "nightly-2026-09-25" }
       # cargo install --version wants FULL SemVer: a two-component "0.13"

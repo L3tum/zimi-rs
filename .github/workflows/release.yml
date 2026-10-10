@@ -46,13 +46,13 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
         env:
           POSTGRES_USER: zimservice
           POSTGRES_PASSWORD: zimservice
           POSTGRES_DB: zimservice
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: docker build -t zimservice:release .
       # e2e: postgres is the runner-managed `services:` entry on this job's
       # per-job network (note at top — no host port anywhere). The app
@@ -172,7 +172,7 @@ jobs:
   publish-forgejo:
     needs: [test, should-push]
     if: github.server_url != 'https://github.com' && needs.should-push.outputs.should_push == 'true'
-    uses: l3tum/reusable-workflows/.github/workflows/publish-forgejo.yml@main
+    uses: l3tum/reusable-workflows/.github/workflows/publish-forgejo.yml@d2fdda085ba30d019e52118458c9de3d3a91c6cc # main
     with:
       PUSH: ${{ needs.should-push.outputs.should_push }}
     secrets:
@@ -184,6 +184,6 @@ jobs:
   publish-gchr:
     needs: [test, should-push]
     if: github.server_url == 'https://github.com' && needs.should-push.outputs.should_push == 'true'
-    uses: l3tum/reusable-workflows/.github/workflows/publish-gchr.yml@main
+    uses: l3tum/reusable-workflows/.github/workflows/publish-gchr.yml@d2fdda085ba30d019e52118458c9de3d3a91c6cc # main
     with:
       PUSH: ${{ needs.should-push.outputs.should_push }}
