@@ -251,10 +251,13 @@ pub async fn acquire_mutating_guard(config: &Config) -> anyhow::Result<Option<Mu
 }
 
 /// How often the advisory-lock liveness monitor probes the lock connection
-/// (a `SELECT 1` on the dedicated connection). Connection death is only
-/// ever detected within this interval; 30s keeps the extra probe cost
-/// negligible while bounding the window in which a silently-released
-/// advisory lock would be unnoticed.
+/// (a `SELECT 1` on the dedicated connection). Connection death is detected
+/// within at most two intervals (the pacing sleep plus the probe's own
+/// deadline); 30s keeps the extra probe cost negligible while bounding the
+/// window in which a silently-released advisory lock would be unnoticed.
+/// This is the probe *cadence* — `detect_advisory_lock_loss` takes it as a
+/// parameter (production passes this constant; tests pass a small value so
+/// they can wait it out on a real clock).
 const ADVISORY_LOCK_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// H1: detect that the advisory-lock connection has died mid-run, and invoke
@@ -262,26 +265,53 @@ const ADVISORY_LOCK_CHECK_INTERVAL: std::time::Duration = std::time::Duration::f
 ///
 /// sqlx's `PgConnection` has no separately abortable I/O driver to join
 /// (tokio-postgres' spawned `Connection` task did), so liveness is probed by
-/// a `SELECT 1` on the dedicated connection itself, every
-/// [`ADVISORY_LOCK_CHECK_INTERVAL`]. Any probe failure — Postgres restart,
-/// network drop, or a server-side close — means the socket is gone and
+/// a `SELECT 1` on the dedicated connection itself, once per `interval`
+/// (production passes [`ADVISORY_LOCK_CHECK_INTERVAL`]; tests pass a small
+/// value — the cadence is a parameter, not a constant a test cannot wait
+/// out, per the real-clock test pattern).
+///
+/// **The sleep paces the loop — the timeout does not (CPU regression,
+/// 2026-10).** The loop sleeps `interval`, then probes; the per-probe
+/// [`tokio::time::timeout`] only bounds a *hung* socket. The original code
+/// used the timeout as its only pacing — but a timeout bounds a hang, not an
+/// interval: on success `SELECT 1` returns in ~1 ms and the loop re-probed
+/// immediately, firing thousands of probes per second at the server and
+/// holding a flat ~50 % of a core on both this process (per-round-trip
+/// encode/decode) and Postgres (thousands of trivial queries) — while every
+/// `pg_stat_activity` snapshot still showed the backend `idle`, each probe
+/// being a sub-millisecond slice of its round trip. (The monitor's
+/// connection is a dedicated non-pooled `PgConnection`, which is also why
+/// the pool checkout metrics stayed quiet throughout.)
+///
+/// Any probe failure — Postgres restart, network drop, or a server-side
+/// close — means the socket is gone and
 /// Postgres has silently released the advisory lock, so the callback fires
-/// (and the function returns). The function is only ever *cancelled* on a
-/// graceful drop (the caller aborts the owning task), in which case the
+/// (and the function returns). A probe that does not even complete within
+/// one interval is the same failure class (a wedged socket cannot be proven
+/// alive), so it also fails closed. The function is only ever *cancelled* on
+/// a graceful drop (the caller aborts the owning task), in which case the
 /// callback never runs and no connection loss has been observed.
 async fn detect_advisory_lock_loss(
     mut conn: PgConnection,
+    interval: std::time::Duration,
     on_connection_lost: impl FnOnce(String),
 ) {
     loop {
-        match tokio::time::timeout(
-            ADVISORY_LOCK_CHECK_INTERVAL,
-            db::raw::execute(&mut conn, "SELECT 1", |q| q),
-        )
-        .await
-        {
-            // Timeout: connection still alive — probe again.
-            Err(_) => {}
+        // Pace the loop: sleep FIRST, then probe. A `timeout` around the
+        // probe alone does not pace a loop whose probe succeeds in ~1 ms —
+        // that was the 2026-10 CPU regression (see the module note above).
+        tokio::time::sleep(interval).await;
+        match tokio::time::timeout(interval, db::raw::execute(&mut conn, "SELECT 1", |q| q)).await {
+            // Timeout: the probe never completed — the socket is wedged and
+            // cannot be proven alive; fail closed like any probe failure.
+            Err(_) => {
+                let reason = format!(
+                    "advisory-lock liveness probe made no progress within {interval:?} — \
+                     treating the lock connection as lost"
+                );
+                on_connection_lost(reason);
+                return;
+            }
             Ok(Ok(_)) => {}
             // Probe failed — the socket is gone and the lock was released.
             Ok(Err(e)) => {
@@ -310,7 +340,7 @@ fn spawn_advisory_lock_monitor(
         // The production callback logs and raises the die flag on a real
         // loss, so the detector only returns after the fail-closed action
         // already ran inside the callback.
-        detect_advisory_lock_loss(conn, |reason| {
+        detect_advisory_lock_loss(conn, ADVISORY_LOCK_CHECK_INTERVAL, |reason| {
             tracing::error!(
                 reason = %reason,
                 "single-instance advisory lock lost mid-run — another `serve` on \
@@ -751,18 +781,24 @@ mod tests {
 
     // ── H1: advisory-lock liveness-monitor detection ─────────────────────
     //
-    // The sqlx detector probes a *real* dedicated connection (`SELECT 1` on
-    // an interval), so both tests are DB-gated like the smoke tests below:
-    // they skip cleanly when no DB is reachable unless `ZIMSERVICE_REQUIRE_DB`
-    // is set.
+    // The sqlx detector probes a *real* dedicated connection (`SELECT 1`
+    // once per interval — the cadence is a parameter), so all three tests
+    // are DB-gated like the smoke tests below: they skip cleanly when no DB
+    // is reachable unless `ZIMSERVICE_REQUIRE_DB` is set.
+    //
+    /// Test cadence for the detector: small enough that a probe (and a
+    /// probe failure) lands well inside the tests' timeouts, on a real
+    /// clock. (50 ms × the windows below; production uses the 30 s
+    /// [`ADVISORY_LOCK_CHECK_INTERVAL`].)
+    const TEST_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
     #[tokio::test]
     async fn liveness_monitor_fires_on_closed_connection() {
         use std::sync::atomic::{AtomicBool, Ordering};
         // A dedicated connection whose backend is terminated up front — the
-        // "socket went away" case the monitor must catch. Because the backend
-        // is already gone, the first `SELECT 1` probe fails at once; no
-        // interval wait.
+        // "socket went away" case the monitor must catch. With the test
+        // cadence the first probe lands ~50 ms in and fails at once (the
+        // backend is already gone).
         let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
         });
@@ -792,8 +828,9 @@ mod tests {
         drop(helper);
         let fired = Arc::new(AtomicBool::new(false));
         let fired_cb = fired.clone();
-        let detector =
-            detect_advisory_lock_loss(conn, move |_| fired_cb.store(true, Ordering::SeqCst));
+        let detector = detect_advisory_lock_loss(conn, TEST_PROBE_INTERVAL, move |_| {
+            fired_cb.store(true, Ordering::SeqCst)
+        });
         tokio::time::timeout(std::time::Duration::from_secs(5), detector)
             .await
             .expect("detection of a closed connection must fire within 5s");
@@ -807,10 +844,11 @@ mod tests {
     async fn liveness_monitor_stays_quiet_while_alive() {
         use std::sync::atomic::{AtomicBool, Ordering};
         // A live dedicated connection: within a short window the detector
-        // must NOT report a loss and must NOT fire the callback (no false
-        // positive on a healthy connection). We abandon the (still-pending)
-        // detector — its probe loop simply never completes in this window —
-        // which also drops the connection.
+        // (a handful of successful probes at the test cadence) must NOT
+        // report a loss and must NOT fire the callback (no false positive on
+        // a healthy connection). We abandon the (still-pending) detector —
+        // its probe loop simply never completes in this window — which also
+        // drops the connection.
         // DB gate (src/testing.rs): counted skip, strict-mode hard-fail.
         let Some(conn) =
             crate::testing::test_conn("liveness_monitor_stays_quiet_while_alive").await
@@ -820,12 +858,92 @@ mod tests {
         let _db_gate = crate::testing::DbExclusiveGuard::acquire();
         let fired = Arc::new(AtomicBool::new(false));
         let fired_cb = fired.clone();
-        let detector =
-            detect_advisory_lock_loss(conn, move |_| fired_cb.store(true, Ordering::SeqCst));
+        let detector = detect_advisory_lock_loss(conn, TEST_PROBE_INTERVAL, move |_| {
+            fired_cb.store(true, Ordering::SeqCst)
+        });
         let _ = tokio::time::timeout(std::time::Duration::from_millis(120), detector).await;
         assert!(
             !fired.load(Ordering::SeqCst),
             "a healthy connection must not trip the liveness monitor"
+        );
+    }
+
+    /// CPU regression (2026-10): the probe loop must pace its `SELECT 1`s at
+    /// one per `interval` — not re-probe on every successful probe. The
+    /// original loop's only pacing was `timeout(interval, probe)`; a timeout
+    /// bounds a hang, not an interval, so a healthy ~1 ms probe re-fired
+    /// immediately — thousands of probes per second, a flat ~50 % core on
+    /// both this process and the Postgres server (the exact production
+    /// symptom: 50 % CPU on service and Postgres while `pg_stat_activity`
+    /// showed every backend `idle`).
+    ///
+    /// Counted through `pg_stat_database.tup_returned` (each `SELECT 1`
+    /// returns exactly one row) under [`crate::testing::DbExclusiveGuard`],
+    /// which keeps every other DB test out of the window. A real clock is
+    /// used: `sleep` only ever runs long under load, so the upper bound is
+    /// load-proof (an unpaced regression produces thousands of rows in the
+    /// window, a paced loop a handful).
+    #[tokio::test]
+    async fn liveness_monitor_probes_are_paced_by_interval() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
+        });
+        // DB gate (src/testing.rs): counted skip, strict-mode hard-fail.
+        let Some(mut conn) =
+            crate::testing::test_conn("liveness_monitor_probes_are_paced_by_interval").await
+        else {
+            return;
+        };
+        let _db_gate = crate::testing::DbExclusiveGuard::acquire();
+        // Baseline rows-returned for this database. (The monitor's own
+        // baseline/post queries each add one row; the bounds absorb that.)
+        let base: i64 = crate::db::raw::fetch_scalar_optional(
+            &mut conn,
+            "SELECT tup_returned FROM pg_stat_database WHERE datname = current_database()",
+            |q| q,
+        )
+        .await
+        .expect("baseline tup_returned")
+        .expect("row");
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_cb = fired.clone();
+        let detector = detect_advisory_lock_loss(conn, TEST_PROBE_INTERVAL, move |_| {
+            fired_cb.store(true, Ordering::SeqCst)
+        });
+        // Run the detector for ~7 probe slots, then drop it — cancellation
+        // closes the connection without firing the callback (a healthy
+        // connection never reports a loss).
+        let _ = tokio::time::timeout(TEST_PROBE_INTERVAL * 7, detector).await;
+        assert!(
+            !fired.load(Ordering::SeqCst),
+            "a healthy connection must not trip the liveness monitor"
+        );
+        // A second dedicated connection reads the post snapshot (the
+        // monitored connection is gone — it was consumed by the detector).
+        let mut post = crate::db::pool::connect_dedicated(&url)
+            .await
+            .expect("post snapshot conn");
+        let post: i64 = crate::db::raw::fetch_scalar_optional(
+            &mut post,
+            "SELECT tup_returned FROM pg_stat_database WHERE datname = current_database()",
+            |q| q,
+        )
+        .await
+        .expect("post tup_returned")
+        .expect("row");
+        let probes = post - base;
+        assert!(
+            probes >= 1,
+            "at least one probe must have run in the window (saw {probes})"
+        );
+        assert!(
+            probes <= 30,
+            "probes must be paced at one per interval: a {} ms window at {} ms \
+             intervals allows a handful, not the thousands of an unpaced loop \
+             (saw {probes})",
+            TEST_PROBE_INTERVAL.as_millis() * 7,
+            TEST_PROBE_INTERVAL.as_millis()
         );
     }
 
