@@ -875,14 +875,59 @@ mod tests {
     /// immediately — thousands of probes per second, a flat ~50 % core on
     /// both this process and the Postgres server (the exact production
     /// symptom: 50 % CPU on service and Postgres while `pg_stat_activity`
-    /// showed every backend `idle`).
+    /// showed every backend `idle` — each trivial query occupied its
+    /// backend for a sub-millisecond slice of a multi-ms round-trip, so
+    /// the server CPU came from query *count*, never from long active
+    /// states).
     ///
-    /// Counted through `pg_stat_database.tup_returned` (each `SELECT 1`
-    /// returns exactly one row) under [`crate::testing::DbExclusiveGuard`],
-    /// which keeps every other DB test out of the window. A real clock is
-    /// used: `sleep` only ever runs long under load, so the upper bound is
-    /// load-proof (an unpaced regression produces thousands of rows in the
-    /// window, a paced loop a handful).
+    /// Measured by the **delta** of the monitor connection's database
+    /// `tup_returned` over a 2 s window (40 probe slots at the 50 ms test
+    /// cadence) — each `SELECT 1` returns exactly one row. Two defenses
+    /// make the delta trustworthy on a *churning* shared server:
+    ///
+    /// 1. **Private temp database** (pid + nanos in the name): nothing
+    ///    else can know its name, so only the monitor's probes can write
+    ///    to its counter.
+    /// 2. **Pre-check**: database OIDs are recycled, and Postgres
+    ///    attributes per-database stats by OID. A backend that is still
+    ///    finishing teardown after its own database was dropped briefly
+    ///    reports into whatever database now holds its OID — the temp DB
+    ///    this test creates can inherit exactly that (this is what failed
+    ///    the first CI run with a 1517-row "probe count"). Such a backend
+    ///    is visible in `pg_stat_activity` under the temp DB's name, so
+    ///    the test requires *exactly one* backend on the temp DB (the
+    ///    monitor) before arming the window, recreating the temp DB once
+    ///    if a straggler is seen and skipping loudly if one persists.
+    /// 3. **Settle gate + control probe**: on a churning shared server a
+    ///    fresh database's counter is not a trustworthy instrument at all:
+    ///    it can absorb one or more one-off phantom stat batches (a
+    ///    per-backend stats entry left behind by an abnormally terminated
+    ///    predecessor is delivered into the new row on the stats worker's
+    ///    next cycle — observed: 0 → ~800 → ~1700 within seconds, then
+    ///    flat), and on the shared dev server it can *lose* live query
+    ///    increments entirely (40 `SELECT 1`s from a clean psql session
+    ///    never appearing in the counter, while a healthy database's row
+    ///    ticks normally). The test therefore (a) takes the baseline only
+    ///    once two counter readings 1.5 s apart agree, then (b) runs a
+    ///    **control**: five `SELECT 1`s from the monitor connection, and
+    ///    requires the counter to rise by exactly ~5 (a [5, 8] band) over
+    ///    the next aggregation cycles — a phantom batch (hundreds of rows)
+    ///    or a row that swallows live increments misses the band. Only a temp DB whose counter both settles
+    ///    and tracks the control is used for the measurement; otherwise
+    ///    the temp DB is recreated once and the test skips loudly if the
+    ///    second attempt is equally unreliable. (CI's fresh postgres has
+    ///    healthy per-database stats, so the measurement runs there —
+    ///    the gate this test protects.)
+    ///
+    /// The monitor's connection is dropped at the window's end (its final
+    /// stats flush then lands), and the counter is polled for up to 6 s to
+    /// absorb the stats-aggregation lag. A paced loop yields ~40 probes;
+    /// an unpaced one yields hundreds (1/RTT on a LAN) to thousands
+    /// (loopback), so `10..=150` separates them with wide margins on both
+    /// while also failing a dead loop (delta ≈ 0).
+    ///
+    /// Needs the server user to be able to `CREATE DATABASE` (true for the
+    /// compose/CI/dev `zimservice` superuser); otherwise it skips.
     #[tokio::test]
     async fn liveness_monitor_probes_are_paced_by_interval() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -890,61 +935,284 @@ mod tests {
             "postgres://zimservice:zimservice@127.0.0.1:5432/zimservice".into()
         });
         // DB gate (src/testing.rs): counted skip, strict-mode hard-fail.
-        let Some(mut conn) =
+        let Some(mut admin) =
             crate::testing::test_conn("liveness_monitor_probes_are_paced_by_interval").await
         else {
             return;
         };
         let _db_gate = crate::testing::DbExclusiveGuard::acquire();
-        // Baseline rows-returned for this database. (The monitor's own
-        // baseline/post queries each add one row; the bounds absorb that.)
-        let base: i64 = crate::db::raw::fetch_scalar_optional(
-            &mut conn,
-            "SELECT tup_returned FROM pg_stat_database WHERE datname = current_database()",
-            |q| q,
-        )
-        .await
-        .expect("baseline tup_returned")
-        .expect("row");
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_cb = fired.clone();
-        let detector = detect_advisory_lock_loss(conn, TEST_PROBE_INTERVAL, move |_| {
-            fired_cb.store(true, Ordering::SeqCst)
-        });
-        // Run the detector for ~7 probe slots, then drop it — cancellation
-        // closes the connection without firing the callback (a healthy
-        // connection never reports a loss).
-        let _ = tokio::time::timeout(TEST_PROBE_INTERVAL * 7, detector).await;
-        assert!(
-            !fired.load(Ordering::SeqCst),
-            "a healthy connection must not trip the liveness monitor"
-        );
-        // A second dedicated connection reads the post snapshot (the
-        // monitored connection is gone — it was consumed by the detector).
-        let mut post = crate::db::pool::connect_dedicated(&url)
-            .await
-            .expect("post snapshot conn");
-        let post: i64 = crate::db::raw::fetch_scalar_optional(
-            &mut post,
-            "SELECT tup_returned FROM pg_stat_database WHERE datname = current_database()",
-            |q| q,
-        )
-        .await
-        .expect("post tup_returned")
-        .expect("row");
-        let probes = post - base;
-        assert!(
-            probes >= 1,
-            "at least one probe must have run in the window (saw {probes})"
-        );
-        assert!(
-            probes <= 30,
-            "probes must be paced at one per interval: a {} ms window at {} ms \
-             intervals allows a handful, not the thousands of an unpaced loop \
-             (saw {probes})",
-            TEST_PROBE_INTERVAL.as_millis() * 7,
-            TEST_PROBE_INTERVAL.as_millis()
-        );
+        // Private temp database (see doc comment): its name is unknown to
+        // anything but this test, so only the monitor's probes can write
+        // to its `pg_stat_database` row.
+        let pid = std::process::id();
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        // Measure once; if a straggler backend from a dropped database is
+        // reporting into the temp DB's (recycled) OID, retry with a fresh
+        // temp DB and skip loudly if the counter stays noisy.
+        'outer: for attempt in 0..2u64 {
+            let nanos = base + u128::from(attempt * 1_000_000);
+            let db_name = format!("zimservice_guards_paced_{pid}_{nanos}");
+            // Abandon this attempt: kill whatever is attached to the temp
+            // DB (the monitor's connection included), drop the DB, and
+            // either retry with a fresh name/OID or skip loudly.
+            macro_rules! abandon_attempt {
+                ($msg:expr) => {{
+                    let _ = crate::db::raw::execute(
+                        &mut admin,
+                        &format!(
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                              WHERE datname = '{db_name}'"
+                        ),
+                        |q| q,
+                    )
+                    .await;
+                    let _ = crate::db::raw::execute(
+                        &mut admin,
+                        &format!("DROP DATABASE IF EXISTS \"{db_name}\""),
+                        |q| q,
+                    )
+                    .await;
+                    if attempt == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue 'outer;
+                    }
+                    eprintln!("skipping: {}", $msg);
+                    return;
+                }};
+            }
+            if crate::db::raw::execute(&mut admin, &format!("CREATE DATABASE \"{db_name}\""), |q| q)
+                .await
+                .is_err()
+            {
+                // The compose/CI/dev superuser always can; a non-superuser
+                // DATABASE_URL has nothing for this test to do.
+                eprintln!("skipping: cannot CREATE DATABASE (user lacks CREATEDB?)");
+                return;
+            }
+            let mut temp_url = url::Url::parse(&url).expect("valid test URL");
+            temp_url.set_path(&format!("/{db_name}"));
+            let mut mon_conn = match crate::db::pool::connect_dedicated(temp_url.as_str()).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = crate::db::raw::execute(
+                        &mut admin,
+                        &format!("DROP DATABASE IF EXISTS \"{db_name}\""),
+                        |q| q,
+                    )
+                    .await;
+                    eprintln!("skipping: temp DB unreachable: {e}");
+                    return;
+                }
+            };
+            // Pre-check (doc comment): the temp DB's OID may have just been
+            // recycled from a dropped database, and a backend still
+            // finishing teardown of that database reports into the row by
+            // OID. Any such straggler is visible in `pg_stat_activity`
+            // under the temp DB's name — require exactly one backend (the
+            // monitor) before arming the window.
+            let mut clean = false;
+            for _ in 0..50 {
+                let n: i64 = crate::db::raw::fetch_scalar_optional(
+                    &mut admin,
+                    &format!("SELECT count(*) FROM pg_stat_activity WHERE datname = '{db_name}'"),
+                    |q| q,
+                )
+                .await
+                .expect("backend count")
+                .expect("count row");
+                if n == 1 {
+                    clean = true;
+                    break;
+                }
+                if n > 1 {
+                    break; // straggler(s) on the recycled OID
+                }
+                // n == 0: the monitor's backend is not visible yet.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if !clean {
+                abandon_attempt!(
+                    "a straggler backend kept reporting into the \
+                                 temp DB's (recycled) OID"
+                );
+            }
+            // Baseline after the counter settles (doc comment, defense
+            // 3): two readings 1.5 s apart must agree before the window
+            // arms, so one-off phantom batches are already in the
+            // baseline and cancel in the delta.
+            let mut baseline = None;
+            let mut prev = None;
+            for _ in 0..8 {
+                let c: i64 = crate::db::raw::fetch_scalar_optional(
+                    &mut admin,
+                    &format!(
+                        "SELECT tup_returned FROM pg_stat_database WHERE datname = '{db_name}'"
+                    ),
+                    |q| q,
+                )
+                .await
+                .expect("counter read")
+                .expect("temp DB stats row");
+                if Some(c) == prev {
+                    baseline = Some(c);
+                    break;
+                }
+                prev = Some(c);
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            }
+            let Some(baseline) = baseline else {
+                abandon_attempt!(
+                    "the temp DB's counter never settled (phantom \
+                                 stats delivery)"
+                );
+            };
+            // Control probe (doc comment, defense 3): the settled counter
+            // must also track live queries. Five known `SELECT 1`s from
+            // the monitor connection have to show up in the counter
+            // within a few aggregation cycles. The rise must land in the
+            // [5, 8] band: a healthy server lands exactly +5, while a
+            // one-off phantom batch (hundreds of rows) or a row that
+            // swallows live increments (observed on the shared dev
+            // server) misses the band and is abandoned.
+            let control_base = baseline;
+            for _ in 0..5 {
+                crate::db::raw::execute(&mut mon_conn, "SELECT 1", |q| q)
+                    .await
+                    .expect("control probe SELECT 1");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let mut control_ok = false;
+            let mut max_seen = control_base;
+            let control_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+            while tokio::time::Instant::now() < control_deadline {
+                let c: i64 = crate::db::raw::fetch_scalar_optional(
+                    &mut admin,
+                    &format!(
+                        "SELECT tup_returned FROM pg_stat_database WHERE datname = '{db_name}'"
+                    ),
+                    |q| q,
+                )
+                .await
+                .expect("counter read")
+                .expect("temp DB stats row");
+                if c > max_seen {
+                    max_seen = c;
+                }
+                let delta = max_seen - control_base;
+                if (5..=8).contains(&delta) {
+                    control_ok = true;
+                    break;
+                }
+                if delta > 8 {
+                    break; // phantom batch — not the control's five rows
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            if !control_ok {
+                abandon_attempt!(
+                    "the temp DB's counter does not track live \
+                                 queries (per-database stats unreliable here)"
+                );
+            }
+            // Re-settle: the counter has absorbed the control rows (and
+            // may still be batching them); wait for two agreeing readings
+            // so the window's baseline is stable and includes them.
+            let mut rebase = None;
+            let mut prev = None;
+            for _ in 0..8 {
+                let c: i64 = crate::db::raw::fetch_scalar_optional(
+                    &mut admin,
+                    &format!(
+                        "SELECT tup_returned FROM pg_stat_database WHERE datname = '{db_name}'"
+                    ),
+                    |q| q,
+                )
+                .await
+                .expect("counter read")
+                .expect("temp DB stats row");
+                if Some(c) == prev {
+                    rebase = Some(c);
+                    break;
+                }
+                prev = Some(c);
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            }
+            let Some(baseline) = rebase else {
+                abandon_attempt!(
+                    "the temp DB's counter never settled after the \
+                                 control probe"
+                );
+            };
+            let fired = Arc::new(AtomicBool::new(false));
+            let fired_cb = fired.clone();
+            // Observation window: 40 probe slots at the 50 ms test cadence.
+            let window = TEST_PROBE_INTERVAL * 40;
+            let detector = detect_advisory_lock_loss(mon_conn, TEST_PROBE_INTERVAL, move |_| {
+                fired_cb.store(true, Ordering::SeqCst)
+            });
+            // Run the detector for the window, then drop it: cancellation
+            // closes the connection (its final stats flush then lands)
+            // without firing the callback (a healthy connection never
+            // reports a loss).
+            let _ = tokio::time::timeout(window, detector).await;
+            // Absorb the stats-aggregation lag: poll the counter for up to
+            // 6 s and keep the highest reading (the counter is monotonic).
+            let mut final_count = baseline;
+            let poll_end = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+            loop {
+                if let Ok(Some(v)) = crate::db::raw::fetch_scalar_optional(
+                    &mut admin,
+                    &format!(
+                        "SELECT tup_returned FROM pg_stat_database WHERE datname = '{db_name}'"
+                    ),
+                    |q| q,
+                )
+                .await
+                {
+                    final_count = final_count.max(v);
+                }
+                if tokio::time::Instant::now() >= poll_end {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            let probes = final_count - baseline;
+            let in_range = (10i64..=150).contains(&probes);
+            assert!(
+                !fired.load(Ordering::SeqCst),
+                "a healthy connection must not trip the liveness monitor"
+            );
+            assert!(
+                in_range,
+                "probes must be paced at one per interval: the temp DB's tup_returned \
+                 rose by {probes} over a {} ms window at {} ms intervals; a paced loop \
+                 yields ~40, an unpaced 1/RTT loop hundreds to thousands (the 2026-10 \
+                 CPU regression), and ~0 means the loop never probed at all",
+                window.as_millis(),
+                TEST_PROBE_INTERVAL.as_millis()
+            );
+            // Best-effort cleanup: the monitor connection is already
+            // dropped; drop the temp DB, retrying briefly in case its
+            // backend has not finished closing. A leftover temp DB is
+            // harmless — the name embeds pid + nanos.
+            for _ in 0..10 {
+                if crate::db::raw::execute(
+                    &mut admin,
+                    &format!("DROP DATABASE IF EXISTS \"{db_name}\""),
+                    |q| q,
+                )
+                .await
+                .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            return; // measurement completed
+        }
     }
 
     // ── H1: DB-gated single-instance refusal (skips without Postgres) ─────
