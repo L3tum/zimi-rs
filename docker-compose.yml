@@ -34,7 +34,7 @@ services:
   postgres:
     # pgvector image: the `vector` extension is required by migration 001
     # (CREATE EXTENSION vector) — a stock postgres image fails at migration.
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
     ports:
       # Loopback-only: Postgres must not be reachable from other hosts.
       - "127.0.0.1:5432:5432"
