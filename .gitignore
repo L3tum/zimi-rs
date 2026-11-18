@@ -27,6 +27,8 @@ Thumbs.db
 
 # Testing
 test-data/
+# Playwright failure artifacts (screenshots / error context)
+test-results/
 # local scratch (draft commit message, scratch crate work)
 tmp/
 

@@ -108,15 +108,20 @@ jobs:
       - run: make web-lint
         env:
           ZIMSERVICE_WEB_CHECK_STRICT: "1"
-  # Real-browser (Playwright, headless Chromium) smoke for the web UI.
-  # Exercises the library and search pages against a LIVE zimservice
-  # process — the layer the jsdom suite (web-lint job) and the HTTP
-  # wiremock tests cannot cover (2026-10 review, Tests: no real-browser
-  # coverage). Postgres is the runner-managed `services:` entry (note at
-  # top); the app is a bare in-job process on 127.0.0.1:8877 (the job
-  # container's own loopback — not a host port, so no collision surface).
-  # Open mode on a loopback bind is allowed by the boot policy, so no auth
-  # env is needed.
+  # Real-browser (Playwright, headless Chromium) tests for the web UI:
+  # smoke + core flows (search round-trip, settings save round-trip,
+  # password-mode auth prompt) against a LIVE zimservice process — the
+  # layer the jsdom suite (web-lint job) and the HTTP wiremock tests
+  # cannot cover (2026-10 review, Tests: no real-browser coverage).
+  # Postgres is the runner-managed `services:` entry (note at top); the
+  # main app is a bare in-job process on 127.0.0.1:8877 (the job
+  # container's own loopback — not a host port, so no collision surface),
+  # open mode (loopback binds are allowed by the boot policy). One indexed
+  # fixture ZIM is seeded before serve starts so the search flow has a
+  # result to find. The password-mode flow spec starts its OWN second
+  # server on 127.0.0.1:8878 in password mode against a dedicated fresh
+  # database (created below) so its env-seeded credentials land on a clean
+  # settings table.
   web-browser-smoke:
     runs-on: ubuntu-latest
     services:
@@ -149,7 +154,35 @@ jobs:
           done
           (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null \
             || { echo "web-browser-smoke: postgres:5432 never opened" >&2; exit 1; }
-          ZIM_DIR=$(mktemp -d) \
+
+          # Dedicated throwaway database for the password-mode flow spec:
+          # access.mode / access.admin_password are seeded from the
+          # environment only on first settings load, and the spec's prompt
+          # flow needs the loopback default require_auth_for_reads=false —
+          # both true only on a FRESH database (disposable, per the
+          # services convention above). The JOB container needs a pg client
+          # for this (the service container has the server, not the client);
+          # the runner image may or may not ship psql, so install on demand.
+          command -v psql >/dev/null 2>&1 \
+            || (apt-get update -qq && apt-get install -y -qq postgresql-client)
+          psql "postgres://zimservice:zimservice@postgres:5432/zimservice" \
+            -c "CREATE DATABASE zimservice_pw"
+
+          # Seed one indexed ZIM so the real search flow has a result to
+          # find (fixture article: "Test ZIM file"). `list --sync`
+          # reconciles the fresh DB with the files on disk; `index` must
+          # run BEFORE the server starts — mutating commands refuse while
+          # a server holds the per-DB advisory lock.
+          FIXTURE_DIR=$(mktemp -d)
+          cp tests/fixtures/tiny.zim "$FIXTURE_DIR/"
+          ZIM_DIR="$FIXTURE_DIR" \
+          DATABASE_URL=postgres://zimservice:zimservice@postgres:5432/zimservice \
+          ZIMSERVICE_REQUIRE_DB=1 target/release/zimservice list --sync
+          ZIM_DIR="$FIXTURE_DIR" \
+          DATABASE_URL=postgres://zimservice:zimservice@postgres:5432/zimservice \
+          ZIMSERVICE_REQUIRE_DB=1 target/release/zimservice index --zim tiny
+
+          ZIM_DIR="$FIXTURE_DIR" \
           DATABASE_URL=postgres://zimservice:zimservice@postgres:5432/zimservice \
           ZIMSERVICE_REQUIRE_DB=1 \
           HOST=127.0.0.1 \
@@ -165,6 +198,7 @@ jobs:
           done
           curl -sf http://127.0.0.1:8877/health
           ZIMSERVICE_BASE_URL=http://127.0.0.1:8877 \
+          ZIMSERVICE_PW_DATABASE_URL=postgres://zimservice:zimservice@postgres:5432/zimservice_pw \
             npx playwright test --config tests/web/playwright.config.mjs
           kill "$SERVER_PID" 2>/dev/null || true
   # MSRV gate: fail CI if the code silently requires a newer toolchain than
