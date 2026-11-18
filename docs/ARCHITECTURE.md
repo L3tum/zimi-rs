@@ -17,7 +17,7 @@ hardlink-based file sharing, an OpenAI-compatible embedding pipeline, and an MCP
   that seed and lock runtime settings from the environment; runtime tunables
   deliberately live in the `settings` table, not here.
 
-- **`src/startup.rs`** — startup orchestration and the single-instance guards
+- **`src/startup/`** — startup orchestration and the single-instance guards
   (moved from `src/main.rs` so the guard order around the mutating
   `build_state` is a testable unit). `StartupMode::{Serve, Mutating, ReadOnly}`
   selects whether the ZIM cache is reconciled with disk; `build_state` assembles
@@ -119,6 +119,13 @@ hardlink-based file sharing, an OpenAI-compatible embedding pipeline, and an MCP
   memoized (2 s TTL); the Postgres `SELECT 1` probe is deliberately not.
   `DegradationTracker` records which search capabilities are degraded.
 
+- **`src/process.rs`** — live readers for the process-mode opt-out flags
+  (`multi_instance_allowed`, `multi_db_allowed`): read the two
+  `ZIMSERVICE_ALLOW_*` env vars at call time so the guards, the `/health`
+  flags, and the settings-divergence warnings all agree. Leaf module (no
+  crate-internal deps) so `settings/` and `serve/` can use it without
+  inverting the `startup` dependency graph (P5, 2026-10 layering fix).
+
 - **`src/util.rs`** — `redact_url`: rewrites `user:pass@` in a URL's authority
   to `***@` so credentials never reach logs (re-exported at the crate root).
 
@@ -171,7 +178,7 @@ would corrupt the shared in-process state — the settings cache, the rate
 limiter, the qBittorrent client cache, and the ZIM LRU (`src/main.rs` bail,
 `README.md` "Single-instance deployment").
 
-Enforcement (`src/startup.rs`):
+Enforcement (`src/startup/`):
 
 1. **Per-database advisory lock.**
    `pg_try_advisory_lock(hashtext('zimservice:instance'))` —
@@ -324,7 +331,7 @@ path.
 Explicitly declared out of scope:
 
 - **High availability / clustering.** Single instance by design: at most one
-  `serve` per database *and* per `zim_dir` (`src/main.rs`, `src/startup.rs`,
+  `serve` per database *and* per `zim_dir` (`src/main.rs`, `src/startup/`,
   `README.md` "Single-instance deployment"). The guards exist so a violation
   fails fast, not to enable it.
 - **Per-client rate limiting.** The token bucket is service-wide by design
@@ -365,7 +372,7 @@ Explicitly declared out of scope:
   default on non-loopback binds**: `access.require_auth_for_reads` starts as
   `true` there unless `REQUIRE_AUTH_FOR_READS` is set explicitly (M-1
   hardening — the bind-based startup default is injected into the env
-  snapshot in `src/startup.rs` via
+  snapshot in `src/startup/` via
   `config::Config::apply_require_reads_default`; the all-zero CIDR refusal
   (M-3) for `general.trusted_proxy_cidrs` is enforced in `src/main.rs`).
   `README.md` "Security model".

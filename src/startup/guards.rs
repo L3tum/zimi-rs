@@ -912,8 +912,9 @@ mod tests {
     ///    **control**: five `SELECT 1`s from the monitor connection, and
     ///    requires the counter to rise by exactly ~5 (a [5, 8] band) over
     ///    the next aggregation cycles — a phantom batch (hundreds of rows)
-    ///    or a row that swallows live increments misses the band. Only a temp DB whose counter both settles
-    ///    and tracks the control is used for the measurement; otherwise
+    ///    or a row that swallows live increments misses the band.
+    ///    Only a temp DB whose counter both settles and
+    ///    tracks the control is used for the measurement; otherwise
     ///    the temp DB is recreated once and the test skips loudly if the
     ///    second attempt is equally unreliable. (CI's fresh postgres has
     ///    healthy per-database stats, so the measurement runs there —

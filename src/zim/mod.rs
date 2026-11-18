@@ -1266,12 +1266,14 @@ mod tests {
         let m = manager(&dir);
         write_zim(&dir, "alpha", 100);
         m.reconcile(&found(&dir)); // populate cache only
-                                   // An id-less cache entry is an UNPERSISTED stub — resync must persist
-                                   // it (the stub-gap fix; see resync_unpersisted_stub_attempts_persist).
-                                   // Simulate the DB row existing (persist_to_db writes the id back) so
-                                   // this test isolates the converged no-op: with nothing new on disk
-                                   // and everything persisted, the resync must not touch the DB (which
-                                   // would fail: the pool is unroutable) and report no changes.
+                                   // An id-less cache entry is an UNPERSISTED stub — resync must
+                                   // persist it (the stub-gap fix; see
+                                   // resync_unpersisted_stub_attempts_persist). Simulate the DB
+                                   // row existing (persist_to_db writes the id back) so this test
+                                   // isolates the converged no-op: with nothing new on disk and
+                                   // everything persisted, the resync must not touch the DB
+                                   // (which would fail: the pool is unroutable) and report no
+                                   // changes.
         m.cache.write().unwrap().get_mut("alpha").unwrap().id = Some(1);
 
         let report = m.resync().await.unwrap();
@@ -1288,9 +1290,10 @@ mod tests {
         let m = manager(&dir);
         write_zim(&dir, "alpha", 100);
         m.reconcile(&found(&dir)); // seed the in-memory cache
-                                   // Mark the entry persisted (id set): an id-less stub would make the
-                                   // FIRST resync attempt the (failing) persist — the stub-gap behavior
-                                   // pinned by resync_unpersisted_stub_attempts_persist.
+                                   // Mark the entry persisted (id set): an id-less stub would
+                                   // make the FIRST resync attempt the (failing) persist — the
+                                   // stub-gap behavior pinned by
+                                   // resync_unpersisted_stub_attempts_persist.
         m.cache.write().unwrap().get_mut("alpha").unwrap().id = Some(1);
 
         // First resync: populates the snapshot; reconcile finds no diff and
