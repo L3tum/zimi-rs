@@ -397,7 +397,16 @@ jobs:
       - run: |
           cargo install cargo-audit
           git clone --depth 1 https://github.com/RustSec/advisory-db /tmp/advisory-db
-          cargo audit --db /tmp/advisory-db
+          # --ignore RUSTSEC-2026-0459 (libsqlite3-sys 0.37.0, C SQLite
+          # CVE-2026-119375, patched in >=0.39.0): LOCKFILE-ONLY entry —
+          # sqlx 0.9.0 (the only 0.9.x release; our `sqlx = "0.9"` requirement)
+          # pins sqlx-sqlite 0.9.0 -> libsqlite3-sys 0.37.0 exactly, and the
+          # sqlite feature is OFF (`features = ["postgres", ...]`), so no
+          # SQLite code is compiled for any target (`cargo tree --target all
+          # -i libsqlite3-sys` is empty) and the CVE is unreachable here.
+          # Revisit at the sqlx 1.x bump. CLI flag, not audit.toml: the
+          # cargo-audit on this toolchain has no config-file support.
+          cargo audit --db /tmp/advisory-db --ignore RUSTSEC-2026-0459
   # Docker image build gate: catch the toolchain (H1) and build-context
   # (H2) regressions that only surface during an actual image build, plus
   # (m3, 2026-09 review) an e2e run of the built image: boot it against a
