@@ -728,8 +728,17 @@ mod tests {
     /// is wall-clock: the loop (tick = `TEST_TICK`) makes its real I/O pass
     /// between polls, and the poll simply waits for it. `None` from a check
     /// (a failed probe) retries.
-    async fn wait_until<F, Fut>(mut check: F, what: &str)
-    where
+    ///
+    /// `loop_task` (the spawned loop, when this wait guards loop work) is
+    /// diagnosed on timeout via [`timeout_diag`]: a `tokio::spawn` panic is
+    /// isolated from the test, so without it a dead loop would burn the whole
+    /// budget and fail as plain slowness with zero diagnostics (observed
+    /// 2026-11, coverage job).
+    async fn wait_until<F, Fut>(
+        mut check: F,
+        what: &str,
+        loop_task: Option<&mut tokio::task::JoinHandle<()>>,
+    ) where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Option<bool>>,
     {
@@ -739,11 +748,41 @@ mod tests {
                 return;
             }
             if std::time::Instant::now() >= deadline {
-                panic!("loop test: timed out waiting for {what}");
+                panic!(
+                    "loop test: timed out waiting for {what}{}",
+                    timeout_diag(loop_task).await
+                );
             }
             // Wall-clock pause between probes (real clock — the loop makes
             // its pass between polls).
             tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Timeout suffix for [`wait_until`]: if the loop task is still running,
+    /// say so (budget exhausted under load); if it has finished, join it
+    /// (instant — it is already finished) and surface the `JoinError`, so a
+    /// loop that PANICKED mid-test reports its panic payload instead of
+    /// masquerading as slowness.
+    async fn timeout_diag(loop_task: Option<&mut tokio::task::JoinHandle<()>>) -> String {
+        let Some(h) = loop_task else {
+            return String::new();
+        };
+        if !h.is_finished() {
+            return " (loop task still running — budget exhausted under load)".to_string();
+        }
+        match h.await {
+            Ok(()) => " (loop task exited normally — unexpected)".to_string(),
+            Err(e) if e.is_panic() => {
+                let payload = e.into_panic();
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                    .unwrap_or_else(|| format!("{payload:?}"));
+                format!(" (loop task PANICKED: {msg})")
+            }
+            Err(e) => format!(" (loop task terminated: {e})"),
         }
     }
 
@@ -830,10 +869,15 @@ mod tests {
             loop_settings(&pool, &server.uri(), true).await,
         );
         let first = seed_zim_article(&pool, "A/wave1").await;
-        let loop_task = tokio::spawn(auto_embed_loop(state, TEST_TICK));
+        let mut loop_task = tokio::spawn(auto_embed_loop(state, TEST_TICK));
 
         // Wave 1: the first tick's pipeline pass embeds the seeded article.
-        wait_until(|| article_embedded(&pool, first), "wave-1 article embedded").await;
+        wait_until(
+            || article_embedded(&pool, first),
+            "wave-1 article embedded",
+            Some(&mut loop_task),
+        )
+        .await;
 
         // Wave 2: new work appears while the loop is running (no setting
         // change, no restart). Only a loop that re-runs `list_embeddable_zims`
@@ -842,6 +886,7 @@ mod tests {
         wait_until(
             || article_embedded(&pool, second),
             "wave-2 article embedded on a later tick",
+            Some(&mut loop_task),
         )
         .await;
 
@@ -891,7 +936,7 @@ mod tests {
         let settings = loop_settings(&pool, &server.uri(), false).await;
         let first = seed_zim_article(&pool, "A/phase-off").await;
         let state = loop_state(pool.clone(), settings.clone());
-        let loop_task = tokio::spawn(auto_embed_loop(state, TEST_TICK));
+        let mut loop_task = tokio::spawn(auto_embed_loop(state, TEST_TICK));
 
         // Let the loop tick a few times while disabled: each tick re-reads
         // `embedding.enabled` and must skip — no claim, no HTTP.
@@ -928,6 +973,7 @@ mod tests {
         wait_until(
             || article_embedded(&pool, first),
             "article embedded after runtime enable",
+            Some(&mut loop_task),
         )
         .await;
         assert!(
@@ -1079,6 +1125,7 @@ mod tests {
         wait_until(
             || async { articles_live_tup(&pool).await.map(|t| t >= 10_000) },
             "stats to reflect 10k live rows",
+            None,
         )
         .await;
 
