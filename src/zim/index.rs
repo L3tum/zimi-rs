@@ -1341,11 +1341,14 @@ fn parse_zim_date(s: &str) -> Option<NaiveDate> {
 /// The pid scope also removes the cross-process cleanup hazard: two
 /// processes can no longer share (or clobber) a checkpoint path for the same
 /// ZIM name.
+///
+/// Pure path computation (no filesystem access): the pid-scoped dir is
+/// created by `save_checkpoint` on the blocking pool instead, so this
+/// stays safe to call from an async worker.
 fn checkpoint_file_path(zim_name: &str) -> PathBuf {
     let dir = std::env::temp_dir()
         .join("zimservice")
         .join(format!("pid-{}", std::process::id()));
-    let _ = fs::create_dir_all(&dir);
     dir.join(format!("{zim_name}.index-checkpoint.json"))
 }
 
@@ -1367,6 +1370,11 @@ async fn save_checkpoint(path: &Path, cp: &Checkpoint) {
         Err(_) => return,
     };
     tokio::task::spawn_blocking(move || {
+        // The pid-scoped dir is created here (blocking pool) — only the
+        // first checkpoint of a run actually fires the syscall.
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         let _ = fs::write(&path, json);
     })
     .await

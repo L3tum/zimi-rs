@@ -296,6 +296,11 @@ pub fn verify_admin_password(stored: &str, pw: &str) -> bool {
         if hex_decode(hash_hex).is_none_or(|h| h.len() != 32) {
             return false;
         }
+        // `hex_decode` above accepts either hex case, while `hex_encode`
+        // emits lowercase — normalize the stored copy so an uppercase
+        // row verifies instead of failing closed forever (the row is
+        // operator-controlled, and the compare stays constant-time).
+        let hash_hex = hash_hex.to_ascii_lowercase();
         let mut h = sha2::Sha256::new();
         h.update(salt.as_slice());
         h.update(pw.as_bytes());
@@ -306,7 +311,7 @@ pub fn verify_admin_password(stored: &str, pw: &str) -> bool {
             h.update(out);
             out = h.finalize();
         }
-        constant_time_eq(&hex_encode(&out), hash_hex)
+        constant_time_eq(&hex_encode(&out), &hash_hex)
     } else {
         constant_time_eq(pw, stored)
     }
@@ -577,6 +582,25 @@ mod tests {
         assert_sha2_shape(&h);
         assert!(verify_admin_password(&h, "s3cret"));
         assert!(!verify_admin_password(&h, "wrong"));
+    }
+
+    #[test]
+    fn verify_admin_password_sha2_legacy_uppercase_hex_verifies() {
+        // A legacy row whose hex fields are uppercase decodes fine (the
+        // length checks are case-insensitive), but the final compare runs
+        // against lowercase `hex_encode` output — it must verify via
+        // case normalization, not 401 forever (LOW-1, 2026-11 review).
+        let h = hash_sha2_legacy("s3cret");
+        let (prefix, rest) = h.split_once('$').expect("salt separator");
+        let (salt, hash) = rest.split_once('$').expect("hash separator");
+        let upper = format!(
+            "{prefix}${}${}",
+            salt.to_ascii_uppercase(),
+            hash.to_ascii_uppercase()
+        );
+        assert_ne!(upper, h, "fixture must actually differ in case");
+        assert!(verify_admin_password(&upper, "s3cret"));
+        assert!(!verify_admin_password(&upper, "wrong"));
     }
 
     #[test]
