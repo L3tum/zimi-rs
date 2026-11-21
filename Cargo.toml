@@ -60,7 +60,7 @@ sha2 = "0.11"
 # argon2id KDF for the admin password (SEC-M1)
 argon2 = "0.5"
 # salt generation for argon2id (OsRng) — feature unifies with argon2's dep
-password-hash = { version = "0.5", features = ["getrandom"] }
+password-hash = { version = "0.6", features = ["getrandom"] }
 # SEC-L5: at-rest encryption (AES-256-GCM) + KEK derivation (HKDF-SHA256)
 # for the secret settings under `SECURITY_KEY` — already compiled via
 # rustls (sqlx/reqwest TLS) → zero build-time cost.
