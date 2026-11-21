@@ -68,7 +68,7 @@ ring = "0.17"
 # SEC-L5: fresh random 12-byte GCM nonce per encryption — already at
 # 0.2.17 in Cargo.lock via password-hash's getrandom feature → zero
 # build-time cost.
-getrandom = "0.2"
+getrandom = "0.4"
 # StreamExt::next over reqwest's bytes_stream() in the torrent poller's stream_part
 tokio-stream = "0.1"
 
