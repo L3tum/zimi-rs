@@ -15,7 +15,7 @@ axum = "0.8"
 tower-http = { version = "0.7", features = ["cors", "limit", "trace"] }
 
 # OpenAPI
-utoipa = { version = "5", features = ["preserve_path_order", "chrono"] }
+utoipa = { version = "6", features = ["preserve_path_order", "chrono"] }
 
 # Database (sqlx Postgres — the only data-access layer; see db::raw)
 # sqlx 0.9: the combined runtime+TLS features were deleted; runtime and TLS
