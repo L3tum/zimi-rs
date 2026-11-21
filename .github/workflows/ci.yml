@@ -82,7 +82,7 @@ jobs:
       # skip silently without node/their dependency; CI always has node,
       # so a missing node/css-tree/jsdom must fail the gate, not pass it.
       - uses: actions/setup-node@v7
-        with: { node-version: 22 }
+        with: { node-version: 26 }
       - run: npm install --no-audit --no-fund
       - run: make web-check
         env:
@@ -103,7 +103,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
-        with: { node-version: 22 }
+        with: { node-version: 26 }
       - run: npm install --no-audit --no-fund
       - run: make web-lint
         env:
@@ -134,7 +134,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
-        with: { node-version: 22 }
+        with: { node-version: 26 }
       - uses: ./.github/actions/setup-rust
         with: { toolchain: "1.96.0" }
       - run: npm install --no-audit --no-fund
