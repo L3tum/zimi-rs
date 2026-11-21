@@ -710,9 +710,9 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "deformat"
-version = "0.15.3"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84bb4809b79a422fe4f33bc60e84eed908d7eae8cbabaf24f01674f5205d4aec"
+checksum = "a1be85a3e3ae6aeea025f2cc95bf8298db5269993d4ab3a48cf857d7870465b2"
 dependencies = [
  "dom_smoothie",
  "memchr",
