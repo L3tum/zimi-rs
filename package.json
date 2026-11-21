@@ -12,7 +12,7 @@
     "@playwright/test": "^1.52.0",
     "css-tree": "^3.2.1",
     "eslint": "^9",
-    "globals": "^16",
+    "globals": "^17.0.0",
     "jsdom": "^30.0.1"
   }
 }
