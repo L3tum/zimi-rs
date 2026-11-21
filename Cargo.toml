@@ -58,7 +58,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # postgres-protocol's SCRAM stack; hex is formatted with a local helper).
 sha2 = "0.11"
 # argon2id KDF for the admin password (SEC-M1)
-argon2 = "0.5"
+argon2 = "0.6"
 # salt generation for argon2id (OsRng) — feature unifies with argon2's dep
 password-hash = { version = "0.5", features = ["getrandom"] }
 # SEC-L5: at-rest encryption (AES-256-GCM) + KEK derivation (HKDF-SHA256)
