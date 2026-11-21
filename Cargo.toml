@@ -110,7 +110,7 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 wiremock = "0.6"
-dtor = "0.0.7"
+dtor = "1.0.0"
 # criterion: perf micro-benches (benches/{search,retrieval}.rs, `harness =
 # false`). Dev-only — never enters the production build. 0.6 line: the
 # conservative latest of the 0.5/0.6 range the benches target (0.7/0.8 exist
