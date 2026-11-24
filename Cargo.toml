@@ -105,17 +105,17 @@ zimservice = { path = ".", features = ["testing"] }
 # auto_embed_loop lifecycle tests (the loop's cadence is a plain
 # tokio::time::sleep, so the paused clock fast-forwards its ticks; test-only —
 # dev-dependencies never enter the production build).
-tokio = { version = "1", features = ["test-util"] }
-tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
-wiremock = "0.6"
-dtor = "0.0.7"
+tokio = { version = "=1.53.1", features = ["test-util"] }
+tempfile = "=3.27.0"
+tower = { version = "=0.5.3", features = ["util"] }
+http-body-util = "=0.1.5"
+wiremock = "=0.6.5"
+dtor = "=0.0.7"
 # criterion: perf micro-benches (benches/{search,retrieval}.rs, `harness =
 # false`). Dev-only — never enters the production build. 0.6 line: the
 # conservative latest of the 0.5/0.6 range the benches target (0.7/0.8 exist
 # with the same core API but raise the MSRV to 1.86+).
-criterion = "0.6"
+criterion = "=0.6.0"
 
 # Criterion bench targets: `harness = false` because criterion provides its
 # own `main` (the default libtest harness would ignore the criterion API).
