@@ -5,7 +5,7 @@
 # binary that dies at container start with `GLIBC_2.38 not found`. Pin the
 # base variant explicitly; the build-time check after `cargo build` enforces
 # the invariant so a future base drift fails the build, not the boot.
-FROM rust:1.96.0-slim-bookworm AS builder
+FROM rust:1.100.0-slim-bookworm@sha256:bb875b0f8ce726053e259034848c471840e96bfe591fd52556178ae9a05e6126 AS builder
 WORKDIR /build
 # Dependency-layer caching: fetch the manifest-only layer first so the
 # Cargo.lock-driven download layer stays valid across source-only changes.

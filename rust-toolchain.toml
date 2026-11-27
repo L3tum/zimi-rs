@@ -3,4 +3,4 @@
 # clippy/rustfmt results match the gates that block merges. MSRV 1.94 is
 # still guarded by `rust-version` in Cargo.toml and the dedicated `msrv`
 # CI job.
-channel = "1.96.0"
+channel = "1.100.1"
